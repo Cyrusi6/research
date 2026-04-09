@@ -1,0 +1,16 @@
+.venv/
+.pytest_cache/
+__pycache__/
+*.py[cod]
+
+workspace/
+
+.coverage
+htmlcov/
+
+*.log
+*.tmp
+
+.DS_Store
+
+*.ris

@@ -1,0 +1,69 @@
+project:
+  target_venue: "NeurIPS 2026"
+  language: "en"
+  workspace_root: "workspace"
+  external_resource_roots:
+    mm_root: "${MM_ROOT}"
+
+llm:
+  provider: "codex_cli"
+  model: "gpt-5.4"
+  temperature: 0.2
+  timeout_seconds: 180
+  use_real_api: true
+  codex_cli:
+    use_resume: true
+    session_strategy: "per_agent"
+    sandbox: "read-only"
+    approval_policy: "never"
+
+literature:
+  semantic_scholar_api_key: "${SEMANTIC_SCHOLAR_API_KEY}"
+  max_papers: 12
+  arxiv_max_results: 8
+  recent_years: 2
+  download_pdfs: true
+  request_timeout_seconds: 20
+
+plan:
+  min_hypotheses: 1
+  min_baselines: 2
+  min_datasets: 1
+  require_ablation: true
+  require_resource_budget: true
+
+experiment:
+  simulate: false
+  gpu_ids: "auto"
+  max_concurrent_jobs: 2
+  timeout_hours: 24
+  checkpoint_interval_min: 30
+  random_seeds: [42, 123, 456]
+  auto_reduce_batch_on_oom: true
+  self_heal:
+    enabled: true
+    max_attempts: 3
+  cleanup_failed_idea_runs: true
+  failure_log_filename: "failure.md"
+
+ideation:
+  challenge_target_rsum: 507.0
+
+writing:
+  template: "neurips2026"
+  page_limit: 10
+  compile_engine: "pdflatex"
+  require_compile: false
+  claim_verification:
+    enabled: true
+    min_pass_rate: 0.8
+
+review:
+  pass_threshold: 7.0
+  max_iterations: 5
+
+orchestration:
+  auto_mode: true
+  user_confirm_idea: false
+  per_stage_judge: true
+  judge_max_retries: 2
