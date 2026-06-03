@@ -1,7 +1,167 @@
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
 from auto_research.llm import ModelClient
+
+
+def test_openai_api_key_rotation_prefers_base_key_then_numbered(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "base-key")
+    monkeypatch.setenv("OPENAI_API_KEY_1", "first-key")
+    monkeypatch.setenv("OPENAI_API_KEY_2", "second-key")
+    client = ModelClient(
+        {
+            "llm": {
+                "provider": "openai",
+                "reasoning_provider": "openai",
+                "base_url": "https://api-cdn.owlai.tech/v1/responses",
+                "model": "gpt-5.4",
+                "timeout_seconds": 10,
+                "use_real_api": False,
+            }
+        }
+    )
+
+    assert client._openai_api_keys[:3] == ["base-key", "first-key", "second-key"]
+
+
+def test_openai_api_key_rotation_falls_back_on_quota(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "base-key")
+    monkeypatch.setenv("OPENAI_API_KEY_1", "first-key")
+
+    class FakeQuotaError(Exception):
+        status_code = 429
+
+    calls = []
+
+    class FakeResponses:
+        def __init__(self, api_key: str):
+            self.api_key = api_key
+
+        def create(self, **kwargs):
+            calls.append(self.api_key)
+            if self.api_key == "first-key":
+                raise FakeQuotaError("quota exceeded")
+            return SimpleNamespace(output_text='{"ok": true}')
+
+    class FakeClient:
+        def __init__(self, api_key: str, **kwargs):
+            self.responses = FakeResponses(api_key)
+
+    monkeypatch.setattr("auto_research.llm.OpenAI", FakeClient)
+
+    client = ModelClient(
+        {
+            "llm": {
+                "provider": "openai",
+                "reasoning_provider": "openai",
+                "base_url": "https://api-cdn.owlai.tech/v1/responses",
+                "model": "gpt-5.4",
+                "timeout_seconds": 10,
+                "use_real_api": True,
+            }
+        }
+    )
+
+    result = client.generate(
+        instructions="Return JSON.",
+        prompt="{}",
+    )
+
+    assert result.text == '{"ok": true}'
+    assert calls == ["base-key"]
+
+
+def test_openai_api_key_rotation_falls_back_from_base_to_numbered(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "base-key")
+    monkeypatch.setenv("OPENAI_API_KEY_1", "first-key")
+
+    class FakeQuotaError(Exception):
+        status_code = 429
+
+    calls = []
+
+    class FakeResponses:
+        def __init__(self, api_key: str):
+            self.api_key = api_key
+
+        def create(self, **kwargs):
+            calls.append(self.api_key)
+            if self.api_key == "base-key":
+                raise FakeQuotaError("quota exceeded")
+            return SimpleNamespace(output_text='{"ok": true}')
+
+    class FakeClient:
+        def __init__(self, api_key: str, **kwargs):
+            self.responses = FakeResponses(api_key)
+
+    monkeypatch.setattr("auto_research.llm.OpenAI", FakeClient)
+
+    client = ModelClient(
+        {
+            "llm": {
+                "provider": "openai",
+                "reasoning_provider": "openai",
+                "base_url": "https://api-cdn.owlai.tech/v1/responses",
+                "model": "gpt-5.4",
+                "timeout_seconds": 10,
+                "use_real_api": True,
+            }
+        }
+    )
+
+    result = client.generate(
+        instructions="Return JSON.",
+        prompt="{}",
+    )
+
+    assert result.text == '{"ok": true}'
+    assert calls == ["base-key", "first-key"]
+
+
+def test_openai_api_key_rotation_retries_all_keys(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "base-key")
+    monkeypatch.setenv("OPENAI_API_KEY_1", "first-key")
+
+    class FakeRateLimitError(Exception):
+        status_code = 429
+
+    calls = []
+
+    class FakeResponses:
+        def __init__(self, api_key: str):
+            self.api_key = api_key
+
+        def create(self, **kwargs):
+            calls.append(self.api_key)
+            if len(calls) < 3:
+                raise FakeRateLimitError("Too Many Requests")
+            return SimpleNamespace(output_text='{"ok": true}')
+
+    class FakeClient:
+        def __init__(self, api_key: str, **kwargs):
+            self.responses = FakeResponses(api_key)
+
+    monkeypatch.setattr("auto_research.llm.OpenAI", FakeClient)
+
+    client = ModelClient(
+        {
+            "llm": {
+                "provider": "openai",
+                "reasoning_provider": "openai",
+                "base_url": "https://api-cdn.owlai.tech/v1/responses",
+                "model": "gpt-5.4",
+                "timeout_seconds": 10,
+                "request_retries": 2,
+                "use_real_api": True,
+            }
+        }
+    )
+
+    result = client.generate(instructions="Return JSON.", prompt="{}")
+
+    assert result.text == '{"ok": true}'
+    assert calls == ["base-key", "first-key", "base-key"]
 
 
 def test_codex_cli_provider_persists_session(monkeypatch, tmp_path: Path) -> None:

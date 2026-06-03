@@ -1,6 +1,7 @@
 """Project-wide constants."""
 
 STAGE_ORDER = [
+    "S0_intake",
     "S1_literature",
     "S2_plan",
     "S3_experiment",
@@ -9,6 +10,7 @@ STAGE_ORDER = [
 ]
 
 STAGE_LABELS = {
+    "S0_intake": "intake",
     "S1_literature": "literature",
     "S2_plan": "plan",
     "S3_experiment": "experiment",
@@ -18,6 +20,7 @@ STAGE_LABELS = {
 
 REQUIRED_STAGE_DIRS = [
     "references",
+    "intake",
     "literature",
     "plan",
     "experiment",

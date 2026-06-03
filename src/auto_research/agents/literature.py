@@ -3,15 +3,26 @@
 from __future__ import annotations
 
 import json
+import re
+import shutil
+import subprocess
+import tempfile
+import time
+from pathlib import Path
 from typing import Any
 
+from ..c2c import (
+    build_c2c_ideas_with_llm,
+    is_c2c_project,
+)
 from ..adapters.literature import LiteratureProvider
-from ..agents.idea_review import IdeaReviewAgent
 from ..importers import ConsensusImporter
-from ..itr_ideas import build_itr_theme_map, build_laps_candidate_ideas, collect_consensus_entries, theme_map_markdown
+from ..itr_ideas import build_itr_theme_map, collect_consensus_entries, theme_map_markdown
+from ..failure_log import load_c2c_feedback_bundle
 from ..resources import discover_local_mm_resources
-from ..utils import compact_markdown, sanitize_filename, split_sentences
+from ..utils import compact_markdown, now_utc, read_yaml, sanitize_filename, split_sentences, write_yaml
 from .base import AgentContext
+from .debate import MultiAgentReasoningService, c2c_debate_markdown
 
 
 class LiteratureAgent:
@@ -27,6 +38,8 @@ class LiteratureAgent:
         return self._run_literature(topic)
 
     def _run_literature(self, topic: str) -> dict[str, Any]:
+        if is_c2c_project(self.context.config):
+            return self._run_c2c_literature(topic)
         papers = self.provider.search(topic)
         papers.extend(self._search_consensus_imports())
         papers = self.provider._deduplicate(papers)
@@ -71,6 +84,7 @@ class LiteratureAgent:
         theme_map_record = None
         imports = ConsensusImporter(self.context.project_root).list_imports()
         imported_entries = collect_consensus_entries(imports)
+        evidence_records: list[dict[str, Any]] = []
         if imported_entries:
             theme_map = build_itr_theme_map(imported_entries)
             theme_map_record = self.context.artifacts.write_text(
@@ -81,18 +95,68 @@ class LiteratureAgent:
                 summary="Consensus-derived image-text retrieval theme map",
                 source_paths=[metadata_record["path"]],
             )
-            raw_ideas = build_laps_candidate_ideas(theme_map, discover_local_mm_resources(self.context.config), topic=topic)
-            review_payload = IdeaReviewAgent(self.context).review(ideas=raw_ideas, theme_map=theme_map)
-            ideas = review_payload["ideas"]
-        else:
-            ideas = self._build_ideas(topic, ingested)
+        evidence_result = self._run_generic_evidence_direction(topic=topic, papers=ingested, survey=survey, theme_map_path=theme_map_record["path"] if theme_map_record else None)
+        if evidence_result.get("status") == "blocked":
+            blocked_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "evidence_agent_blocked.json",
+                evidence_result,
+                artifact_type="s1_evidence_agent_blocked",
+                summary="S1 Codex evidence agent could not produce valid idea JSON",
+                source_paths=[metadata_record["path"], survey_record["path"], *( [theme_map_record["path"]] if theme_map_record else [] )],
+            )
+            return {
+                "papers": ingested,
+                "artifacts": [metadata_record["path"], survey_record["path"], *( [theme_map_record["path"]] if theme_map_record else [] ), blocked_record["path"]],
+                "status": "blocked",
+                "blocked_reason": evidence_result.get("blocked_reason") or evidence_result.get("reason") or "S1 Codex evidence agent blocked",
+            }
+        ideas = evidence_result["ideas"]
+        evidence_requests_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "evidence_requests.json",
+            evidence_result.get("evidence_requests", []),
+            artifact_type="s1_evidence_requests",
+            summary="S1 requested evidence before idea choice",
+            source_paths=[metadata_record["path"], survey_record["path"]],
+        )
+        evidence_bundle_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "evidence_bundle.json",
+            evidence_result.get("evidence_bundle", {}),
+            artifact_type="s1_evidence_bundle",
+            summary="S1 evidence bundle for idea choice",
+            source_paths=[evidence_requests_record["path"], metadata_record["path"], survey_record["path"]],
+        )
+        direction_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "direction_decision.json",
+            evidence_result.get("direction_decision", {}),
+            artifact_type="s1_direction_decision",
+            summary="S1 selected high-level idea/direction",
+            source_paths=[evidence_bundle_record["path"]],
+        )
+        evidence_session_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "evidence_session.json",
+            evidence_result.get("evidence_session", {}),
+            artifact_type="s1_evidence_session",
+            summary="S1 Codex evidence-on-demand session transcript",
+            source_paths=[evidence_requests_record["path"], evidence_bundle_record["path"], direction_record["path"]],
+        )
+        evidence_records = [evidence_requests_record, evidence_bundle_record, direction_record, evidence_session_record]
         ideas_record = self.context.artifacts.write_json(
             self.stage_key,
             "ideas.json",
             ideas,
             artifact_type="ideas",
             summary=f"{len(ideas)} candidate ideas",
-            source_paths=[metadata_record["path"], *( [theme_map_record["path"]] if theme_map_record else [] )],
+            source_paths=[
+                metadata_record["path"],
+                survey_record["path"],
+                *( [theme_map_record["path"]] if theme_map_record else [] ),
+                *[record["path"] for record in evidence_records],
+            ],
         )
         feasibility = self._build_feasibility(ideas)
         feasibility_record = self.context.artifacts.write_text(
@@ -109,6 +173,553 @@ class LiteratureAgent:
                 metadata_record["path"],
                 survey_record["path"],
                 *( [theme_map_record["path"]] if theme_map_record else [] ),
+                *[record["path"] for record in evidence_records],
+                ideas_record["path"],
+                feasibility_record["path"],
+            ],
+        }
+
+    def _run_c2c_literature(self, topic: str) -> dict[str, Any]:
+        static_bundle = self._load_c2c_static_bundle()
+        if not static_bundle:
+            blocked_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "c2c_missing_s0_intake.json",
+                {
+                    "status": "blocked",
+                    "reason": "Missing S0 C2C static intake bundle. Run S0_intake before S1_literature.",
+                    "required_path": "intake/c2c/static_bundle.json",
+                },
+                artifact_type="c2c_missing_s0_intake",
+                summary="C2C S1 blocked because S0 static intake is missing",
+            )
+            return {
+                "papers": [],
+                "artifacts": [blocked_record["path"]],
+                "status": "blocked",
+                "blocked_reason": "Missing S0 C2C static intake bundle: intake/c2c/static_bundle.json",
+            }
+
+        reference_result = static_bundle.get("reference_result") or {}
+        reference_cards = reference_result.get("cards") or []
+        repo_manifest = static_bundle.get("repo_manifest") or {}
+        historical_results = static_bundle.get("historical_results") or {}
+        baseline = static_bundle.get("baseline") or {}
+        repo_card = static_bundle.get("repo_card") or {}
+        paper_cards = static_bundle.get("paper_cards") or []
+        paper_chunks = static_bundle.get("paper_chunks") or []
+        bibliography_cards = static_bundle.get("bibliography_cards") or []
+        rebuttal_matrix = static_bundle.get("rebuttal_matrix") or {}
+        rebuttal_chunks = static_bundle.get("rebuttal_chunks") or []
+        code_cards = static_bundle.get("code_cards") or []
+        code_file_manifest = static_bundle.get("code_file_manifest") or {}
+        code_symbols = static_bundle.get("code_symbols") or []
+        code_chunks = static_bundle.get("code_chunks") or []
+        code_edges = static_bundle.get("code_edges") or []
+        code_repo_map = static_bundle.get("code_repo_map") or {}
+        code_intake_report = static_bundle.get("code_intake_report") or {}
+        implementation_surface_map = static_bundle.get("implementation_surface_map") or {}
+        code_retrieval_index = static_bundle.get("code_retrieval_index") or {}
+        cache_summary = static_bundle.get("cache_summary") or {}
+        chunk_index = static_bundle.get("chunk_index") or {}
+        result_ledger_csv = static_bundle.get("result_ledger_csv") or ""
+        negative_memory = static_bundle.get("negative_memory") or {}
+        retrieval_plan = static_bundle.get("retrieval_plan") or {}
+        followup_bundle = static_bundle.get("followup_bundle") or {}
+        metadata = static_bundle.get("metadata") or [
+            {
+                "paper_id": card.get("paper_id"),
+                "title": card.get("title"),
+                "source_path": card.get("source_path"),
+                "local_path": card.get("local_path"),
+                "kind": card.get("kind"),
+                "text_snippet": (card.get("text") or "")[:1200],
+            }
+            for card in reference_cards
+        ]
+        feedback = self._load_feedback()
+        if self.context.config.get("ideation", {}).get("debate", {}).get("enabled", True):
+            ideas = []
+        else:
+            ideas = build_c2c_ideas_with_llm(
+                llm=self.context.llm,
+                topic=topic,
+                repo_manifest=repo_manifest,
+                baseline=baseline,
+                reference_cards=reference_cards,
+                rebuttal_concerns=rebuttal_matrix,
+                negative_memory=negative_memory,
+            )
+
+        metadata_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "papers/metadata.json",
+            metadata,
+            artifact_type="metadata",
+            summary="C2C configured reference materials",
+            source_paths=["intake/c2c/static_bundle.json"],
+        )
+        repo_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/repo_manifest.json",
+            repo_manifest,
+            artifact_type="c2c_repo_manifest",
+            summary="C2C repo intake manifest",
+            source_paths=["intake/c2c/repo_manifest.json"],
+        )
+        repo_card_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/repo_card.json",
+            repo_card,
+            artifact_type="c2c_repo_card",
+            summary="C2C repo capabilities, constraints, and evidence inventory",
+            source_paths=["intake/c2c/repo_card.json"],
+        )
+        history_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/historical_results.json",
+            historical_results,
+            artifact_type="c2c_historical_results",
+            summary="Imported C2C historical experiment evidence",
+            source_paths=["intake/c2c/historical_results.json"],
+        )
+        result_ledger_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "c2c/result_ledger.csv",
+            result_ledger_csv,
+            artifact_type="c2c_result_ledger",
+            summary="Normalized C2C historical result ledger",
+            source_paths=["intake/c2c/result_ledger.csv"],
+        )
+        baseline_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/baseline_evidence.json",
+            baseline,
+            artifact_type="c2c_baseline_evidence",
+            summary="C2C baseline target to beat",
+            source_paths=["intake/c2c/baseline_evidence.json"],
+        )
+        paper_cards_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/paper_cards.json",
+            paper_cards,
+            artifact_type="c2c_paper_cards",
+            summary="Structured cards for configured C2C-area papers",
+            source_paths=["intake/c2c/paper_cards.json"],
+        )
+        paper_chunks_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "c2c/paper_chunks.jsonl",
+            _jsonl(paper_chunks),
+            artifact_type="c2c_paper_chunks",
+            summary="Section-aware C2C paper chunks without bibliography text",
+            source_paths=["intake/c2c/paper_chunks.jsonl"],
+            metadata={"chunk_count": len(paper_chunks)},
+        )
+        bibliography_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/bibliography.json",
+            bibliography_cards,
+            artifact_type="c2c_bibliography",
+            summary="Reference sections preserved separately for related-work expansion",
+            source_paths=["intake/c2c/bibliography.json"],
+        )
+        rebuttal_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/rebuttal_concern_matrix.json",
+            rebuttal_matrix,
+            artifact_type="c2c_rebuttal_concerns",
+            summary="Reviewer concern matrix parsed from rebuttal materials",
+            source_paths=["intake/c2c/rebuttal_concern_matrix.json"],
+        )
+        rebuttal_chunks_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "c2c/rebuttal_chunks.jsonl",
+            _jsonl(rebuttal_chunks),
+            artifact_type="c2c_rebuttal_chunks",
+            summary="Review and rebuttal chunks with source anchors",
+            source_paths=["intake/c2c/rebuttal_chunks.jsonl"],
+            metadata={"chunk_count": len(rebuttal_chunks)},
+        )
+        code_cards_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/code_cards.json",
+            code_cards,
+            artifact_type="c2c_code_cards",
+            summary="Core C2C code symbols, config knobs, and imports",
+            source_paths=["intake/c2c/code_cards.json"],
+        )
+        code_file_manifest_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/code_file_manifest.json",
+            code_file_manifest,
+            artifact_type="c2c_code_file_manifest",
+            summary="Tree-sitter code file manifest and edit surface",
+            source_paths=["intake/c2c/code_file_manifest.json"],
+        )
+        code_symbols_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "c2c/code_symbols.jsonl",
+            _jsonl(code_symbols),
+            artifact_type="c2c_code_symbols",
+            summary="Tree-sitter code symbols for repository map",
+            source_paths=["intake/c2c/code_symbols.jsonl"],
+            metadata={"symbol_count": len(code_symbols)},
+        )
+        code_chunks_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "c2c/code_chunks.jsonl",
+            _jsonl(code_chunks),
+            artifact_type="c2c_code_chunks",
+            summary="Function-level source chunks for S1 reasoning",
+            source_paths=["intake/c2c/code_chunks.jsonl"],
+            metadata={"chunk_count": len(code_chunks)},
+        )
+        code_edges_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "c2c/code_edges.jsonl",
+            _jsonl(code_edges),
+            artifact_type="c2c_code_edges",
+            summary="Static code relation graph edges",
+            source_paths=["intake/c2c/code_edges.jsonl"],
+            metadata={"edge_count": len(code_edges)},
+        )
+        code_repo_map_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/code_repo_map.json",
+            code_repo_map,
+            artifact_type="c2c_code_repo_map",
+            summary="Compact tree-sitter repository map",
+            source_paths=["intake/c2c/code_repo_map.json"],
+        )
+        code_repo_map_md_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "c2c/code_repo_map.md",
+            _code_repo_map_markdown(code_repo_map),
+            artifact_type="c2c_code_repo_map_markdown",
+            summary="Readable tree-sitter repository map",
+            source_paths=["intake/c2c/code_repo_map.md"],
+        )
+        code_intake_report_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/code_intake_report.json",
+            code_intake_report,
+            artifact_type="c2c_code_intake_report",
+            summary="Code intake coverage and quality diagnostics",
+            source_paths=["intake/c2c/code_intake_report.json"],
+        )
+        implementation_surface_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/implementation_surface_map.json",
+            implementation_surface_map,
+            artifact_type="c2c_implementation_surface_map",
+            summary="Editable mechanism surfaces for S2.5 patches",
+            source_paths=["intake/c2c/implementation_surface_map.json"],
+        )
+        code_retrieval_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/code_retrieval_index.json",
+            code_retrieval_index,
+            artifact_type="c2c_code_retrieval_index",
+            summary="Precomputed code retrieval entry points for S1/S2",
+            source_paths=["intake/c2c/code_retrieval_index.json"],
+        )
+        cache_summary_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/cache_summary.json",
+            cache_summary,
+            artifact_type="c2c_static_cache_summary",
+            summary="S0 cache hit/miss summary for MinerU and code intake",
+            source_paths=["intake/c2c/cache_summary.json"],
+        )
+        chunk_index_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/chunk_index.json",
+            chunk_index,
+            artifact_type="c2c_chunk_index",
+            summary="Full S0 chunk catalog for paper, rebuttal, and code retrieval",
+            source_paths=["intake/c2c/chunk_index.json"],
+        )
+        chunk_index_jsonl_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "c2c/chunk_index.jsonl",
+            _jsonl(chunk_index.get("entries", []) if isinstance(chunk_index, dict) else []),
+            artifact_type="c2c_chunk_index_jsonl",
+            summary="Line-delimited S0 chunk catalog for retrieval",
+            source_paths=["intake/c2c/chunk_index.jsonl"],
+            metadata={"chunk_count": (chunk_index.get("counts", {}) or {}).get("total", 0) if isinstance(chunk_index, dict) else 0},
+        )
+        retrieval_plan_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/retrieval_plan.json",
+            retrieval_plan,
+            artifact_type="c2c_retrieval_plan",
+            summary="Chunk retrieval plan for paper, rebuttal, and code evidence",
+            source_paths=["intake/c2c/retrieval_plan.json"],
+        )
+        followup_bundle_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/retrieval_followup.json",
+            followup_bundle,
+            artifact_type="c2c_retrieval_followup",
+            summary="Follow-up retrieval questions and targets",
+            source_paths=["intake/c2c/retrieval_followup.json"],
+        )
+        negative_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/negative_result_memory.json",
+            negative_memory,
+            artifact_type="c2c_negative_result_memory",
+            summary="Below-baseline local variants and avoid-repeat rules",
+            source_paths=["intake/c2c/negative_result_memory.json"],
+        )
+        debate_record = None
+        debate_md_record = None
+        constraints_record = None
+        evidence_requests_record = None
+        evidence_bundle_record = None
+        direction_record = None
+        evidence_session_record = None
+        if self.context.config.get("ideation", {}).get("debate", {}).get("enabled", True):
+            if _use_legacy_c2c_debate(self.context.config):
+                debate = MultiAgentReasoningService(self.context).run_c2c_debate(
+                    topic=topic,
+                    repo_card=repo_card,
+                    paper_cards=paper_cards,
+                    paper_chunks=paper_chunks,
+                    rebuttal_matrix=rebuttal_matrix,
+                    rebuttal_chunks=rebuttal_chunks,
+                    code_cards=code_cards,
+                    code_chunks=code_chunks,
+                    negative_memory=negative_memory,
+                    baseline=baseline,
+                    retrieval_plan=retrieval_plan,
+                    followup_bundle=followup_bundle,
+                    feedback=feedback,
+                )
+            else:
+                debate = self._run_c2c_evidence_on_demand_direction(
+                    topic=topic,
+                    evidence_brief=static_bundle.get("evidence_brief") or {},
+                    chunk_index=chunk_index,
+                    paper_chunks=paper_chunks,
+                    rebuttal_chunks=rebuttal_chunks,
+                    code_chunks=code_chunks,
+                    code_edges=code_edges,
+                    code_intake_report=code_intake_report,
+                    implementation_surface_map=implementation_surface_map,
+                    code_retrieval_index=code_retrieval_index,
+                    baseline=baseline,
+                    negative_memory=negative_memory,
+                    rebuttal_matrix=rebuttal_matrix,
+                    feedback=feedback,
+                )
+                if debate.get("status") == "blocked":
+                    blocked_record = self.context.artifacts.write_json(
+                        self.stage_key,
+                        "c2c/evidence_agent_blocked.json",
+                        debate,
+                        artifact_type="c2c_s1_evidence_agent_blocked",
+                        summary="S1 Codex evidence agent could not produce valid direction JSON",
+                        source_paths=["intake/c2c/evidence_brief.json", "intake/c2c/chunk_index.json"],
+                    )
+                    return {
+                        "papers": metadata,
+                        "artifacts": [blocked_record["path"]],
+                        "status": "blocked",
+                        "blocked_reason": debate.get("blocked_reason") or debate.get("reason") or "S1 Codex evidence agent blocked",
+                    }
+            ideas = debate["selected_ideas"]
+            if debate.get("strategy") == "codex_resume_evidence_agent":
+                evidence_requests_record = self.context.artifacts.write_json(
+                    self.stage_key,
+                    "c2c/evidence_requests.json",
+                    debate.get("evidence_requests", []),
+                    artifact_type="c2c_s1_evidence_requests",
+                    summary="S1 requested evidence before direction choice",
+                    source_paths=["intake/c2c/evidence_brief.json", "intake/c2c/chunk_index.json"],
+                )
+                evidence_bundle_record = self.context.artifacts.write_json(
+                    self.stage_key,
+                    "c2c/evidence_bundle.json",
+                    debate.get("evidence_bundle", {}),
+                    artifact_type="c2c_s1_evidence_bundle",
+                    summary="S1 fetched evidence chunks for direction choice",
+                    source_paths=[evidence_requests_record["path"], chunk_index_record["path"], code_retrieval_record["path"]],
+                )
+                direction_record = self.context.artifacts.write_json(
+                    self.stage_key,
+                    "c2c/direction_decision.json",
+                    debate.get("direction_decision", {}),
+                    artifact_type="c2c_s1_direction_decision",
+                    summary="S1 selected mechanism direction after evidence retrieval",
+                    source_paths=[evidence_bundle_record["path"], negative_record["path"], baseline_record["path"]],
+                )
+                evidence_session_record = self.context.artifacts.write_json(
+                    self.stage_key,
+                    "c2c/evidence_session.json",
+                    debate.get("evidence_session", {}),
+                    artifact_type="c2c_s1_evidence_session",
+                    summary="S1 Codex evidence-on-demand session transcript",
+                    source_paths=[evidence_requests_record["path"], evidence_bundle_record["path"], direction_record["path"]],
+                )
+            debate_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "idea_debate.json",
+                debate,
+                artifact_type="c2c_idea_debate",
+                summary="C2C multi-agent idea debate",
+                source_paths=[
+                    repo_card_record["path"],
+                    paper_cards_record["path"],
+                    paper_chunks_record["path"],
+                    rebuttal_record["path"],
+                    rebuttal_chunks_record["path"],
+                    code_cards_record["path"],
+                    code_file_manifest_record["path"],
+                    code_symbols_record["path"],
+                    code_chunks_record["path"],
+                    code_edges_record["path"],
+                    code_repo_map_record["path"],
+                    code_intake_report_record["path"],
+                    implementation_surface_record["path"],
+                    code_retrieval_record["path"],
+                    cache_summary_record["path"],
+                    chunk_index_record["path"],
+                    retrieval_plan_record["path"],
+                    followup_bundle_record["path"],
+                    negative_record["path"],
+                    *(
+                        [
+                            evidence_requests_record["path"],
+                            evidence_bundle_record["path"],
+                            direction_record["path"],
+                            evidence_session_record["path"],
+                        ]
+                        if evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record
+                        else []
+                    ),
+                ],
+            )
+            debate_md_record = self.context.artifacts.write_text(
+                self.stage_key,
+                "idea_debate.md",
+                c2c_debate_markdown(debate),
+                artifact_type="c2c_idea_debate_summary",
+                summary="Readable C2C idea debate summary",
+                source_paths=[debate_record["path"]],
+            )
+            constraints_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "negative_constraints.json",
+                debate["negative_constraints"],
+                artifact_type="c2c_negative_constraints",
+                summary="C2C reviewer and failure constraints",
+                source_paths=[debate_record["path"]],
+            )
+        survey_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "survey.md",
+            self._build_c2c_survey(topic, baseline, reference_result["cards"], historical_results, rebuttal_matrix, negative_memory),
+            artifact_type="survey",
+            summary="C2C-focused literature and evidence survey",
+            source_paths=["intake/c2c/evidence_brief.json", metadata_record["path"], baseline_record["path"], rebuttal_record["path"], negative_record["path"]],
+        )
+        ideas_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "ideas.json",
+            ideas,
+            artifact_type="ideas",
+            summary="C2C candidate research ideas",
+            source_paths=[
+                repo_card_record["path"],
+                baseline_record["path"],
+                paper_cards_record["path"],
+                paper_chunks_record["path"],
+                bibliography_record["path"],
+                rebuttal_record["path"],
+                rebuttal_chunks_record["path"],
+                code_cards_record["path"],
+                code_file_manifest_record["path"],
+                code_symbols_record["path"],
+                code_chunks_record["path"],
+                code_edges_record["path"],
+                code_repo_map_record["path"],
+                code_intake_report_record["path"],
+                implementation_surface_record["path"],
+                code_retrieval_record["path"],
+                cache_summary_record["path"],
+                chunk_index_record["path"],
+                retrieval_plan_record["path"],
+                followup_bundle_record["path"],
+                negative_record["path"],
+                *(
+                    [
+                        evidence_requests_record["path"],
+                        evidence_bundle_record["path"],
+                        direction_record["path"],
+                        evidence_session_record["path"],
+                        debate_record["path"],
+                        debate_md_record["path"],
+                        constraints_record["path"],
+                    ]
+                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record
+                    else []
+                ),
+            ],
+        )
+        feasibility_record = self.context.artifacts.write_text(
+            self.stage_key,
+            "feasibility_check.md",
+            self._build_c2c_feasibility(ideas, baseline),
+            artifact_type="feasibility",
+            summary="C2C feasibility note",
+            source_paths=[ideas_record["path"], baseline_record["path"]],
+        )
+        return {
+            "papers": metadata,
+            "artifacts": [
+                metadata_record["path"],
+                repo_record["path"],
+                repo_card_record["path"],
+                history_record["path"],
+                result_ledger_record["path"],
+                baseline_record["path"],
+                paper_cards_record["path"],
+                paper_chunks_record["path"],
+                bibliography_record["path"],
+                rebuttal_record["path"],
+                rebuttal_chunks_record["path"],
+                code_cards_record["path"],
+                code_file_manifest_record["path"],
+                code_symbols_record["path"],
+                code_chunks_record["path"],
+                code_edges_record["path"],
+                code_repo_map_record["path"],
+                code_repo_map_md_record["path"],
+                code_intake_report_record["path"],
+                implementation_surface_record["path"],
+                code_retrieval_record["path"],
+                cache_summary_record["path"],
+                chunk_index_record["path"],
+                chunk_index_jsonl_record["path"],
+                retrieval_plan_record["path"],
+                followup_bundle_record["path"],
+                negative_record["path"],
+                *(
+                    [
+                        evidence_requests_record["path"],
+                        evidence_bundle_record["path"],
+                        direction_record["path"],
+                        evidence_session_record["path"],
+                        debate_record["path"],
+                        debate_md_record["path"],
+                        constraints_record["path"],
+                    ]
+                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record
+                    else []
+                ),
+                survey_record["path"],
                 ideas_record["path"],
                 feasibility_record["path"],
             ],
@@ -126,6 +737,153 @@ class LiteratureAgent:
             for arxiv_id in item.get("arxiv_ids", [])[:5]:
                 papers.extend(self.provider.search(arxiv_id))
         return papers
+
+    def _load_feedback(self) -> list[dict[str, Any]]:
+        bundle = load_c2c_feedback_bundle(self.context.project_root, view="method")
+        return [bundle["summary_entry"], *bundle["entries"], *bundle["iteration_traces"]]
+
+    def _load_c2c_static_bundle(self) -> dict[str, Any]:
+        path = self.context.project_root / "intake" / "c2c" / "static_bundle.json"
+        if not path.exists():
+            return {}
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _run_generic_evidence_direction(self, *, topic: str, papers: list[dict[str, Any]], survey: str, theme_map_path: str | None) -> dict[str, Any]:
+        cfg = _s1_codex_agent_config(self.context.config, mode="generic")
+        result = _run_s1_codex_evidence_agent(
+            project_root=self.context.project_root,
+            config=self.context.config,
+            prompt=_generic_s1_codex_evidence_prompt(
+                topic=topic,
+                papers=papers,
+                survey=survey,
+                theme_map_path=theme_map_path,
+                resources=discover_local_mm_resources(self.context.config),
+            ),
+            max_repairs=int(cfg.get("max_json_repairs") or 2),
+            timeout_seconds=int(cfg.get("timeout_seconds") or (self.context.config.get("llm", {}) or {}).get("timeout_seconds") or 1800),
+            mode="generic",
+        )
+        if result.get("status") != "ok":
+            return {
+                "status": "blocked",
+                "strategy": "codex_resume_evidence_agent",
+                "blocked_reason": result.get("reason") or "S1 Codex evidence agent did not return valid JSON.",
+                "evidence_session": result,
+                "ideas": [],
+            }
+        payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+        ideas = _generic_s1_codex_ideas(payload)
+        return {
+            "status": "ok",
+            "strategy": "codex_resume_evidence_agent",
+            "ideas": ideas,
+            "evidence_requests": payload.get("evidence_requests") if isinstance(payload.get("evidence_requests"), list) else [],
+            "evidence_bundle": payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {"items": []},
+            "direction_decision": payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {},
+            "evidence_session": {
+                "schema_version": "s1_codex_evidence_session_v1",
+                "status": "ok",
+                "session_key": result.get("session_key"),
+                "session_id": result.get("session_id"),
+                "used_existing_session": result.get("used_existing_session"),
+                "attempts": result.get("attempts", []),
+                "repair_count": result.get("repair_count", 0),
+                "source": "codex_cli",
+            },
+        }
+
+    def _run_c2c_evidence_on_demand_direction(
+        self,
+        *,
+        topic: str,
+        evidence_brief: dict[str, Any],
+        chunk_index: dict[str, Any],
+        paper_chunks: list[dict[str, Any]],
+        rebuttal_chunks: list[dict[str, Any]],
+        code_chunks: list[dict[str, Any]],
+        code_edges: list[dict[str, Any]],
+        code_intake_report: dict[str, Any],
+        implementation_surface_map: dict[str, Any],
+        code_retrieval_index: dict[str, Any],
+        baseline: dict[str, Any],
+        negative_memory: dict[str, Any],
+        rebuttal_matrix: dict[str, Any],
+        feedback: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        cfg = _s1_codex_agent_config(self.context.config)
+        result = _run_s1_codex_evidence_agent(
+            project_root=self.context.project_root,
+            config=self.context.config,
+            prompt=_s1_codex_evidence_prompt(
+                topic=topic,
+                evidence_brief=evidence_brief,
+                chunk_index=chunk_index,
+                code_intake_report=code_intake_report,
+                implementation_surface_map=implementation_surface_map,
+                code_retrieval_index=code_retrieval_index,
+                baseline=baseline,
+                negative_memory=negative_memory,
+                rebuttal_matrix=rebuttal_matrix,
+                feedback=feedback,
+            ),
+            max_repairs=int(cfg.get("max_json_repairs") or 2),
+            timeout_seconds=int(cfg.get("timeout_seconds") or (self.context.config.get("llm", {}) or {}).get("timeout_seconds") or 1800),
+            mode="c2c",
+        )
+        if result.get("status") != "ok":
+            return {
+                "status": "blocked",
+                "strategy": "codex_resume_evidence_agent",
+                "blocked_reason": result.get("reason") or "S1 Codex evidence agent did not return valid JSON.",
+                "evidence_session": result,
+                "selected_ideas": [],
+                "negative_constraints": {},
+            }
+        payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
+        evidence_requests = payload.get("evidence_requests") if isinstance(payload.get("evidence_requests"), list) else []
+        evidence_bundle = payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {"items": []}
+        direction_decision = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
+        selected_ideas = _s1_codex_direction_cards(payload)
+        negative_constraints = payload.get("negative_constraints") if isinstance(payload.get("negative_constraints"), dict) else {}
+        decision_chain = payload.get("decision_chain") if isinstance(payload.get("decision_chain"), dict) else direction_decision.get("decision_chain")
+        if not isinstance(decision_chain, dict):
+            decision_chain = _s1_codex_decision_chain(payload, selected_ideas)
+        return {
+            "status": "ok",
+            "strategy": "codex_resume_evidence_agent",
+            "roles": ["codex_evidence_agent"],
+            "rounds": [],
+            "meta_judge": {
+                "role": "codex_evidence_agent",
+                "status": "ok",
+                "session_id": result.get("session_id"),
+                "decision_chain": decision_chain,
+                "decision_rationale": direction_decision.get("rationale") or direction_decision.get("why_this_direction") or decision_chain.get("conclusion"),
+            },
+            "decision_chain": decision_chain,
+            "direction_decision": direction_decision,
+            "selected_ideas": selected_ideas,
+            "negative_constraints": negative_constraints,
+            "evidence_requests": evidence_requests,
+            "evidence_bundle": evidence_bundle,
+            "evidence_session": {
+                "schema_version": "c2c_s1_codex_evidence_session_v1",
+                "status": "ok",
+                "session_key": result.get("session_key"),
+                "session_id": result.get("session_id"),
+                "used_existing_session": result.get("used_existing_session"),
+                "attempts": result.get("attempts", []),
+                "repair_count": result.get("repair_count", 0),
+                "source": "codex_cli",
+            },
+            "quality_flags": [],
+            "run_log": {"progress_path": "literature/c2c/evidence_session.json", "events": result.get("attempts", [])},
+        }
 
     def _run_related_work_audit(self) -> dict[str, Any]:
         paper_path = self.context.project_root / "paper" / "sections" / "related_work.tex"
@@ -273,6 +1031,78 @@ class LiteratureAgent:
         return compact_markdown("\n".join(lines))
 
     @staticmethod
+    def _build_c2c_survey(
+        topic: str,
+        baseline: dict[str, Any],
+        reference_cards: list[dict[str, Any]],
+        historical_results: dict[str, Any],
+        rebuttal_matrix: dict[str, Any] | None = None,
+        negative_memory: dict[str, Any] | None = None,
+    ) -> str:
+        lines = [
+            f"# C2C Survey: {topic}",
+            "",
+            "## Baseline Target",
+            f"- Method: {baseline.get('name')}",
+            f"- Three-dataset mean: {baseline.get('mean')}",
+            f"- Dataset scores: {baseline.get('datasets')}",
+            "",
+            "## Configured References",
+        ]
+        for card in reference_cards:
+            text = (card.get("text") or "").replace("\n", " ")[:260]
+            lines.append(f"- **{card.get('title')}** ({card.get('kind')}): {text}")
+        lines.extend(["", "## Imported Historical Evidence"])
+        counts = historical_results.get("counts", {})
+        lines.append(f"- Small-loop rows: {counts.get('small_loop_rows', 0)}")
+        lines.append(f"- Summary JSON files: {counts.get('summary_jsons', 0)}")
+        if rebuttal_matrix:
+            lines.extend(["", "## Reviewer Concern Signals"])
+            top_concerns = rebuttal_matrix.get("top_concerns") or []
+            lines.append(f"- Top concerns: {top_concerns or ['none detected']}")
+            for item in rebuttal_matrix.get("matrix", [])[:4]:
+                if item.get("hit_count", 0) > 0:
+                    lines.append(f"- {item.get('concern_id')}: priority={item.get('priority')}, hits={item.get('hit_count')}")
+        if negative_memory:
+            lines.extend(["", "## Negative Result Memory"])
+            lines.append(f"- Below-baseline rows: {negative_memory.get('failed_result_count', 0)}")
+            for rule in (negative_memory.get("blocked_idea_patterns") or [])[:5]:
+                lines.append(f"- Avoid: {rule}")
+        lines.extend(
+            [
+                "",
+                "## Working Thesis",
+                "- Keep receiver, sharer, datasets, and small2048 protocol fixed.",
+                "- Search for bounded changes in cross-tokenizer span alignment, confidence gating, and KV aggregation.",
+                "- Treat validation loss as diagnostic only; benchmark mean is the primary signal.",
+            ]
+        )
+        return compact_markdown("\n".join(lines))
+
+    @staticmethod
+    def _build_c2c_feasibility(ideas: list[dict[str, Any]], baseline: dict[str, Any]) -> str:
+        lines = [
+            "# C2C Feasibility Check",
+            "",
+            f"- Baseline to beat: {baseline.get('name')} mean={baseline.get('mean')}",
+            "- Allowed edit scope: core alignment modules plus generated recipe/local configs.",
+            "- Verification: py_compile, span-overlap unit test, small2048 train, three dataset eval.",
+            "",
+        ]
+        for idea in ideas:
+            lines.extend(
+                [
+                    f"## {idea['title']}",
+                    f"- Novelty: {idea.get('novelty_score')}/10",
+                    f"- Feasibility: {idea.get('feasibility_score')}/10",
+                    f"- Hypothesis: {idea.get('hypothesis', idea.get('description', ''))}",
+                    f"- Risk: {idea.get('risk', 'unknown')}",
+                    "",
+                ]
+            )
+        return compact_markdown("\n".join(lines))
+
+    @staticmethod
     def _format_audit(audit: dict[str, Any]) -> str:
         lines = ["# Related Work Audit", ""]
         for key in ["missing_critical", "missing_recent", "novelty_conflicts", "grouping_suggestions"]:
@@ -321,3 +1151,765 @@ class LiteratureAgent:
                 current["local_pdf_path"] = record["local_pdf_path"]
             updated.append(current)
         return updated
+
+
+def _jsonl(items: list[dict[str, Any]]) -> str:
+    return "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in items)
+
+
+def _code_repo_map_markdown(repo_map: dict[str, Any]) -> str:
+    if not isinstance(repo_map, dict):
+        return "# Code Repo Map\n\nNo code repo map available.\n"
+    lines = ["# Code Repo Map", ""]
+    counts = repo_map.get("counts") or {}
+    lines.append(f"- Files: {counts.get('files', 0)}")
+    lines.append(f"- Symbols: {counts.get('symbols', 0)}")
+    lines.append(f"- Chunks: {counts.get('chunks', 0)}")
+    lines.append(f"- Edges: {counts.get('edges', 0)}")
+    for file_entry in repo_map.get("files", [])[:80]:
+        if not isinstance(file_entry, dict):
+            continue
+        lines.extend(["", f"## {file_entry.get('path')}"])
+        lines.append(f"- edit_surface: {file_entry.get('edit_surface')}")
+        for symbol in (file_entry.get("symbols") or [])[:30]:
+            if isinstance(symbol, dict):
+                lines.append(f"- `{symbol.get('symbol')}` ({symbol.get('kind')}) lines {symbol.get('start_line')}-{symbol.get('end_line')}")
+    return "\n".join(lines).strip() + "\n"
+
+
+def _use_legacy_c2c_debate(config: dict[str, Any]) -> bool:
+    debate_cfg = ((config.get("ideation") or {}).get("debate") or {})
+    agent_cfg = _s1_codex_agent_config(config, mode="c2c")
+    strategy = str(agent_cfg.get("strategy") or debate_cfg.get("strategy") or "codex_resume_evidence_agent").strip().lower()
+    return bool(debate_cfg.get("legacy_multi_agent")) or strategy in {"legacy_multi_agent", "legacy_debate", "multi_agent_debate"}
+
+
+def _s1_codex_agent_config(config: dict[str, Any], *, mode: str = "c2c") -> dict[str, Any]:
+    cfg: dict[str, Any] = {
+        "strategy": "codex_resume_evidence_agent",
+        "session_key": "s1:c2c_evidence_direction" if mode == "c2c" else "s1:generic_evidence_direction",
+        "max_json_repairs": 2,
+        "resume_enabled": True,
+    }
+    agent_cfg = ((config.get("agents") or {}).get("s1_evidence_agent") or {})
+    c2c_cfg = ((config.get("c2c") or {}).get("s1_evidence_agent") or {}) if mode == "c2c" else {}
+    generic_cfg = ((config.get("literature") or {}).get("s1_evidence_agent") or {}) if mode != "c2c" else {}
+    if isinstance(agent_cfg, dict):
+        cfg.update(agent_cfg)
+    if isinstance(generic_cfg, dict):
+        cfg.update(generic_cfg)
+    if isinstance(c2c_cfg, dict):
+        cfg.update(c2c_cfg)
+    return cfg
+
+
+def _s1_codex_evidence_prompt(
+    *,
+    topic: str,
+    evidence_brief: dict[str, Any],
+    chunk_index: dict[str, Any],
+    code_intake_report: dict[str, Any],
+    implementation_surface_map: dict[str, Any],
+    code_retrieval_index: dict[str, Any],
+    baseline: dict[str, Any],
+    negative_memory: dict[str, Any],
+    rebuttal_matrix: dict[str, Any],
+    feedback: list[dict[str, Any]],
+) -> str:
+    context_payload = {
+        "schema_version": "c2c_s1_codex_prompt_context_v1",
+        "topic": topic,
+        "task": "Choose one broad C2C mechanism direction for effect-first discovery. Do not generate concrete S2/S2.5 variants.",
+        "available_artifacts": [
+            "intake/c2c/evidence_brief.json",
+            "intake/c2c/chunk_index.json",
+            "intake/c2c/chunk_index.jsonl",
+            "intake/c2c/paper_chunks.jsonl",
+            "intake/c2c/rebuttal_chunks.jsonl",
+            "intake/c2c/code_chunks.jsonl",
+            "intake/c2c/code_edges.jsonl",
+            "intake/c2c/code_repo_map.md",
+            "intake/c2c/implementation_surface_map.json",
+            "intake/c2c/code_intake_report.json",
+            "intake/c2c/code_retrieval_index.json",
+            "intake/c2c/negative_result_memory.json",
+            "experiment/results/failure_feedback.json",
+            "plan/direction_scorecard.json",
+        ],
+        "baseline": _compact_json_value(baseline, max_chars=4000),
+        "evidence_brief": _compact_json_value(evidence_brief, max_chars=9000),
+        "chunk_catalog": _compact_json_value(_summarize_chunk_index_for_prompt(chunk_index), max_chars=9000),
+        "code_intake_report": _compact_json_value(code_intake_report, max_chars=5000),
+        "implementation_surface_map": _compact_json_value(implementation_surface_map, max_chars=6000),
+        "code_retrieval_index": _compact_json_value(code_retrieval_index, max_chars=5000),
+        "negative_memory": _compact_json_value(negative_memory, max_chars=5000),
+        "rebuttal_matrix": _compact_json_value(rebuttal_matrix, max_chars=5000),
+        "method_level_failure_feedback": _compact_json_value(feedback[:12], max_chars=7000),
+    }
+    output_contract = {
+        "schema_version": "c2c_s1_codex_direction_v1",
+        "status": "ok",
+        "evidence_requests": [
+            {
+                "query": "short search target you investigated",
+                "source_type": "paper|rebuttal|code|artifact",
+                "desired_evidence": "method|risk|implementation|failure",
+                "why_needed": "why this evidence matters",
+            }
+        ],
+        "evidence_bundle": {
+            "items": [
+                {
+                    "chunk_id": "chunk id or artifact anchor",
+                    "source_path": "path inspected",
+                    "source_type": "paper|rebuttal|code|artifact",
+                    "summary": "short factual evidence summary",
+                    "supports": ["direction id or claim"],
+                    "risks": ["risk or counterevidence, if any"],
+                }
+            ]
+        },
+        "direction_decision": {
+            "direction_id": "stable snake_case id",
+            "mechanism_direction": "short mechanism name",
+            "mechanism_type": "recognized mechanism label",
+            "core_hypothesis": "effect hypothesis",
+            "allowed_variants": ["variant families allowed inside this direction"],
+            "forbidden_patterns": ["patterns not to repeat"],
+            "target_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+            "failure_focus": ["what S2/S3 should diagnose"],
+            "expected_files": ["high-level likely edit surfaces, not a concrete patch plan"],
+            "verification_commands": ["required checks S2/S3 must preserve"],
+            "rationale": "why this direction is worth trying now",
+        },
+        "selected_ideas": [
+            {
+                "id": "same as direction_decision.direction_id",
+                "title": "high-level direction title",
+                "selected": True,
+                "hypothesis": "same high-level direction hypothesis",
+                "novelty_score": 7,
+                "feasibility_score": 7,
+                "mechanism_type": "one of: utility_predicted_cache_routing, counterfactual_training_objective, semantic_span_graph_alignment, verifier_guided_cache_acceptance, latent_bridge_memory, pathology_conditioned_controller",
+                "description": "broad direction only, not a concrete patch variant",
+                "motivation": "why S2 should explore this direction",
+                "reviewer_risk_response": "method-level risk and mitigation",
+                "expected_files": ["likely edit surfaces, not a full patch plan"],
+                "verification_commands": ["checks S2/S3 should preserve"],
+                "evidence_refs": [{"source_type": "paper", "source_label": "chunk or artifact", "claim": "supporting fact"}],
+                "counterevidence_refs": [{"source_type": "failure_feedback", "source_label": "chunk or artifact", "claim": "risk fact"}],
+                "code_refs": [{"source_type": "code", "source_label": "file or symbol", "claim": "implementation surface"}],
+                "s1_allowed_variants": ["broad variant families S2 may explore"],
+                "s1_forbidden_patterns": ["method patterns S2 must avoid"],
+            }
+        ],
+        "negative_constraints": {
+            "reviewer_concerns": ["method-level concern to respect"],
+            "forbidden_idea_ids": ["failed method ids, not S2.5 coding errors"],
+            "forbidden_patterns": ["method patterns to avoid"],
+            "failure_feedback_rules": ["how S2/S3 should use method-level failures"],
+        },
+        "decision_chain": {
+            "evidence": ["supporting fact ids"],
+            "counterevidence": ["risk fact ids"],
+            "conclusion": "one sentence decision",
+        },
+    }
+    return "\n\n".join(
+        [
+            "You are the S1 Codex resume evidence agent for an automated C2C research loop.",
+            "Work read-only. You may inspect the listed artifacts with shell commands if the brief is not enough. Do not edit files.",
+            "S1 only chooses a method direction. Ignore S2.5 implementation/runtime errors as method evidence unless they reveal an actual method-level infeasibility.",
+            "Pick exactly one mechanism direction. Do not produce concrete patch variants; S2 will do that from direction_decision.allowed_variants.",
+            "Optimize for effect-first discovery: the output should help S2/S2.5 find a runnable patch with cheap proxy upside and no evaluator contamination.",
+            "selected_ideas must contain exactly one selected high-level direction card. It is the S1 output passed to S2; do not make the program infer it for you.",
+            "Return only one valid JSON object. No markdown, no comments, no prose outside JSON.",
+            "Context JSON:",
+            json.dumps(context_payload, ensure_ascii=False, indent=2),
+            "Required JSON shape:",
+            json.dumps(output_contract, ensure_ascii=False, indent=2),
+        ]
+    )
+
+
+def _generic_s1_codex_evidence_prompt(
+    *,
+    topic: str,
+    papers: list[dict[str, Any]],
+    survey: str,
+    theme_map_path: str | None,
+    resources: dict[str, Any],
+) -> str:
+    compact_papers = [
+        {
+            "paper_id": paper.get("paper_id"),
+            "title": paper.get("title"),
+            "year": paper.get("year"),
+            "source": paper.get("source"),
+            "venue": paper.get("venue"),
+            "abstract": (paper.get("abstract") or paper.get("text_snippet") or "")[:900],
+            "local_pdf_path": paper.get("local_pdf_path"),
+        }
+        for paper in papers[:12]
+    ]
+    context_payload = {
+        "schema_version": "generic_s1_codex_prompt_context_v1",
+        "topic": topic,
+        "task": "Choose one high-level research idea/direction for S2 to plan. Do not generate concrete experiment variants.",
+        "available_artifacts": [
+            "literature/papers/metadata.json",
+            "literature/survey.md",
+            *(["literature/theme_map.md"] if theme_map_path else []),
+            "meta/negative_memory.jsonl",
+            "experiment/results/failure_feedback.json",
+            "plan/performance_feedback.json",
+        ],
+        "papers": compact_papers,
+        "survey_excerpt": survey[:10000],
+        "theme_map_path": theme_map_path,
+        "local_resources": _compact_json_value(resources, max_chars=6000),
+    }
+    output_contract = {
+        "schema_version": "generic_s1_codex_direction_v1",
+        "status": "ok",
+        "evidence_requests": [
+            {
+                "query": "evidence or artifact you inspected",
+                "source_type": "paper|artifact|code|memory",
+                "desired_evidence": "method|risk|implementation|benchmark",
+                "why_needed": "why this evidence matters",
+            }
+        ],
+        "evidence_bundle": {
+            "items": [
+                {
+                    "source_path": "artifact path or paper id",
+                    "source_type": "paper|artifact|code|memory",
+                    "summary": "short factual evidence summary",
+                    "supports": ["idea id or claim"],
+                    "risks": ["risk or counterevidence, if any"],
+                }
+            ]
+        },
+        "direction_decision": {
+            "direction_id": "stable snake_case id",
+            "title": "high-level research idea title",
+            "core_hypothesis": "main effect hypothesis",
+            "allowed_variants": ["broad variant families S2 may explore"],
+            "forbidden_patterns": ["method patterns not to repeat"],
+            "target_datasets": ["dataset or benchmark names if known"],
+            "failure_focus": ["what S2/S3 should diagnose"],
+            "rationale": "why this direction is worth trying now",
+        },
+        "selected_ideas": [
+            {
+                "id": "same as direction_decision.direction_id",
+                "title": "high-level research idea title",
+                "selected": True,
+                "hypothesis": "main effect hypothesis",
+                "novelty_score": 7,
+                "feasibility_score": 7,
+                "description": "broad idea only, not a concrete S2 variant",
+                "motivation": "why S2 should plan this direction",
+                "expected_contribution": "expected research contribution",
+                "key_baselines": ["baseline names or families"],
+                "required_compute": "rough compute expectation",
+                "key_references": ["paper ids or artifact refs"],
+                "evidence_refs": [{"source_type": "paper", "source_label": "paper id or artifact", "claim": "supporting fact"}],
+                "counterevidence_refs": [{"source_type": "artifact", "source_label": "artifact or risk", "claim": "risk fact"}],
+            }
+        ],
+        "negative_constraints": {
+            "forbidden_idea_ids": ["failed direction ids if any"],
+            "forbidden_patterns": ["method patterns to avoid"],
+            "failure_feedback_rules": ["how S2/S3 should use failures"],
+        },
+        "decision_chain": {
+            "evidence": ["supporting fact ids"],
+            "counterevidence": ["risk fact ids"],
+            "conclusion": "one sentence decision",
+        },
+    }
+    return "\n\n".join(
+        [
+            "You are the global S1 Codex resume evidence agent for an automated research loop.",
+            "Work read-only. You may inspect listed artifacts if the brief is not enough. Do not edit files.",
+            "S1 chooses one high-level research idea/direction. S2 turns it into concrete experiment candidates.",
+            "Return exactly one selected idea in selected_ideas. Do not let the program infer missing idea content.",
+            "Return only one valid JSON object. No markdown, no comments, no prose outside JSON.",
+            "Context JSON:",
+            json.dumps(context_payload, ensure_ascii=False, indent=2),
+            "Required JSON shape:",
+            json.dumps(output_contract, ensure_ascii=False, indent=2),
+        ]
+    )
+
+
+def _run_s1_codex_evidence_agent(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+    prompt: str,
+    max_repairs: int,
+    timeout_seconds: int,
+    mode: str = "c2c",
+) -> dict[str, Any]:
+    cfg = _s1_codex_agent_config(config, mode=mode)
+    session_key = str(cfg.get("session_key") or "s1:c2c_evidence_direction")
+    if not shutil.which("codex"):
+        return {
+            "status": "blocked",
+            "reason": "codex executable not found; S1 Codex evidence agent cannot run and no fallback is enabled",
+            "session_key": session_key,
+            "attempts": [],
+        }
+    session_record = _load_s1_codex_session_record(project_root, session_key)
+    session_id = _session_id_from_record(session_record) if cfg.get("resume_enabled", True) else None
+    used_existing_session = bool(session_id)
+    attempts: list[dict[str, Any]] = []
+    validation_errors: list[str] = []
+    previous_output = ""
+    previous_status = ""
+    total_attempts = max(1, int(max_repairs) + 1)
+
+    for attempt_idx in range(total_attempts):
+        repair_attempt = attempt_idx > 0
+        current_prompt = (
+            _s1_codex_json_repair_prompt(validation_errors, previous_output, previous_status, mode=mode)
+            if repair_attempt
+            else prompt
+        )
+        call = _run_s1_codex_cli_once(
+            project_root=project_root,
+            config=config,
+            session_key=session_key,
+            session_id=session_id,
+            prompt=current_prompt,
+            timeout_seconds=timeout_seconds,
+            repair_attempt=repair_attempt,
+            attempt=attempt_idx + 1,
+            mode=mode,
+        )
+        if call.get("session_id"):
+            session_id = str(call["session_id"])
+        attempts.append(_s1_codex_attempt_summary(call))
+        status = str(call.get("status") or "")
+        payload = call.get("payload") if isinstance(call.get("payload"), dict) else None
+        if status == "ok" and payload is not None:
+            validation_errors = _validate_s1_codex_payload(payload, mode=mode)
+            if not validation_errors:
+                return {
+                    "status": "ok",
+                    "payload": payload,
+                    "session_key": session_key,
+                    "session_id": session_id,
+                    "used_existing_session": used_existing_session,
+                    "repair_count": attempt_idx,
+                    "attempts": attempts,
+                }
+            previous_status = "contract_invalid"
+        else:
+            validation_errors = [str(call.get("reason") or f"codex output status={status}")]
+            previous_status = status or "invalid"
+        previous_output = str(call.get("raw_text") or call.get("reason") or "")[-4000:]
+
+    return {
+        "status": "blocked",
+        "reason": "S1 Codex evidence agent did not return valid contract JSON after repair attempts",
+        "session_key": session_key,
+        "session_id": session_id,
+        "used_existing_session": used_existing_session,
+        "repair_count": max(0, total_attempts - 1),
+        "attempts": attempts,
+        "validation_errors": validation_errors,
+        "last_output_tail": previous_output[-2000:],
+    }
+
+
+def _run_s1_codex_cli_once(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+    session_key: str,
+    session_id: str | None,
+    prompt: str,
+    timeout_seconds: int,
+    repair_attempt: bool,
+    attempt: int,
+    mode: str,
+) -> dict[str, Any]:
+    llm_cfg = config.get("llm", {}) or {}
+    codex_cfg = llm_cfg.get("codex_cli") or {}
+    agent_cfg = _s1_codex_agent_config(config, mode=mode)
+    with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as handle:
+        output_path = Path(handle.name)
+    command = ["codex"]
+    sandbox = str(agent_cfg.get("sandbox") or codex_cfg.get("sandbox") or "read-only")
+    approval_policy = str(agent_cfg.get("approval_policy") or codex_cfg.get("approval_policy") or "never")
+    command.extend(["-s", sandbox, "-a", approval_policy, "exec", "--skip-git-repo-check", "--output-last-message", str(output_path)])
+    if agent_cfg.get("json_events", codex_cfg.get("json_events", True)):
+        command.append("--json")
+    model = str(agent_cfg.get("model") or llm_cfg.get("model") or "")
+    if model:
+        command.extend(["-m", model])
+    command.extend(["-C", str(project_root.resolve())])
+    if session_id:
+        command.extend(["resume", session_id, "-"])
+    else:
+        command.append("-")
+
+    merged_prompt = (
+        "Follow this task exactly. You are selecting an S1 method direction only. "
+        "Do not edit files. Return only valid JSON.\n\n"
+        f"{prompt}"
+    )
+    started = now_utc()
+    start_monotonic = time.monotonic()
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            input=merged_prompt,
+            cwd=project_root,
+            timeout=max(1, int(timeout_seconds)),
+        )
+        raw_text = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
+    except subprocess.TimeoutExpired as exc:
+        raw_text = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
+        call = {
+            "status": "timeout",
+            "reason": f"codex timed out: {exc}",
+            "session_key": session_key,
+            "session_id": session_id,
+            "attempt": attempt,
+            "repair_attempt": repair_attempt,
+            "started_at": started,
+            "ended_at": now_utc(),
+            "duration_seconds": round(time.monotonic() - start_monotonic, 3),
+            "raw_text": raw_text,
+        }
+        _append_s1_codex_event(project_root, session_key, _s1_codex_attempt_summary(call), mode=mode)
+        return call
+    finally:
+        output_path.unlink(missing_ok=True)
+
+    parsed_session_id = _parse_s1_codex_session_id(result.stderr, result.stdout) or session_id
+    call = {
+        "status": "ok" if result.returncode == 0 else "failed",
+        "returncode": result.returncode,
+        "reason": None if result.returncode == 0 else (result.stderr[-1200:] or result.stdout[-1200:] or f"codex exited {result.returncode}"),
+        "session_key": session_key,
+        "session_id": parsed_session_id,
+        "previous_session_id": session_id,
+        "attempt": attempt,
+        "repair_attempt": repair_attempt,
+        "started_at": started,
+        "ended_at": now_utc(),
+        "duration_seconds": round(time.monotonic() - start_monotonic, 3),
+        "raw_text": raw_text,
+    }
+    if parsed_session_id:
+        _save_s1_codex_session(project_root, session_key, parsed_session_id, config, call)
+    if result.returncode == 0:
+        payload = _parse_json_object(raw_text)
+        if isinstance(payload, dict):
+            call["payload"] = payload
+        else:
+            call["status"] = "invalid_json"
+            call["reason"] = "Codex did not return a JSON object"
+    _append_s1_codex_event(project_root, session_key, _s1_codex_attempt_summary(call), mode=mode)
+    return call
+
+
+def _s1_codex_json_repair_prompt(validation_errors: list[str], previous_output: str, previous_status: str, *, mode: str = "c2c") -> str:
+    schema_name = "c2c_s1_codex_direction_v1" if mode == "c2c" else "generic_s1_codex_direction_v1"
+    payload = {
+        "schema_version": f"{mode}_s1_codex_json_repair_v1",
+        "status": previous_status or "invalid",
+        "errors_to_fix": validation_errors,
+        "previous_output_tail": previous_output[-4000:],
+        "instructions": [
+            f"Return only a valid JSON object matching {schema_name}.",
+            "Keep the same S1 method-direction task and reuse the context already present in this resume session.",
+            "Do not switch to prose or markdown.",
+            "If a field is missing, fill it from the artifacts you have already inspected or inspect the listed artifacts again.",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _validate_s1_codex_payload(payload: dict[str, Any], *, mode: str = "c2c") -> list[str]:
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        return ["top-level output must be a JSON object"]
+    if str(payload.get("status") or "ok").lower() not in {"ok", "direction_selected"}:
+        errors.append("status must be ok or direction_selected")
+    if not isinstance(payload.get("direction_decision"), dict) or not payload.get("direction_decision"):
+        errors.append("direction_decision must be a non-empty object")
+    else:
+        decision = payload["direction_decision"]
+        direction_fields = ["direction_id", "core_hypothesis", "allowed_variants", "forbidden_patterns", "failure_focus"]
+        direction_fields.append("mechanism_direction" if mode == "c2c" else "title")
+        for field in direction_fields:
+            if decision.get(field) in (None, "", []):
+                errors.append(f"direction_decision missing {field}")
+    if not isinstance(payload.get("negative_constraints"), dict):
+        errors.append("negative_constraints must be an object")
+    if not isinstance(payload.get("evidence_requests"), list):
+        errors.append("evidence_requests must be a list")
+    evidence_bundle = payload.get("evidence_bundle")
+    if not isinstance(evidence_bundle, dict):
+        errors.append("evidence_bundle must be an object")
+    elif not isinstance(evidence_bundle.get("items"), list) or not evidence_bundle.get("items"):
+        errors.append("evidence_bundle.items must be a non-empty list")
+    ideas = payload.get("selected_ideas")
+    if not isinstance(ideas, list):
+        errors.append("selected_ideas must be a list")
+        return errors
+    if len(ideas) != 1:
+        errors.append("S1 selected_ideas must contain exactly one high-level direction card; S2 generates concrete variants")
+    selected_count = sum(1 for idea in ideas if isinstance(idea, dict) and idea.get("selected") is True)
+    if ideas and selected_count != 1:
+        errors.append("the optional S1 direction card must have exactly one selected=true")
+    direction_ids = set()
+    for idx, idea in enumerate(ideas[:1], start=1):
+        if not isinstance(idea, dict):
+            errors.append(f"selected_ideas[{idx}] must be an object")
+            continue
+        for field in ["id", "title", "hypothesis", "novelty_score", "feasibility_score"]:
+            if idea.get(field) in (None, "", []):
+                errors.append(f"selected_ideas[{idx}] missing {field}")
+        ref_fields = ["evidence_refs", "counterevidence_refs"]
+        if mode == "c2c":
+            ref_fields = ["expected_files", "verification_commands", "evidence_refs", "counterevidence_refs", "code_refs"]
+        for field in ref_fields:
+            if not isinstance(idea.get(field), list) or not idea.get(field):
+                errors.append(f"selected_ideas[{idx}].{field} must be a non-empty list")
+        if mode == "c2c" and not idea.get("reviewer_risk_response"):
+            errors.append(f"selected_ideas[{idx}] missing reviewer_risk_response")
+        if mode == "c2c" and not idea.get("mechanism_type"):
+            errors.append(f"selected_ideas[{idx}] missing mechanism_type")
+        direction_id = idea.get("s1_direction_id") or idea.get("direction_id") or (payload.get("direction_decision") or {}).get("direction_id")
+        if direction_id:
+            direction_ids.add(str(direction_id))
+    if len(direction_ids) > 1:
+        errors.append("selected_ideas must stay within one S1 direction_id")
+    return errors
+
+
+def _s1_codex_direction_cards(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = payload.get("selected_ideas")
+    if not isinstance(raw, list):
+        return []
+    direction = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
+    direction_id = str(direction.get("direction_id") or "")
+    cards = []
+    for item in raw[:1]:
+        if not isinstance(item, dict):
+            continue
+        card = dict(item)
+        if direction_id:
+            card["s1_direction_id"] = str(card.get("s1_direction_id") or card.get("direction_id") or direction_id)
+            card["direction_id"] = str(card.get("direction_id") or direction_id)
+        card["selected"] = True
+        card["s1_evidence_agent"] = {
+            "source": "codex_resume_evidence_agent",
+            "direction_id": card.get("s1_direction_id") or card.get("direction_id") or direction_id,
+            "evidence_bundle_items": len((payload.get("evidence_bundle") or {}).get("items") or []) if isinstance(payload.get("evidence_bundle"), dict) else 0,
+        }
+        cards.append(card)
+    return cards
+
+
+def _generic_s1_codex_ideas(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw = payload.get("selected_ideas")
+    if not isinstance(raw, list):
+        return []
+    direction = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
+    direction_id = str(direction.get("direction_id") or "")
+    ideas = []
+    for item in raw[:1]:
+        if not isinstance(item, dict):
+            continue
+        idea = dict(item)
+        if direction_id:
+            idea.setdefault("direction_id", direction_id)
+        idea["selected"] = True
+        idea["s1_evidence_agent"] = {
+            "source": "codex_resume_evidence_agent",
+            "direction_id": idea.get("direction_id") or direction_id or idea.get("id"),
+            "evidence_bundle_items": len((payload.get("evidence_bundle") or {}).get("items") or []) if isinstance(payload.get("evidence_bundle"), dict) else 0,
+        }
+        ideas.append(idea)
+    return ideas
+
+
+def _s1_codex_payload_refs(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    items = []
+    bundle = payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {}
+    for entry in bundle.get("items") or []:
+        if isinstance(entry, dict):
+            items.append(entry)
+    evidence_refs: list[dict[str, Any]] = []
+    counter_refs: list[dict[str, Any]] = []
+    code_refs: list[dict[str, Any]] = []
+    for entry in items:
+        ref = {
+            "source_type": entry.get("source_type") or "artifact",
+            "source_label": entry.get("chunk_id") or entry.get("source_path") or "evidence_bundle",
+            "source_path": entry.get("source_path"),
+            "claim": entry.get("summary") or entry.get("claim") or "",
+        }
+        if ref["source_type"] == "code":
+            code_refs.append(ref)
+        elif entry.get("risks"):
+            counter_refs.append(ref)
+        else:
+            evidence_refs.append(ref)
+    if not evidence_refs and items:
+        entry = items[0]
+        evidence_refs.append(
+            {
+                "source_type": entry.get("source_type") or "artifact",
+                "source_label": entry.get("chunk_id") or entry.get("source_path") or "evidence_bundle",
+                "source_path": entry.get("source_path"),
+                "claim": entry.get("summary") or "",
+            }
+        )
+    return evidence_refs, counter_refs, code_refs
+
+
+def _s1_codex_decision_chain(payload: dict[str, Any], ideas: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = next((idea for idea in ideas if idea.get("selected")), ideas[0] if ideas else {})
+    return {
+        "evidence": [str(ref.get("source_label") or ref.get("claim")) for ref in selected.get("evidence_refs") or [] if isinstance(ref, dict)][:5],
+        "counterevidence": [str(ref.get("source_label") or ref.get("claim")) for ref in selected.get("counterevidence_refs") or [] if isinstance(ref, dict)][:5],
+        "conclusion": (payload.get("direction_decision") or {}).get("rationale") if isinstance(payload.get("direction_decision"), dict) else selected.get("hypothesis"),
+    }
+
+
+def _summarize_chunk_index_for_prompt(chunk_index: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(chunk_index, dict):
+        return {}
+    entries = chunk_index.get("entries") if isinstance(chunk_index.get("entries"), list) else []
+    compact_entries = []
+    for entry in entries[:180]:
+        if not isinstance(entry, dict):
+            continue
+        compact_entries.append(
+            {
+                "chunk_id": entry.get("chunk_id"),
+                "source_type": entry.get("source_type"),
+                "source_path": entry.get("source_path"),
+                "section": entry.get("section"),
+                "keywords": entry.get("keywords"),
+            }
+        )
+    return {
+        "counts": chunk_index.get("counts") or {},
+        "entries": compact_entries,
+        "truncated_entries": max(0, len(entries) - len(compact_entries)),
+    }
+
+
+def _compact_json_value(value: Any, *, max_chars: int) -> Any:
+    text = json.dumps(value, ensure_ascii=False)
+    if len(text) <= max_chars:
+        return value
+    return {"truncated": True, "max_chars": max_chars, "json_prefix": text[:max_chars]}
+
+
+def _load_s1_codex_session_record(project_root: Path, session_key: str) -> dict[str, Any]:
+    payload = read_yaml(project_root / "meta" / "codex_sessions.yaml", default={"sessions": {}}) or {"sessions": {}}
+    session = (payload.get("sessions") or {}).get(session_key) if isinstance(payload, dict) else None
+    return session if isinstance(session, dict) else {}
+
+
+def _session_id_from_record(session: dict[str, Any]) -> str | None:
+    if isinstance(session, dict) and session.get("session_id"):
+        return str(session["session_id"])
+    return None
+
+
+def _save_s1_codex_session(project_root: Path, session_key: str, session_id: str, config: dict[str, Any], call: dict[str, Any]) -> None:
+    path = project_root / "meta" / "codex_sessions.yaml"
+    payload = read_yaml(path, default={"sessions": {}}) or {"sessions": {}}
+    payload.setdefault("sessions", {})
+    previous = payload["sessions"].get(session_key) if isinstance(payload["sessions"].get(session_key), dict) else {}
+    payload["sessions"][session_key] = {
+        "session_id": session_id,
+        "provider": "codex_cli",
+        "model": (config.get("llm") or {}).get("model"),
+        "updated_at": now_utc(),
+        "purpose": "s1_c2c_evidence_direction",
+        "created_at": previous.get("created_at") or now_utc(),
+        "last_call": _s1_codex_attempt_summary(call),
+    }
+    write_yaml(path, payload)
+
+
+def _append_s1_codex_event(project_root: Path, session_key: str, event: dict[str, Any], *, mode: str = "c2c") -> None:
+    path = project_root / "literature" / ("c2c/s1_codex_events.jsonl" if mode == "c2c" else "s1_codex_events.jsonl")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"session_key": session_key, **event}, ensure_ascii=False) + "\n")
+
+
+def _s1_codex_attempt_summary(call: dict[str, Any]) -> dict[str, Any]:
+    summary = {
+        "status": call.get("status"),
+        "returncode": call.get("returncode"),
+        "reason": call.get("reason"),
+        "session_id": call.get("session_id"),
+        "previous_session_id": call.get("previous_session_id"),
+        "attempt": call.get("attempt"),
+        "repair_attempt": call.get("repair_attempt"),
+        "started_at": call.get("started_at"),
+        "ended_at": call.get("ended_at"),
+        "duration_seconds": call.get("duration_seconds"),
+    }
+    raw_text = str(call.get("raw_text") or "")
+    if raw_text:
+        summary["raw_text_tail"] = raw_text[-1000:]
+    if isinstance(call.get("payload"), dict):
+        summary["payload_keys"] = sorted(str(key) for key in call["payload"].keys())
+    return {key: value for key, value in summary.items() if value is not None}
+
+
+def _parse_s1_codex_session_id(stderr: str, stdout: str = "") -> str | None:
+    match = re.search(r"session id:\s*([0-9a-fA-F-]+)", stderr or "")
+    if match:
+        return match.group(1)
+    for line in (stdout or "").splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(event, dict) and event.get("type") == "thread.started" and event.get("thread_id"):
+            return str(event["thread_id"])
+    return None
+
+
+def _parse_json_object(text: str) -> dict[str, Any] | None:
+    try:
+        payload = json.loads(text)
+        return payload if isinstance(payload, dict) else None
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"```(?:json)?\s*(.*?)```", text or "", flags=re.DOTALL)
+    if match:
+        try:
+            payload = json.loads(match.group(1).strip())
+            return payload if isinstance(payload, dict) else None
+        except json.JSONDecodeError:
+            return None
+    start = (text or "").find("{")
+    end = (text or "").rfind("}")
+    if start >= 0 and end > start:
+        try:
+            payload = json.loads(text[start : end + 1])
+            return payload if isinstance(payload, dict) else None
+        except json.JSONDecodeError:
+            return None
+    return None

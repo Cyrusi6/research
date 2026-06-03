@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AutoResearchIdeaContract",
+  "type": "array",
+  "minItems": 1,
+  "items": {
+    "type": "object",
+    "required": ["id", "title", "novelty_score", "feasibility_score"],
+    "properties": {
+      "id": {"type": "string"},
+      "title": {"type": "string"},
+      "hypothesis": {"type": "string"},
+      "novelty_score": {"type": "number"},
+      "feasibility_score": {"type": "number"},
+      "expected_files": {"type": "array"},
+      "verification_commands": {"type": "array"},
+      "evidence_refs": {"type": "array"},
+      "counterevidence_refs": {"type": "array"},
+      "code_refs": {"type": "array"},
+      "mechanism_type": {"type": "string"},
+      "mechanism_summary": {"type": "string"},
+      "paper_claim": {"type": "string"},
+      "why_baseline_fails": {"type": "string"},
+      "expected_signature": {"type": "object"},
+      "ablation_plan": {"type": "object"},
+      "novelty_gate": {"type": "object"},
+      "implementation_scope": {"type": "string"},
+      "implementation_plan": {"type": "object"},
+      "required_new_files": {"type": "array"},
+      "integration_points": {"type": "array"},
+      "smoke_tests": {"type": "array"},
+      "decomposition_plan": {"type": "array"},
+      "implementation_scope_gate": {"type": "object"}
+    }
+  }
+}

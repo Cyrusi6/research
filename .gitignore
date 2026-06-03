@@ -14,3 +14,6 @@ htmlcov/
 .DS_Store
 
 *.ris
+
+.env
+.env.local

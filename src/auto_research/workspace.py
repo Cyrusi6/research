@@ -7,8 +7,11 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from .artifacts import ArtifactManager
 from .constants import REQUIRED_STAGE_DIRS, STAGE_LABELS, STAGE_ORDER
+from .orchestration_state import OrchestrationStateManager
 from .registry import default_registry
+from .stage_contracts import StageContractManager
 from .utils import ensure_dir, now_utc, read_yaml, slugify, write_json, write_text, write_yaml
 
 
@@ -55,16 +58,14 @@ def init_workspace(config: dict, topic: str, *, project_id: str | None = None, s
         ensure_dir(paths.root / name)
     ensure_dir(paths.papers_dir)
     ensure_dir(paths.bib_dir)
+    artifacts = ArtifactManager(paths.root)
 
     for stage_key in STAGE_ORDER:
         stage_dir = paths.stage_dir(stage_key)
         ensure_dir(stage_dir / "logs")
         ensure_dir(stage_dir / "_tmp")
         ensure_dir(stage_dir / "failed")
-        write_json(
-            stage_dir / "stage_manifest.json",
-            {"stage": STAGE_LABELS[stage_key], "updated_at": now_utc(), "artifacts": []},
-        )
+        artifacts.initialize_stage_manifest(stage_key, force=True)
 
     write_json(paths.papers_dir / "manifest.json", {"updated_at": now_utc(), "papers": []})
     write_text(paths.meta_dir / "session_log.jsonl", "")
@@ -78,6 +79,8 @@ def init_workspace(config: dict, topic: str, *, project_id: str | None = None, s
     )
     registry = default_registry(project_id=project_id, topic=topic, config=config)
     write_yaml(paths.meta_dir / "registry.yaml", registry)
+    OrchestrationStateManager(paths.root).initialize(registry, force=True)
+    StageContractManager(paths.root).initialize_all(force=True, config=config, iteration=registry.get("iteration"))
     write_yaml(
         paths.meta_dir / "environment.yaml",
         {

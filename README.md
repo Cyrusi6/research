@@ -38,7 +38,13 @@ workspace/<project_id>/
 
 ## Environment
 
-- `OPENAI_API_KEY`: optional, used for richer text generation.
+- `OPENAI_API_KEY`: required for S1/S2 GPT reasoning when `llm.reasoning_provider: openai`.
+- `OPENAI_BASE_URL`: optional, for OpenAI-compatible third-party endpoints. Host-only values such as `https://api-cdn.owlai.tech` are normalized to the SDK API root; full `/v1/responses` values are also accepted.
+- `OPENAI_REASONING_EFFORT`: optional reasoning effort, for example `xhigh`.
+- `OPENAI_DEFAULT_HEADERS`: optional JSON object or `key=value;key2=value2` string for non-auth proxy headers.
+- `OPENAI_ORGANIZATION`: optional, forwarded to the OpenAI client.
+- `OPENAI_PROJECT`: optional, forwarded to the OpenAI client.
+- `.env` or `.env.local` in the repo root are loaded automatically if present.
 - `SEMANTIC_SCHOLAR_API_KEY`: optional, improves literature retrieval rate limits.
 - `SERPAPI_API_KEY`: reserved for future use.
 - `MM_ROOT`: optional, points to a local multimodal research assets directory when reusing datasets, codebases, or checkpoints.

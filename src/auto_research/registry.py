@@ -66,6 +66,7 @@ def begin_stage(registry: dict[str, Any], stage_key: str) -> None:
     stage["blocked_reason"] = None
     registry["current_stage"] = stage_key
     registry["status"] = "running"
+    registry["blocked_reason"] = None
 
 
 def complete_stage(registry: dict[str, Any], stage_key: str, *, artifacts: list[str] | None = None) -> None:
@@ -79,6 +80,7 @@ def complete_stage(registry: dict[str, Any], stage_key: str, *, artifacts: list[
         registry.setdefault("artifacts_summary", {})[stage_key] = len(artifacts)
     next_idx = stage_index(stage_key) + 1
     registry["current_stage"] = STAGE_ORDER[next_idx] if next_idx < len(STAGE_ORDER) else "DONE"
+    registry["blocked_reason"] = None
     if registry["current_stage"] == "DONE":
         registry["status"] = "completed"
 

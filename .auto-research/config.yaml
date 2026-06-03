@@ -7,15 +7,44 @@ project:
 
 llm:
   provider: "codex_cli"
+  reasoning_provider: "openai"
+  execution_provider: "none"
   model: "gpt-5.4"
   temperature: 0.2
-  timeout_seconds: 180
+  timeout_seconds: 1800
   use_real_api: true
+  json_retries: 3
   codex_cli:
     use_resume: true
     session_strategy: "per_agent"
     sandbox: "read-only"
     approval_policy: "never"
+
+agents:
+  literature_scout:
+    model: "gpt-5.4"
+    temperature: 0.2
+  rebuttal_analyst:
+    model: "gpt-5.4"
+    temperature: 0.1
+  method_inventor:
+    model: "gpt-5.4"
+    temperature: 0.5
+  skeptic_reviewer:
+    model: "gpt-5.4"
+    temperature: 0.1
+  systems_feasibility:
+    model: "gpt-5.4"
+    temperature: 0.1
+  experiment_designer:
+    model: "gpt-5.4"
+    temperature: 0.2
+  meta_judge:
+    model: "gpt-5.4"
+    temperature: 0.1
+  c2c-posthoc-reviewer:
+    model: "gpt-5.4"
+    temperature: 0.1
 
 literature:
   semantic_scholar_api_key: "${SEMANTIC_SCHOLAR_API_KEY}"
@@ -34,7 +63,11 @@ plan:
 
 experiment:
   simulate: false
+  disable_llm_during_execution: true
   gpu_ids: "auto"
+  gpu_policy:
+    max_gpus: 6
+    min_free_mb: 0
   max_concurrent_jobs: 2
   timeout_hours: 24
   checkpoint_interval_min: 30
@@ -46,8 +79,70 @@ experiment:
   cleanup_failed_idea_runs: true
   failure_log_filename: "failure.md"
 
+c2c:
+  small_loop:
+    proxy_screen:
+      enabled: true
+      mode: "replay"
+      train_samples: 128
+      eval_limit: 64
+      eval_datasets: ["mmlu-redux", "ai2-arc", "openbookqa"]
+      commands: []
+      static_hard_gate: true
+      reject_on_command_failure: true
+      reject_if_no_executable_change: true
+      reject_eval_code_changes: true
+      reject_test_only_changes: true
+      require_proxy_metrics: true
+      require_paired_baseline: true
+      run_baseline_if_missing: true
+      allow_configured_baseline_fallback: true
+      min_proxy_mean_delta: -0.3
+      soft_proxy_mean_delta: 0.0
+      max_proxy_dataset_regression: 1.5
+      soft_max_proxy_dataset_regression: 0.75
+      proxy_score_regression_weight: 0.5
+      risk_penalty_per_label: 0.05
+      min_proxy_score:
+      soft_min_proxy_score: 0.0
+      baseline_cache_path: "experiment/results/c2c_proxy_baseline.json"
+
+code_patch:
+  enabled: true
+  backend: codex_persistent_cli
+  persistent_session: true
+  use_git_worktree: true
+  worktree_base_ref: 113c3a9b2538cbf096a0477e1ec99ae2a2e0d12a
+  codex_json_events: true
+  no_progress_timeout_seconds:
+  timeout_seconds: 1800
+  max_candidates: 3
+  codex_sandbox: workspace-write
+  codex_approval_policy: never
+  validation:
+    require_py_compile: true
+    require_targeted_tests: true
+  dynamic_whitelist:
+    include_prefixes: ["rosetta/", "script/", "recipe/", "test/", "tests/"]
+    include_extensions: [".py", ".json", ".yaml", ".yml", ".toml", ".txt"]
+    include_root_globs: ["pyproject.toml", "requirements*.txt"]
+    exclude_prefixes: [".git/", "wandb/", "__pycache__/", "local/checkpoints/", "local/snapshots/", "local/final_results/", "data/", "datasets/", "models/"]
+    exclude_extensions: [".pt", ".pth", ".safetensors", ".bin", ".ckpt", ".parquet", ".arrow"]
+
 ideation:
   challenge_target_rsum: 507.0
+  max_regeneration_rounds: 3
+  debate:
+    enabled: true
+    parallel: true
+    rounds: 2
+    agent_timeout_seconds: 1200
+    role_timeout_seconds:
+      rebuttal_analyst: 1500
+      method_inventor: 1500
+      skeptic_reviewer: 1500
+      systems_feasibility: 1500
+    meta_timeout_seconds: 1800
 
 writing:
   template: "neurips2026"
@@ -62,8 +157,30 @@ review:
   pass_threshold: 7.0
   max_iterations: 5
 
+hitl:
+  enabled: true
+  mode: "feishu"             # "feishu" | "cli_only"
+  blocking: true             # if true, pipeline blocks until human responds
+  timeout_minutes: 60
+  feishu:
+    app_id: "${FEISHU_APP_ID}"
+    app_secret: "${FEISHU_APP_SECRET}"
+    user_open_id: "${FEISHU_USER_OPEN_ID}"   # preferred; leave empty to lookup by email
+    user_email: "${FEISHU_USER_EMAIL}"
+  approval_stages:            # which stages require human approval
+    - "S2_plan"
+    - "S4_writing"
+
 orchestration:
-  auto_mode: true
+  auto_mode: false            # auto_mode=false means HITL is active
   user_confirm_idea: false
   per_stage_judge: true
   judge_max_retries: 2
+  failure_feedback:
+    enabled: true
+    route_s3_failure_to_s1: true
+    early_stop:
+      enabled: false
+      min_iterations: 3
+      patience: 3
+      stop_if_best_delta_below: -0.5
