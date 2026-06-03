@@ -512,3 +512,7 @@ docs/agent_context/project_brief.md
 - 所有阶段必须有 artifact manifest、gate report、stage contract。
 - C2C 路径是当前最完整路径。
 - 普通非 C2C 路径仍较轻量，不应被 C2C contract 误伤。
+## Git Workflow
+git add .
+git commit -m "Update docs"
+git push

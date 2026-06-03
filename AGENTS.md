@@ -41,5 +41,3 @@ uv run auto-research init-c2c \
 - Keep design history in `FRAMEWORK_STAGE_UPDATES.md`.
 - `/docs/agent_context/project_brief.md` contains the project context and user-provided requirements summarized from previous conversations.
 
-## Git Workflow
-- After completing changes, commit and push to `origin main` via SSH: `git remote set-url origin git@github.com:Cyrusi6/research.git && git push origin main`; check `git status --short` first and do not commit secrets, local credentials, large generated artifacts, or `workspace/` outputs unless explicitly requested.
