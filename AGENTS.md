@@ -42,8 +42,4 @@ uv run auto-research init-c2c \
 - `/docs/agent_context/project_brief.md` contains the project context and user-provided requirements summarized from previous conversations.
 
 ## Git Workflow
-- Default GitHub repository: `https://github.com/Cyrusi6/research.git`.
-- After completing requested code or documentation changes, run the relevant tests or syntax checks, then commit and push to `origin main` unless the user explicitly says not to push.
-- Before pushing, verify `git remote -v` points to `Cyrusi6/research.git`; if it points elsewhere, stop and ask the user.
-- Before committing, inspect `git status --short` and avoid committing secrets, local credentials, large generated artifacts, or `workspace/` outputs unless the user explicitly asks.
-- Use concise commit messages that describe the completed change, for example `Update pipeline stage docs`.
+- After completing changes, commit and push to `origin main` via SSH: `git remote set-url origin git@github.com:Cyrusi6/research.git && git push origin main`; check `git status --short` first and do not commit secrets, local credentials, large generated artifacts, or `workspace/` outputs unless explicitly requested.
