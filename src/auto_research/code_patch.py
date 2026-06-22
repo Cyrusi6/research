@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import ast
 import difflib
 import copy
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -15,19 +17,20 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .adapters.runner import ExperimentRunner, GpuSelection
 from .artifacts import ArtifactManager
 from .c2c import C2CAdapter, c2c_candidate_config_overrides, c2c_idea_novelty_report, repo_snapshot_manifest
+from .llm import codex_subprocess_env
 from .utils import ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, sha256_file, write_json, write_yaml
 
 
 DEFAULT_CODE_PATCH_CONFIG = {
     "enabled": False,
-    "backend": "codex_cli",
+    "backend": "codex_persistent_cli",
     "timeout_seconds": 1800,
-    "max_candidates": 3,
-    "variants_per_candidate": 2,
-    "persistent_session": False,
-    "use_git_worktree": False,
+    "max_candidates": 1,
+    "variants_per_candidate": 1,
+    "stop_after_first_ok_score": None,
     "materialize_snapshot_baseline": True,
     "codex_json_events": True,
     "no_progress_timeout_seconds": None,
@@ -36,19 +39,55 @@ DEFAULT_CODE_PATCH_CONFIG = {
     "codex_sandbox_fallback": "danger-full-access",
     "codex_approval_policy": "never",
     "reasoning_effort": "high",
+    "implementation_repair_diagnosis": {
+        "enabled": True,
+        "max_file_reads": 20,
+        "allow_lightweight_commands": True,
+        "repeated_failure_detection": {
+            "enabled": True,
+            "min_repeats": 2,
+            "changed_files_jaccard_threshold": 0.8,
+        },
+    },
     "validation": {
+        "gate_mode": "discovery",
         "require_py_compile": True,
         "require_targeted_tests": True,
+        "require_config_activation": True,
         "runtime_smoke": {
             "enabled": True,
             "train_samples": 8,
             "timeout_seconds": 600,
-            "gpu_ids": [0],
+            "gpu_ids": "auto",
+            "min_free_mb": 8192,
+            "oom_retry": {"enabled": True, "max_retries": 1},
+            "resource_wait": {"enabled": True, "timeout_seconds": 7200, "poll_seconds": 120},
             "skip_if_missing_train_entry": True,
+            "mechanism_activation": {
+                "enabled": True,
+                "hard_gate": True,
+                "require_switch_in_disabled_eval_config": True,
+                "require_switch_referenced_in_runtime_code": True,
+                "forward_probe": {
+                    "enabled": True,
+                    "hard_gate": True,
+                    "script": "script/auto_research/activation_forward_probe.py",
+                    "builtin_fallback": True,
+                    "timeout_seconds": 180,
+                    "min_changed_fields": 1,
+                },
+                "runtime_code_files": [
+                    "rosetta/model/aligner.py",
+                    "rosetta/model/projector.py",
+                    "rosetta/model/wrapper.py",
+                ],
+            },
         },
         "max_repair_attempts": 1,
         "max_contract_repair_attempts": 1,
         "max_changed_files": 6,
+        "strict_max_changed_files": False,
+        "auto_prune_over_scope_files": False,
         "repair_eval_code_changes": True,
         "repair_test_only_changes": True,
         "mechanism_self_review": {
@@ -243,93 +282,11 @@ class FrozenPatchGuard:
                 target.unlink()
 
 
-class CodexPatchBackend:
+class CodexPersistentPatchBackend:
     def __init__(self, config: dict[str, Any], project_root: Path):
         self.config = config
         self.project_root = project_root
 
-    def generate(self, implementation_contract: dict[str, Any], temp_repo: Path, edit_policy: DynamicEditPolicy) -> dict[str, Any]:
-        if not shutil.which("codex"):
-            return {"status": "codex_failed", "reason": "codex executable not found"}
-        code_patch_config = _code_patch_config(self.config)
-        primary_sandbox = str(code_patch_config.get("codex_sandbox") or "workspace-write")
-        primary = self._run_codex_once(implementation_contract, temp_repo, edit_policy, sandbox=primary_sandbox)
-        fallback_sandbox = str(code_patch_config.get("codex_sandbox_fallback") or "")
-        if (
-            fallback_sandbox
-            and fallback_sandbox != primary_sandbox
-            and _codex_sandbox_error(primary)
-        ):
-            fallback = self._run_codex_once(implementation_contract, temp_repo, edit_policy, sandbox=fallback_sandbox)
-            action = {
-                "action": "retry_codex_with_fallback_sandbox",
-                "status": fallback.get("status"),
-                "primary_sandbox": primary_sandbox,
-                "fallback_sandbox": fallback_sandbox,
-                "reason": _codex_sandbox_reason(primary),
-            }
-            fallback["recovery_actions"] = [*primary.get("recovery_actions", []), action, *fallback.get("recovery_actions", [])]
-            fallback["primary_attempt"] = _compact_backend_attempt(primary)
-            return fallback
-        return primary
-
-    def _run_codex_once(self, implementation_contract: dict[str, Any], temp_repo: Path, edit_policy: DynamicEditPolicy, *, sandbox: str) -> dict[str, Any]:
-        code_patch_config = _code_patch_config(self.config)
-        with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as handle:
-            output_path = Path(handle.name)
-        prompt = _codex_patch_prompt(implementation_contract, edit_policy)
-        command = [
-            "codex",
-            "-s",
-            sandbox,
-            "-a",
-            str(code_patch_config.get("codex_approval_policy") or "never"),
-            "exec",
-            "--skip-git-repo-check",
-            "--output-last-message",
-            str(output_path),
-        ]
-        model = str(self.config.get("llm", {}).get("model") or "")
-        if model:
-            command.extend(["-m", model])
-        reasoning_effort = str(
-            code_patch_config.get("reasoning_effort")
-            or self.config.get("llm", {}).get("reasoning_effort")
-            or ""
-        ).strip()
-        if reasoning_effort and reasoning_effort != "none":
-            command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
-        command.extend(["-C", str(temp_repo), "-"])
-        try:
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                input=prompt,
-                cwd=temp_repo,
-                timeout=int(code_patch_config.get("timeout_seconds") or 1800),
-            )
-            message = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
-        except subprocess.TimeoutExpired as exc:
-            return {"status": "codex_failed", "reason": f"codex timed out: {exc}"}
-        finally:
-            output_path.unlink(missing_ok=True)
-        if result.returncode != 0:
-            reason = result.stderr[-2000:] or result.stdout[-2000:] or f"codex exited {result.returncode}"
-            retryable = _codex_retryable_error_text(reason, result.stdout, result.stderr)
-            return {
-                "status": "retryable_codex_failed" if retryable else "codex_failed",
-                "reason": reason,
-                "stdout": result.stdout[-2000:],
-                "stderr": result.stderr[-2000:],
-                "sandbox": sandbox,
-                "retryable": retryable,
-                "failure_category": "llm_rate_limit_or_quota" if retryable else "codex_cli_failure",
-            }
-        return {"status": "ok", "rationale": message.strip(), "stdout": result.stdout[-2000:], "stderr": result.stderr[-2000:], "sandbox": sandbox}
-
-
-class CodexPersistentPatchBackend(CodexPatchBackend):
     def generate(self, implementation_contract: dict[str, Any], temp_repo: Path, edit_policy: DynamicEditPolicy) -> dict[str, Any]:
         if not shutil.which("codex"):
             return {"status": "codex_failed", "reason": "codex executable not found"}
@@ -341,6 +298,17 @@ class CodexPersistentPatchBackend(CodexPatchBackend):
             return {"status": "codex_failed", "reason": f"persistent Codex worktree missing: {repo}"}
         code_patch_config = _code_patch_config(self.config)
         primary_sandbox = str(code_patch_config.get("codex_sandbox") or "workspace-write")
+        llm_codex_config = (
+            self.config.get("llm", {}).get("codex_cli", {})
+            if isinstance(self.config.get("llm", {}), dict)
+            else {}
+        )
+        preload_sandbox = str(
+            code_patch_config.get("codex_preload_sandbox")
+            or code_patch_config.get("codex_sandbox")
+            or llm_codex_config.get("sandbox")
+            or "read-only"
+        )
         recovery_actions: list[dict[str, Any]] = []
         if not _load_persistent_codex_session(Path(str(workspace.get("session_path") or ""))):
             preload = self._run_persistent_codex_once_inner(
@@ -348,7 +316,7 @@ class CodexPersistentPatchBackend(CodexPatchBackend):
                 repo,
                 edit_policy,
                 workspace,
-                sandbox="read-only",
+                sandbox=preload_sandbox,
                 force_new_session=False,
                 prompt_kind="preload",
             )
@@ -393,6 +361,7 @@ class CodexPersistentPatchBackend(CodexPatchBackend):
         workspace: dict[str, Any],
         *,
         sandbox: str,
+        prompt_kind: str = "patch",
     ) -> dict[str, Any]:
         result = self._run_persistent_codex_once_inner(
             implementation_contract,
@@ -401,7 +370,7 @@ class CodexPersistentPatchBackend(CodexPatchBackend):
             workspace,
             sandbox=sandbox,
             force_new_session=False,
-            prompt_kind="patch",
+            prompt_kind=prompt_kind,
         )
         if result.get("status") == "codex_failed" and result.get("resume_failed") and result.get("session_id"):
             retry = self._run_persistent_codex_once_inner(
@@ -411,7 +380,7 @@ class CodexPersistentPatchBackend(CodexPatchBackend):
                 workspace,
                 sandbox=sandbox,
                 force_new_session=True,
-                prompt_kind="patch",
+                prompt_kind=prompt_kind,
             )
             action = {
                 "action": "retry_codex_with_new_persistent_session",
@@ -480,6 +449,7 @@ class CodexPersistentPatchBackend(CodexPatchBackend):
                 input=prompt,
                 cwd=repo,
                 timeout=int(code_patch_config.get("timeout_seconds") or 1800),
+                env=codex_subprocess_env(self.config),
             )
             message = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
         except subprocess.TimeoutExpired as exc:
@@ -533,7 +503,7 @@ class CodexPersistentPatchBackend(CodexPatchBackend):
             _sync_project_codex_session(self.project_root, str(workspace.get("session_key") or ""), parsed_session_id, self.config, workspace=workspace)
         if result.returncode != 0:
             reason = result.stderr[-2000:] or result.stdout[-2000:] or f"codex exited {result.returncode}"
-            retryable = _codex_retryable_error_text(reason, result.stdout, result.stderr)
+            retryable = _codex_retryable_error_text(reason, result.stderr)
             return {
                 "status": "retryable_codex_failed" if retryable else "codex_failed",
                 "reason": reason,
@@ -544,6 +514,8 @@ class CodexPersistentPatchBackend(CodexPatchBackend):
                 "failure_category": "llm_rate_limit_or_quota" if retryable else "codex_cli_failure",
                 "session_id": parsed_session_id or session_id,
                 "resume_failed": bool(session_id and not retryable),
+                "same_session_reused": bool(session_id and (parsed_session_id or session_id) == session_id),
+                "previous_session_id": session_id,
                 "codex_call": call_record,
                 "code_worktree": _compact_code_worktree(workspace),
             }
@@ -554,6 +526,8 @@ class CodexPersistentPatchBackend(CodexPatchBackend):
             "stderr": result.stderr[-2000:],
             "sandbox": sandbox,
             "session_id": parsed_session_id or session_id,
+            "same_session_reused": bool(session_id and (parsed_session_id or session_id) == session_id),
+            "previous_session_id": session_id,
             "codex_call": call_record,
             "code_worktree": _compact_code_worktree(workspace),
         }
@@ -574,20 +548,45 @@ class CodePatchAgent:
             return {"status": "disabled", "candidates": [], "artifacts": []}
         adapter = C2CAdapter(self.project_root, self.config)
         policy = DynamicEditPolicy.from_config(code_patch_config.get("dynamic_whitelist") or {})
-        max_candidates = int(code_patch_config.get("max_candidates") or 3)
         previous_failures = _load_previous_patch_failures(self.project_root)
         manifest_candidates = []
         artifacts = []
-        for idx, candidate in enumerate(candidate_ideas):
-            if idx >= max_candidates:
-                candidate["code_patch"] = {"status": "skipped_not_in_patch_budget"}
-                continue
+        selection = _select_single_s2_5_candidate(plan, candidate_ideas)
+        selected_candidate = selection.get("candidate") if isinstance(selection.get("candidate"), dict) else None
+        skipped_candidates: list[dict[str, Any]] = []
+        if selected_candidate is None:
+            for candidate in candidate_ideas:
+                if not isinstance(candidate, dict):
+                    continue
+                candidate["code_patch"] = {
+                    "status": "skipped_no_s2_5_selected_candidate",
+                    "reason": "S2.5 could not identify a selected S2 candidate to implement.",
+                }
+                skipped_candidates.append(_compact_skipped_patch_candidate(candidate, reason="no_selected_candidate"))
+        else:
+            selected_index = selection.get("selected_index")
+            for idx, candidate in enumerate(candidate_ideas):
+                if not isinstance(candidate, dict):
+                    continue
+                if idx == selected_index:
+                    continue
+                candidate["code_patch"] = {
+                    "status": "skipped_s2_5_single_candidate_mode",
+                    "reason": "S2.5 implements only the S2-selected variant; alternative variants stay in S2 planner history.",
+                    "selection_policy": "single_s2_selected_variant",
+                }
+                skipped_candidates.append(
+                    _compact_skipped_patch_candidate(candidate, reason="single_s2_selected_variant")
+                )
+            candidate = selected_candidate
             result = self._generate_candidate_patch(adapter, policy, candidate, plan, previous_failures=previous_failures)
             candidate["code_patch"] = result["code_patch"]
             manifest_candidates.append(result["manifest_entry"])
             artifacts.extend(result.get("artifacts", []))
         retryable_patch_count = sum(1 for item in manifest_candidates if _patch_failure_retryable(item))
         valid_patch_count = sum(1 for item in manifest_candidates if item.get("status") == "ok")
+        valid_patch_ids = [str(item.get("candidate_id")) for item in manifest_candidates if item.get("status") == "ok" and item.get("candidate_id")]
+        selected_patch = _compact_selected_manifest_patch(next((item for item in manifest_candidates if item.get("status") == "ok"), {}))
         if valid_patch_count:
             manifest_status = "ok"
         elif retryable_patch_count:
@@ -597,12 +596,31 @@ class CodePatchAgent:
         manifest = {
             "status": manifest_status,
             "created_at": now_utc(),
-            "backend": code_patch_config.get("backend", "codex_cli"),
+            "backend": "codex_persistent_cli",
+            "selection_policy": {
+                "mode": "single_s2_selected_variant",
+                "selected_by": selection.get("selected_by"),
+                "selected_index": selection.get("selected_index"),
+                "selected_candidate_id": selection.get("selected_candidate_id"),
+                "input_candidate_count": len([item for item in candidate_ideas if isinstance(item, dict)]),
+                "implementation_candidate_count": len(manifest_candidates),
+                "repair_loop": "same_candidate_persistent_session",
+                "ignored_legacy_config": {
+                    "max_candidates": code_patch_config.get("max_candidates"),
+                    "variants_per_candidate": code_patch_config.get("variants_per_candidate"),
+                    "stop_after_first_ok_score": code_patch_config.get("stop_after_first_ok_score"),
+                },
+            },
             "candidate_count": len(manifest_candidates),
+            "input_candidate_count": len([item for item in candidate_ideas if isinstance(item, dict)]),
+            "skipped_candidate_count": len(skipped_candidates),
             "valid_patch_count": valid_patch_count,
+            "valid_patch_ids": valid_patch_ids,
             "failed_patch_count": sum(1 for item in manifest_candidates if item.get("status") not in {"ok", "skipped_not_in_patch_budget"}),
             "retryable_patch_count": retryable_patch_count,
             "retryable": bool(retryable_patch_count and not valid_patch_count),
+            "selected_candidate_id": selected_patch.get("candidate_id"),
+            "selected_patch": selected_patch,
             "policy": {
                 "include_prefixes": policy.include_prefixes,
                 "include_extensions": policy.include_extensions,
@@ -612,6 +630,7 @@ class CodePatchAgent:
             },
             "candidates": manifest_candidates,
             "patches": manifest_candidates,
+            "skipped_candidates": skipped_candidates,
         }
         manifest_record = self.artifacts.write_json(
             self.stage_key,
@@ -633,42 +652,24 @@ class CodePatchAgent:
         *,
         previous_failures: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        code_patch_config = _code_patch_config(self.config)
-        variant_count = max(1, min(3, int(code_patch_config.get("variants_per_candidate") or 1)))
         attempts: list[dict[str, Any]] = []
-        results: list[dict[str, Any]] = []
-        last_result: dict[str, Any] | None = None
-        for variant_index in range(1, variant_count + 1):
-            result = self._generate_candidate_patch_variant(
-                adapter,
-                policy,
-                candidate,
-                plan,
-                previous_failures=previous_failures,
-                variant_index=variant_index,
-                variant_count=variant_count,
-                previous_variant_attempts=attempts,
-            )
-            attempt = _compact_patch_variant_attempt(result.get("manifest_entry") or {}, variant_index=variant_index)
-            attempts.append(attempt)
-            _annotate_patch_variant_result(
-                result,
-                variant_index=variant_index,
-                variant_count=variant_count,
-                attempts=attempts,
-            )
-            last_result = result
-            results.append(result)
-        ok_results = [result for result in results if (result.get("manifest_entry") or {}).get("status") == "ok"]
-        if ok_results:
-            selected = _select_best_patch_variant(ok_results)
-            _annotate_selected_patch_variant(selected, attempts=attempts, selected_reason="quality_score")
-            return selected
-        if last_result is None:
-            raise RuntimeError("variant_count must be at least one")
-        return last_result
+        result = self._generate_selected_candidate_patch_once(
+            adapter,
+            policy,
+            candidate,
+            plan,
+            previous_failures=previous_failures,
+        )
+        attempt = _compact_single_patch_attempt(result.get("manifest_entry") or {})
+        attempts.append(attempt)
+        _annotate_single_patch_attempt_result(
+            result,
+            attempts=attempts,
+            selection_reason="single_s2_selected_variant",
+        )
+        return result
 
-    def _generate_candidate_patch_variant(
+    def _generate_selected_candidate_patch_once(
         self,
         adapter: C2CAdapter,
         policy: DynamicEditPolicy,
@@ -676,30 +677,31 @@ class CodePatchAgent:
         plan: dict[str, Any],
         *,
         previous_failures: dict[str, Any] | None = None,
-        variant_index: int = 1,
-        variant_count: int = 1,
-        previous_variant_attempts: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         idea_id = sanitize_filename(str(candidate.get("id") or candidate.get("title") or "candidate"))
-        base_rel = f"code_patches/{idea_id}" if variant_index == 1 else f"code_patches/{idea_id}/variants/v{variant_index}"
+        base_rel = f"code_patches/{idea_id}"
         implementation_contract = _build_implementation_contract(
             candidate,
             plan,
             policy,
             previous_failure=_previous_failure_for_candidate(previous_failures, idea_id, candidate),
         )
-        if variant_count > 1:
-            implementation_contract = _implementation_contract_with_variant_feedback(
+        repeated_failure_context = _repeated_implementation_failure_context(
+            self.project_root,
+            implementation_contract,
+            self.config,
+        )
+        if repeated_failure_context.get("is_repeated"):
+            implementation_contract = _implementation_contract_with_repeated_failure_context(
                 implementation_contract,
-                previous_variant_attempts or [],
-                variant_index=variant_index,
-                variant_count=variant_count,
+                repeated_failure_context,
             )
         worktree_workspace = _prepare_code_worktree_workspace(
             self.project_root,
             self.config,
             idea_id=idea_id,
-            variant_index=variant_index,
+            variant_index=1,
+            enabled=isinstance(self.backend, CodexPersistentPatchBackend),
         )
         if worktree_workspace.get("status") != "ok":
             reason = str(worktree_workspace.get("reason") or "failed to prepare persistent code worktree")
@@ -718,10 +720,54 @@ class CodePatchAgent:
                 implementation_contract,
                 worktree_workspace,
             )
+        workspace_recovery_actions = list(worktree_workspace.get("recovery_actions") or [])
+        diagnosis_record: dict[str, Any] | None = None
+        diagnosis_payload: dict[str, Any] = {}
+        repeated_failure_context = _repeated_failure_context_from_contract(implementation_contract)
+        if _implementation_repair_diagnosis_enabled(self.config, implementation_contract):
+            diagnosis_record, diagnosis_payload = self._run_implementation_repair_diagnosis(
+                base_rel,
+                implementation_contract,
+                worktree_workspace,
+                adapter.env_python,
+                policy,
+                recovery_actions=workspace_recovery_actions,
+            )
+            if diagnosis_payload:
+                implementation_contract = _implementation_contract_with_repair_diagnosis(
+                    implementation_contract,
+                    diagnosis_payload,
+                )
+            if diagnosis_record:
+                workspace_recovery_actions.append(
+                    {
+                        "action": "s2_5_implementation_repair_diagnosis",
+                        "status": diagnosis_payload.get("status") or "unknown",
+                        "path": diagnosis_record.get("path"),
+                        "same_session_reused": diagnosis_payload.get("same_session_reused"),
+                    }
+                )
         prompt_text = _codex_patch_prompt(implementation_contract, policy)
         workspace_context = _patch_workspace_context(adapter.repo_root, worktree_workspace, idea_id=idea_id)
         with workspace_context as temp_repo:
+            pre_codex_action = _auto_prune_worktree_scope_before_codex(
+                adapter.repo_root,
+                temp_repo,
+                policy,
+                candidate,
+                implementation_contract,
+                self.config,
+            )
+            if pre_codex_action:
+                workspace_recovery_actions.append(pre_codex_action)
             backend_result = self.backend.generate(implementation_contract, temp_repo, policy)
+            if workspace_recovery_actions:
+                backend_result["recovery_actions"] = [
+                    *workspace_recovery_actions,
+                    *backend_result.get("recovery_actions", []),
+                ]
+            if repeated_failure_context:
+                backend_result["repeated_failure_context"] = repeated_failure_context
             contract_repair_attempts = int(
                 (_code_patch_config(self.config).get("validation", {}) or {}).get("max_contract_repair_attempts", 1)
                 or 0
@@ -762,7 +808,16 @@ class CodePatchAgent:
                     prompt_text=prompt_text,
                     recovery_actions=backend_result.get("recovery_actions", []),
                 )
-            draft = _build_patch_from_repo_delta(adapter.repo_root, temp_repo, policy)
+            draft, scope_action = _build_pruned_patch_from_repo_delta(
+                adapter.repo_root,
+                temp_repo,
+                policy,
+                candidate,
+                implementation_contract,
+                self.config,
+            )
+            if scope_action:
+                backend_result["recovery_actions"] = [*backend_result.get("recovery_actions", []), scope_action]
             if draft["status"] == "blocked_no_executable_change" and _codex_sandbox_error(backend_result):
                 fallback = self._retry_backend_after_noop_sandbox_error(
                     backend_result,
@@ -784,7 +839,16 @@ class CodePatchAgent:
                             prompt_text=prompt_text,
                             recovery_actions=backend_result.get("recovery_actions", []),
                         )
-                    draft = _build_patch_from_repo_delta(adapter.repo_root, temp_repo, policy)
+                    draft, scope_action = _build_pruned_patch_from_repo_delta(
+                        adapter.repo_root,
+                        temp_repo,
+                        policy,
+                        candidate,
+                        implementation_contract,
+                        self.config,
+                    )
+                    if scope_action:
+                        backend_result["recovery_actions"] = [*backend_result.get("recovery_actions", []), scope_action]
             while draft["status"] != "ok" and contract_repair_attempt < contract_repair_attempts:
                 contract_repair_attempt += 1
                 repair = self._retry_backend_after_contract_failure(
@@ -800,7 +864,16 @@ class CodePatchAgent:
                 backend_result = repair
                 implementation_contract = repair.get("implementation_contract", implementation_contract)
                 prompt_text = _codex_patch_prompt(implementation_contract, policy)
-                draft = _build_patch_from_repo_delta(adapter.repo_root, temp_repo, policy)
+                draft, scope_action = _build_pruned_patch_from_repo_delta(
+                    adapter.repo_root,
+                    temp_repo,
+                    policy,
+                    candidate,
+                    implementation_contract,
+                    self.config,
+                )
+                if scope_action:
+                    backend_result["recovery_actions"] = [*backend_result.get("recovery_actions", []), scope_action]
             if draft["status"] != "ok":
                 return self._write_failed_patch_artifacts(
                     base_rel,
@@ -832,7 +905,16 @@ class CodePatchAgent:
                 backend_result = repair
                 implementation_contract = repair.get("implementation_contract", implementation_contract)
                 prompt_text = _codex_patch_prompt(implementation_contract, policy)
-                draft = _build_patch_from_repo_delta(adapter.repo_root, temp_repo, policy)
+                draft, scope_action = _build_pruned_patch_from_repo_delta(
+                    adapter.repo_root,
+                    temp_repo,
+                    policy,
+                    candidate,
+                    implementation_contract,
+                    self.config,
+                )
+                if scope_action:
+                    backend_result["recovery_actions"] = [*backend_result.get("recovery_actions", []), scope_action]
                 if draft["status"] != "ok":
                     return self._write_failed_patch_artifacts(
                         base_rel,
@@ -863,21 +945,27 @@ class CodePatchAgent:
                 )
             mechanism_review = _mechanism_self_review(draft, implementation_contract, self.config)
             validation = _validate_patch_repo(temp_repo, draft["changed_files"], adapter.env_python, self.config, candidate=candidate)
-            activation = _validate_config_activation(draft.get("diff", ""), candidate)
+            activation = _validate_config_activation(draft.get("diff", ""), candidate, self.config)
             validation["activation_check"] = activation
             validation["risk_check"] = risk_check
             validation["mechanism_review"] = mechanism_review
             validation["recovery_actions"] = backend_result.get("recovery_actions", [])
+            if _validation_has_runtime_resource_retry(validation):
+                validation["retryable"] = True
+                validation["resource_retry"] = True
+                validation["failure_category"] = "runtime_smoke_resource_retry"
             max_repair_attempts = int(
                 (_code_patch_config(self.config).get("validation", {}) or {}).get("max_repair_attempts", 1)
                 or 0
             )
             repair_attempt = 0
-            while (
-                validation["status"] != "ok"
-                or activation["status"] != "ok"
-                or risk_check["status"] != "ok"
-                or mechanism_review["status"] != "ok"
+            while _patch_needs_repair(
+                validation,
+                activation,
+                risk_check,
+                mechanism_review,
+                draft,
+                self.config,
             ) and repair_attempt < max_repair_attempts:
                 repair_attempt += 1
                 restore_action = _restore_proxy_risk_files(adapter.repo_root, temp_repo, risk_check)
@@ -915,7 +1003,16 @@ class CodePatchAgent:
                 backend_result = repair
                 implementation_contract = repair.get("implementation_contract", implementation_contract)
                 prompt_text = _codex_patch_prompt(implementation_contract, policy)
-                draft = _build_patch_from_repo_delta(adapter.repo_root, temp_repo, policy)
+                draft, scope_action = _build_pruned_patch_from_repo_delta(
+                    adapter.repo_root,
+                    temp_repo,
+                    policy,
+                    candidate,
+                    implementation_contract,
+                    self.config,
+                )
+                if scope_action:
+                    backend_result["recovery_actions"] = [*backend_result.get("recovery_actions", []), scope_action]
                 if draft["status"] != "ok":
                     return self._write_failed_patch_artifacts(
                         base_rel,
@@ -930,18 +1027,24 @@ class CodePatchAgent:
                     )
                 mechanism_review = _mechanism_self_review(draft, implementation_contract, self.config)
                 validation = _validate_patch_repo(temp_repo, draft["changed_files"], adapter.env_python, self.config, candidate=candidate)
-                activation = _validate_config_activation(draft.get("diff", ""), candidate)
+                activation = _validate_config_activation(draft.get("diff", ""), candidate, self.config)
                 validation["activation_check"] = activation
                 risk_check = _validate_patch_proxy_risk(draft, candidate, self.config)
                 validation["risk_check"] = risk_check
                 validation["mechanism_review"] = mechanism_review
                 validation["recovery_actions"] = backend_result.get("recovery_actions", [])
+                if _validation_has_runtime_resource_retry(validation):
+                    validation["retryable"] = True
+                    validation["resource_retry"] = True
+                    validation["failure_category"] = "runtime_smoke_resource_retry"
             patch_payload = {
                 "schema_version": 1,
                 "candidate_id": candidate.get("id"),
                 "title": candidate.get("title"),
+                "variant_fingerprint": candidate.get("variant_fingerprint") or ((candidate.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(candidate.get("s2_variant"), dict) else None),
+                "s2_variant": candidate.get("s2_variant") if isinstance(candidate.get("s2_variant"), dict) else {},
                 "created_at": now_utc(),
-                "backend": _code_patch_config(self.config).get("backend", "codex_cli"),
+                "backend": "codex_persistent_cli",
                 "backend_sandbox": backend_result.get("sandbox"),
                 "code_worktree": backend_result.get("code_worktree") or _compact_code_worktree(worktree_workspace),
                 "codex_call": backend_result.get("codex_call") or {},
@@ -949,23 +1052,20 @@ class CodePatchAgent:
                 "operations": draft["operations"],
                 "changed_files": draft["changed_files"],
                 "implementation_contract": implementation_contract,
+                "repair_diagnosis": diagnosis_payload,
                 "activation_check": activation,
                 "risk_check": risk_check,
                 "mechanism_review": mechanism_review,
                 "rationale": backend_result.get("rationale", ""),
             }
-            if validation["status"] != "ok":
-                status = "validation_failed"
-            elif activation["status"] != "ok":
-                status = activation["status"]
-            elif risk_check["status"] != "ok":
-                status = risk_check["status"]
-            elif mechanism_review["status"] != "ok":
-                status = mechanism_review["status"]
-            elif not draft["operations"]:
-                status = "blocked_no_executable_change"
-            else:
-                status = "ok"
+            status = _patch_blocking_status(
+                validation,
+                activation,
+                risk_check,
+                mechanism_review,
+                draft,
+                self.config,
+            )
             quality_score = _patch_quality_score(
                 draft,
                 validation,
@@ -974,7 +1074,18 @@ class CodePatchAgent:
                 mechanism_review,
                 implementation_contract,
             )
+            quality_debt = quality_score.get("quality_debt", [])
             patch_payload["quality_score"] = quality_score
+            patch_payload["quality_debt"] = quality_debt
+            snapshot = _freeze_patched_repo_snapshot(
+                self.project_root,
+                temp_repo,
+                base_rel,
+                idea_id=idea_id,
+                status=status,
+                changed_files=draft["changed_files"],
+            )
+            patch_payload["patched_repo_snapshot"] = snapshot
             records = self._write_patch_artifacts(
                 base_rel,
                 patch_payload,
@@ -994,25 +1105,44 @@ class CodePatchAgent:
                 "codex_prompt": records["codex_prompt"],
                 "changed_files": draft["changed_files"],
                 "has_executable_change": status == "ok" and bool(draft["operations"]),
+                "patched_repo_snapshot": snapshot,
                 "quality_score": quality_score,
+                "quality_debt": quality_debt,
                 "recovery_actions": backend_result.get("recovery_actions", []),
             }
+            if _validation_has_runtime_resource_retry(validation):
+                code_patch["retryable"] = True
+                code_patch["resource_retry"] = True
+                code_patch["failure_category"] = "runtime_smoke_resource_retry"
+                code_patch["reason"] = "runtime smoke could not complete because available GPU memory was insufficient after OOM retry"
+            if diagnosis_record:
+                code_patch["repair_diagnosis"] = diagnosis_record["path"]
             if backend_result.get("code_worktree"):
                 code_patch["code_worktree"] = backend_result.get("code_worktree")
             if backend_result.get("session_id"):
                 code_patch["codex_session_id"] = backend_result.get("session_id")
             if status != "ok":
-                code_patch["reason"] = (
-                    risk_check.get("reason")
-                    or activation.get("reason")
-                    or mechanism_review.get("reason")
-                    or validation.get("reason")
-                    or status
-                )
+                if _validation_has_runtime_resource_retry(validation):
+                    code_patch["reason"] = "runtime smoke could not complete because available GPU memory was insufficient after OOM retry"
+                else:
+                    code_patch["reason"] = (
+                        risk_check.get("reason")
+                        or activation.get("reason")
+                        or mechanism_review.get("reason")
+                        or validation.get("reason")
+                        or status
+                    )
                 code_patch["risk_check"] = risk_check
                 code_patch["mechanism_review"] = mechanism_review
             entry = dict(code_patch)
-            entry.update({"candidate_id": candidate.get("id"), "title": candidate.get("title")})
+            entry.update(
+                {
+                    "candidate_id": candidate.get("id"),
+                    "title": candidate.get("title"),
+                    "variant_fingerprint": candidate.get("variant_fingerprint") or ((candidate.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(candidate.get("s2_variant"), dict) else None),
+                    "s2_variant": candidate.get("s2_variant") if isinstance(candidate.get("s2_variant"), dict) else {},
+                }
+            )
             return {"code_patch": code_patch, "manifest_entry": entry, "artifacts": list(records.values())}
 
     def _retry_backend_after_noop_sandbox_error(
@@ -1039,19 +1169,7 @@ class CodePatchAgent:
             fallback["recovery_actions"] = [*primary_result.get("recovery_actions", []), action, *fallback.get("recovery_actions", [])]
             fallback["primary_attempt"] = _compact_backend_attempt(primary_result)
             return fallback
-        if not isinstance(self.backend, CodexPatchBackend):
-            return None
-        fallback = self.backend._run_codex_once(implementation_contract, temp_repo, policy, sandbox=fallback_sandbox)
-        action = {
-            "action": "retry_codex_noop_with_fallback_sandbox",
-            "status": fallback.get("status"),
-            "primary_sandbox": primary_sandbox,
-            "fallback_sandbox": fallback_sandbox,
-            "reason": _codex_sandbox_reason(primary_result),
-        }
-        fallback["recovery_actions"] = [*primary_result.get("recovery_actions", []), action, *fallback.get("recovery_actions", [])]
-        fallback["primary_attempt"] = _compact_backend_attempt(primary_result)
-        return fallback
+        return None
 
     def _retry_backend_after_contract_failure(
         self,
@@ -1063,9 +1181,11 @@ class CodePatchAgent:
         *,
         attempt: int,
     ) -> dict[str, Any] | None:
+        repair_packet = _contract_repair_packet(failure, primary_result, attempt=attempt)
         repair_contract = _implementation_contract_with_contract_feedback(
             implementation_contract,
             failure,
+            repair_packet=repair_packet,
             attempt=attempt,
         )
         repair = self.backend.generate(repair_contract, temp_repo, policy)
@@ -1075,6 +1195,13 @@ class CodePatchAgent:
             "attempt": attempt,
             "failed_status": failure.get("status"),
             "failed_reason": _contract_failure_reason(failure),
+            "repair_session": _repair_session_reuse_report(
+                self.config,
+                primary_result,
+                repair,
+                backend=self.backend,
+            ),
+            "repair_packet_summary": _repair_packet_summary(repair_packet),
         }
         repair["recovery_actions"] = [
             *primary_result.get("recovery_actions", []),
@@ -1096,10 +1223,12 @@ class CodePatchAgent:
         *,
         attempt: int,
     ) -> dict[str, Any] | None:
+        repair_packet = _validation_repair_packet(validation, draft, primary_result, attempt=attempt)
         repair_contract = _implementation_contract_with_validation_feedback(
             implementation_contract,
             validation,
             draft,
+            repair_packet=repair_packet,
             attempt=attempt,
         )
         repair = self.backend.generate(repair_contract, temp_repo, policy)
@@ -1108,6 +1237,13 @@ class CodePatchAgent:
             "status": repair.get("status"),
             "attempt": attempt,
             "failed_checks": _failed_validation_checks(validation, limit=3),
+            "repair_session": _repair_session_reuse_report(
+                self.config,
+                primary_result,
+                repair,
+                backend=self.backend,
+            ),
+            "repair_packet_summary": _repair_packet_summary(repair_packet),
         }
         repair["recovery_actions"] = [
             *primary_result.get("recovery_actions", []),
@@ -1153,6 +1289,8 @@ class CodePatchAgent:
             "schema_version": 1,
             "candidate_id": candidate.get("id"),
             "title": candidate.get("title"),
+            "variant_fingerprint": candidate.get("variant_fingerprint") or ((candidate.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(candidate.get("s2_variant"), dict) else None),
+            "s2_variant": candidate.get("s2_variant") if isinstance(candidate.get("s2_variant"), dict) else {},
             "created_at": now_utc(),
             "operations": [],
             "changed_files": changed_files or [],
@@ -1188,8 +1326,75 @@ class CodePatchAgent:
         if risk_check:
             code_patch["risk_check"] = risk_check
         entry = dict(code_patch)
-        entry.update({"candidate_id": candidate.get("id") or idea_id, "title": candidate.get("title")})
+        entry.update(
+            {
+                "candidate_id": candidate.get("id") or idea_id,
+                "title": candidate.get("title"),
+                "variant_fingerprint": candidate.get("variant_fingerprint") or ((candidate.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(candidate.get("s2_variant"), dict) else None),
+                "s2_variant": candidate.get("s2_variant") if isinstance(candidate.get("s2_variant"), dict) else {},
+            }
+        )
         return {"code_patch": code_patch, "manifest_entry": entry, "artifacts": list(records.values())}
+
+    def _run_implementation_repair_diagnosis(
+        self,
+        base_rel: str,
+        implementation_contract: dict[str, Any],
+        worktree_workspace: dict[str, Any],
+        env_python: str,
+        policy: DynamicEditPolicy,
+        *,
+        recovery_actions: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        if not isinstance(self.backend, CodexPersistentPatchBackend):
+            return None, {}
+        if not worktree_workspace.get("enabled") or worktree_workspace.get("status") != "ok":
+            return None, {}
+        repo = Path(str(worktree_workspace.get("repo") or ""))
+        if not repo.exists():
+            return None, {}
+        code_patch_config = _code_patch_config(self.config)
+        sandbox = str(
+            (code_patch_config.get("implementation_repair_diagnosis") or {}).get("codex_sandbox")
+            or code_patch_config.get("codex_preload_sandbox")
+            or code_patch_config.get("codex_sandbox")
+            or "workspace-write"
+        )
+        diagnosis_contract = _implementation_repair_diagnosis_contract(
+                implementation_contract,
+                self.project_root,
+                env_python,
+                self.config,
+                repeated_failure_context=_repeated_failure_context_from_contract(implementation_contract),
+            )
+        started_session = _load_persistent_codex_session(Path(str(worktree_workspace.get("session_path") or "")))
+        result = self.backend._run_persistent_codex_once(
+            diagnosis_contract,
+            repo,
+            policy,
+            worktree_workspace,
+            sandbox=sandbox,
+            prompt_kind="repair_diagnosis",
+        )
+        payload = _repair_diagnosis_payload_from_codex_result(
+            result,
+            diagnosis_contract,
+            started_session=started_session,
+        )
+        payload["recovery_actions_before_diagnosis"] = list(recovery_actions)
+        record = self.artifacts.write_json(
+            self.stage_key,
+            f"{base_rel}/repair_diagnosis.json",
+            payload,
+            artifact_type="c2c_s2_5_repair_diagnosis",
+            summary="S2.5 implementation repair root-cause diagnosis",
+            source_paths=[
+                "plan/s2_5_repair_dispatch.json",
+                "plan/code_patches/patch_manifest.json",
+                f"{base_rel}/implementation_contract.json",
+            ],
+        )
+        return record, payload
 
     def _write_patch_artifacts(
         self,
@@ -1231,24 +1436,138 @@ class CodePatchAgent:
 
 
 def _code_patch_config(config: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(DEFAULT_CODE_PATCH_CONFIG)
+    merged = copy.deepcopy(DEFAULT_CODE_PATCH_CONFIG)
     user = config.get("code_patch") or {}
-    for key, value in user.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            nested = dict(merged[key])
-            nested.update(value)
-            merged[key] = nested
+    merged = _deep_merge_dict(merged, user if isinstance(user, dict) else {})
+    return _normalize_code_patch_config_for_project(merged, config)
+
+
+def _normalize_code_patch_config_for_project(code_patch_config: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
+    """Keep S2.5 runtime validation portable across resumed C2C projects."""
+    if not isinstance(config.get("c2c"), dict) or not config.get("c2c", {}).get("enabled", False):
+        return code_patch_config
+    validation = code_patch_config.setdefault("validation", {})
+    if not isinstance(validation, dict):
+        return code_patch_config
+    smoke_cfg = validation.setdefault("runtime_smoke", {})
+    if not isinstance(smoke_cfg, dict):
+        return code_patch_config
+    if not bool(smoke_cfg.get("respect_configured_gpu_ids", False)):
+        original_gpu_ids = smoke_cfg.get("gpu_ids", "auto")
+        if original_gpu_ids not in (None, "", "auto"):
+            smoke_cfg["legacy_configured_gpu_ids"] = original_gpu_ids
+        smoke_cfg["gpu_ids"] = "auto"
+        smoke_cfg["gpu_selection_policy"] = "auto_free_memory"
+    smoke_cfg.setdefault("min_free_mb", DEFAULT_CODE_PATCH_CONFIG["validation"]["runtime_smoke"]["min_free_mb"])
+    smoke_cfg.setdefault("oom_retry", copy.deepcopy(DEFAULT_CODE_PATCH_CONFIG["validation"]["runtime_smoke"]["oom_retry"]))
+    smoke_cfg.setdefault("resource_wait", copy.deepcopy(DEFAULT_CODE_PATCH_CONFIG["validation"]["runtime_smoke"]["resource_wait"]))
+    return code_patch_config
+
+
+def code_patch_gate_mode(config: dict[str, Any] | None) -> str:
+    code_patch = _code_patch_config(config or {})
+    validation = code_patch.get("validation") if isinstance(code_patch.get("validation"), dict) else {}
+    mode = validation.get("gate_mode", code_patch.get("gate_mode", "discovery"))
+    return "strict" if str(mode or "").strip().lower() == "strict" else "discovery"
+
+
+def _strict_patch_gate(config: dict[str, Any] | None) -> bool:
+    return code_patch_gate_mode(config) == "strict"
+
+
+def _activation_wiring_hard_gate(config: dict[str, Any] | None) -> bool:
+    validation = (_code_patch_config(config or {}).get("validation") or {})
+    smoke_cfg = validation.get("runtime_smoke") if isinstance(validation.get("runtime_smoke"), dict) else {}
+    wiring_cfg = smoke_cfg.get("mechanism_activation") if isinstance(smoke_cfg.get("mechanism_activation"), dict) else {}
+    if "hard_gate" in wiring_cfg:
+        return bool(wiring_cfg.get("hard_gate"))
+    return _strict_patch_gate(config)
+
+
+def _activation_check_blocks_patch(activation: dict[str, Any], config: dict[str, Any] | None) -> bool:
+    if activation.get("status") == "ok":
+        return False
+    if activation.get("blocking") is not None:
+        return bool(activation.get("blocking"))
+    return _strict_patch_gate(config)
+
+
+def _mechanism_review_blocks_patch(mechanism_review: dict[str, Any], config: dict[str, Any] | None) -> bool:
+    if mechanism_review.get("status") == "ok":
+        return False
+    if mechanism_review.get("blocking") is not None:
+        return bool(mechanism_review.get("blocking"))
+    return _strict_patch_gate(config)
+
+
+def _validation_check_blocks_patch(validation: dict[str, Any]) -> bool:
+    return validation.get("status") != "ok"
+
+
+def _validation_has_runtime_resource_retry(validation: dict[str, Any] | None) -> bool:
+    if not isinstance(validation, dict):
+        return False
+    if validation.get("resource_retry") is True:
+        return True
+    if validation.get("failure_category") == "runtime_smoke_resource_retry":
+        return True
+    for check in validation.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        if check.get("resource_retry") is True or check.get("failure_category") == "runtime_smoke_resource_retry":
+            return True
+    return False
+
+
+def _patch_blocking_status(
+    validation: dict[str, Any],
+    activation: dict[str, Any],
+    risk_check: dict[str, Any],
+    mechanism_review: dict[str, Any],
+    draft: dict[str, Any],
+    config: dict[str, Any] | None,
+) -> str:
+    if _validation_check_blocks_patch(validation):
+        return "validation_failed"
+    if _activation_check_blocks_patch(activation, config):
+        return str(activation.get("status") or "config_activation_missing")
+    if risk_check.get("status") != "ok":
+        return str(risk_check.get("status") or "proxy_risk_repair_required")
+    if _mechanism_review_blocks_patch(mechanism_review, config):
+        return str(mechanism_review.get("status") or "mechanism_self_review_failed")
+    if not draft.get("operations"):
+        return "blocked_no_executable_change"
+    return "ok"
+
+
+def _patch_needs_repair(
+    validation: dict[str, Any],
+    activation: dict[str, Any],
+    risk_check: dict[str, Any],
+    mechanism_review: dict[str, Any],
+    draft: dict[str, Any],
+    config: dict[str, Any] | None,
+) -> bool:
+    if _validation_has_runtime_resource_retry(validation):
+        return False
+    return _patch_blocking_status(validation, activation, risk_check, mechanism_review, draft, config) != "ok"
+
+
+def _deep_merge_dict(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
+    for key, value in overlay.items():
+        if isinstance(value, dict) and isinstance(base.get(key), dict):
+            base[key] = _deep_merge_dict(copy.deepcopy(base[key]), value)
         else:
-            merged[key] = value
-    return merged
+            base[key] = copy.deepcopy(value)
+    return base
 
 
-def _default_code_patch_backend(config: dict[str, Any], project_root: Path) -> CodexPatchBackend:
+def _default_code_patch_backend(config: dict[str, Any], project_root: Path) -> CodexPersistentPatchBackend:
     code_patch_config = _code_patch_config(config)
-    backend_name = str(code_patch_config.get("backend") or "codex_cli")
-    if backend_name == "codex_persistent_cli" or code_patch_config.get("persistent_session"):
+    backend_name = str(code_patch_config.get("backend") or "codex_persistent_cli")
+    if backend_name == "codex_persistent_cli":
         return CodexPersistentPatchBackend(config, project_root)
-    return CodexPatchBackend(config, project_root)
+    raise ValueError("S2.5 code patch generation only supports backend=codex_persistent_cli")
 
 
 def _prepare_code_worktree_workspace(
@@ -1257,22 +1576,11 @@ def _prepare_code_worktree_workspace(
     *,
     idea_id: str,
     variant_index: int,
+    enabled: bool,
 ) -> dict[str, Any]:
     code_patch_config = _code_patch_config(config)
-    enabled = (
-        str(code_patch_config.get("backend") or "") == "codex_persistent_cli"
-        or bool(code_patch_config.get("persistent_session"))
-        or bool(code_patch_config.get("use_git_worktree"))
-    )
     if not enabled:
         return {"enabled": False, "status": "ok"}
-    if not code_patch_config.get("use_git_worktree", True):
-        return {
-            "enabled": True,
-            "status": "codex_failed",
-            "reason": "persistent Codex backend requires use_git_worktree=true",
-            "recovery_actions": [],
-        }
     target_repo_value = ((config.get("c2c") or {}).get("target_repo") or "")
     target_repo = Path(str(target_repo_value)).expanduser() if target_repo_value else None
     if target_repo is None or not target_repo.exists():
@@ -1382,6 +1690,7 @@ def _prepare_code_worktree_workspace(
         "events_path": str(events_path.resolve()),
         "metadata_path": str(metadata_path.resolve()),
         "created_or_updated_at": now_utc(),
+        "session_policy": "persistent_resume_required",
         "recovery_actions": recovery_actions,
     }
     write_json(metadata_path, metadata)
@@ -1524,6 +1833,66 @@ def _materialize_snapshot_into_worktree(snapshot_root: Path, repo: Path) -> dict
     return {"copied_files": copied, "removed_extra_files": removed}
 
 
+def _freeze_patched_repo_snapshot(
+    project_root: Path,
+    patched_repo: Path,
+    base_rel: str,
+    *,
+    idea_id: str,
+    status: str,
+    changed_files: list[str],
+) -> dict[str, Any]:
+    if status != "ok":
+        return {"status": "skipped", "reason": f"patch status is {status}"}
+    snapshot_rel = f"plan/{base_rel}/patched_repo_snapshot"
+    manifest_rel = f"plan/{base_rel}/patched_repo_snapshot_manifest.json"
+    snapshot_root = project_root / snapshot_rel
+    if snapshot_root.exists():
+        shutil.rmtree(snapshot_root)
+    ensure_dir(snapshot_root.parent)
+    shutil.copytree(patched_repo, snapshot_root, ignore=_patched_repo_snapshot_ignore)
+    manifest = repo_snapshot_manifest(snapshot_root)
+    manifest.update(
+        {
+            "schema_version": "patched_repo_snapshot_v1",
+            "candidate_id": idea_id,
+            "created_at": now_utc(),
+            "snapshot_path": snapshot_rel,
+            "changed_files": list(changed_files or []),
+            "source": "s2_5_codex_validated_worktree",
+            "execution_truth": True,
+            "filtered_runtime_artifacts": True,
+        }
+    )
+    write_json(project_root / manifest_rel, manifest)
+    return {
+        "status": "ok",
+        "path": snapshot_rel,
+        "manifest": manifest_rel,
+        "file_count": manifest.get("file_count"),
+        "sha256": manifest.get("sha256"),
+        "changed_files": list(changed_files or []),
+    }
+
+
+def _patched_repo_snapshot_ignore(directory: str, names: list[str]) -> set[str]:
+    ignored = set(_temporary_patch_ignore(directory, names))
+    for name in names:
+        rel = Path(directory) / name
+        rel_name = name
+        try:
+            rel_name = rel.name
+        except OSError:
+            pass
+        if rel_name in ignored:
+            continue
+        if _path_ignored_for_patch_delta(rel_name):
+            ignored.add(name)
+    if Path(directory).name == "local":
+        ignored.update({"auto_research_runs", "checkpoints", "snapshots", "final_results"})
+    return ignored.intersection(names)
+
+
 def _remove_empty_parents(path: Path, *, stop_at: Path) -> None:
     current = path
     stop = stop_at.resolve()
@@ -1572,6 +1941,410 @@ def _implementation_contract_with_worktree(implementation_contract: dict[str, An
     contract = json.loads(json.dumps(implementation_contract, ensure_ascii=False))
     contract["code_worktree"] = _compact_code_worktree(workspace)
     return contract
+
+
+def _implementation_contract_with_repair_diagnosis(
+    implementation_contract: dict[str, Any],
+    diagnosis: dict[str, Any],
+) -> dict[str, Any]:
+    contract = json.loads(json.dumps(implementation_contract, ensure_ascii=False))
+    contract["repair_diagnosis"] = _compact_value(diagnosis, max_chars=6000)
+    requirements = list(contract.get("s2_5_requirements") or [])
+    requirements.append(
+        "Before editing, use repair_diagnosis.root_cause/evidence/repair_target as the source of truth for this implementation repair; "
+        "fix the diagnosed config/constructor/forward/tensor path without changing the candidate or S2 method."
+    )
+    contract["s2_5_requirements"] = requirements
+    return contract
+
+
+def _repeated_implementation_failure_context(
+    project_root: Path,
+    implementation_contract: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    repeat_cfg = (((_code_patch_config(config).get("implementation_repair_diagnosis") or {}).get("repeated_failure_detection")) or {})
+    if repeat_cfg.get("enabled") is False:
+        return {"is_repeated": False, "reason": "disabled"}
+    previous_failure = implementation_contract.get("previous_failure") if isinstance(implementation_contract.get("previous_failure"), dict) else {}
+    dispatch = previous_failure.get("s2_5_repair_dispatch") if isinstance(previous_failure.get("s2_5_repair_dispatch"), dict) else {}
+    current = _implementation_failure_fingerprint(
+        diagnostics=dispatch.get("activation_forward_probe_diagnostics") if isinstance(dispatch.get("activation_forward_probe_diagnostics"), dict) else {},
+        tensor_checks=dispatch.get("tensor_checks"),
+        changed_files=dispatch.get("changed_files") or [],
+    )
+    manifest_entry = _previous_manifest_entry_for_candidate(project_root, str(implementation_contract.get("candidate_id") or ""))
+    previous = _previous_manifest_failure_fingerprint(project_root, manifest_entry) if manifest_entry else {}
+    comparison = _compare_implementation_failure_fingerprints(
+        current,
+        previous,
+        changed_files_jaccard_threshold=float(repeat_cfg.get("changed_files_jaccard_threshold", 0.8) or 0.8),
+    )
+    is_repeated = bool(comparison.get("repeated_signals"))
+    return {
+        "schema_version": "s2_5_repeated_implementation_failure_context_v1",
+        "is_repeated": is_repeated,
+        "min_repeats": int(repeat_cfg.get("min_repeats", 2) or 2),
+        "current_fingerprint": current,
+        "previous_fingerprint": previous,
+        "previous_manifest_entry": {
+            "candidate_id": manifest_entry.get("candidate_id") if isinstance(manifest_entry, dict) else None,
+            "status": manifest_entry.get("status") if isinstance(manifest_entry, dict) else None,
+            "validation": manifest_entry.get("validation") if isinstance(manifest_entry, dict) else None,
+        },
+        "repeated_signals": comparison.get("repeated_signals") or [],
+        "changed_files_similarity": comparison.get("changed_files_similarity"),
+        "instruction": (
+            "If is_repeated=true, stop ordinary same-path patch repair. Diagnose why the same tensor/cache/switch/changed-file fingerprint persisted, "
+            "then change the implementation repair target or wiring boundary while preserving the same candidate and variant."
+        ),
+    }
+
+
+def _previous_manifest_entry_for_candidate(project_root: Path, candidate_id: str) -> dict[str, Any] | None:
+    manifest = read_json(project_root / "plan" / "code_patches" / "patch_manifest.json", default={}) or {}
+    entries = [entry for entry in manifest.get("candidates") or manifest.get("patches") or [] if isinstance(entry, dict)]
+    if candidate_id:
+        matched = next((entry for entry in entries if str(entry.get("candidate_id") or "") == candidate_id), None)
+        if matched:
+            return matched
+    return entries[0] if entries else None
+
+
+def _previous_manifest_failure_fingerprint(project_root: Path, entry: dict[str, Any]) -> dict[str, Any]:
+    validation = {}
+    validation_path = entry.get("validation") if isinstance(entry, dict) else None
+    if validation_path:
+        validation = read_json(project_root / str(validation_path), default={}) or {}
+    diagnostics = _forward_probe_diagnostics_from_validation(validation) if isinstance(validation, dict) else {}
+    return _implementation_failure_fingerprint(
+        diagnostics=diagnostics,
+        tensor_checks=diagnostics,
+        changed_files=(entry.get("changed_files") or []) if isinstance(entry, dict) else [],
+    )
+
+
+def _implementation_failure_fingerprint(
+    *,
+    diagnostics: dict[str, Any],
+    tensor_checks: Any,
+    changed_files: list[Any],
+) -> dict[str, Any]:
+    diagnostics = diagnostics if isinstance(diagnostics, dict) else {}
+    tensor_payload = tensor_checks if tensor_checks not in (None, [], {}) else diagnostics
+    identical_tensors = _normalize_identical_tensor_names(
+        _nested_tensor_value(tensor_payload, "identical_tensors")
+        or _nested_tensor_value(diagnostics, "identical_tensors")
+    )
+    return {
+        "identical_tensors": identical_tensors,
+        "changed_tensors": _normalize_identical_tensor_names(
+            _nested_tensor_value(tensor_payload, "changed_tensors")
+            or _nested_tensor_value(diagnostics, "changed_tensors")
+        ),
+        "cache_key_diff": _normalized_float(diagnostics.get("cache_key_diff")),
+        "cache_value_diff": _normalized_float(diagnostics.get("cache_value_diff")),
+        "switch_seen_by_forward": diagnostics.get("switch_seen_by_forward"),
+        "projector_output_identical": diagnostics.get("projector_output_identical"),
+        "wrapper_cache_identical": diagnostics.get("wrapper_cache_identical"),
+        "repair_focus": [str(item) for item in diagnostics.get("repair_focus") or [] if item],
+        "changed_files": sorted({str(path) for path in changed_files if path}),
+    }
+
+
+def _nested_tensor_value(payload: Any, key: str) -> Any:
+    if isinstance(payload, dict):
+        if key in payload:
+            return payload.get(key)
+        tensor_checks = payload.get("tensor_checks")
+        if isinstance(tensor_checks, dict) and key in tensor_checks:
+            return tensor_checks.get(key)
+    return None
+
+
+def _normalize_identical_tensor_names(value: Any) -> list[str]:
+    items = value if isinstance(value, list) else [value] if value else []
+    names: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            name = item.get("name") or item.get("tensor") or item.get("field")
+        else:
+            name = item
+        if name:
+            names.append(str(name))
+    return sorted(set(names))
+
+
+def _normalized_float(value: Any) -> float | None:
+    try:
+        return round(float(value), 8)
+    except (TypeError, ValueError):
+        return None
+
+
+def _compare_implementation_failure_fingerprints(
+    current: dict[str, Any],
+    previous: dict[str, Any],
+    *,
+    changed_files_jaccard_threshold: float,
+) -> dict[str, Any]:
+    if not current or not previous:
+        return {"repeated_signals": [], "changed_files_similarity": 0.0}
+    repeated: list[str] = []
+    current_identical = set(current.get("identical_tensors") or [])
+    previous_identical = set(previous.get("identical_tensors") or [])
+    same_identical = sorted(current_identical.intersection(previous_identical))
+    if same_identical:
+        repeated.append("same_identical_tensors:" + ",".join(same_identical[:5]))
+    for key in ["cache_key_diff", "cache_value_diff"]:
+        if current.get(key) is not None and current.get(key) == previous.get(key):
+            repeated.append(f"same_{key}:{current.get(key)}")
+    if current.get("switch_seen_by_forward") is False and previous.get("switch_seen_by_forward") is False:
+        repeated.append("same_switch_seen_by_forward_false")
+    if current.get("projector_output_identical") is True and previous.get("projector_output_identical") is True:
+        repeated.append("same_projector_output_identical")
+    if current.get("wrapper_cache_identical") is True and previous.get("wrapper_cache_identical") is True:
+        repeated.append("same_wrapper_cache_identical")
+    similarity = _jaccard_similarity(set(current.get("changed_files") or []), set(previous.get("changed_files") or []))
+    if similarity >= changed_files_jaccard_threshold and current.get("changed_files") and previous.get("changed_files"):
+        repeated.append(f"changed_files_still_same:{similarity:.2f}")
+    return {"repeated_signals": repeated, "changed_files_similarity": similarity}
+
+
+def _jaccard_similarity(left: set[str], right: set[str]) -> float:
+    if not left and not right:
+        return 0.0
+    union = left.union(right)
+    if not union:
+        return 0.0
+    return len(left.intersection(right)) / len(union)
+
+
+def _implementation_contract_with_repeated_failure_context(
+    implementation_contract: dict[str, Any],
+    repeated_failure_context: dict[str, Any],
+) -> dict[str, Any]:
+    contract = json.loads(json.dumps(implementation_contract, ensure_ascii=False))
+    context = _compact_value(repeated_failure_context, max_chars=5000)
+    contract["repeated_failure_context"] = context
+    requirements = list(contract.get("s2_5_requirements") or [])
+    requirements.append(
+        "Repeated implementation failure detected: do not keep making small edits along the same failing path. "
+        "Use repeated_failure_context to identify the unchanged tensor/switch/cache/changed-file fingerprint, then switch integration point or repair a lower-level wiring boundary while preserving the same candidate."
+    )
+    contract["s2_5_requirements"] = requirements
+    return contract
+
+
+def _implementation_repair_diagnosis_enabled(config: dict[str, Any], implementation_contract: dict[str, Any]) -> bool:
+    cfg = (_code_patch_config(config).get("implementation_repair_diagnosis") or {})
+    if cfg.get("enabled") is False:
+        return False
+    previous_failure = implementation_contract.get("previous_failure") if isinstance(implementation_contract.get("previous_failure"), dict) else {}
+    repair_contract = (
+        previous_failure.get("proxy_effect_repair_contract")
+        if isinstance(previous_failure.get("proxy_effect_repair_contract"), dict)
+        else implementation_contract.get("proxy_effect_repair_contract")
+        if isinstance(implementation_contract.get("proxy_effect_repair_contract"), dict)
+        else {}
+    )
+    dispatch = previous_failure.get("s2_5_repair_dispatch") if isinstance(previous_failure.get("s2_5_repair_dispatch"), dict) else {}
+    if str(repair_contract.get("mode") or "") == "s2_5_only_implementation_repair":
+        return True
+    if str(dispatch.get("mode") or dispatch.get("repair_lane") or "") == "s2_5_only_implementation_repair":
+        return True
+    if previous_failure.get("failure_class") == "implementation_failure":
+        return True
+    return False
+
+
+def _implementation_repair_diagnosis_contract(
+    implementation_contract: dict[str, Any],
+    project_root: Path,
+    env_python: str,
+    config: dict[str, Any],
+    *,
+    repeated_failure_context: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    contract = json.loads(json.dumps(implementation_contract, ensure_ascii=False))
+    previous_failure = contract.get("previous_failure") if isinstance(contract.get("previous_failure"), dict) else {}
+    repair_dispatch = previous_failure.get("s2_5_repair_dispatch") if isinstance(previous_failure.get("s2_5_repair_dispatch"), dict) else {}
+    patch_manifest = read_json(project_root / "plan" / "code_patches" / "patch_manifest.json", default={}) or {}
+    env_path = str(env_python or ((config.get("c2c") or {}).get("env_python") or sys.executable))
+    diagnosis_cfg = (_code_patch_config(config).get("implementation_repair_diagnosis") or {})
+    contract["implementation_repair_diagnosis"] = {
+        "schema_version": "s2_5_implementation_repair_diagnosis_request_v1",
+        "mode": "root_cause_pre_pass",
+        "do_not_edit_files": True,
+        "same_candidate_required": True,
+        "same_variant_fingerprint_required": bool(contract.get("variant_fingerprint")),
+        "environment": {
+            "python_cmd": env_path,
+            "must_use_env_python": True,
+            "using_c2c_env_python": _using_target_env_python(env_path),
+        },
+        "artifacts_to_read": [
+            "plan/s2_5_repair_dispatch.json",
+            "plan/code_patches/patch_manifest.json",
+            "plan/code_patches/<candidate>/implementation_contract.json",
+        ],
+        "changed_files": repair_dispatch.get("changed_files") or [],
+        "activation_forward_probe_diagnostics": repair_dispatch.get("activation_forward_probe_diagnostics") or {},
+        "tensor_checks": repair_dispatch.get("tensor_checks") or {},
+        "repeated_failure_context": repeated_failure_context or {},
+        "patch_manifest": _compact_value(patch_manifest, max_chars=5000),
+        "max_file_reads": diagnosis_cfg.get("max_file_reads", 20),
+        "allowed_lightweight_commands": [
+            f"{env_path} -m py_compile <changed python files>",
+            f"{env_path} <targeted smoke/forward probe only when available>",
+        ],
+        "forbidden_commands": [
+            "full train",
+            "large proxy train/eval",
+            "torch.distributed.run",
+            "multi-GPU jobs",
+            "editing evaluator/probe code to bypass checks",
+        ],
+        "required_output_schema": {
+            "root_cause": "string",
+            "evidence": ["string"],
+            "repair_target": ["string"],
+            "forbidden": ["string"],
+            "lightweight_commands_run": ["string"],
+            "env_python_used": "string",
+            "confidence": "low|medium|high",
+        },
+    }
+    requirements = list(contract.get("s2_5_requirements") or [])
+    requirements.append(
+        "Diagnosis pre-pass only: inspect files and lightweight command output, then report root_cause/evidence/repair_target; do not edit files in this turn."
+    )
+    if repeated_failure_context and repeated_failure_context.get("is_repeated"):
+        requirements.append(
+            "Repeated failure pre-pass: explicitly explain why the same tensor/cache/switch/changed-files fingerprint persisted, and choose a different implementation repair target than the repeated changed-file-only path."
+        )
+    contract["s2_5_requirements"] = requirements
+    return contract
+
+
+def _repeated_failure_context_from_contract(implementation_contract: dict[str, Any]) -> dict[str, Any]:
+    context = implementation_contract.get("repeated_failure_context")
+    return context if isinstance(context, dict) else {}
+
+
+def _repair_diagnosis_payload_from_codex_result(
+    result: dict[str, Any],
+    diagnosis_contract: dict[str, Any],
+    *,
+    started_session: str | None,
+) -> dict[str, Any]:
+    text = str(result.get("rationale") or "").strip()
+    parsed = _parse_repair_diagnosis_text(text)
+    call = result.get("codex_call") if isinstance(result.get("codex_call"), dict) else {}
+    environment = (diagnosis_contract.get("implementation_repair_diagnosis") or {}).get("environment") or {}
+    session_after = result.get("session_id") or call.get("session_id")
+    previous_session = result.get("previous_session_id") or call.get("previous_session_id")
+    payload = {
+        "schema_version": "s2_5_implementation_repair_diagnosis_v1",
+        "created_at": now_utc(),
+        "status": result.get("status"),
+        "implementation_repair_diagnosis": _compact_value(
+            diagnosis_contract.get("implementation_repair_diagnosis") or {},
+            max_chars=6000,
+        ),
+        "root_cause": parsed.get("root_cause") or "",
+        "evidence": parsed.get("evidence") or [],
+        "repair_target": parsed.get("repair_target") or [],
+        "forbidden": parsed.get("forbidden") or [],
+        "lightweight_commands_run": parsed.get("lightweight_commands_run") or [],
+        "env_python_used": parsed.get("env_python_used") or environment.get("python_cmd"),
+        "confidence": parsed.get("confidence") or "unknown",
+        "raw_response": text[-6000:],
+        "environment": environment,
+        "same_session_reused": bool(
+            started_session
+            and (
+                session_after == started_session
+                or previous_session == started_session
+                or result.get("same_session_reused") is True
+            )
+        ),
+        "session_id_before": started_session,
+        "session_id_after": session_after,
+        "previous_session_id": previous_session,
+        "codex_call": call,
+        "code_worktree": result.get("code_worktree") or diagnosis_contract.get("code_worktree") or {},
+        "primary_attempt": _compact_backend_attempt(result),
+    }
+    if result.get("status") != "ok":
+        payload["reason"] = result.get("reason") or result.get("stderr") or "diagnosis Codex call failed"
+    return payload
+
+
+def _parse_repair_diagnosis_text(text: str) -> dict[str, Any]:
+    if not text:
+        return {}
+    parsed = _extract_json_object(text)
+    if isinstance(parsed, dict):
+        return {
+            "root_cause": str(parsed.get("root_cause") or ""),
+            "evidence": _coerce_string_list(parsed.get("evidence")),
+            "repair_target": _coerce_string_list(parsed.get("repair_target")),
+            "forbidden": _coerce_string_list(parsed.get("forbidden")),
+            "lightweight_commands_run": _coerce_string_list(parsed.get("lightweight_commands_run")),
+            "env_python_used": str(parsed.get("env_python_used") or ""),
+            "confidence": str(parsed.get("confidence") or ""),
+        }
+    fields: dict[str, Any] = {}
+    for key in ["root_cause", "env_python_used", "confidence"]:
+        match = re.search(rf"(?im)^\s*[-*# ]*{re.escape(key)}\s*[:：]\s*(.+)$", text)
+        if match:
+            fields[key] = match.group(1).strip()
+    for key in ["evidence", "repair_target", "forbidden", "lightweight_commands_run"]:
+        fields[key] = _extract_markdown_list_field(text, key)
+    return fields
+
+
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    candidates = [text]
+    fenced = re.findall(r"```(?:json)?\s*(\{.*?\})\s*```", text, flags=re.DOTALL)
+    candidates = fenced + candidates
+    for candidate in candidates:
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end <= start:
+            continue
+        try:
+            value = json.loads(candidate[start : end + 1])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _coerce_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item) for item in value if str(item).strip()][:20]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _extract_markdown_list_field(text: str, key: str) -> list[str]:
+    pattern = re.compile(rf"(?ims)^\s*[-*# ]*{re.escape(key)}\s*[:：]\s*(.*?)(?=^\s*[-*# ]*[a-zA-Z_]+\s*[:：]|\Z)")
+    match = pattern.search(text)
+    if not match:
+        return []
+    block = match.group(1).strip()
+    items = []
+    for line in block.splitlines():
+        cleaned = re.sub(r"^\s*[-*]\s*", "", line).strip()
+        if cleaned:
+            items.append(cleaned)
+    if not items and block:
+        items.append(block)
+    return items[:20]
 
 
 def _worktree_workspace_from_contract(implementation_contract: dict[str, Any]) -> dict[str, Any] | None:
@@ -1623,18 +2396,57 @@ def _compact_code_worktree(workspace: dict[str, Any] | None) -> dict[str, Any]:
 
 def _persistent_codex_prompt(implementation_contract: dict[str, Any], edit_policy: DynamicEditPolicy, *, prompt_kind: str) -> str:
     prompt = _codex_patch_prompt(implementation_contract, edit_policy)
+    repeated_failure_note = ""
+    if isinstance(implementation_contract.get("repeated_failure_context"), dict) and implementation_contract["repeated_failure_context"].get("is_repeated"):
+        repeated_failure_note = (
+            "Repeated failure warning: repeated_failure_context.is_repeated=true. "
+            "ordinary same-path repair has already failed; change the implementation repair target or wiring boundary while preserving the candidate. "
+            "Do not keep making small edits around the same identical tensor/switch/cache/changed-files signature.\n\n"
+        )
     if prompt_kind == "preload":
         return (
             "Persistent S2.5 Codex session bootstrap and context preload.\n"
             "Inspect the repository enough to form a compact patch blueprint for this idea. "
             "Do not edit files in this turn. Return a concise blueprint with intended files, integration path, "
             "runtime-smoke risks, and why the patch should affect cheap proxy.\n\n"
+            + repeated_failure_note
+            + prompt
+        )
+    if prompt_kind == "repair_diagnosis":
+        return (
+            "Persistent S2.5 Codex root-cause diagnosis pre-pass.\n"
+            "You are in the same implementation repair context for the locked candidate. "
+            "Do not edit files in this turn. Diagnose why the current patch is not eligible for S3.\n\n"
+            "Mandatory environment rule: run any lightweight Python command with the supplied C2C conda env python "
+            "from implementation_repair_diagnosis.environment.python_cmd. Do not use system python unless that exact path is unavailable.\n\n"
+            "Read the listed artifacts when present: plan/s2_5_repair_dispatch.json, plan/code_patches/patch_manifest.json, "
+            "the failed patch implementation_contract.json, and changed_files. Use rg/file reads to inspect whether config reaches rosetta_config, "
+            "constructors, wrapper/projector/aligner forward, and enabled/disabled tensor changes.\n\n"
+            "Allowed lightweight commands only: py_compile, focused/targeted smoke, and forward probe with the configured env python. "
+            "Do not run full train, large proxy, distributed jobs, or edit evaluator/validation code.\n\n"
+            "Return a concise JSON object with keys root_cause, evidence, repair_target, forbidden, lightweight_commands_run, env_python_used, confidence. "
+            "If implementation_repair_diagnosis.repeated_failure_context.is_repeated is true, explicitly name the repeated signals and choose a different repair target or lower-level wiring boundary; do not recommend another small edit to the same unchanged files/tensors.\n"
+            "If exact JSON is impossible, return a short markdown section with the same fields.\n\n"
+            + repeated_failure_note
+            + prompt
+        )
+    if implementation_contract.get("codex_repair_packet"):
+        return (
+            "Persistent S2.5 Codex same-session repair turn.\n"
+            "You are continuing the same implementation context for the current idea. "
+            "Do not restart from high-level planning and do not change the research direction. "
+            "Read codex_repair_packet first: it contains failed commands, traces, changed files, config/probe evidence, and the current diff excerpt. "
+            "Edit repository files directly so the current patch becomes eligible for S3. "
+            "If activation or forward-probe evidence failed, repair the real config -> constructor -> forward -> tensor path; do not edit validation/probe code to bypass the check.\n\n"
+            + repeated_failure_note
             + prompt
         )
     return (
-        "Persistent S2.5 Codex repair turn. Continue from the same idea/session/worktree. "
+        "Persistent S2.5 Codex repair turn. This is an implementation turn, not a planning turn. "
+        "You must edit repository files directly before your final answer. Do not return only a blueprint, plan, analysis, or intended-files list. "
         "Use the supplied validation or contract feedback as the primary task, keep the diff narrow, "
-        "and avoid re-designing unrelated mechanism pieces.\n\n"
+        "and avoid re-designing unrelated mechanism pieces. If you conclude no edit is needed, verify the exact failing check is already fixed; otherwise make the minimal code edit that fixes it.\n\n"
+        + repeated_failure_note
         + prompt
     )
 
@@ -1785,8 +2597,10 @@ def _codex_retryable_error_text(*parts: Any) -> bool:
         "rate_limit",
         "ratelimit",
         "insufficient_quota",
-        "quota",
-        "billing",
+        "exceeded your current quota",
+        "quota exceeded",
+        "billing hard limit",
+        "billing limit",
         "payment required",
         "temporarily unavailable",
         "retry-after",
@@ -1799,11 +2613,18 @@ def _patch_failure_retryable(entry: dict[str, Any] | None) -> bool:
         return False
     if entry.get("retryable") is True:
         return True
+    if entry.get("resource_retry") is True:
+        return True
+    if entry.get("validation_status") == "runtime_smoke_resource_retry":
+        return True
     if entry.get("status") == "retryable_codex_failed":
         return True
-    if entry.get("failure_category") == "llm_rate_limit_or_quota":
+    if entry.get("failure_category") in {"llm_rate_limit_or_quota", "runtime_smoke_resource_retry"}:
         return True
     if _codex_retryable_error_text(entry.get("reason"), entry.get("stderr"), entry.get("stdout")):
+        return True
+    validation = entry.get("validation") if isinstance(entry.get("validation"), dict) else {}
+    if _validation_has_runtime_resource_retry(validation):
         return True
     for action in entry.get("recovery_actions") or []:
         if isinstance(action, dict) and _patch_failure_retryable(action):
@@ -1855,6 +2676,9 @@ def _compact_backend_attempt(result: dict[str, Any]) -> dict[str, Any]:
     return {
         "status": result.get("status"),
         "sandbox": result.get("sandbox"),
+        "session_id": result.get("session_id"),
+        "previous_session_id": result.get("previous_session_id"),
+        "same_session_reused": result.get("same_session_reused"),
         "reason": str(result.get("reason") or "")[-1000:],
         "stderr": str(result.get("stderr") or "")[-1000:],
         "stdout": str(result.get("stdout") or "")[-1000:],
@@ -1862,10 +2686,322 @@ def _compact_backend_attempt(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _compact_patch_variant_attempt(entry: dict[str, Any], *, variant_index: int) -> dict[str, Any]:
+def _repair_session_reuse_report(
+    config: dict[str, Any],
+    primary_result: dict[str, Any],
+    repair: dict[str, Any],
+    *,
+    backend: Any,
+) -> dict[str, Any]:
+    primary_call = primary_result.get("codex_call") if isinstance(primary_result.get("codex_call"), dict) else {}
+    repair_call = repair.get("codex_call") if isinstance(repair.get("codex_call"), dict) else {}
+    before_session = (
+        primary_result.get("session_id")
+        or primary_call.get("session_id")
+        or primary_call.get("previous_session_id")
+    )
+    after_session = repair.get("session_id") or repair_call.get("session_id")
+    repair_previous_session = repair.get("previous_session_id") or repair_call.get("previous_session_id")
+    persistent_backend = isinstance(backend, CodexPersistentPatchBackend)
+    same_session_reused = bool(
+        persistent_backend
+        and before_session
+        and (
+            after_session == before_session
+            or repair_previous_session == before_session
+            or repair.get("same_session_reused") is True
+        )
+    )
+    del config
+    report = {
+        "required": True,
+        "backend": type(backend).__name__,
+        "persistent_backend": persistent_backend,
+        "session_id_before": before_session,
+        "session_id_after": after_session,
+        "repair_previous_session_id": repair_previous_session,
+        "same_session_reused": same_session_reused,
+        "resume_command_used": bool(repair_previous_session),
+    }
+    if not persistent_backend:
+        report["warning"] = "same-session repair requires codex_persistent_cli"
+    elif before_session and not same_session_reused:
+        report["warning"] = "repair did not reuse the previous Codex session"
+    return report
+
+
+def _s2_5_repair_session_policy() -> dict[str, Any]:
+    return {
+        "same_resume_session_required": True,
+        "do_not_replan_method": True,
+        "repair_scope": "implementation_only",
+        "instruction": (
+            "Continue from the existing S2.5 Codex context when available. "
+            "Use codex_repair_packet as the source of truth for failed commands, traces, changed files, config/probe evidence, and the current diff. "
+            "Repair the current implementation until it is eligible for S3; do not send this failure back to S1/S2 as method evidence."
+        ),
+    }
+
+
+def _contract_repair_packet(failure: dict[str, Any], primary_result: dict[str, Any], *, attempt: int) -> dict[str, Any]:
+    return {
+        "schema_version": "s2_5_codex_repair_packet_v1",
+        "repair_kind": "contract_failure",
+        "attempt": attempt,
+        "failed_status": failure.get("status"),
+        "failed_reason": _contract_failure_reason(failure),
+        "errors": _compact_value(failure.get("errors") or [], max_chars=3000),
+        "changed_files": list(failure.get("changed_files") or [])[:30],
+        "risk_labels": list(failure.get("risk_labels") or [])[:20],
+        "risk_files": _compact_value(failure.get("risk_files") or [], max_chars=4000),
+        "diff_excerpt": _validation_output_excerpt(str(failure.get("diff") or ""), max_chars=8000),
+        "primary_attempt": _compact_backend_attempt(primary_result),
+        "instruction": (
+            "Repair the existing patch in the same Codex resume context when available. "
+            "Use the failed_status/reason and diff_excerpt to fix the concrete implementation problem; keep the method idea unchanged."
+        ),
+    }
+
+
+def _validation_repair_packet(
+    validation: dict[str, Any],
+    draft: dict[str, Any],
+    primary_result: dict[str, Any],
+    *,
+    attempt: int,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "s2_5_codex_repair_packet_v1",
+        "repair_kind": "validation_or_activation_failure",
+        "attempt": attempt,
+        "failed_status": validation.get("status"),
+        "changed_files": list(draft.get("changed_files") or validation.get("changed_files") or [])[:30],
+        "diff_excerpt": _validation_output_excerpt(str(draft.get("diff") or ""), max_chars=10000),
+        "failed_checks": _failed_validation_checks(validation, limit=8),
+        "failed_command_evidence": _failed_validation_command_evidence(validation, limit=8),
+        "activation_check": _compact_value(validation.get("activation_check") or {}, max_chars=5000),
+        "risk_check": _compact_value(validation.get("risk_check") or {}, max_chars=5000),
+        "mechanism_review": _compact_value(validation.get("mechanism_review") or {}, max_chars=5000),
+        "activation_probe_evidence": _activation_probe_evidence_from_validation(validation),
+        "activation_forward_probe_diagnostics": _forward_probe_diagnostics_from_validation(validation),
+        "repeated_failure_context": primary_result.get("repeated_failure_context") if isinstance(primary_result.get("repeated_failure_context"), dict) else {},
+        "primary_attempt": _compact_backend_attempt(primary_result),
+        "instruction": (
+            "Repair the current checkout, not the research direction. "
+            "Prioritize failed_command_evidence, activation_check, activation_probe_evidence, and activation_forward_probe_diagnostics. "
+            "For forward-probe failures, use the unchanged tensor names, enabled/disabled sha pairs, switch/config status, "
+            "and repair_focus to fix constructor params, forward branches, or wrapper parameter passing instead of editing validation code."
+            " If repeated_failure_context.is_repeated is true, stop ordinary same-path repair and change the wiring boundary or integration target while preserving the candidate."
+        ),
+    }
+
+
+def _failed_validation_command_evidence(validation: dict[str, Any], *, limit: int) -> list[dict[str, Any]]:
+    evidence: list[dict[str, Any]] = []
+    for check in validation.get("checks") or []:
+        if not isinstance(check, dict) or check.get("returncode") == 0:
+            continue
+        evidence.append(
+            {
+                "name": check.get("name"),
+                "status": check.get("status"),
+                "returncode": check.get("returncode"),
+                "blocking": check.get("blocking"),
+                "failure_category": check.get("failure_category"),
+                "command": check.get("command"),
+                "switch": check.get("switch"),
+                "probe_environment": check.get("probe_environment") if str(check.get("name") or "") == "runtime_smoke:mechanism_activation_forward_probe" and isinstance(check.get("probe_environment"), dict) else {},
+                "repair_hint": check.get("repair_hint"),
+                "stdout_tail": str(check.get("stdout") or "")[-2200:],
+                "stderr_tail": str(check.get("stderr") or "")[-2200:],
+                "forward_probe_diagnostics": _forward_probe_diagnostics_from_check(check)
+                if str(check.get("name") or "") == "runtime_smoke:mechanism_activation_forward_probe"
+                else {},
+            }
+        )
+    return evidence[:limit]
+
+
+def _activation_probe_evidence_from_validation(validation: dict[str, Any]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for check in validation.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        name = str(check.get("name") or "")
+        if name == "runtime_smoke:mechanism_activation_wiring":
+            result["wiring"] = {
+                "status": check.get("status"),
+                "returncode": check.get("returncode"),
+                "failure_category": check.get("failure_category"),
+                "stderr": check.get("stderr"),
+                "switch": check.get("switch"),
+                "enabled_eval_configs": check.get("enabled_eval_configs"),
+                "disabled_eval_configs": check.get("disabled_eval_configs"),
+                "rosetta_config": check.get("rosetta_config"),
+                "runtime_code_refs": check.get("runtime_code_refs"),
+            }
+        elif name == "runtime_smoke:mechanism_activation_forward_probe":
+            diagnostics = _forward_probe_diagnostics_from_check(check)
+            result["forward_probe"] = {
+                "status": check.get("status"),
+                "returncode": check.get("returncode"),
+                "failure_category": check.get("failure_category"),
+                "stderr": check.get("stderr"),
+                "command": check.get("command"),
+                "switch": check.get("switch"),
+                "probe_source": check.get("probe_source"),
+                "probe_script": check.get("probe_script"),
+                "probe_environment": check.get("probe_environment") if isinstance(check.get("probe_environment"), dict) else {},
+                "probe": _compact_value(check.get("probe") or {}, max_chars=5000),
+                "diagnostics": diagnostics,
+            }
+    return result
+
+
+def _forward_probe_diagnostics_from_validation(validation: dict[str, Any]) -> dict[str, Any]:
+    for check in validation.get("checks") or []:
+        if isinstance(check, dict) and str(check.get("name") or "") == "runtime_smoke:mechanism_activation_forward_probe":
+            return _forward_probe_diagnostics_from_check(check)
+    return {}
+
+
+def _forward_probe_diagnostics_from_check(check: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(check, dict):
+        return {}
+    probe = check.get("probe") if isinstance(check.get("probe"), dict) else {}
+    if not probe:
+        return {}
+    tensor_checks = [
+        _compact_forward_tensor_check(item)
+        for item in probe.get("tensor_checks") or []
+        if isinstance(item, dict)
+    ]
+    tensor_checks = [item for item in tensor_checks if item]
+    changed_tensors = [item for item in tensor_checks if item.get("changed")]
+    identical_tensors = [item for item in tensor_checks if item and not item.get("changed")]
+    projector_checks = [item for item in tensor_checks if str(item.get("name") or "").startswith("projector_output.")]
+    wrapper_checks = [item for item in tensor_checks if str(item.get("name") or "").startswith("wrapper_cache.")]
+    wrapper_probe = probe.get("wrapper_probe") if isinstance(probe.get("wrapper_probe"), dict) else {}
+    projector_output_identical = bool(projector_checks) and not any(item.get("changed") for item in projector_checks)
+    wrapper_cache_identical = bool(wrapper_checks) and not any(item.get("changed") for item in wrapper_checks)
+    projector_called = _first_bool(probe.get("projector_called"), wrapper_probe.get("projector_called"))
+    switch_seen_by_forward = _first_bool(probe.get("switch_seen_by_forward"), wrapper_probe.get("switch_seen_by_forward"))
+    cache_key_diff = _first_non_none(probe.get("cache_key_diff"), wrapper_probe.get("cache_key_diff"))
+    cache_value_diff = _first_non_none(probe.get("cache_value_diff"), wrapper_probe.get("cache_value_diff"))
+    enabled = probe.get("enabled") if isinstance(probe.get("enabled"), dict) else {}
+    disabled = probe.get("disabled") if isinstance(probe.get("disabled"), dict) else {}
+    diagnostics = {
+        "status": check.get("status"),
+        "returncode": check.get("returncode"),
+        "failure_category": check.get("failure_category"),
+        "switch": check.get("switch"),
+        "probe_source": check.get("probe_source"),
+        "probe_type": probe.get("probe_type"),
+        "probe_environment": check.get("probe_environment") if isinstance(check.get("probe_environment"), dict) else {},
+        "mechanism_observed": bool(probe.get("mechanism_observed")),
+        "switch_config": {
+            "enabled_value": enabled.get("switch_value"),
+            "disabled_value": disabled.get("switch_value"),
+            "enabled_rosetta_hash": enabled.get("rosetta_hash"),
+            "disabled_rosetta_hash": disabled.get("rosetta_hash"),
+        },
+        "projector_called": projector_called,
+        "switch_seen_by_forward": switch_seen_by_forward,
+        "cache_key_diff": cache_key_diff,
+        "cache_value_diff": cache_value_diff,
+        "projector_output_identical": projector_output_identical,
+        "wrapper_cache_identical": wrapper_cache_identical,
+        "changed_tensors": changed_tensors[:8],
+        "identical_tensors": identical_tensors[:12],
+        "repair_focus": _forward_probe_repair_focus(
+            disabled_switch=disabled.get("switch_value"),
+            projector_called=projector_called,
+            switch_seen_by_forward=switch_seen_by_forward,
+            projector_output_identical=projector_output_identical,
+            wrapper_cache_identical=wrapper_cache_identical,
+            changed_tensors=changed_tensors,
+        ),
+    }
+    if wrapper_probe:
+        diagnostics["wrapper_probe_status"] = wrapper_probe.get("status")
+        diagnostics["wrapper_failures"] = list(wrapper_probe.get("failures") or [])[:8]
+    return diagnostics
+
+
+def _compact_forward_tensor_check(item: dict[str, Any]) -> dict[str, Any]:
+    name = str(item.get("name") or "")
+    if not name:
+        return {}
+    return {
+        "name": name,
+        "changed": bool(item.get("changed")),
+        "max_abs_diff": item.get("max_abs_diff"),
+        "mean_abs_diff": item.get("mean_abs_diff"),
+        "enabled_sha256": item.get("enabled_sha256"),
+        "disabled_sha256": item.get("disabled_sha256"),
+        "shape": item.get("shape") if isinstance(item.get("shape"), list) else [],
+    }
+
+
+def _forward_probe_repair_focus(
+    *,
+    disabled_switch: Any,
+    projector_called: bool | None,
+    switch_seen_by_forward: bool | None,
+    projector_output_identical: bool,
+    wrapper_cache_identical: bool,
+    changed_tensors: list[dict[str, Any]],
+) -> list[str]:
+    focus: list[str] = []
+    if disabled_switch is not True:
+        focus.append("config_materialization_or_ablation_switch_polarity")
+    if switch_seen_by_forward is False:
+        focus.append("forward_branch_missing_switch_or_rosetta_config_read")
+    if projector_called is False:
+        focus.append("wrapper_projection_path_not_executed_or_projector_not_called")
+    if projector_output_identical:
+        focus.append("constructor_params_or_projector_forward_branch_noop")
+    if changed_tensors and wrapper_cache_identical:
+        focus.append("wrapper_cache_injection_not_using_changed_projector_output")
+    if wrapper_cache_identical:
+        focus.append("wrapper_cache_key_value_identical_enabled_disabled")
+    return list(dict.fromkeys(focus)) or ["inspect_forward_probe_tensor_checks"]
+
+
+def _first_bool(*values: Any) -> bool | None:
+    for value in values:
+        if isinstance(value, bool):
+            return value
+    return None
+
+
+def _first_non_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _repair_packet_summary(packet: dict[str, Any]) -> dict[str, Any]:
+    failed_checks = []
+    for check in packet.get("failed_checks") or packet.get("failed_command_evidence") or []:
+        if isinstance(check, dict):
+            failed_checks.append(str(check.get("name") or check.get("failure_category") or "")[:120])
+    return {
+        "schema_version": packet.get("schema_version"),
+        "repair_kind": packet.get("repair_kind"),
+        "attempt": packet.get("attempt"),
+        "failed_status": packet.get("failed_status"),
+        "failed_reason": str(packet.get("failed_reason") or "")[-600:],
+        "failed_checks": [item for item in failed_checks if item][:8],
+        "changed_files": list(packet.get("changed_files") or [])[:12],
+    }
+
+
+def _compact_single_patch_attempt(entry: dict[str, Any]) -> dict[str, Any]:
     quality_score = entry.get("quality_score") if isinstance(entry.get("quality_score"), dict) else {}
     return {
-        "variant_index": variant_index,
+        "variant_index": 1,
         "status": entry.get("status"),
         "reason": str(entry.get("reason") or "")[-1000:],
         "changed_files": list(entry.get("changed_files") or [])[:12],
@@ -1876,52 +3012,137 @@ def _compact_patch_variant_attempt(entry: dict[str, Any], *, variant_index: int)
     }
 
 
-def _annotate_patch_variant_result(
+def _annotate_single_patch_attempt_result(
     result: dict[str, Any],
     *,
-    variant_index: int,
-    variant_count: int,
     attempts: list[dict[str, Any]],
+    selection_reason: str = "single_patch_attempt",
 ) -> None:
     for key in ("code_patch", "manifest_entry"):
         value = result.get(key)
         if not isinstance(value, dict):
             continue
-        value["variant_index"] = variant_index
-        value["variant_count"] = variant_count
-        value["selected_variant"] = variant_index if value.get("status") == "ok" else None
+        value["variant_index"] = 1
+        value["variant_count"] = 1
+        value["selected_variant"] = 1 if value.get("status") == "ok" else None
         value["variant_attempts"] = list(attempts)
+        value["selection_reason"] = selection_reason
 
 
-def _annotate_selected_patch_variant(result: dict[str, Any], *, attempts: list[dict[str, Any]], selected_reason: str) -> None:
-    entry = result.get("manifest_entry") if isinstance(result.get("manifest_entry"), dict) else {}
-    selected_variant = entry.get("variant_index")
-    selected_score = entry.get("quality_score") or {}
-    updated_attempts = []
-    for attempt in attempts:
-        copied = dict(attempt)
-        copied["selected"] = copied.get("variant_index") == selected_variant
-        updated_attempts.append(copied)
-    for key in ("code_patch", "manifest_entry"):
-        value = result.get(key)
-        if not isinstance(value, dict):
-            continue
-        value["selected_variant"] = selected_variant
-        value["variant_attempts"] = updated_attempts
-        value["selection_reason"] = selected_reason
-        value["selected_quality_score"] = selected_score
+def _select_single_s2_5_candidate(plan: dict[str, Any], candidate_ideas: list[dict[str, Any]]) -> dict[str, Any]:
+    candidates = [(idx, item) for idx, item in enumerate(candidate_ideas) if isinstance(item, dict)]
+    if not candidates:
+        return {"candidate": None, "selected_index": None, "selected_by": "none", "selected_candidate_id": None}
+    for idx, candidate in candidates:
+        if candidate.get("selected") is True:
+            return {
+                "candidate": candidate,
+                "selected_index": idx,
+                "selected_by": "candidate.selected",
+                "selected_candidate_id": candidate.get("id"),
+            }
+    selected_idea = plan.get("selected_idea") if isinstance(plan, dict) and isinstance(plan.get("selected_idea"), dict) else {}
+    matched = _match_s2_5_candidate_selector(candidates, selected_idea)
+    if matched:
+        idx, candidate = matched
+        return {
+            "candidate": candidate,
+            "selected_index": idx,
+            "selected_by": "plan.selected_idea",
+            "selected_candidate_id": candidate.get("id"),
+        }
+    next_variant = plan.get("next_variant") if isinstance(plan, dict) and isinstance(plan.get("next_variant"), dict) else {}
+    matched = _match_s2_5_candidate_selector(candidates, next_variant)
+    if matched:
+        idx, candidate = matched
+        return {
+            "candidate": candidate,
+            "selected_index": idx,
+            "selected_by": "plan.next_variant",
+            "selected_candidate_id": candidate.get("id"),
+        }
+    selected_variants = plan.get("selected_variant_candidates") if isinstance(plan, dict) else None
+    if isinstance(selected_variants, list):
+        for selector in selected_variants:
+            if not isinstance(selector, dict):
+                continue
+            matched = _match_s2_5_candidate_selector(candidates, selector)
+            if matched:
+                idx, candidate = matched
+                return {
+                    "candidate": candidate,
+                    "selected_index": idx,
+                    "selected_by": "plan.selected_variant_candidates",
+                    "selected_candidate_id": candidate.get("id"),
+                }
+    idx, candidate = candidates[0]
+    return {
+        "candidate": candidate,
+        "selected_index": idx,
+        "selected_by": "first_candidate_fallback",
+        "selected_candidate_id": candidate.get("id"),
+    }
 
 
-def _select_best_patch_variant(results: list[dict[str, Any]]) -> dict[str, Any]:
-    return max(
-        results,
-        key=lambda result: (
-            ((result.get("manifest_entry") or {}).get("quality_score") or {}).get("score", 0),
-            -int(((result.get("manifest_entry") or {}).get("quality_score") or {}).get("diff_line_count", 0) or 0),
-            -int(((result.get("manifest_entry") or {}).get("quality_score") or {}).get("changed_file_count", 0) or 0),
-            -int((result.get("manifest_entry") or {}).get("variant_index") or 0),
-        ),
-    )
+def _match_s2_5_candidate_selector(
+    candidates: list[tuple[int, dict[str, Any]]],
+    selector: dict[str, Any],
+) -> tuple[int, dict[str, Any]] | None:
+    if not isinstance(selector, dict) or not selector:
+        return None
+    selector_id = str(selector.get("id") or selector.get("candidate_id") or "").strip()
+    selector_fingerprint = str(
+        selector.get("variant_fingerprint")
+        or ((selector.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(selector.get("s2_variant"), dict) else "")
+        or ""
+    ).strip()
+    for idx, candidate in candidates:
+        candidate_id = str(candidate.get("id") or candidate.get("candidate_id") or "").strip()
+        candidate_fingerprint = str(
+            candidate.get("variant_fingerprint")
+            or ((candidate.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(candidate.get("s2_variant"), dict) else "")
+            or ""
+        ).strip()
+        if selector_id and candidate_id and selector_id == candidate_id:
+            return idx, candidate
+        if selector_fingerprint and candidate_fingerprint and selector_fingerprint == candidate_fingerprint:
+            return idx, candidate
+    return None
+
+
+def _compact_skipped_patch_candidate(candidate: dict[str, Any], *, reason: str) -> dict[str, Any]:
+    return {
+        "candidate_id": candidate.get("id") or candidate.get("candidate_id"),
+        "title": candidate.get("title"),
+        "variant_fingerprint": candidate.get("variant_fingerprint")
+        or ((candidate.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(candidate.get("s2_variant"), dict) else None),
+        "status": (candidate.get("code_patch") or {}).get("status"),
+        "reason": reason,
+    }
+
+
+def _compact_selected_manifest_patch(entry: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(entry, dict) or not entry:
+        return {}
+    return {
+        "candidate_id": entry.get("candidate_id") or entry.get("id"),
+        "title": entry.get("title"),
+        "status": entry.get("status"),
+        "variant_fingerprint": entry.get("variant_fingerprint"),
+        "s2_variant": entry.get("s2_variant") or {},
+        "patch_json": entry.get("patch_json"),
+        "diff": entry.get("diff"),
+        "validation": entry.get("validation"),
+        "implementation_contract": entry.get("implementation_contract"),
+        "codex_prompt": entry.get("codex_prompt"),
+        "patched_repo_snapshot": entry.get("patched_repo_snapshot") or {},
+        "changed_files": list(entry.get("changed_files") or []),
+        "has_executable_change": bool(entry.get("has_executable_change")),
+        "quality_score": entry.get("quality_score") or {},
+        "quality_debt": entry.get("quality_debt") or (entry.get("quality_score") or {}).get("quality_debt") or [],
+        "selected_variant": entry.get("selected_variant"),
+        "selection_reason": entry.get("selection_reason"),
+    }
 
 
 def _patch_quality_score(
@@ -1935,6 +3156,7 @@ def _patch_quality_score(
     changed_files = list(draft.get("changed_files") or [])
     diff_line_count = len(str(draft.get("diff") or "").splitlines())
     score_inputs = mechanism_review.get("score_inputs") if isinstance(mechanism_review.get("score_inputs"), dict) else {}
+    quality_debt = _patch_quality_debt(validation, activation, risk_check, mechanism_review)
     score = 0
     reasons: list[str] = []
     if validation.get("status") == "ok":
@@ -1968,6 +3190,9 @@ def _patch_quality_score(
     if soft_issues:
         score -= 4 * len(soft_issues)
         reasons.append("soft_quality_gaps")
+    if quality_debt:
+        score -= 3 * len(quality_debt)
+        reasons.append("quality_debt")
     if any(str(check.get("name") or "").startswith("runtime_smoke:") and check.get("returncode") == 0 for check in validation.get("checks") or [] if isinstance(check, dict)):
         score += 12
         reasons.append("runtime_smoke_ok")
@@ -1992,6 +3217,7 @@ def _patch_quality_score(
         "penalty": penalty,
         "risk_labels": risk_labels,
         "soft_issues": soft_issues,
+        "quality_debt": quality_debt,
         "changed_file_count": len(changed_files),
         "diff_line_count": diff_line_count,
         "mechanism_review_status": mechanism_review.get("status"),
@@ -1999,6 +3225,51 @@ def _patch_quality_score(
         if isinstance(implementation_contract.get("mechanism_contract"), dict)
         else None,
     }
+
+
+def _patch_quality_debt(
+    validation: dict[str, Any],
+    activation: dict[str, Any],
+    risk_check: dict[str, Any],
+    mechanism_review: dict[str, Any],
+) -> list[dict[str, Any]]:
+    debt: list[dict[str, Any]] = []
+    for warning in risk_check.get("warnings") or []:
+        debt.append({"source": "risk_check", "label": "patch_scope_warning", "message": str(warning)})
+    for label in risk_check.get("risk_labels") or []:
+        if label in {"patch_too_broad"} and risk_check.get("status") == "ok":
+            debt.append({"source": "risk_check", "label": str(label), "message": "Patch is runnable but broader than the soft discovery limit."})
+    for label in activation.get("soft_issues") or []:
+        debt.append({"source": "activation_check", "label": str(label), "message": activation.get("reason") or str(label)})
+    for parameter in activation.get("missing_parameters") or []:
+        if activation.get("status") == "ok" and activation.get("soft_issues"):
+            debt.append({"source": "activation_check", "label": "unactivated_config_parameter", "parameter": str(parameter)})
+    for label in mechanism_review.get("soft_issues") or []:
+        debt.append({"source": "mechanism_review", "label": str(label), "message": "Deferred mechanism quality evidence."})
+    for warning in mechanism_review.get("warnings") or []:
+        if warning not in mechanism_review.get("soft_issues", []):
+            debt.append({"source": "mechanism_review", "label": str(warning), "message": "Mechanism review warning."})
+    for check in validation.get("checks") or []:
+        if not isinstance(check, dict):
+            continue
+        if check.get("soft_failure") or check.get("blocking") is False:
+            debt.append(
+                {
+                    "source": "validation",
+                    "label": str(check.get("failure_category") or check.get("name") or "soft_validation_failure"),
+                    "check": check.get("name"),
+                    "message": check.get("stderr") or check.get("repair_hint") or "",
+                }
+            )
+    unique: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for item in debt:
+        key = (str(item.get("source") or ""), str(item.get("label") or ""), str(item.get("parameter") or item.get("check") or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
 
 
 def _nearest_existing_parent(path: Path) -> Path:
@@ -2053,19 +3324,218 @@ def _build_patch_from_repo_delta(source_repo: Path, modified_repo: Path, policy:
     return {"status": "ok", "errors": [], "operations": operations, "changed_files": changed_files, "diff": "\n".join(diff_chunks)}
 
 
+def _auto_prune_worktree_scope_before_build(
+    source_repo: Path,
+    modified_repo: Path,
+    policy: DynamicEditPolicy,
+    candidate: dict[str, Any],
+    implementation_contract: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    validation_config = _code_patch_config(config).get("validation", {}) or {}
+    if not validation_config.get("auto_prune_scope", True):
+        return None
+
+    source_files = _text_file_map(source_repo, policy)
+    modified_files = _text_file_map(modified_repo, policy)
+    changed_files = [
+        rel_path
+        for rel_path in sorted(set(source_files) | set(modified_files))
+        if source_files.get(rel_path) != modified_files.get(rel_path)
+    ]
+    if not changed_files:
+        return None
+
+    restored: list[str] = []
+    reasons: dict[str, str] = {}
+
+    for rel_path in changed_files:
+        if rel_path in source_files and rel_path not in modified_files:
+            if _restore_repo_path(source_repo, modified_repo, rel_path):
+                restored.append(rel_path)
+                reasons[rel_path] = "delete_file_not_allowed"
+        elif _evaluator_like_path(rel_path):
+            if _restore_repo_path(source_repo, modified_repo, rel_path):
+                restored.append(rel_path)
+                reasons[rel_path] = "evaluator_like_file"
+
+    if restored:
+        source_files = _text_file_map(source_repo, policy)
+        modified_files = _text_file_map(modified_repo, policy)
+        changed_files = [
+            rel_path
+            for rel_path in sorted(set(source_files) | set(modified_files))
+            if source_files.get(rel_path) != modified_files.get(rel_path)
+        ]
+
+    max_changed_files = validation_config.get("max_changed_files")
+    if (
+        max_changed_files is not None
+        and len(changed_files) > int(max_changed_files)
+        and validation_config.get("auto_prune_over_scope_files", False)
+    ):
+        keep = set(
+            _allowed_core_patch_files(
+                changed_files,
+                candidate,
+                implementation_contract,
+                max_files=int(max_changed_files),
+            )
+        )
+        for rel_path in changed_files:
+            if rel_path in keep:
+                continue
+            if _restore_repo_path(source_repo, modified_repo, rel_path):
+                restored.append(rel_path)
+                reasons[rel_path] = "over_scope_low_priority_file"
+
+    if not restored:
+        return None
+    return {
+        "action": "auto_prune_worktree_scope_before_build",
+        "status": "ok",
+        "restored_files": list(dict.fromkeys(restored)),
+        "reasons": reasons,
+        "reason": "restored deletions, evaluator-like files, or low-priority over-scope files before patch construction",
+    }
+
+
+def _auto_prune_worktree_scope_before_codex(
+    source_repo: Path,
+    modified_repo: Path,
+    policy: DynamicEditPolicy,
+    candidate: dict[str, Any],
+    implementation_contract: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any] | None:
+    validation_config = _code_patch_config(config).get("validation", {}) or {}
+    if not validation_config.get("auto_prune_scope", True):
+        return None
+
+    source_files = _text_file_map(source_repo, policy)
+    modified_files = _text_file_map(modified_repo, policy)
+    changed_files = [
+        rel_path
+        for rel_path in sorted(set(source_files) | set(modified_files))
+        if source_files.get(rel_path) != modified_files.get(rel_path)
+    ]
+    if not changed_files:
+        return None
+
+    keep = _pre_codex_keep_files(changed_files, candidate, implementation_contract)
+    restored: list[str] = []
+    reasons: dict[str, str] = {}
+    for rel_path in changed_files:
+        reason = ""
+        if rel_path in source_files and rel_path not in modified_files:
+            reason = "delete_file_not_allowed"
+        elif _evaluator_like_path(rel_path):
+            reason = "evaluator_like_file"
+        elif rel_path not in keep:
+            reason = "stale_unrequested_worktree_change"
+        if reason and _restore_repo_path(source_repo, modified_repo, rel_path):
+            restored.append(rel_path)
+            reasons[rel_path] = reason
+
+    if not restored:
+        return None
+    return {
+        "action": "auto_prune_worktree_scope_before_codex",
+        "status": "ok",
+        "restored_files": list(dict.fromkeys(restored)),
+        "reasons": reasons,
+        "reason": "restored stale persistent worktree changes before Codex sees the implementation repair context",
+    }
+
+
+def _pre_codex_keep_files(
+    changed_files: list[str],
+    candidate: dict[str, Any],
+    implementation_contract: dict[str, Any],
+) -> set[str]:
+    expected = set(_expected_file_list(((implementation_contract.get("implementation_targets") or {}).get("expected_files"))))
+    scope = implementation_contract.get("implementation_scope") if isinstance(implementation_contract.get("implementation_scope"), dict) else {}
+    required = set(_expected_file_list(scope.get("required_new_files")))
+    smoke_tests = set(_expected_file_list(scope.get("smoke_tests")))
+    contract = candidate.get("experiment_contract") if isinstance(candidate.get("experiment_contract"), dict) else {}
+    explicit = set(
+        _expected_file_list(candidate.get("expected_files"))
+        + _expected_file_list(contract.get("expected_files"))
+        + _expected_file_list(candidate.get("required_new_files"))
+        + _expected_file_list((candidate.get("implementation_plan") or {}).get("required_new_files") if isinstance(candidate.get("implementation_plan"), dict) else [])
+    )
+    keep: set[str] = set()
+    keep.update(path for path in changed_files if path in expected or path in required or path in smoke_tests or path in explicit)
+    keep.update(path for path in changed_files if _model_mechanism_path(path))
+    keep.update(path for path in changed_files if _focused_test_path(path))
+    keep.update(path for path in changed_files if _recipe_path(path))
+    return keep
+
+
+def _build_pruned_patch_from_repo_delta(
+    source_repo: Path,
+    modified_repo: Path,
+    policy: DynamicEditPolicy,
+    candidate: dict[str, Any],
+    implementation_contract: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    prebuild_action = _auto_prune_worktree_scope_before_build(
+        source_repo,
+        modified_repo,
+        policy,
+        candidate,
+        implementation_contract,
+        config,
+    )
+    draft = _build_patch_from_repo_delta(source_repo, modified_repo, policy)
+    draft, postbuild_action = _auto_prune_patch_scope_and_rebuild(
+        source_repo,
+        modified_repo,
+        policy,
+        draft,
+        candidate,
+        implementation_contract,
+        config,
+    )
+    actions = [action for action in (prebuild_action, postbuild_action) if action]
+    if not actions:
+        return draft, None
+    if len(actions) == 1:
+        return draft, actions[0]
+    restored: list[str] = []
+    reasons: dict[str, str] = {}
+    for action in actions:
+        restored.extend(str(path) for path in action.get("restored_files") or [])
+        if isinstance(action.get("reasons"), dict):
+            reasons.update({str(key): str(value) for key, value in action["reasons"].items()})
+    return draft, {
+        "action": "auto_prune_worktree_and_patch_scope",
+        "status": "ok",
+        "restored_files": list(dict.fromkeys(restored)),
+        "reasons": reasons,
+        "steps": actions,
+        "reason": "restored unsafe worktree changes before freezing patch",
+    }
+
+
 def _validate_patch_proxy_risk(draft: dict[str, Any], candidate: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:
     validation_config = _code_patch_config(config).get("validation", {}) or {}
     changed_files = list(draft.get("changed_files") or [])
     executable_files = [path for path in changed_files if Path(path).suffix in {".py", ".json", ".yaml", ".yml", ".toml"}]
     risk_labels: list[str] = []
     risk_files: list[dict[str, Any]] = []
+    warnings: list[str] = []
     status = "ok"
     reason = ""
     max_changed_files = validation_config.get("max_changed_files")
     if max_changed_files is not None and len(changed_files) > int(max_changed_files):
-        status = "patch_too_broad"
-        reason = f"patch changes {len(changed_files)} files, above S2.5 risk limit {int(max_changed_files)}"
         risk_labels.append("patch_too_broad")
+        warning = f"patch changes {len(changed_files)} files, above S2.5 soft risk limit {int(max_changed_files)}"
+        warnings.append(warning)
+        if validation_config.get("strict_max_changed_files", False):
+            status = "patch_too_broad"
+            reason = warning.replace("soft risk limit", "strict risk limit")
     if validation_config.get("repair_eval_code_changes", True):
         evaluator_files = [path for path in changed_files if _evaluator_like_path(path)]
         if evaluator_files:
@@ -2086,12 +3556,125 @@ def _validate_patch_proxy_risk(draft: dict[str, Any], candidate: dict[str, Any],
         "executable_files": executable_files,
         "risk_labels": list(dict.fromkeys(risk_labels)),
         "risk_files": risk_files,
+        "warnings": warnings,
         "repair_hint": (
             "Keep the idea, but shrink or relocate the patch so cheap proxy can execute it safely."
             if status != "ok"
             else ""
         ),
     }
+
+
+def _auto_prune_patch_scope_and_rebuild(
+    source_repo: Path,
+    modified_repo: Path,
+    policy: DynamicEditPolicy,
+    draft: dict[str, Any],
+    candidate: dict[str, Any],
+    implementation_contract: dict[str, Any],
+    config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    validation_config = _code_patch_config(config).get("validation", {}) or {}
+    if not validation_config.get("auto_prune_scope", True) or draft.get("status") != "ok":
+        return draft, None
+
+    changed_files = list(draft.get("changed_files") or [])
+    restored: list[str] = []
+    reasons: dict[str, str] = {}
+
+    for rel_path in changed_files:
+        if _evaluator_like_path(rel_path):
+            if _restore_repo_path(source_repo, modified_repo, rel_path):
+                restored.append(rel_path)
+                reasons[rel_path] = "evaluator_like_file"
+
+    if restored:
+        draft = _build_patch_from_repo_delta(source_repo, modified_repo, policy)
+        changed_files = list(draft.get("changed_files") or [])
+
+    max_changed_files = validation_config.get("max_changed_files")
+    if (
+        max_changed_files is not None
+        and len(changed_files) > int(max_changed_files)
+        and validation_config.get("auto_prune_over_scope_files", False)
+    ):
+        keep = set(_allowed_core_patch_files(changed_files, candidate, implementation_contract, max_files=int(max_changed_files)))
+        for rel_path in changed_files:
+            if rel_path in keep:
+                continue
+            if _restore_repo_path(source_repo, modified_repo, rel_path):
+                restored.append(rel_path)
+                reasons[rel_path] = "over_scope_low_priority_file"
+        draft = _build_patch_from_repo_delta(source_repo, modified_repo, policy)
+
+    if not restored:
+        return draft, None
+    return draft, {
+        "action": "auto_prune_patch_scope_before_freeze",
+        "status": "ok",
+        "restored_files": list(dict.fromkeys(restored)),
+        "reasons": reasons,
+        "reason": "restored evaluator or low-priority over-scope files before freezing patch",
+    }
+
+
+def _restore_repo_path(source_repo: Path, modified_repo: Path, rel_path: str) -> bool:
+    source = source_repo / rel_path
+    target = modified_repo / rel_path
+    if source.exists() and source.is_file():
+        ensure_dir(target.parent)
+        target.write_text(source.read_text(encoding="utf-8", errors="ignore"), encoding="utf-8")
+        return True
+    if target.exists():
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+        return True
+    return False
+
+
+def _allowed_core_patch_files(
+    changed_files: list[str],
+    candidate: dict[str, Any],
+    implementation_contract: dict[str, Any],
+    *,
+    max_files: int,
+) -> list[str]:
+    expected = set(_expected_file_list(((implementation_contract.get("implementation_targets") or {}).get("expected_files"))))
+    scope = implementation_contract.get("implementation_scope") if isinstance(implementation_contract.get("implementation_scope"), dict) else {}
+    required = set(_expected_file_list(scope.get("required_new_files")))
+    smoke_tests = set(_expected_file_list(scope.get("smoke_tests")))
+    contract = candidate.get("experiment_contract") if isinstance(candidate.get("experiment_contract"), dict) else {}
+    forbidden = set(_expected_file_list(candidate.get("forbidden_files")) + _expected_file_list(contract.get("forbidden_files")))
+
+    keep = [path for path in changed_files if path in required]
+    keep.extend(path for path in changed_files if path in expected and path not in keep)
+    keep.extend(path for path in changed_files if _model_mechanism_path(path) and path not in keep)
+    keep.extend(path for path in changed_files if path in smoke_tests and path not in keep)
+    keep.extend(path for path in changed_files if _focused_test_path(path) and path not in keep)
+    keep.extend(path for path in changed_files if _recipe_path(path) and path not in keep)
+    if len(keep) < max_files:
+        keep.extend(path for path in changed_files if path not in keep and path not in forbidden and _train_integration_path(path))
+    if len(keep) < max_files:
+        keep.extend(path for path in changed_files if path not in keep and path not in forbidden)
+    return keep[:max(1, int(max_files))]
+
+
+def _model_mechanism_path(path: str) -> bool:
+    return path.startswith("rosetta/model/") and Path(path).suffix in {".py", ".json", ".yaml", ".yml", ".toml"}
+
+
+def _focused_test_path(path: str) -> bool:
+    return path.startswith(("test/", "tests/")) and Path(path).suffix == ".py"
+
+
+def _recipe_path(path: str) -> bool:
+    return path.startswith("recipe/") and Path(path).suffix in {".json", ".yaml", ".yml", ".toml"}
+
+
+def _train_integration_path(path: str) -> bool:
+    return path.startswith("script/train/") and Path(path).suffix == ".py"
 
 
 def _restore_proxy_risk_files(source_repo: Path, modified_repo: Path, risk_check: dict[str, Any]) -> dict[str, Any] | None:
@@ -2129,6 +3712,7 @@ def _mechanism_self_review(draft: dict[str, Any], implementation_contract: dict[
     review_cfg = ((_code_patch_config(config).get("validation", {}) or {}).get("mechanism_self_review") or {})
     if not isinstance(review_cfg, dict) or not review_cfg.get("enabled", True):
         return {"status": "ok", "skipped": True, "reason": "mechanism self-review disabled", "mechanism_evidence_map": []}
+    strict = _strict_patch_gate(config)
     changed_files = list(draft.get("changed_files") or [])
     diff_text = str(draft.get("diff") or "")
     mechanism_contract = implementation_contract.get("mechanism_contract") if isinstance(implementation_contract.get("mechanism_contract"), dict) else {}
@@ -2156,20 +3740,22 @@ def _mechanism_self_review(draft: dict[str, Any], implementation_contract: dict[
     issues: list[str] = []
     warnings: list[str] = []
     soft_issues: list[str] = []
-    if review_cfg.get("require_mechanism_evidence", True) and not (core_files or expected_hits):
+    if review_cfg.get("require_mechanism_evidence", True) and not (core_files or expected_hits) and strict:
         issues.append("missing_core_mechanism_file")
+    elif review_cfg.get("require_mechanism_evidence", True) and not (core_files or expected_hits):
+        soft_issues.append("missing_core_mechanism_file")
     if ablation_switch and not ablation_wired:
-        if review_cfg.get("require_ablation_wired", False):
+        if strict and review_cfg.get("require_ablation_wired", False):
             issues.append("ablation_switch_not_wired")
         else:
             soft_issues.append("ablation_switch_not_wired")
     if coverage_required and not coverage_evidence:
-        if review_cfg.get("require_coverage_evidence", False):
+        if strict and review_cfg.get("require_coverage_evidence", False):
             issues.append("missing_coverage_diagnostics_evidence")
         else:
             soft_issues.append("missing_coverage_diagnostics_evidence")
     if matched_required and not matched_coverage_evidence:
-        if review_cfg.get("require_matched_coverage_evidence", False):
+        if strict and review_cfg.get("require_matched_coverage_evidence", False):
             issues.append("missing_matched_coverage_evidence")
         else:
             soft_issues.append("missing_matched_coverage_evidence")
@@ -2183,6 +3769,8 @@ def _mechanism_self_review(draft: dict[str, Any], implementation_contract: dict[
     quality_repair = _quality_repair_advice(soft_issues, implementation_contract)
     return {
         "status": status,
+        "gate_mode": code_patch_gate_mode(config),
+        "blocking": bool(issues),
         "reason": "; ".join(issues),
         "issues": issues,
         "soft_issues": soft_issues,
@@ -2242,8 +3830,9 @@ def _evaluator_like_path(path: str) -> bool:
     name = Path(normalized).name.lower()
     return (
         normalized.startswith("script/evaluation/")
+        or normalized == "script/auto_research/activation_forward_probe.py"
         or normalized == "rosetta/utils/evaluate.py"
-        or name in {"unified_evaluator.py", "evaluate.py", "evaluator.py"}
+        or name in {"unified_evaluator.py", "evaluate.py", "evaluator.py", "activation_forward_probe.py"}
     )
 
 
@@ -2480,6 +4069,18 @@ def _validate_patch_repo(
             checks.append(smoke_check)
             if smoke_check.get("returncode") not in {0, None}:
                 status = "validation_failed"
+    if status == "ok":
+        activation_wiring_check = _mechanism_activation_wiring_smoke_check(repo_root, python_cmd, config, candidate or {})
+        if activation_wiring_check:
+            checks.append(activation_wiring_check)
+            if activation_wiring_check.get("returncode") not in {0, None} and activation_wiring_check.get("blocking", True):
+                status = "validation_failed"
+    if status == "ok":
+        activation_forward_check = _mechanism_activation_forward_probe_check(repo_root, python_cmd, config, candidate or {})
+        if activation_forward_check:
+            checks.append(activation_forward_check)
+            if activation_forward_check.get("returncode") not in {0, None} and activation_forward_check.get("blocking", True):
+                status = "validation_failed"
     return {"status": status, "checks": checks, "changed_files": changed_files}
 
 
@@ -2494,7 +4095,12 @@ class ValidationCommandResult:
 
 def _run_validation_command(command: list[str], *, cwd: Path, timeout: int) -> ValidationCommandResult:
     try:
-        result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        env = None
+        if command and Path(str(command[1] if len(command) > 1 else "")).name == "c2c_activation_forward_probe.py":
+            env = dict(os.environ)
+            existing_pythonpath = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = str(cwd) + ((os.pathsep + existing_pythonpath) if existing_pythonpath else "")
+        result = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, env=env)
     except subprocess.TimeoutExpired as exc:
         stdout = _decode_timeout_output(exc.stdout)
         stderr_parts = [_decode_timeout_output(exc.stderr)]
@@ -2566,9 +4172,6 @@ def _runtime_smoke_check(repo_root: Path, python_cmd: str, config: dict[str, Any
         smoke_repo = Path(tmp) / "repo"
         try:
             shutil.copytree(repo_root, smoke_repo, ignore=_temporary_patch_ignore)
-            adapter = C2CAdapter(smoke_repo, _runtime_smoke_adapter_config(config, smoke_repo, python_cmd, smoke_cfg))
-            run_spec = adapter.materialize_candidate_configs(candidate or {}, _runtime_smoke_gpu_selection(smoke_cfg))
-            _harden_runtime_smoke_train_config(run_spec.get("train_config"), smoke_cfg)
         except Exception as exc:
             return {
                 "name": "runtime_smoke:first_batch_train",
@@ -2579,57 +4182,740 @@ def _runtime_smoke_check(repo_root: Path, python_cmd: str, config: dict[str, Any
                 "repair_hint": "Fix the patch so C2C candidate train config materialization succeeds before S3.",
             }
 
-        commands = run_spec.get("commands") or {}
-        command = commands.get("train")
-        if not command:
-            return {
-                "name": "runtime_smoke:first_batch_train",
-                "returncode": 1,
-                "status": "failed",
-                "failure_category": "missing_train_command",
-                "stderr": "C2C runtime smoke could not build a train command.",
-            }
-
-        command = _disable_wandb_for_command(command)
         timeout_seconds = max(1, int(smoke_cfg.get("timeout_seconds") or 600))
-        try:
-            result = subprocess.run(
-                command,
-                cwd=smoke_repo,
-                capture_output=True,
-                text=True,
-                shell=True,
-                timeout=timeout_seconds,
-            )
-        except subprocess.TimeoutExpired as exc:
-            stdout = _validation_output_excerpt(_decode_timeout_output(exc.stdout))
-            stderr = _validation_output_excerpt((_decode_timeout_output(exc.stderr) + f"\nCommand timed out after {timeout_seconds}s").strip())
-            return {
+        attempts: list[dict[str, Any]] = []
+        last_check: dict[str, Any] | None = None
+        attempt_queue = _runtime_smoke_gpu_attempts(config, smoke_cfg)
+        attempt_index = 0
+        while attempt_index < len(attempt_queue):
+            attempt_plan = attempt_queue[attempt_index]
+            attempt_index += 1
+            selected_gpu_ids = list(attempt_plan.get("selected_gpu_ids") or [])
+            if attempt_plan.get("resource_unavailable"):
+                return {
+                    "name": "runtime_smoke:first_batch_train",
+                    "returncode": 75,
+                    "status": "resource_retry",
+                    "failure_category": "runtime_smoke_resource_retry",
+                    "retryable": True,
+                    "resource_retry": True,
+                    "stderr": (
+                        "Runtime smoke did not start because no allowed GPU reached "
+                        f"min_free_mb={attempt_plan.get('min_free_mb')} before resource_wait timeout."
+                    ),
+                    "attempts": attempts,
+                    "selected_gpu_ids": selected_gpu_ids,
+                    "gpu_selection": {
+                        "selected_gpu_ids": selected_gpu_ids,
+                        "reason": attempt_plan.get("reason"),
+                        "memory_free_mb": attempt_plan.get("memory_free_mb"),
+                        "memory_total_mb": attempt_plan.get("memory_total_mb"),
+                        "min_free_mb": attempt_plan.get("min_free_mb"),
+                        "snapshot": attempt_plan.get("snapshot") or [],
+                        "resource_wait": attempt_plan.get("resource_wait") or {},
+                    },
+                    "train_samples": _runtime_smoke_train_samples(smoke_cfg),
+                    "repair_hint": _runtime_smoke_repair_hint("runtime_smoke_resource_retry"),
+                }
+            try:
+                adapter = C2CAdapter(
+                    smoke_repo,
+                    _runtime_smoke_adapter_config(
+                        config,
+                        smoke_repo,
+                        python_cmd,
+                        smoke_cfg,
+                        selected_gpu_ids=selected_gpu_ids,
+                    ),
+                )
+                run_spec = adapter.materialize_candidate_configs(
+                    candidate or {},
+                    _runtime_smoke_gpu_selection(smoke_cfg, selected_gpu_ids=selected_gpu_ids, snapshot=attempt_plan.get("snapshot") or []),
+                )
+                _harden_runtime_smoke_train_config(run_spec.get("train_config"), smoke_cfg)
+            except Exception as exc:
+                return {
+                    "name": "runtime_smoke:first_batch_train",
+                    "returncode": 1,
+                    "status": "failed",
+                    "failure_category": "runtime_smoke_materialization_failed",
+                    "stderr": _validation_output_excerpt(f"{type(exc).__name__}: {exc}"),
+                    "attempts": attempts,
+                    "selected_gpu_ids": selected_gpu_ids,
+                    "repair_hint": "Fix the patch so C2C candidate train config materialization succeeds before S3.",
+                }
+
+            commands = run_spec.get("commands") or {}
+            command = commands.get("train")
+            if not command:
+                return {
+                    "name": "runtime_smoke:first_batch_train",
+                    "returncode": 1,
+                    "status": "failed",
+                    "failure_category": "missing_train_command",
+                    "stderr": "C2C runtime smoke could not build a train command.",
+                    "attempts": attempts,
+                    "selected_gpu_ids": selected_gpu_ids,
+                }
+
+            command = _disable_wandb_for_command(command)
+            try:
+                result = subprocess.run(
+                    command,
+                    cwd=smoke_repo,
+                    capture_output=True,
+                    text=True,
+                    shell=True,
+                    timeout=timeout_seconds,
+                )
+            except subprocess.TimeoutExpired as exc:
+                stdout = _validation_output_excerpt(_decode_timeout_output(exc.stdout))
+                stderr = _validation_output_excerpt((_decode_timeout_output(exc.stderr) + f"\nCommand timed out after {timeout_seconds}s").strip())
+                return {
+                    "name": "runtime_smoke:first_batch_train",
+                    "returncode": 124,
+                    "status": "failed",
+                    "failure_category": "runtime_smoke_timeout",
+                    "stdout": stdout,
+                    "stderr": stderr,
+                    "command": _validation_output_excerpt(command, max_chars=1200),
+                    "attempts": attempts,
+                    "selected_gpu_ids": selected_gpu_ids,
+                    "timeout_seconds": timeout_seconds,
+                    "repair_hint": _runtime_smoke_repair_hint("runtime_smoke_timeout"),
+                }
+
+            stdout = _validation_output_excerpt(result.stdout)
+            stderr = _validation_output_excerpt(result.stderr)
+            category = _runtime_smoke_failure_category(stdout, stderr, result.returncode)
+            attempt_record = {
+                "attempt": len(attempts) + 1,
+                "selected_gpu_ids": selected_gpu_ids,
+                "gpu_free_mb": attempt_plan.get("memory_free_mb"),
+                "gpu_total_mb": attempt_plan.get("memory_total_mb"),
+                "returncode": result.returncode,
+                "failure_category": category,
+                "command": _validation_output_excerpt(command, max_chars=800),
+                "stdout_tail": str(stdout or "")[-1200:],
+                "stderr_tail": str(stderr or "")[-1200:],
+            }
+            attempts.append(attempt_record)
+            last_check = {
                 "name": "runtime_smoke:first_batch_train",
-                "returncode": 124,
-                "status": "failed",
-                "failure_category": "runtime_smoke_timeout",
+                "returncode": result.returncode,
+                "status": "ok" if result.returncode == 0 else "failed",
+                "failure_category": category,
                 "stdout": stdout,
                 "stderr": stderr,
                 "command": _validation_output_excerpt(command, max_chars=1200),
-                "timeout_seconds": timeout_seconds,
-                "repair_hint": _runtime_smoke_repair_hint("runtime_smoke_timeout"),
+                "train_samples": _runtime_smoke_train_samples(smoke_cfg),
+                "selected_gpu_ids": selected_gpu_ids,
+                "gpu_selection": {
+                    "selected_gpu_ids": selected_gpu_ids,
+                    "reason": attempt_plan.get("reason"),
+                    "memory_free_mb": attempt_plan.get("memory_free_mb"),
+                    "memory_total_mb": attempt_plan.get("memory_total_mb"),
+                    "min_free_mb": attempt_plan.get("min_free_mb"),
+                    "snapshot": attempt_plan.get("snapshot") or [],
+                    "resource_wait": attempt_plan.get("resource_wait") or {},
+                },
+                "attempts": attempts,
+                "repair_hint": _runtime_smoke_repair_hint(category),
             }
-    stdout = _validation_output_excerpt(result.stdout)
-    stderr = _validation_output_excerpt(result.stderr)
-    category = _runtime_smoke_failure_category(stdout, stderr, result.returncode)
-    check = {
-        "name": "runtime_smoke:first_batch_train",
-        "returncode": result.returncode,
-        "status": "ok" if result.returncode == 0 else "failed",
-        "failure_category": category,
-        "stdout": stdout,
-        "stderr": stderr,
-        "command": _validation_output_excerpt(command, max_chars=1200),
-        "train_samples": _runtime_smoke_train_samples(smoke_cfg),
-        "repair_hint": _runtime_smoke_repair_hint(category),
+            if result.returncode == 0:
+                return last_check
+            if category != "runtime_smoke_oom":
+                return last_check
+            if _runtime_smoke_oom_retry_enabled(smoke_cfg) and _runtime_smoke_oom_count(attempts) <= _runtime_smoke_oom_max_retries(smoke_cfg):
+                retry_plan = _runtime_smoke_oom_retry_attempt(
+                    config,
+                    smoke_cfg,
+                    tried_gpu_ids={gpu for attempt in attempts for gpu in attempt.get("selected_gpu_ids") or []},
+                )
+            else:
+                retry_plan = None
+            if retry_plan:
+                attempt_queue.append(retry_plan)
+        if last_check:
+            if last_check.get("failure_category") == "runtime_smoke_oom":
+                last_check["failure_category"] = "runtime_smoke_resource_retry"
+                last_check["retryable"] = True
+                last_check["resource_retry"] = True
+                last_check["status"] = "resource_retry"
+                last_check["repair_hint"] = _runtime_smoke_repair_hint("runtime_smoke_resource_retry")
+            return last_check
+    return None
+
+
+def _mechanism_activation_wiring_smoke_check(repo_root: Path, python_cmd: str, config: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any] | None:
+    smoke_cfg = ((_code_patch_config(config).get("validation", {}) or {}).get("runtime_smoke") or {})
+    if not isinstance(smoke_cfg, dict) or not smoke_cfg.get("enabled", True):
+        return None
+    wiring_cfg = smoke_cfg.get("mechanism_activation")
+    if wiring_cfg is None:
+        wiring_cfg = {}
+    if not isinstance(wiring_cfg, dict) or not wiring_cfg.get("enabled", True):
+        return None
+    hard_gate = _activation_wiring_hard_gate(config)
+    switch = _candidate_ablation_switch_for_patch(candidate)
+    if not switch:
+        return {
+            "name": "runtime_smoke:mechanism_activation_wiring",
+            "returncode": 1,
+            "status": "failed",
+            "blocking": hard_gate,
+            "soft_failure": not hard_gate,
+            "failure_category": "missing_ablation_switch",
+            "stderr": "candidate experiment_contract does not declare an ablation_switch",
+            "repair_hint": "Add experiment_contract.ablation_switch and wire it to disable only the proposed mechanism.",
+        }
+
+    with tempfile.TemporaryDirectory(prefix="auto_research_activation_wiring_smoke_") as tmp:
+        smoke_repo = Path(tmp) / "repo"
+        try:
+            shutil.copytree(repo_root, smoke_repo, ignore=_temporary_patch_ignore)
+            adapter = C2CAdapter(smoke_repo, _runtime_smoke_adapter_config(config, smoke_repo, python_cmd, smoke_cfg))
+            run_spec = adapter.materialize_candidate_configs(candidate or {}, _runtime_smoke_gpu_selection(smoke_cfg))
+            activation_spec = _materialize_runtime_activation_wiring_configs(
+                run_spec,
+                switch=switch,
+                wiring_cfg=wiring_cfg,
+            )
+        except Exception as exc:
+            return {
+                "name": "runtime_smoke:mechanism_activation_wiring",
+                "returncode": 1,
+                "status": "failed",
+                "blocking": hard_gate,
+                "soft_failure": not hard_gate,
+                "failure_category": "mechanism_activation_materialization_failed",
+                "stderr": _validation_output_excerpt(f"{type(exc).__name__}: {exc}"),
+                "repair_hint": "Fix candidate config materialization so enabled and ablation-disabled eval configs can be built before S3.",
+            }
+
+        evidence = _mechanism_activation_wiring_evidence(
+            smoke_repo,
+            candidate,
+            run_spec,
+            activation_spec,
+            switch=switch,
+            wiring_cfg=wiring_cfg,
+        )
+    failures = list(evidence.get("failures") or [])
+    return {
+        "name": "runtime_smoke:mechanism_activation_wiring",
+        "returncode": 0 if not failures else 1,
+        "status": "ok" if not failures else "failed",
+        "blocking": bool(failures and hard_gate),
+        "soft_failure": bool(failures and not hard_gate),
+        "gate_mode": code_patch_gate_mode(config),
+        "failure_category": "" if not failures else "mechanism_activation_wiring_failed",
+        "stdout": _validation_output_excerpt(json.dumps(evidence, ensure_ascii=False, indent=2)),
+        "stderr": "" if not failures else "; ".join(failures),
+        "switch": switch,
+        "enabled_eval_configs": evidence.get("enabled_eval_configs") or {},
+        "disabled_eval_configs": evidence.get("disabled_eval_configs") or {},
+        "rosetta_config": evidence.get("rosetta_config") or {},
+        "runtime_code_refs": evidence.get("runtime_code_refs") or {},
+        "repair_hint": _mechanism_activation_wiring_repair_hint(failures),
     }
-    return check
+
+
+def _mechanism_activation_forward_probe_check(repo_root: Path, python_cmd: str, config: dict[str, Any], candidate: dict[str, Any]) -> dict[str, Any] | None:
+    smoke_cfg = ((_code_patch_config(config).get("validation", {}) or {}).get("runtime_smoke") or {})
+    if not isinstance(smoke_cfg, dict) or not smoke_cfg.get("enabled", True):
+        return None
+    activation_cfg = smoke_cfg.get("mechanism_activation")
+    if activation_cfg is None:
+        activation_cfg = {}
+    if not isinstance(activation_cfg, dict) or not activation_cfg.get("enabled", True):
+        return None
+    probe_cfg = activation_cfg.get("forward_probe")
+    if probe_cfg is None:
+        probe_cfg = {}
+    if not isinstance(probe_cfg, dict) or not probe_cfg.get("enabled", True):
+        return None
+    hard_gate = bool(probe_cfg.get("hard_gate", activation_cfg.get("hard_gate", False)))
+    switch = _candidate_ablation_switch_for_patch(candidate)
+    if not switch:
+        return {
+            "name": "runtime_smoke:mechanism_activation_forward_probe",
+            "returncode": 1,
+            "status": "failed",
+            "blocking": hard_gate,
+            "soft_failure": not hard_gate,
+            "failure_category": "missing_ablation_switch",
+            "stderr": "candidate experiment_contract does not declare an ablation_switch",
+            "repair_hint": _mechanism_activation_forward_probe_repair_hint(["missing_ablation_switch"]),
+        }
+    script_rel = str(probe_cfg.get("script") or "script/auto_research/activation_forward_probe.py")
+    script_path = repo_root / script_rel
+    builtin_probe = Path(__file__).resolve().parent / "probes" / "c2c_activation_forward_probe.py"
+    use_builtin_probe = bool(not script_path.exists() and probe_cfg.get("builtin_fallback", True) and builtin_probe.exists())
+    if not script_path.exists() and not use_builtin_probe:
+        return {
+            "name": "runtime_smoke:mechanism_activation_forward_probe",
+            "returncode": 0,
+            "status": "skipped",
+            "blocking": False,
+            "soft_failure": False,
+            "reason": f"forward activation probe script not found: {script_rel}",
+            "expected_script": script_rel,
+            "repair_hint": "Add a lightweight activation_forward_probe.py to compare enabled/disabled mechanism tensors before S3.",
+        }
+
+    with tempfile.TemporaryDirectory(prefix="auto_research_activation_forward_probe_") as tmp:
+        smoke_repo = Path(tmp) / "repo"
+        output_path = Path(tmp) / "activation_forward_probe.json"
+        probe_environment: dict[str, Any] = {}
+        try:
+            shutil.copytree(repo_root, smoke_repo, ignore=_temporary_patch_ignore)
+            adapter = C2CAdapter(smoke_repo, _runtime_smoke_adapter_config(config, smoke_repo, python_cmd, smoke_cfg))
+            run_spec = adapter.materialize_candidate_configs(candidate or {}, _runtime_smoke_gpu_selection(smoke_cfg))
+            activation_spec = _materialize_runtime_activation_wiring_configs(
+                run_spec,
+                switch=switch,
+                wiring_cfg=activation_cfg,
+            )
+            enabled_eval = next(iter(((activation_spec.get("enabled_eval_configs") or {}) or {}).values()), "")
+            disabled_eval = next(iter((activation_spec.get("eval_configs") or {}).values()), "")
+        except Exception as exc:
+            return {
+                "name": "runtime_smoke:mechanism_activation_forward_probe",
+                "returncode": 1,
+                "status": "failed",
+                "blocking": hard_gate,
+                "soft_failure": not hard_gate,
+                "failure_category": "mechanism_activation_forward_probe_materialization_failed",
+                "stderr": _validation_output_excerpt(f"{type(exc).__name__}: {exc}"),
+                "repair_hint": _mechanism_activation_forward_probe_repair_hint(["materialization_failed"]),
+            }
+
+        probe_script = smoke_repo / script_rel if not use_builtin_probe else builtin_probe
+        probe_environment = _forward_probe_environment_preflight(
+            smoke_repo,
+            python_cmd,
+            use_builtin_probe=use_builtin_probe,
+        )
+        command = [
+            python_cmd,
+            _probe_script_command_arg(probe_script, smoke_repo),
+            "--enabled-config",
+            str(Path(enabled_eval).relative_to(smoke_repo) if Path(enabled_eval).is_absolute() and _is_relative_to(Path(enabled_eval), smoke_repo) else enabled_eval),
+            "--disabled-config",
+            str(Path(disabled_eval).relative_to(smoke_repo) if Path(disabled_eval).is_absolute() and _is_relative_to(Path(disabled_eval), smoke_repo) else disabled_eval),
+            "--switch",
+            switch,
+            "--output",
+            str(output_path),
+        ]
+        timeout_seconds = max(1, int(probe_cfg.get("timeout_seconds") or 180))
+        result = _run_validation_command(command, cwd=smoke_repo, timeout=timeout_seconds)
+        probe_payload = read_json(output_path, default={}) if output_path.exists() else {}
+
+    evidence = _normalize_activation_forward_probe_payload(probe_payload, min_changed_fields=int(probe_cfg.get("min_changed_fields") or 1))
+    failures = list(evidence.get("failures") or [])
+    if result.returncode != 0:
+        failures.append("forward_probe_command_failed")
+    return {
+        "name": "runtime_smoke:mechanism_activation_forward_probe",
+        "returncode": 0 if not failures else 1,
+        "status": "ok" if not failures else "failed",
+        "blocking": bool(failures and hard_gate),
+        "soft_failure": bool(failures and not hard_gate),
+        "failure_category": "" if not failures else "mechanism_activation_forward_probe_failed",
+        "stdout": _validation_output_excerpt(result.stdout),
+        "stderr": _validation_output_excerpt("; ".join(failures) or result.stderr),
+        "command": _validation_output_excerpt(" ".join(str(part) for part in command), max_chars=1200),
+        "switch": switch,
+        "probe_source": "builtin" if use_builtin_probe else "repo",
+        "probe_script": str(builtin_probe if use_builtin_probe else script_rel),
+        "probe_environment": probe_environment,
+        "probe": evidence,
+        "repair_hint": _mechanism_activation_forward_probe_repair_hint(failures),
+    }
+
+
+def _forward_probe_environment_preflight(repo_root: Path, python_cmd: str, *, use_builtin_probe: bool) -> dict[str, Any]:
+    payload = {
+        "probe_python": str(python_cmd),
+        "using_c2c_env_python": _using_target_env_python(python_cmd),
+        "torch_available": False,
+        "torch_version": None,
+        "repo_import_ok": False,
+        "repo_import_error": "",
+        "returncode": None,
+    }
+    script = (
+        "import importlib, json, sys\n"
+        "payload = {\n"
+        "  'executable': sys.executable,\n"
+        "  'torch_available': False,\n"
+        "  'torch_version': None,\n"
+        "  'repo_import_ok': False,\n"
+        "  'repo_import_error': '',\n"
+        "}\n"
+        "try:\n"
+        "    torch = importlib.import_module('torch')\n"
+        "    payload['torch_available'] = True\n"
+        "    payload['torch_version'] = getattr(torch, '__version__', None)\n"
+        "except Exception as exc:\n"
+        "    payload['torch_error'] = type(exc).__name__ + ': ' + str(exc)\n"
+        "try:\n"
+        "    importlib.import_module('rosetta.model.projector')\n"
+        "    payload['repo_import_ok'] = True\n"
+        "except Exception as exc:\n"
+        "    payload['repo_import_error'] = type(exc).__name__ + ': ' + str(exc)\n"
+        "print(json.dumps(payload, ensure_ascii=True))\n"
+    )
+    try:
+        result = subprocess.run(
+            [python_cmd, "-c", script],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=_pythonpath_env_for_repo(repo_root),
+        )
+    except Exception as exc:
+        payload["repo_import_error"] = f"{type(exc).__name__}: {exc}"
+        return payload
+    payload["returncode"] = result.returncode
+    stdout = (result.stdout or "").strip().splitlines()
+    if stdout:
+        try:
+            observed = json.loads(stdout[-1])
+        except json.JSONDecodeError:
+            observed = {}
+        if isinstance(observed, dict):
+            payload["probe_python"] = str(observed.get("executable") or payload["probe_python"])
+            payload["torch_available"] = bool(observed.get("torch_available"))
+            payload["torch_version"] = observed.get("torch_version")
+            payload["repo_import_ok"] = bool(observed.get("repo_import_ok"))
+            payload["repo_import_error"] = str(observed.get("repo_import_error") or observed.get("torch_error") or "")
+    if result.stderr and not payload.get("repo_import_error"):
+        payload["stderr_tail"] = result.stderr[-1000:]
+    payload["using_builtin_probe"] = bool(use_builtin_probe)
+    return payload
+
+
+def _pythonpath_env_for_repo(repo_root: Path) -> dict[str, str]:
+    env = dict(os.environ)
+    existing_pythonpath = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = str(repo_root) + ((os.pathsep + existing_pythonpath) if existing_pythonpath else "")
+    return env
+
+
+def _using_target_env_python(python_cmd: str) -> bool:
+    try:
+        resolved = Path(python_cmd).resolve()
+    except OSError:
+        return str(python_cmd) != sys.executable
+    try:
+        current = Path(sys.executable).resolve()
+    except OSError:
+        current = Path(sys.executable)
+    return resolved != current
+
+
+def _normalize_activation_forward_probe_payload(payload: Any, *, min_changed_fields: int) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not payload:
+        return {
+            "status": "missing_output",
+            "mechanism_observed": False,
+            "changed_fields": [],
+            "failures": ["missing_forward_probe_output"],
+        }
+    changed_fields = [str(item) for item in payload.get("changed_fields") or payload.get("changed_tensors") or [] if item]
+    compared_fields = [str(item) for item in payload.get("compared_fields") or payload.get("compared_tensors") or [] if item]
+    unchanged_fields = [str(item) for item in payload.get("unchanged_fields") or payload.get("unchanged_tensors") or [] if item]
+    if "mechanism_observed" in payload:
+        mechanism_observed = bool(payload.get("mechanism_observed"))
+    else:
+        mechanism_observed = bool(len(changed_fields) >= max(1, min_changed_fields))
+    failures = [str(item) for item in payload.get("failures") or [] if item]
+    if not compared_fields and not changed_fields:
+        failures.append("no_forward_probe_fields_compared")
+    if not mechanism_observed:
+        failures.append("enabled_disabled_forward_outputs_identical")
+    return {
+        "status": "changed" if mechanism_observed else "unchanged",
+        "mechanism_observed": mechanism_observed,
+        "changed_fields": changed_fields[:20],
+        "unchanged_fields": unchanged_fields[:20],
+        "compared_fields": compared_fields[:40],
+        "tensor_checks": payload.get("tensor_checks") if isinstance(payload.get("tensor_checks"), list) else [],
+        "projector_tensor_checks": payload.get("projector_tensor_checks") if isinstance(payload.get("projector_tensor_checks"), list) else [],
+        "wrapper_probe": payload.get("wrapper_probe") if isinstance(payload.get("wrapper_probe"), dict) else {},
+        "cache_key_diff": payload.get("cache_key_diff"),
+        "cache_value_diff": payload.get("cache_value_diff"),
+        "projector_called": payload.get("projector_called"),
+        "switch_seen_by_forward": payload.get("switch_seen_by_forward"),
+        "enabled": payload.get("enabled") if isinstance(payload.get("enabled"), dict) else {},
+        "disabled": payload.get("disabled") if isinstance(payload.get("disabled"), dict) else {},
+        "probe_type": payload.get("probe_type"),
+        "fallback_reason": payload.get("fallback_reason"),
+        "forward_probe_error": payload.get("forward_probe_error") if isinstance(payload.get("forward_probe_error"), dict) else {},
+        "projector_spec": payload.get("projector_spec") if isinstance(payload.get("projector_spec"), dict) else {},
+        "forward_probe_projector_spec": payload.get("forward_probe_projector_spec") if isinstance(payload.get("forward_probe_projector_spec"), dict) else {},
+        "static_trace": payload.get("static_trace") if isinstance(payload.get("static_trace"), dict) else {},
+        "trace": payload.get("trace") if isinstance(payload.get("trace"), dict) else {},
+        "raw_status": payload.get("status"),
+        "failures": list(dict.fromkeys(failures)),
+    }
+
+
+def _mechanism_activation_wiring_evidence(
+    repo_root: Path,
+    candidate: dict[str, Any],
+    run_spec: dict[str, Any],
+    activation_spec: dict[str, Any],
+    *,
+    switch: str,
+    wiring_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    enabled_eval_configs = {
+        str(dataset): str(path)
+        for dataset, path in (
+            activation_spec.get("enabled_eval_configs")
+            or (run_spec.get("proxy_screen") or {}).get("eval_configs")
+            or run_spec.get("eval_configs")
+            or {}
+        ).items()
+    }
+    disabled_eval_configs = {
+        str(dataset): str(path)
+        for dataset, path in (activation_spec.get("eval_configs") or {}).items()
+    }
+    enabled_rosetta = _first_rosetta_config(enabled_eval_configs.values())
+    disabled_rosetta = _first_rosetta_config(disabled_eval_configs.values())
+    config_keys = sorted(
+        key
+        for key in _candidate_rosetta_activation_keys(candidate)
+        if key and key != "checkpoints_dir"
+    )
+    runtime_refs = _runtime_code_reference_evidence(
+        repo_root,
+        switch=switch,
+        config_keys=config_keys,
+        files=wiring_cfg.get("runtime_code_files"),
+    )
+    failures: list[str] = []
+    if activation_spec.get("status") != "materialized":
+        failures.append(f"activation smoke disabled config was not materialized: {activation_spec.get('reason') or activation_spec.get('status')}")
+    if wiring_cfg.get("require_switch_in_disabled_eval_config", True):
+        if disabled_rosetta.get(switch) is not True:
+            failures.append(f"disabled eval rosetta_config does not set {switch}=true")
+    if enabled_rosetta.get(switch) is True:
+        failures.append(f"enabled proxy eval rosetta_config already sets {switch}=true")
+    missing_enabled_keys = [
+        key
+        for key in config_keys
+        if key not in enabled_rosetta and key not in disabled_rosetta
+    ]
+    if config_keys and len(missing_enabled_keys) == len(config_keys):
+        failures.append("candidate config_overrides did not appear in enabled/disabled eval rosetta_config")
+    if wiring_cfg.get("require_switch_referenced_in_runtime_code", True) and not runtime_refs.get("switch_refs"):
+        if not runtime_refs.get("config_key_refs"):
+            failures.append(f"no runtime model file references ablation switch {switch} or activated config keys")
+        else:
+            failures.append(f"runtime model files reference config keys but not ablation switch {switch}")
+    if (
+        wiring_cfg.get("require_switch_referenced_in_runtime_code", True)
+        and runtime_refs.get("switch_refs")
+        and not runtime_refs.get("forward_switch_refs")
+    ):
+        failures.append(f"runtime model files mention {switch} but no forward function reads it")
+    return {
+        "switch": switch,
+        "enabled_eval_configs": enabled_eval_configs,
+        "disabled_eval_configs": disabled_eval_configs,
+        "rosetta_config": {
+            "enabled_keys": sorted(enabled_rosetta.keys()),
+            "disabled_keys": sorted(disabled_rosetta.keys()),
+            "disabled_switch_value": disabled_rosetta.get(switch),
+            "enabled_switch_value": enabled_rosetta.get(switch),
+            "activated_config_keys": config_keys,
+            "missing_enabled_or_disabled_config_keys": missing_enabled_keys,
+        },
+        "runtime_code_refs": runtime_refs,
+        "failures": failures,
+    }
+
+
+def _materialize_runtime_activation_wiring_configs(
+    run_spec: dict[str, Any],
+    *,
+    switch: str,
+    wiring_cfg: dict[str, Any],
+) -> dict[str, Any]:
+    enabled_eval_configs = (run_spec.get("proxy_screen") or {}).get("eval_configs") or run_spec.get("eval_configs") or {}
+    if not isinstance(enabled_eval_configs, dict) or not enabled_eval_configs:
+        return {"enabled": True, "status": "failed", "reason": "enabled eval configs missing for mechanism activation wiring smoke"}
+    run_root = Path(run_spec["run_root"])
+    smoke_root = run_root / "runtime_activation_wiring_disabled"
+    ensure_dir(smoke_root)
+    run_root_rel = f"local/auto_research_runs/{run_spec['run_id']}"
+    max_datasets = max(1, int(wiring_cfg.get("max_datasets") or 1))
+    selected = list(enabled_eval_configs.items())[:max_datasets]
+    disabled_eval_configs: dict[str, Path] = {}
+    for dataset, enabled_path_value in selected:
+        enabled_path = Path(enabled_path_value)
+        payload = read_yaml(enabled_path, default={}) if enabled_path.suffix in {".yaml", ".yml"} else read_json(enabled_path, default={})
+        if not isinstance(payload, dict):
+            payload = {}
+        if not isinstance(payload.get("model"), dict):
+            payload["model"] = {}
+        payload["model"].setdefault("rosetta_config", {})
+        if not isinstance(payload["model"]["rosetta_config"], dict):
+            payload["model"]["rosetta_config"] = {}
+        payload["model"]["rosetta_config"][switch] = True
+        payload.setdefault("output", {})
+        if isinstance(payload["output"], dict):
+            payload["output"]["output_dir"] = f"{run_root_rel}/runtime_activation_wiring_disabled/results/{dataset}"
+        eval_path = smoke_root / f"eval_{dataset}.yaml"
+        write_yaml(eval_path, payload)
+        disabled_eval_configs[str(dataset)] = eval_path
+    return {
+        "enabled": True,
+        "status": "materialized",
+        "switch": switch,
+        "enabled_eval_configs": {str(dataset): Path(path) for dataset, path in enabled_eval_configs.items()},
+        "eval_configs": disabled_eval_configs,
+        "run_root": smoke_root,
+    }
+
+
+def _first_rosetta_config(paths: Any) -> dict[str, Any]:
+    for raw_path in paths or []:
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        payload = read_yaml(path, default={}) if path.suffix in {".yaml", ".yml"} else read_json(path, default={})
+        if not isinstance(payload, dict):
+            continue
+        rosetta = ((payload.get("model") or {}).get("rosetta_config") or {})
+        return dict(rosetta) if isinstance(rosetta, dict) else {}
+    return {}
+
+
+def _runtime_code_reference_evidence(repo_root: Path, *, switch: str, config_keys: list[str], files: Any) -> dict[str, Any]:
+    if not files:
+        files = ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"]
+    file_refs: dict[str, dict[str, Any]] = {}
+    switch_refs: list[str] = []
+    forward_functions: list[str] = []
+    forward_switch_refs: list[str] = []
+    config_key_refs: list[dict[str, str]] = []
+    forward_config_key_refs: list[dict[str, str]] = []
+    for rel_path in _expected_file_list(files):
+        path = repo_root / rel_path
+        if not path.exists() or not path.is_file():
+            file_refs[rel_path] = {"exists": False, "switch_ref": False, "forward_switch_ref": False, "config_key_refs": []}
+            continue
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        file_switch_ref = bool(switch and switch in text)
+        file_config_refs = [key for key in config_keys if key and key in text]
+        forward_refs = _forward_reference_evidence(text, switch=switch, config_keys=config_keys)
+        file_refs[rel_path] = {
+            "exists": True,
+            "switch_ref": file_switch_ref,
+            "forward_functions": forward_refs.get("forward_functions") or [],
+            "forward_switch_ref": bool(forward_refs.get("switch_ref")),
+            "forward_config_key_refs": forward_refs.get("config_key_refs") or [],
+            "config_key_refs": file_config_refs,
+        }
+        if file_switch_ref:
+            switch_refs.append(rel_path)
+        if forward_refs.get("forward_functions"):
+            forward_functions.extend(f"{rel_path}:{name}" for name in forward_refs.get("forward_functions") or [])
+        if forward_refs.get("switch_ref"):
+            forward_switch_refs.append(rel_path)
+        for key in file_config_refs:
+            config_key_refs.append({"path": rel_path, "key": key})
+        for key in forward_refs.get("config_key_refs") or []:
+            forward_config_key_refs.append({"path": rel_path, "key": str(key)})
+    return {
+        "switch_refs": switch_refs,
+        "forward_functions": forward_functions,
+        "forward_switch_refs": forward_switch_refs,
+        "config_key_refs": config_key_refs,
+        "forward_config_key_refs": forward_config_key_refs,
+        "files": file_refs,
+    }
+
+
+def _forward_reference_evidence(text: str, *, switch: str, config_keys: list[str]) -> dict[str, Any]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return {"forward_functions": [], "switch_ref": False, "config_key_refs": []}
+    forward_functions: list[str] = []
+    switch_ref = False
+    config_refs: set[str] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or node.name != "forward":
+            continue
+        forward_functions.append(node.name)
+        segment = ast.get_source_segment(text, node) or ""
+        if switch and switch in segment:
+            switch_ref = True
+        config_refs.update(key for key in config_keys if key and key in segment)
+    return {
+        "forward_functions": forward_functions,
+        "switch_ref": switch_ref,
+        "config_key_refs": sorted(config_refs),
+    }
+
+
+def _candidate_rosetta_activation_keys(candidate: dict[str, Any]) -> set[str]:
+    overrides = c2c_candidate_config_overrides(candidate)
+    eval_override = overrides.get("eval") if isinstance(overrides, dict) else {}
+    rosetta = (((eval_override or {}).get("model") or {}).get("rosetta_config") or {}) if isinstance(eval_override, dict) else {}
+    if not isinstance(rosetta, dict):
+        return set()
+    keys = _flatten_config_keys(rosetta)
+    return {key for key in keys if key not in {"model", "eval", "train", "rosetta_config", "checkpoints_dir"}}
+
+
+def _candidate_ablation_switch_for_patch(candidate: dict[str, Any]) -> str:
+    contract = candidate.get("experiment_contract") if isinstance(candidate.get("experiment_contract"), dict) else {}
+    ablation_plan = candidate.get("ablation_plan") if isinstance(candidate.get("ablation_plan"), dict) else {}
+    switch = contract.get("ablation_switch") or ablation_plan.get("switch")
+    return str(switch).strip() if switch not in (None, "") else ""
+
+
+def _mechanism_activation_wiring_repair_hint(failures: list[str]) -> str:
+    if not failures:
+        return ""
+    return (
+        "Repair eval-path activation before S3: ensure experiment_contract.config_overrides reaches eval model.rosetta_config, "
+        "ensure the disabled activation-smoke eval config sets the ablation switch, and make wrapper/projector/aligner forward code "
+        "read that switch to bypass only the proposed mechanism."
+    )
+
+
+def _mechanism_activation_forward_probe_repair_hint(failures: list[str]) -> str:
+    if not failures:
+        return ""
+    return (
+        "Repair forward-level mechanism activation before S3: use the ablation switch inside the actual wrapper/projector/aligner forward path "
+        "so enabled and disabled configs change a concrete tensor, routing score, cache weight, projector output, or wrapper projected cache on the same small batch."
+    )
+
+
+def _probe_script_command_arg(probe_script: Path, smoke_repo: Path) -> str:
+    if _is_relative_to(probe_script, smoke_repo):
+        return str(probe_script.relative_to(smoke_repo))
+    return str(probe_script)
+
+
+def _is_relative_to(path: Path, base: Path) -> bool:
+    try:
+        path.relative_to(base)
+        return True
+    except ValueError:
+        return False
 
 
 def _disable_wandb_for_command(command: str) -> str:
@@ -2642,7 +4928,14 @@ def _disable_wandb_for_command(command: str) -> str:
     return f"{prefix}{command}"
 
 
-def _runtime_smoke_adapter_config(config: dict[str, Any], repo_root: Path, python_cmd: str, smoke_cfg: dict[str, Any]) -> dict[str, Any]:
+def _runtime_smoke_adapter_config(
+    config: dict[str, Any],
+    repo_root: Path,
+    python_cmd: str,
+    smoke_cfg: dict[str, Any],
+    *,
+    selected_gpu_ids: list[int] | None = None,
+) -> dict[str, Any]:
     adapter_config = copy.deepcopy(config)
     c2c_cfg = adapter_config.setdefault("c2c", {})
     c2c_cfg["snapshot_path"] = str(repo_root)
@@ -2651,7 +4944,10 @@ def _runtime_smoke_adapter_config(config: dict[str, Any], repo_root: Path, pytho
     small_loop["train_samples"] = _runtime_smoke_train_samples(smoke_cfg)
     small_loop["eval_limit"] = int(smoke_cfg.get("eval_limit") or 1)
     small_loop["eval_datasets"] = list(smoke_cfg.get("eval_datasets") or small_loop.get("eval_datasets") or ["mmlu-redux"])[:1]
-    small_loop["gpu_ids"] = smoke_cfg.get("gpu_ids", small_loop.get("gpu_ids", [0]))
+    if selected_gpu_ids is not None:
+        small_loop["gpu_ids"] = list(selected_gpu_ids)
+    else:
+        small_loop["gpu_ids"] = smoke_cfg.get("gpu_ids", small_loop.get("gpu_ids", "auto"))
     small_loop["num_train_processes"] = int(smoke_cfg.get("num_train_processes") or 1)
     small_loop["strict_dataset_cache"] = bool(smoke_cfg.get("strict_dataset_cache", False))
     small_loop.setdefault("proxy_screen", {"enabled": False})
@@ -2694,15 +4990,232 @@ def _harden_runtime_smoke_train_config(train_config_path: Any, smoke_cfg: dict[s
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def _runtime_smoke_gpu_selection(smoke_cfg: dict[str, Any]) -> Any:
-    class _SmokeGpuSelection:
-        pass
+def _runtime_smoke_gpu_selection(
+    smoke_cfg: dict[str, Any],
+    *,
+    selected_gpu_ids: list[int] | None = None,
+    snapshot: list[dict[str, Any]] | None = None,
+) -> GpuSelection:
+    selected = list(selected_gpu_ids if selected_gpu_ids is not None else _coerce_runtime_smoke_gpu_ids(smoke_cfg.get("gpu_ids", "auto")))
+    policy = {
+        "source": "s2_5_runtime_smoke",
+        "gpu_ids": smoke_cfg.get("gpu_ids", "auto"),
+        "min_free_mb": _runtime_smoke_min_free_mb(smoke_cfg),
+        "max_gpus": 1,
+    }
+    reason = "runtime_smoke_auto_selected_by_free_memory" if str(smoke_cfg.get("gpu_ids", "auto")) == "auto" else "configured_runtime_smoke_gpu_ids"
+    return GpuSelection(selected_ids=selected, policy=policy, snapshot=list(snapshot or []), reason=reason)
 
-    selection = _SmokeGpuSelection()
-    selection.selected_ids = _coerce_runtime_smoke_gpu_ids(smoke_cfg.get("gpu_ids", [0]))
-    selection.policy = {"source": "s2_5_runtime_smoke"}
-    selection.reason = "configured_runtime_smoke_gpu_ids"
-    return selection
+
+def _runtime_smoke_gpu_attempts(config: dict[str, Any], smoke_cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    gpu_policy = {
+        "gpu_ids": smoke_cfg.get("gpu_ids", "auto"),
+        "min_free_mb": _runtime_smoke_min_free_mb(smoke_cfg),
+        "max_gpus": 1,
+    }
+    selection = ExperimentRunner(config).select_gpus(gpu_policy)
+    snapshot = selection.snapshot or []
+    allowed_ids = _runtime_smoke_allowed_gpu_ids(smoke_cfg, snapshot)
+    candidates = [
+        item
+        for item in snapshot
+        if int(item.get("index", -1)) in allowed_ids and int(item.get("memory_free_mb") or 0) >= _runtime_smoke_min_free_mb(smoke_cfg)
+    ]
+    candidates.sort(key=lambda item: (-int(item.get("memory_free_mb") or 0), int(item.get("utilization_gpu") or 100), int(item.get("index") or 999)))
+    if not candidates and _runtime_smoke_resource_wait_enabled(smoke_cfg):
+        wait = _wait_for_runtime_smoke_gpu(config, smoke_cfg, allowed_ids=allowed_ids)
+        snapshot = wait.get("snapshot") or snapshot
+        candidates = [
+            item
+            for item in snapshot
+            if int(item.get("index", -1)) in allowed_ids and int(item.get("memory_free_mb") or 0) >= _runtime_smoke_min_free_mb(smoke_cfg)
+        ]
+        candidates.sort(key=lambda item: (-int(item.get("memory_free_mb") or 0), int(item.get("utilization_gpu") or 100), int(item.get("index") or 999)))
+        for item in candidates:
+            item["resource_wait"] = wait
+        if not candidates and snapshot:
+            fallback = sorted(
+                [item for item in snapshot if int(item.get("index", -1)) in allowed_ids],
+                key=lambda item: (-int(item.get("memory_free_mb") or 0), int(item.get("index") or 999)),
+            )
+            selected_snapshot = fallback[0] if fallback else {}
+            selected = int(selected_snapshot.get("index", -1)) if selected_snapshot else None
+            return [
+                {
+                    "selected_gpu_ids": [selected] if selected is not None and selected >= 0 else [],
+                    "reason": "runtime_smoke_resource_wait_timeout",
+                    "memory_free_mb": selected_snapshot.get("memory_free_mb"),
+                    "memory_total_mb": selected_snapshot.get("memory_total_mb"),
+                    "min_free_mb": _runtime_smoke_min_free_mb(smoke_cfg),
+                    "snapshot": snapshot,
+                    "resource_wait": wait,
+                    "resource_unavailable": True,
+                }
+            ]
+    if not candidates and snapshot:
+        fallback = sorted(
+            [item for item in snapshot if int(item.get("index", -1)) in allowed_ids],
+            key=lambda item: (-int(item.get("memory_free_mb") or 0), int(item.get("index") or 999)),
+        )
+        selected_snapshot = fallback[0] if fallback else {}
+        selected = int(selected_snapshot.get("index", -1)) if selected_snapshot else None
+        return [
+            {
+                "selected_gpu_ids": [selected] if selected is not None and selected >= 0 else [],
+                "reason": "runtime_smoke_resource_unavailable",
+                "memory_free_mb": selected_snapshot.get("memory_free_mb"),
+                "memory_total_mb": selected_snapshot.get("memory_total_mb"),
+                "min_free_mb": _runtime_smoke_min_free_mb(smoke_cfg),
+                "snapshot": snapshot,
+                "resource_wait": {
+                    "status": "timeout" if _runtime_smoke_resource_wait_enabled(smoke_cfg) else "disabled",
+                    "enabled": _runtime_smoke_resource_wait_enabled(smoke_cfg),
+                    "min_free_mb": _runtime_smoke_min_free_mb(smoke_cfg),
+                },
+                "resource_unavailable": True,
+            }
+        ]
+    if not candidates:
+        return [
+            {
+                "selected_gpu_ids": _coerce_runtime_smoke_gpu_ids(smoke_cfg.get("gpu_ids", "auto"))[:1],
+                "reason": "runtime_smoke_no_gpu_snapshot",
+                "memory_free_mb": None,
+                "memory_total_mb": None,
+                "min_free_mb": _runtime_smoke_min_free_mb(smoke_cfg),
+                "snapshot": snapshot,
+                "resource_wait": {"status": "not_ready", "enabled": _runtime_smoke_resource_wait_enabled(smoke_cfg)},
+            }
+        ]
+    return [
+        {
+            "selected_gpu_ids": [int(item["index"])],
+            "reason": "runtime_smoke_auto_selected_by_free_memory",
+            "memory_free_mb": item.get("memory_free_mb"),
+            "memory_total_mb": item.get("memory_total_mb"),
+            "min_free_mb": _runtime_smoke_min_free_mb(smoke_cfg),
+            "snapshot": snapshot,
+            "resource_wait": item.get("resource_wait") or {"status": "ready", "enabled": _runtime_smoke_resource_wait_enabled(smoke_cfg)},
+        }
+        for item in candidates[:1]
+    ]
+
+
+def _runtime_smoke_allowed_gpu_ids(smoke_cfg: dict[str, Any], snapshot: list[dict[str, Any]]) -> set[int]:
+    explicit = _coerce_runtime_smoke_gpu_ids(smoke_cfg.get("gpu_ids", "auto"))
+    if explicit:
+        return {int(item) for item in explicit}
+    return {int(item.get("index")) for item in snapshot if "index" in item}
+
+
+def _runtime_smoke_min_free_mb(smoke_cfg: dict[str, Any]) -> int:
+    return max(0, int(smoke_cfg.get("min_free_mb") or 8192))
+
+
+def _runtime_smoke_resource_wait_enabled(smoke_cfg: dict[str, Any]) -> bool:
+    wait_cfg = smoke_cfg.get("resource_wait") if isinstance(smoke_cfg.get("resource_wait"), dict) else {}
+    return bool(wait_cfg.get("enabled", True))
+
+
+def _runtime_smoke_oom_retry_enabled(smoke_cfg: dict[str, Any]) -> bool:
+    retry_cfg = smoke_cfg.get("oom_retry") if isinstance(smoke_cfg.get("oom_retry"), dict) else {}
+    return bool(retry_cfg.get("enabled", True))
+
+
+def _runtime_smoke_oom_max_retries(smoke_cfg: dict[str, Any]) -> int:
+    retry_cfg = smoke_cfg.get("oom_retry") if isinstance(smoke_cfg.get("oom_retry"), dict) else {}
+    return max(0, int(retry_cfg.get("max_retries") or 1))
+
+
+def _runtime_smoke_oom_count(attempts: list[dict[str, Any]]) -> int:
+    return sum(1 for attempt in attempts if attempt.get("failure_category") == "runtime_smoke_oom")
+
+
+def _runtime_smoke_oom_retry_attempt(config: dict[str, Any], smoke_cfg: dict[str, Any], *, tried_gpu_ids: set[int]) -> dict[str, Any] | None:
+    min_free_mb = _runtime_smoke_min_free_mb(smoke_cfg)
+    selection = ExperimentRunner(config).select_gpus({"gpu_ids": smoke_cfg.get("gpu_ids", "auto"), "min_free_mb": min_free_mb, "max_gpus": 1})
+    snapshot = selection.snapshot or []
+    allowed_ids = _runtime_smoke_allowed_gpu_ids(smoke_cfg, snapshot)
+    candidates = [
+        item
+        for item in snapshot
+        if int(item.get("index", -1)) in allowed_ids
+        and int(item.get("index", -1)) not in tried_gpu_ids
+        and int(item.get("memory_free_mb") or 0) >= min_free_mb
+    ]
+    candidates.sort(key=lambda item: (-int(item.get("memory_free_mb") or 0), int(item.get("utilization_gpu") or 100), int(item.get("index") or 999)))
+    wait: dict[str, Any] | None = None
+    if not candidates and _runtime_smoke_resource_wait_enabled(smoke_cfg):
+        wait = _wait_for_runtime_smoke_gpu(config, smoke_cfg, allowed_ids=allowed_ids - set(tried_gpu_ids))
+        snapshot = wait.get("snapshot") or snapshot
+        candidates = [
+            item
+            for item in snapshot
+            if int(item.get("index", -1)) in allowed_ids
+            and int(item.get("index", -1)) not in tried_gpu_ids
+            and int(item.get("memory_free_mb") or 0) >= min_free_mb
+        ]
+        candidates.sort(key=lambda item: (-int(item.get("memory_free_mb") or 0), int(item.get("utilization_gpu") or 100), int(item.get("index") or 999)))
+    if not candidates:
+        return None
+    item = candidates[0]
+    return {
+        "selected_gpu_ids": [int(item["index"])],
+        "reason": "runtime_smoke_oom_retry_auto_selected_by_free_memory",
+        "memory_free_mb": item.get("memory_free_mb"),
+        "memory_total_mb": item.get("memory_total_mb"),
+        "min_free_mb": min_free_mb,
+        "snapshot": snapshot,
+        "resource_wait": wait or {"status": "ready", "enabled": _runtime_smoke_resource_wait_enabled(smoke_cfg)},
+    }
+
+
+def _wait_for_runtime_smoke_gpu(config: dict[str, Any], smoke_cfg: dict[str, Any], *, allowed_ids: set[int]) -> dict[str, Any]:
+    if not allowed_ids:
+        return {
+            "status": "no_allowed_gpu",
+            "enabled": True,
+            "polls": 0,
+            "waited_seconds": 0,
+            "min_free_mb": _runtime_smoke_min_free_mb(smoke_cfg),
+            "snapshot": [],
+        }
+    wait_cfg = smoke_cfg.get("resource_wait") if isinstance(smoke_cfg.get("resource_wait"), dict) else {}
+    timeout_seconds = max(0, int(wait_cfg.get("timeout_seconds") or 0))
+    poll_seconds = max(1, int(wait_cfg.get("poll_seconds") or 60))
+    min_free_mb = _runtime_smoke_min_free_mb(smoke_cfg)
+    started = time.monotonic()
+    polls = 0
+    last_snapshot: list[dict[str, Any]] = []
+    while time.monotonic() - started <= timeout_seconds:
+        polls += 1
+        snapshot = ExperimentRunner._gpu_snapshot()
+        last_snapshot = snapshot
+        ready = [
+            item
+            for item in snapshot
+            if int(item.get("index", -1)) in allowed_ids and int(item.get("memory_free_mb") or 0) >= min_free_mb
+        ]
+        if ready:
+            return {
+                "status": "ready",
+                "enabled": True,
+                "polls": polls,
+                "waited_seconds": round(time.monotonic() - started, 3),
+                "min_free_mb": min_free_mb,
+                "snapshot": snapshot,
+            }
+        if timeout_seconds == 0:
+            break
+        time.sleep(min(poll_seconds, max(0.0, timeout_seconds - (time.monotonic() - started))))
+    return {
+        "status": "timeout",
+        "enabled": True,
+        "polls": polls,
+        "waited_seconds": round(time.monotonic() - started, 3),
+        "min_free_mb": min_free_mb,
+        "snapshot": last_snapshot,
+    }
 
 
 def _coerce_runtime_smoke_gpu_ids(value: Any) -> list[int]:
@@ -2740,7 +5253,15 @@ def _runtime_smoke_repair_hint(category: str) -> str:
         "valid_mask_runtime_error": "Define and thread valid_mask through the new mechanism for both train and eval paths; add a fallback when masks are absent.",
         "dtype_mismatch": "Cast new tensors/modules to the hidden-state dtype before arithmetic, especially Float/BFloat16 paths.",
         "device_mismatch": "Create new tensors on the same device as the hidden states or source tensors; avoid default CPU tensors in forward.",
-        "runtime_smoke_oom": "Shrink temporary tensors and avoid full-cache materialization in the first-batch path.",
+        "runtime_smoke_oom": (
+            "Treat this as resource-sensitive first: check whether the configured runtime-smoke GPU is already occupied "
+            "and retry on a freer GPU when possible. If memory is still insufficient on an idle GPU, shrink temporary "
+            "tensors and avoid full-cache materialization in the first-batch path."
+        ),
+        "runtime_smoke_resource_retry": (
+            "No code repair should be attempted yet: runtime smoke could not obtain a GPU with enough free memory. "
+            "Wait for a GPU that satisfies runtime_smoke.min_free_mb, then resume S2.5 validation."
+        ),
         "runtime_dependency_missing": "Use existing C2C dependencies and paths; do not introduce unavailable runtime files.",
         "runtime_smoke_timeout": "Reduce first-batch work and remove blocking full-dataset/full-cache work from the patched train path.",
         "first_batch_runtime_error": "Fix the patched forward/train path so a one-sample first batch can complete before proxy train.",
@@ -2774,6 +5295,7 @@ def _build_implementation_contract(
     implementation_plan = candidate.get("implementation_plan") if isinstance(candidate.get("implementation_plan"), dict) else contract.get("implementation_plan")
     if not isinstance(implementation_plan, dict):
         implementation_plan = {}
+    s2_variant = candidate.get("s2_variant") if isinstance(candidate.get("s2_variant"), dict) else {}
     implementation_scope = candidate.get("implementation_scope") or contract.get("implementation_scope") or implementation_plan.get("scope") or "bounded"
     scope_requirements = _scope_requirements(str(implementation_scope), implementation_plan)
     proxy_effect_repair_contract = (
@@ -2784,6 +5306,8 @@ def _build_implementation_contract(
     return {
         "candidate_id": candidate.get("id"),
         "title": candidate.get("title"),
+        "variant_fingerprint": candidate.get("variant_fingerprint") or s2_variant.get("variant_fingerprint"),
+        "s2_variant": _compact_value(s2_variant, max_chars=1600),
         "hypothesis": candidate.get("hypothesis"),
         "mechanism": _first_present(
             candidate,
@@ -2837,16 +5361,20 @@ def _build_implementation_contract(
         },
         "plan_context": _compact_value(selected_plan, max_chars=2000),
         "s2_5_requirements": [
-            "Implement only the selected idea, with the smallest coherent code change that can affect S3 training/evaluation.",
+            "Implement only the selected idea, with enough coherent code to make the mechanism executable and effect-bearing in S3.",
+            "Codex implementation freedom is intentional: multi-file or helper-module patches are acceptable when the mechanism genuinely requires them.",
             "Implement the mechanism-level claim in mechanism_contract; do not satisfy the task with only threshold, top-k, confidence-floor, fallback, or recipe tuning.",
             "Do not implement the idea as an added hard accept/reject gate on top of the baseline. If gating is part of the mechanism, it must be trained/estimated and paired with coverage diagnostics.",
             "Effect-first discovery: prioritize runnable code and cheap-proxy/full-S3 effect over paperization-only diagnostics.",
+            "S3 eligibility is decided by execution truth: py_compile/tests/runtime smoke, config activation, ablation wiring, forward activation, evaluator safety, and cheap proxy readiness.",
             "Keep ablation_switch, coverage diagnostics, and matched-coverage support lightweight when natural; missing paperization evidence can be completed after an effect is found.",
             "Emit or preserve lightweight mechanism evidence where natural, such as accepted-span counts, utility/verifier/pathology stats, or bridge-memory stats.",
             *scope_requirements,
             "Prefer existing local abstractions and configuration style over new framework code.",
             "If you add a new configurable constructor or recipe parameter, it must be explicitly represented in the supplied config_overrides or by editing an allowed recipe file.",
             "Do not repeat prior failed patch behavior; if previous_patch_failure is present, fix the reported validation or activation issue.",
+            "Honor s2_variant.variant_fingerprint and implement that selected mechanism variant, not a generic or previously tried same-direction patch.",
+            "If s2_variant.integration_point or s2_variant.control_signal is provided, wire the patch around those choices unless validation proves they are impossible.",
             *_previous_proxy_effect_repair_requirements(proxy_effect_repair_contract),
             "Add focused tests for the new behavior. Do not run GPU training.",
             "Do not create run-result artifacts such as local/auto_research_runs files during S2.5; S3 materializes those outputs.",
@@ -2854,32 +5382,53 @@ def _build_implementation_contract(
             *_previous_quality_repair_requirements(previous_failure),
         ],
         "previous_patch_failure": previous_failure or {},
-        "proxy_effect_repair_contract": _compact_value(proxy_effect_repair_contract, max_chars=1800) if proxy_effect_repair_contract else {},
+        "previous_failure": previous_failure or {},
+        "proxy_effect_repair_contract": _compact_value(proxy_effect_repair_contract, max_chars=2800) if proxy_effect_repair_contract else {},
     }
 
 
 def _scope_requirements(scope: str, implementation_plan: dict[str, Any]) -> list[str]:
     normalized = scope.strip().lower()
     if normalized == "large":
-        mvp = implementation_plan.get("mvp_slice") or "Implement only the first executable MVP slice from decomposition_plan."
+        mvp = implementation_plan.get("mvp_slice") or "Use decomposition_plan to choose a coherent executable slice when the full mechanism is too broad for one reliable patch."
         return [
-            "This is a large-scope idea: do not rewrite the full training/evaluation stack in one patch.",
-            f"Implement the first decomposed MVP slice only: {mvp}",
+            "This is a large-scope idea: broad cross-file implementation is allowed when needed, but do not rewrite evaluator/metric code or unrelated training infrastructure.",
+            f"Use the decomposition guidance to keep the patch coherent and executable, not artificially tiny: {mvp}",
             "Keep integration points explicit and leave TODO-free, runnable baseline fallback behavior behind the ablation switch.",
         ]
     if normalized == "medium":
         return [
-            "This is a medium-scope idea: new helper modules are allowed when listed in implementation_scope.required_new_files.",
+            "This is a medium-scope idea: new helper modules and multiple integration files are allowed when needed for a fully wired mechanism.",
             "Wire every new module through the listed integration_points and add or update the listed smoke_tests.",
         ]
     return [
-        "This is a bounded-scope idea: prefer in-place changes to existing C2C model files unless a listed required_new_file is essential.",
+        "This is a bounded-scope idea: prefer existing C2C model surfaces, but add files when needed to make the mechanism real and testable.",
     ]
 
 
 def _previous_proxy_effect_repair_requirements(contract: dict[str, Any]) -> list[str]:
     if not isinstance(contract, dict) or not contract:
         return []
+    if str(contract.get("mode") or "") == "s2_5_only_implementation_repair":
+        signals = [str(signal) for signal in contract.get("implementation_failure_signals") or [] if signal][:6]
+        selected_candidate_id = str(contract.get("selected_candidate_id") or "").strip()
+        variant_fingerprint = str(contract.get("variant_fingerprint") or "").strip()
+        requirements = [
+            "This is S2.5-only implementation repair, not S1/S2 method planning: keep the same candidate and repair patch eligibility for S3.",
+            "Do not invent a new mechanism, switch variants, rerun S2 planning, or weaken validation/proxy/readiness gates.",
+            "Reuse the same persistent Codex session/worktree for this candidate when available; preserve the implementation context and fix the current patch.",
+            "Use previous_failure.s2_5_repair_dispatch, activation_forward_probe_diagnostics, tensor_checks, patch_manifest, and changed_files as primary evidence.",
+            "Repair the real config -> rosetta_config -> constructor/wrapper/projector/aligner forward -> tensor/output activation path before changing effect logic.",
+            "If a tensor is identical enabled-vs-disabled, make the ablation switch reach the forward path and change the relevant tensor; do not edit probe/evaluator code to bypass this.",
+            "The repair target is patch_eligible_for_s3=true. If this cannot be achieved after implementation repair, leave an implementation_blocked rationale instead of changing the method.",
+        ]
+        if selected_candidate_id:
+            requirements.append(f"Same-candidate lock: continue candidate `{selected_candidate_id}`.")
+        if variant_fingerprint:
+            requirements.append(f"Same-variant lock: preserve variant_fingerprint `{variant_fingerprint}`.")
+        if signals:
+            requirements.append("Implementation failure signals to address: " + ", ".join(signals) + ".")
+        return requirements
     dragging = [
         str(item.get("dataset"))
         for item in contract.get("dragging_datasets") or []
@@ -2892,6 +5441,21 @@ def _previous_proxy_effect_repair_requirements(contract: dict[str, Any]) -> list
         "Do not spend this cheap-proxy repair on ablation, coverage, matched-coverage, or paperization-only diagnostics unless required to make the effect runnable.",
         "Do not edit evaluator or metric computation files, and do not weaken proxy thresholds or baseline metrics.",
     ]
+    activation_smoke = contract.get("activation_smoke") if isinstance(contract.get("activation_smoke"), dict) else {}
+    if activation_smoke:
+        switch = activation_smoke.get("switch") or "ablation_switch"
+        disabled_configs = activation_smoke.get("eval_configs") if isinstance(activation_smoke.get("eval_configs"), dict) else {}
+        disabled_config_paths = ", ".join(str(path) for path in disabled_configs.values())[:500]
+        requirements.extend(
+            [
+                f"Activation smoke failed for `{switch}`: repair eval-path activation/wiring before any mechanism retuning.",
+                "Use proxy_effect_repair_contract.activation_smoke.enabled_metrics, disabled_metrics, metric_comparison, and prediction_comparison as primary evidence.",
+                "Focus on rosetta_config loading, wrapper/projector/aligner forward-path wiring, train-vs-eval config parity, and ablation switch polarity.",
+                "Do not respond by inventing a new idea, weakening the activation smoke threshold, or editing evaluator/metric code.",
+            ]
+        )
+        if disabled_config_paths:
+            requirements.append("Inspect the disabled activation-smoke eval config path(s): " + disabled_config_paths + ".")
     if dragging:
         requirements.append("Prioritize dragging proxy datasets before broad tuning: " + ", ".join(dragging) + ".")
     if risk_labels:
@@ -3016,6 +5580,7 @@ def _implementation_contract_with_validation_feedback(
     validation: dict[str, Any],
     draft: dict[str, Any],
     *,
+    repair_packet: dict[str, Any] | None = None,
     attempt: int,
 ) -> dict[str, Any]:
     repair_contract = json.loads(json.dumps(implementation_contract, ensure_ascii=False))
@@ -3030,6 +5595,7 @@ def _implementation_contract_with_validation_feedback(
         "attempt": attempt,
         "status": feedback_status,
         "failed_checks": _failed_validation_checks(validation, limit=3),
+        "activation_forward_probe_diagnostics": _forward_probe_diagnostics_from_validation(validation),
         "activation_check": activation,
         "mechanism_review": mechanism_review,
         "changed_files": draft.get("changed_files") or [],
@@ -3037,52 +5603,47 @@ def _implementation_contract_with_validation_feedback(
             "Repair the existing patch in this checkout so validation passes. "
             "If activation_check reports missing config parameters, either remove/inline the unapproved public parameter, "
             "rename it to an existing activated config key, or update the patch so the parameter is activated by supplied config_overrides. "
+            "Core mechanism config parameters must close the idea -> config -> constructor -> forward path before S3; do not leave them as defaults. "
             "If mechanism_review reports issues, repair the patch quality directly: add mechanism_evidence_map-worthy model/train/recipe changes, "
             "wire the ablation switch, emit coverage and matched-coverage diagnostics, and remove evaluator-like edits. "
             "If failed_checks contains runtime_smoke:first_batch_train, repair the actual C2C train/forward path before S3: "
             "fix dtype/device mismatches, valid_mask handling, and first-batch runtime exceptions instead of bypassing the smoke check. "
+            "If failed_checks contains runtime_smoke:mechanism_activation_wiring, repair eval-path activation specifically: "
+            "make experiment_contract.config_overrides reach eval model.rosetta_config, make the ablation-disabled eval config set the switch, "
+            "and make wrapper/projector/aligner forward code read the switch to bypass only the proposed mechanism. "
+            "If failed_checks contains runtime_smoke:mechanism_activation_forward_probe, repair forward-level causal activation specifically: "
+            "the enabled and disabled configs must change at least one concrete tensor, routing score, cache weight, or projector output on the same small batch. "
+            "Read codex_repair_packet.activation_forward_probe_diagnostics: unchanged tensor names and enabled/disabled sha pairs tell you exactly which path is no-op; "
+            "repair_focus tells whether to fix config materialization, constructor parameter flow, projector/aligner forward branching, or wrapper cache injection/parameter passing. "
+            "Do not edit script/auto_research/activation_forward_probe.py; it is validation code, not the mechanism. "
             "Keep the same idea, preserve allowed changes, and do not add generated run artifacts."
         ),
     }
+    repair_contract["s2_5_repair_session_policy"] = _s2_5_repair_session_policy()
+    if repair_packet:
+        repair_contract["codex_repair_packet"] = repair_packet
     requirements = list(repair_contract.get("s2_5_requirements") or [])
     requirements.append("This is a repair retry after validation or activation failure; fix the failed checks before returning.")
     if (validation.get("mechanism_review") or {}).get("status") not in {None, "ok"}:
         requirements.append("Mechanism self-review is mandatory: the repaired patch must provide concrete mechanism evidence, ablation wiring, and required diagnostics without evaluator-like edits.")
+    if (validation.get("activation_check") or {}).get("status") == "config_activation_missing":
+        missing = ", ".join(str(item) for item in (validation.get("activation_check") or {}).get("blocking_missing_parameters") or (validation.get("activation_check") or {}).get("missing_parameters") or [])
+        requirements.append("Config activation is mandatory: activate these core mechanism parameter(s) through experiment_contract.config_overrides or an allowed recipe, or inline/remove them for the current implementation: " + missing + ".")
     if any(str(check.get("name") or "").startswith("runtime_smoke:") for check in validation.get("checks") or [] if isinstance(check, dict)):
         requirements.append("Runtime smoke is mandatory: the repaired patch must complete a one-sample first-batch train smoke before proxy train.")
+    if any(str(check.get("name") or "") == "runtime_smoke:mechanism_activation_wiring" for check in validation.get("checks") or [] if isinstance(check, dict)):
+        requirements.append("Mechanism activation wiring is mandatory: enabled/disabled eval configs and model forward code must prove the ablation switch reaches the active C2C path.")
+    if any(str(check.get("name") or "") == "runtime_smoke:mechanism_activation_forward_probe" for check in validation.get("checks") or [] if isinstance(check, dict)):
+        requirements.append("Forward activation probe is mandatory: repair the actual wrapper/projector/aligner forward path so enabled/disabled configs change at least one reported tensor or routing field; use activation_forward_probe_diagnostics.identical_tensors sha pairs and repair_focus to choose the fix; do not edit script/auto_research/activation_forward_probe.py.")
     repair_contract["s2_5_requirements"] = requirements
     return repair_contract
-
-
-def _implementation_contract_with_variant_feedback(
-    implementation_contract: dict[str, Any],
-    previous_variant_attempts: list[dict[str, Any]],
-    *,
-    variant_index: int,
-    variant_count: int,
-) -> dict[str, Any]:
-    variant_contract = json.loads(json.dumps(implementation_contract, ensure_ascii=False))
-    variant_contract["patch_variant"] = {
-        "variant_index": variant_index,
-        "variant_count": variant_count,
-        "previous_variant_attempts": previous_variant_attempts[-3:],
-        "instruction": (
-            "Generate a distinct implementation variant for the same idea. "
-            "If previous variants failed, avoid repeating their changed files, failure mode, or risk pattern unless that file is the only viable integration point. "
-            "Prefer the smallest executable mechanism that can pass S2.5 validation and S3 cheap proxy."
-        ),
-    }
-    requirements = list(variant_contract.get("s2_5_requirements") or [])
-    if variant_index > 1:
-        requirements.append("This is a best-of-N retry after a failed patch variant; produce a materially different implementation, not a cosmetic retry.")
-    variant_contract["s2_5_requirements"] = requirements
-    return variant_contract
 
 
 def _implementation_contract_with_contract_feedback(
     implementation_contract: dict[str, Any],
     failure: dict[str, Any],
     *,
+    repair_packet: dict[str, Any] | None = None,
     attempt: int,
 ) -> dict[str, Any]:
     repair_contract = json.loads(json.dumps(implementation_contract, ensure_ascii=False))
@@ -3099,11 +5660,14 @@ def _implementation_contract_with_contract_feedback(
             "Do not touch forbidden paths or generated run artifacts. "
             "If the prior attempt made no change, edit the declared integration point directly. "
             "If it touched unauthorized files, move the implementation into allowed model/script/recipe/test files."
-            " If contract_failure_feedback.status is patch_too_broad, reduce changed files to the core mechanism and one focused test."
+            " If contract_failure_feedback.status is patch_too_broad, remove unrelated files while keeping every file required for the real mechanism and focused validation."
             " If it is proxy_risk_repair_required or risk_labels include evaluation_code_changed, fully revert evaluator edits and do not edit script/evaluation/*."
             " Move evidence emission into model/train outputs, recipe config, or focused tests instead."
         ),
     }
+    repair_contract["s2_5_repair_session_policy"] = _s2_5_repair_session_policy()
+    if repair_packet:
+        repair_contract["codex_repair_packet"] = repair_packet
     requirements = list(repair_contract.get("s2_5_requirements") or [])
     requirements.append("This is a contract-aware repair retry; directly address contract_failure_feedback before returning.")
     if "evaluation_code_changed" in set(failure.get("risk_labels") or []) or any(
@@ -3141,40 +5705,87 @@ def _failed_validation_checks(validation: dict[str, Any], *, limit: int) -> list
                 "repair_hint": check.get("repair_hint"),
                 "stdout_tail": str(check.get("stdout") or "")[-1600:],
                 "stderr_tail": str(check.get("stderr") or "")[-1600:],
+                "forward_probe_diagnostics": _forward_probe_diagnostics_from_check(check)
+                if str(check.get("name") or "") == "runtime_smoke:mechanism_activation_forward_probe"
+                else {},
             }
         )
     return failed[:limit]
 
 
-def _validate_config_activation(diff_text: str, candidate: dict[str, Any]) -> dict[str, Any]:
+def _validate_config_activation(diff_text: str, candidate: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
     introduced = _introduced_python_config_parameters(diff_text)
     if not introduced:
-        return {"status": "ok", "introduced_config_parameters": [], "activated_parameters": [], "missing_parameters": []}
+        return {
+            "status": "ok",
+            "gate_mode": code_patch_gate_mode(config or {}),
+            "blocking": False,
+            "introduced_config_parameters": [],
+            "activated_parameters": [],
+            "missing_parameters": [],
+            "blocking_missing_parameters": [],
+            "soft_missing_parameters": [],
+        }
     configured_keys = _flatten_config_keys(c2c_candidate_config_overrides(candidate))
     recipe_keys = _added_recipe_keys(diff_text)
     activated = sorted(key for key in introduced if key in configured_keys or key in recipe_keys)
     missing = sorted(key for key in introduced if key not in set(activated))
     if missing:
+        blocking_missing = sorted(key for key in missing if _config_activation_blocks_parameter(key, config))
+        soft_missing = sorted(key for key in missing if key not in set(blocking_missing))
+        blocking = bool(blocking_missing)
         return {
-            "status": "config_activation_missing",
+            "status": "config_activation_missing" if blocking else "ok",
+            "gate_mode": code_patch_gate_mode(config or {}),
+            "blocking": blocking,
+            "soft_issues": [] if blocking else ["unactivated_config_parameter"],
             "reason": (
                 "Patch introduced configurable parameter(s) that are not explicitly activated "
-                f"by experiment_contract.config_overrides or an allowed recipe edit: {', '.join(missing)}"
+                f"by experiment_contract.config_overrides or an allowed recipe edit: {', '.join(blocking_missing or missing)}"
             ),
             "introduced_config_parameters": sorted(introduced),
             "activated_parameters": activated,
             "missing_parameters": missing,
+            "blocking_missing_parameters": blocking_missing,
+            "soft_missing_parameters": soft_missing,
             "configured_keys": sorted(configured_keys),
             "recipe_keys": sorted(recipe_keys),
+            "repair_hint": (
+                "Wire the core mechanism config parameter through experiment_contract.config_overrides or an allowed recipe, "
+                "or inline/remove it for the current implementation so S3 cannot silently run the default path."
+                if blocking
+                else ""
+            ),
         }
     return {
         "status": "ok",
+        "gate_mode": code_patch_gate_mode(config or {}),
+        "blocking": False,
         "introduced_config_parameters": sorted(introduced),
         "activated_parameters": activated,
         "missing_parameters": [],
+        "blocking_missing_parameters": [],
+        "soft_missing_parameters": [],
         "configured_keys": sorted(configured_keys),
         "recipe_keys": sorted(recipe_keys),
     }
+
+
+def _config_activation_blocks_parameter(parameter: str, config: dict[str, Any] | None) -> bool:
+    validation = (_code_patch_config(config or {}).get("validation") or {})
+    setting = validation.get("require_config_activation", True)
+    if setting is False:
+        return _strict_patch_gate(config)
+    if str(setting).strip().lower() in {"soft", "warn", "debt"}:
+        return _strict_patch_gate(config)
+    mode = str(setting).strip().lower()
+    if mode in {"all", "true", "1", "yes"}:
+        return True
+    return _core_mechanism_config_parameter(parameter) or _strict_patch_gate(config)
+
+
+def _core_mechanism_config_parameter(parameter: str) -> bool:
+    return _looks_like_public_config_key(parameter)
 
 
 def _introduced_python_config_parameters(diff_text: str) -> set[str]:
@@ -3290,6 +5901,9 @@ def _load_previous_patch_failures(project_root: Path) -> dict[str, Any]:
 
 
 def _previous_failure_for_candidate(previous_failures: dict[str, Any] | None, idea_id: str, candidate: dict[str, Any]) -> dict[str, Any] | None:
+    candidate_failure = candidate.get("previous_patch_failure") if isinstance(candidate.get("previous_patch_failure"), dict) else {}
+    if candidate_failure:
+        return candidate_failure
     if not previous_failures:
         return None
     keys = [
@@ -3375,15 +5989,17 @@ def _codex_patch_prompt(implementation_contract: dict[str, Any], edit_policy: Dy
     return (
         "You are the S2.5 code patch agent for a C2C research workflow.\n"
         "Edit the repository files directly in this temporary checkout. Do not run GPU training.\n"
+        "This is not a proposal stage: do not stop after a blueprint, patch plan, or file list. The filesystem must contain the implemented code changes when you finish.\n"
         "Implement the supplied implementation contract, not the whole research transcript.\n"
-        "Use the smallest coherent code change that can affect the deterministic S3 experiment.\n"
+        "Use as much coherent code as the selected mechanism needs to be executable and effect-bearing, while avoiding unrelated rewrites.\n"
         "This must be a mechanism-level implementation. Do not return a patch that only changes thresholds, top-k values, confidence floors, fallback values, or recipes.\n"
         "Do not implement an extra hard gate that merely lowers transfer coverage; any gating mechanism must be supported by coverage diagnostics and a matched-coverage ablation path.\n"
         "Honor the mechanism_contract ablation_switch so the new component can be disabled for S3 ablation.\n"
         "Honor mechanism_contract.coverage_diagnostics and mechanism_contract.matched_coverage_ablation.\n"
         "Do not edit script/evaluation/* or evaluator code; emit diagnostics through model/train/recipe outputs or focused tests.\n"
-        "Use implementation_scope to decide patch size: bounded means in-place change, medium may add listed helper files, large means implement only the first MVP slice from the decomposition plan.\n"
-        "You may edit multiple files when the idea requires it, but all edits must respect the dynamic edit policy.\n"
+        "Use implementation_scope as guidance, not a hard size cap: bounded/medium/large describe expected integration surfaces; implement the coherent mechanism slice needed to pass truth gates.\n"
+        "Patch size is not the default hard gate; execution truth is: config activation, ablation wiring, forward activation, runtime smoke, evaluator safety, and cheap proxy readiness.\n"
+        "You may edit multiple files when the idea requires it, but all edits must respect the dynamic edit policy and avoid evaluator contamination.\n"
         "If you introduce a new configurable parameter, ensure it is explicitly activated by the supplied config_overrides or by an allowed recipe edit.\n"
         "Add or update focused tests for the implemented behavior. Do not edit generated caches or coverage outputs.\n\n"
         f"Implementation contract:\n{json.dumps(implementation_contract, ensure_ascii=False, indent=2)}\n\n"
@@ -3391,7 +6007,7 @@ def _codex_patch_prompt(implementation_contract: dict[str, Any], edit_policy: Dy
         f"Allowed extensions: {edit_policy.include_extensions}\n"
         f"Forbidden prefixes: {edit_policy.exclude_prefixes}\n"
         f"Forbidden extensions: {edit_policy.exclude_extensions}\n\n"
-        "Return a concise final rationale. The framework will inspect the filesystem and freeze the diff."
+        "Return a concise final rationale after editing and local validation. The framework will inspect the filesystem and freeze the diff."
     )
 
 

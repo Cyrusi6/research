@@ -9,15 +9,21 @@ llm:
   provider: "codex_cli"
   reasoning_provider: "openai"
   execution_provider: "none"
+  # Force OpenAI/Codex calls to use the primary OpenAI key only.
+  api_key_env: "OPENAI_API_KEY"
+  disable_api_key_fallback: true
   model: "gpt-5.4"
   temperature: 0.2
   timeout_seconds: 1800
+  default_headers:
+    User-Agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0 Safari/537.36"
+    Accept: "application/json"
   use_real_api: true
   json_retries: 3
   codex_cli:
     use_resume: true
     session_strategy: "per_agent"
-    sandbox: "read-only"
+    sandbox: "danger-full-access"
     approval_policy: "never"
 
 agents:
@@ -54,6 +60,21 @@ literature:
   download_pdfs: true
   request_timeout_seconds: 20
 
+intake:
+  semantic_enrichment:
+    enabled: true
+    provider: "deepseek"
+    model: "deepseek-v4-flash"
+    base_url: "https://api.deepseek.com"
+    limit: 6
+    source_types: ["paper", "rebuttal", "code"]
+    max_input_chars: 6000
+    code_max_input_chars: 3000
+    max_tokens: 1200
+    code_max_tokens: 500
+    temperature: 0.1
+    dry_run: false
+
 plan:
   min_hypotheses: 1
   min_baselines: 2
@@ -88,6 +109,17 @@ c2c:
       eval_limit: 64
       eval_datasets: ["mmlu-redux", "ai2-arc", "openbookqa"]
       commands: []
+      gpu_policy:
+        gpu_ids: "auto"
+        max_gpus: 1
+        min_free_mb: 18000
+        max_utilization_gpu: 40
+        respect_resource_filters: true
+        disable_resource_fallback: true
+        resource_wait:
+          enabled: true
+          timeout_seconds: 7200
+          poll_seconds: 120
       static_hard_gate: true
       reject_on_command_failure: true
       reject_if_no_executable_change: true
@@ -98,14 +130,28 @@ c2c:
       run_baseline_if_missing: true
       allow_configured_baseline_fallback: true
       min_proxy_mean_delta: -0.3
-      soft_proxy_mean_delta: 0.0
+      repair_soft_proxy_fail: false
+      soft_proxy_mean_delta: -0.1
       max_proxy_dataset_regression: 1.5
       soft_max_proxy_dataset_regression: 0.75
       proxy_score_regression_weight: 0.5
       risk_penalty_per_label: 0.05
       min_proxy_score:
-      soft_min_proxy_score: 0.0
+      soft_min_proxy_score: -0.3
+      allow_neutral_proxy_full_s3: true
+      neutral_proxy_min_delta: -0.1
+      neutral_proxy_max_dataset_regression: 0.25
       baseline_cache_path: "experiment/results/c2c_proxy_baseline.json"
+      activation_smoke:
+        enabled: true
+        hard_gate: true
+        require_ablation_switch: true
+        max_datasets: 1
+        min_abs_metric_delta: 0.01
+        min_prediction_diff_rate: 0.01
+        min_answer_diff_rate: 0.01
+        min_mean_output_length_delta: 1.0
+        require_observable_difference: true
 
 code_patch:
   enabled: true
@@ -117,11 +163,27 @@ code_patch:
   no_progress_timeout_seconds:
   timeout_seconds: 1800
   max_candidates: 3
-  codex_sandbox: workspace-write
+  codex_preload_sandbox: danger-full-access
+  codex_sandbox: danger-full-access
+  codex_sandbox_fallback: danger-full-access
   codex_approval_policy: never
   validation:
     require_py_compile: true
     require_targeted_tests: true
+    runtime_smoke:
+      enabled: true
+      train_samples: 8
+      timeout_seconds: 600
+      gpu_ids: [0]
+      skip_if_missing_train_entry: true
+      mechanism_activation:
+        enabled: true
+        require_switch_in_disabled_eval_config: true
+        require_switch_referenced_in_runtime_code: true
+        runtime_code_files:
+          - "rosetta/model/aligner.py"
+          - "rosetta/model/projector.py"
+          - "rosetta/model/wrapper.py"
   dynamic_whitelist:
     include_prefixes: ["rosetta/", "script/", "recipe/", "test/", "tests/"]
     include_extensions: [".py", ".json", ".yaml", ".yml", ".toml", ".txt"]

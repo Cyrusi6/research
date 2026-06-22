@@ -90,15 +90,14 @@ C2C 实验执行:
   /home/lijunsi/miniconda3/envs/c2c-py310-cu124/bin/python
 ```
 
-## GPU 要求
+## 运行资源要求
 
-- S2 根据服务器实时 GPU 资源选择训练卡。
-- 如果 `gpu_ids` 是显式列表，优先使用显式列表。
-- 如果 `gpu_ids: auto`，按空闲显存和利用率选择。
-- 最多选择 6 张 GPU。
-- `plan.yaml` 必须记录真实 `selected_gpu_ids`、`resource_snapshot` 和 `gpu_policy`。
-- `resource_budget.peak_concurrent_gpus` 必须等于实际训练 GPU 数。
-- 避免出现“计划 1 卡，实际 4 卡”的不一致。
+- S2 只生成实验协议和候选机制计划，不选择训练卡，也不在 `plan.yaml` 里记录卡号快照。
+- S2.5 runtime smoke 和 S3 train/proxy/eval 在真正执行前读取当前服务器状态并动态选择资源。
+- 如果 `gpu_ids` 是显式列表，执行层优先在该列表内选择可用卡。
+- 如果 `gpu_ids: auto`，执行层按空闲显存和利用率选择。
+- 默认最多选择 6 张 GPU。
+- 避免把早期计划时的资源快照当成真实执行约束。
 
 ## HuggingFace / 模型缓存
 
@@ -220,20 +219,21 @@ S1 两轮讨论：
 
 S2 需要：
 
-- 根据 S1 idea 生成实验计划
-- 自动选择 GPU
-- 写入真实资源策略
-- 读取 failure feedback
-- 生成可执行实验合同
+- 根据 S1 direction 和上一轮 method-level 反馈，生成一个 next variant
+- 同一 S1 direction 内复用 S2 persistent session
+- 不做 GPU / 显存 / 卡号选择；这些下沉到 S2.5/S3
+- 不一次性生成多个 variant；S3/proxy 回传后再生成下一轮
+- implementation failure 不回 S2 planner，只回 S2.5 repair
+- 生成当前要进入 S2.5 的可执行实验合同
 
 重要产物：
 
 ```text
 plan/plan.yaml
+plan/next_variant.json
 plan/candidate_ideas.json
 plan/short_loop_plan.yaml
 plan/plan_feedback.json
-plan/resource_budget.md
 ```
 
 ## S2.5 Codex 代码修改

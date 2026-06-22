@@ -1,32 +1,67 @@
 import json
+import shutil
+import subprocess
+import sys
 import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import yaml
 
 import auto_research.config as config_module
+import auto_research.cli as cli_module
 import auto_research.agents.literature as literature_module
 import auto_research.agents.experiment as experiment_module
 import auto_research.orchestrator as orchestrator_module
 from auto_research.adapters.runner import ExperimentRunner
 from auto_research.agents.debate import MultiAgentReasoningService
 from auto_research.agents.experiment import ExperimentAgent
+from auto_research.agents.intake import IntakeAgent
 from auto_research.agents.plan import PlanAgent
 from auto_research.agents.base import AgentContext
 from auto_research.failure_log import build_c2c_feedback_bundle, load_c2c_feedback_bundle
 from auto_research.artifacts import ArtifactManager
-from auto_research.c2c import C2CAdapter, C2CPatchGuard, c2c_idea_novelty_report, default_c2c_ideas
+from auto_research.c2c import C2CAdapter, C2CPatchGuard, DEFAULT_C2C_PROXY_SCREEN, c2c_idea_novelty_report, collect_c2c_eval_smoke, default_c2c_ideas
+from auto_research.judges import gate_s0
 from auto_research.validators.s2_gate import S2GateValidator
-from auto_research.code_patch import CodePatchAgent, CodexPatchBackend, DynamicEditPolicy, FrozenPatchGuard
+from auto_research.code_patch import (
+    CodePatchAgent,
+    DynamicEditPolicy,
+    FrozenPatchGuard,
+    _code_patch_config,
+    _codex_retryable_error_text,
+    _normalize_activation_forward_probe_payload,
+    _patch_failure_retryable,
+    _runtime_smoke_gpu_attempts,
+    _runtime_smoke_oom_retry_attempt,
+)
 from auto_research.llm import ModelClient
 from auto_research.mineru import MinerUError, MinerUPdfClient
 from auto_research.code_intake import retrieve_code_chunks
+from auto_research.s0_enrichment import DeepSeekS0SemanticEnricher, S0SemanticEnrichmentError
 from auto_research.orchestrator import Orchestrator
-from auto_research.utils import sha256_file
+from auto_research.utils import sha256_file, write_json
 from auto_research.workspace import init_workspace
+from auto_research.cli import _run_c2c_command
+
+
+def _torch_available() -> bool:
+    try:
+        __import__("torch")
+    except Exception:
+        return False
+    return True
+
+
+def _transformers_available() -> bool:
+    try:
+        __import__("transformers")
+    except Exception:
+        return False
+    return True
 
 
 def _base_config(tmp_path: Path, *, simulate: bool = True) -> dict:
@@ -107,10 +142,16 @@ def _fake_git_c2c_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def _s1_codex_direction_payload() -> dict:
+def _s1_codex_direction_payload(
+    *,
+    code_chunk_id: str = "code:rosetta/model/aligner.py",
+    used_shared_memory_refs: list[str] | None = None,
+) -> dict:
+    used_shared_memory_refs = list(used_shared_memory_refs or [])
     return {
         "schema_version": "c2c_s1_codex_direction_v1",
         "status": "ok",
+        "used_shared_memory_refs": used_shared_memory_refs,
         "evidence_requests": [
             {
                 "query": "utility cache routing implementation surface",
@@ -122,7 +163,7 @@ def _s1_codex_direction_payload() -> dict:
         "evidence_bundle": {
             "items": [
                 {
-                    "chunk_id": "code:rosetta/model/aligner.py",
+                    "chunk_id": code_chunk_id,
                     "source_path": "intake/c2c/code_chunks.jsonl",
                     "source_type": "code",
                     "summary": "Alignment and cache transfer surfaces are localized in rosetta/model files.",
@@ -151,6 +192,7 @@ def _s1_codex_direction_payload() -> dict:
             "expected_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
             "verification_commands": ["py_compile", "small2048_train", "three_dataset_eval"],
             "rationale": "The direction is mechanism-level and leaves concrete patch variants to S2.",
+            "used_shared_memory_refs": used_shared_memory_refs,
         },
         "selected_ideas": [
             {
@@ -166,11 +208,12 @@ def _s1_codex_direction_payload() -> dict:
                 "reviewer_risk_response": "Track transfer coverage and per-dataset regressions; forbid evaluator edits and hard-gate stacking.",
                 "expected_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
                 "verification_commands": ["py_compile", "small2048_train", "three_dataset_eval"],
-                "evidence_refs": [{"source_type": "code", "source_label": "code:rosetta/model/aligner.py", "claim": "bounded implementation surface"}],
+                "evidence_refs": [{"source_type": "code", "source_label": code_chunk_id, "claim": "bounded implementation surface"}],
                 "counterevidence_refs": [{"source_type": "failure_feedback", "source_label": "feedback:coverage_collapse", "claim": "avoid hard gate collapse"}],
                 "code_refs": [{"source_type": "code", "source_label": "rosetta/model/aligner.py", "claim": "alignment/cache routing surface"}],
                 "s1_allowed_variants": ["soft residual utility scaling", "coverage-preserving utility modulation"],
                 "s1_forbidden_patterns": ["extra hard accept/reject gate", "evaluator changes"],
+                "used_shared_memory_refs": used_shared_memory_refs,
             }
         ],
         "negative_constraints": {
@@ -178,13 +221,138 @@ def _s1_codex_direction_payload() -> dict:
             "forbidden_idea_ids": ["hard_gate_stack"],
             "forbidden_patterns": ["extra hard accept/reject gate", "evaluator changes"],
             "failure_feedback_rules": ["Use method-level failures only; ignore S2.5 coding noise in S1."],
+            "used_shared_memory_refs": used_shared_memory_refs,
         },
         "decision_chain": {
-            "evidence": ["code:rosetta/model/aligner.py"],
+            "evidence": [code_chunk_id],
             "counterevidence": ["feedback:coverage_collapse"],
             "conclusion": "Use utility-predicted cache routing as the S1 direction and let S2 choose concrete variants.",
+            "used_shared_memory_refs": used_shared_memory_refs,
         },
     }
+
+
+def _write_minimal_s1_ref_catalog(project_root: Path) -> None:
+    intake = project_root / "intake" / "c2c"
+    intake.mkdir(parents=True, exist_ok=True)
+    (project_root / "literature" / "c2c").mkdir(parents=True, exist_ok=True)
+    chunk_index = {
+        "schema_version": "c2c_full_chunk_index_v1",
+        "counts": {"paper": 1, "rebuttal": 1, "code": 1, "total": 3},
+        "entries": [
+            {
+                "chunk_id": "code:rosetta/model/aligner.py",
+                "source_type": "code",
+                "source_path": "rosetta/model/aligner.py",
+                "section": "file",
+                "keywords": ["aligner"],
+                "text_preview": "aligner",
+                "path": "rosetta/model/aligner.py",
+                "symbol": "aligner",
+            },
+            {
+                "chunk_id": "feedback:coverage_collapse",
+                "source_type": "failure_feedback",
+                "source_path": "intake/c2c/negative_result_memory.json",
+                "section": "failure",
+                "keywords": ["coverage"],
+                "text_preview": "coverage collapse",
+            },
+            {
+                "chunk_id": "paper:cache_routing",
+                "source_type": "paper",
+                "source_path": "intake/c2c/paper_chunks.jsonl",
+                "section": "method",
+                "keywords": ["cache"],
+                "text_preview": "cache routing",
+            },
+        ],
+    }
+    (intake / "chunk_index.json").write_text(json.dumps(chunk_index), encoding="utf-8")
+    (intake / "code_file_manifest.json").write_text(json.dumps({"files": [{"path": "rosetta/model/aligner.py"}]}), encoding="utf-8")
+    (intake / "code_symbols.jsonl").write_text(json.dumps({"symbol": "aligner", "path": "rosetta/model/aligner.py"}) + "\n", encoding="utf-8")
+    (intake / "code_chunks.jsonl").write_text(json.dumps({"chunk_id": "code:rosetta/model/aligner.py", "path": "rosetta/model/aligner.py", "symbol": "aligner"}) + "\n", encoding="utf-8")
+    (intake / "negative_result_memory.json").write_text(json.dumps({"blocked": ["coverage"]}), encoding="utf-8")
+    (intake / "paper_chunks.jsonl").write_text(json.dumps({"chunk_id": "paper:cache_routing", "source_path": "paper.md"}) + "\n", encoding="utf-8")
+
+
+def test_c2c_s1_merges_s0_semantic_enrichment_into_chunk_catalog(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_semantic_s1"
+    intake = project_root / "intake" / "c2c"
+    cache = project_root / ".cache" / "auto_research" / "s0_semantic_enrichment" / "deepseek-v4-flash"
+    intake.mkdir(parents=True)
+    cache.mkdir(parents=True)
+    paper_record = {
+        "generated_at": "2026-06-03T00:00:00+00:00",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "prompt_version": "deepseek_s0_semantic_enrichment_v1",
+        "cache_status": "miss",
+        "fallback_used": False,
+        "chunk": {"chunk_id": "paper:method", "source_type": "paper"},
+        "enrichment": {
+            "semantic_summary": "Paper says cache routing should preserve useful transferred states.",
+            "mechanism_tags": ["cache routing", "coverage preservation"],
+            "failure_modes": ["coverage collapse"],
+            "retrieval_keywords": ["utility routing", "soft cache routing"],
+        },
+    }
+    stale_code_record = {
+        "generated_at": "2026-06-03T00:00:01+00:00",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "prompt_version": "deepseek_s0_semantic_enrichment_v1",
+        "cache_status": "miss",
+        "fallback_used": True,
+        "chunk": {"chunk_id": "code:aligner", "source_type": "code"},
+        "enrichment": {"semantic_summary": "Stale fallback summary.", "retrieval_keywords": ["stale"]},
+    }
+    code_record = {
+        "generated_at": "2026-06-03T00:00:02+00:00",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "prompt_version": "deepseek_s0_code_semantic_enrichment_v2",
+        "cache_status": "miss",
+        "fallback_used": False,
+        "chunk": {"chunk_id": "code:aligner", "source_type": "code"},
+        "enrichment": {
+            "semantic_summary": "Aligner is the bounded runtime patch surface for cache transfer and valid_mask handling.",
+            "mechanism_tags": ["runtime", "valid_mask", "alignment"],
+            "failure_modes": ["dtype/device mismatch"],
+            "retrieval_keywords": ["aligner", "valid_mask", "cache transfer"],
+        },
+    }
+    write_json(intake / "semantic_enrichment_sample.json", {"records": [paper_record, stale_code_record]})
+    write_json(cache / "code.json", code_record)
+    paper_chunks = [{"chunk_id": "paper:method", "source_type": "paper", "source_path": "paper.md", "section": "method", "keywords": ["cache"]}]
+    rebuttal_chunks = []
+    code_chunks = [{"chunk_id": "code:aligner", "source_type": "code", "source_path": "rosetta/model/aligner.py", "path": "rosetta/model/aligner.py", "keywords": ["aligner"]}]
+    chunk_index = {
+        "counts": {"paper": 1, "rebuttal": 0, "code": 1, "total": 2},
+        "entries": [
+            {"chunk_id": "paper:method", "source_type": "paper", "source_path": "paper.md", "section": "method", "keywords": ["cache"]},
+            {"chunk_id": "code:aligner", "source_type": "code", "source_path": "rosetta/model/aligner.py", "section": "file", "keywords": ["aligner"]},
+        ],
+    }
+
+    merged = literature_module._merge_s0_semantic_enrichment_for_s1(
+        project_root,
+        paper_chunks=paper_chunks,
+        rebuttal_chunks=rebuttal_chunks,
+        code_chunks=code_chunks,
+        chunk_index=chunk_index,
+        config={"intake": {"semantic_enrichment": {"model": "deepseek-v4-flash"}}},
+    )
+
+    assert merged["report"]["records_loaded"] == 2
+    assert merged["report"]["chunks_enriched"] == {"paper": 1, "rebuttal": 0, "code": 1}
+    code_entry = next(entry for entry in merged["chunk_index"]["entries"] if entry["chunk_id"] == "code:aligner")
+    assert code_entry["semantic_summary"].startswith("Aligner is the bounded runtime patch surface")
+    assert code_entry["semantic_enrichment"]["prompt_version"] == "deepseek_s0_code_semantic_enrichment_v2"
+    prompt_catalog = literature_module._summarize_chunk_index_for_prompt(merged["chunk_index"])
+    prompt_code_entry = next(entry for entry in prompt_catalog["entries"] if entry["chunk_id"] == "code:aligner")
+    assert "valid_mask" in prompt_code_entry["retrieval_keywords"]
+    assert prompt_code_entry["failure_modes"] == ["dtype/device mismatch"]
 
 
 def test_init_c2c_creates_snapshot_and_config(monkeypatch, tmp_path: Path) -> None:
@@ -216,6 +384,130 @@ def test_init_c2c_creates_snapshot_and_config(monkeypatch, tmp_path: Path) -> No
     assert (root / "experiment/c2c/repo_snapshot_manifest.json").exists()
     manifest = json.loads((root / "experiment/c2c/repo_snapshot_manifest.json").read_text(encoding="utf-8"))
     assert "source_git_commit" in manifest
+
+
+def test_run_c2c_command_prepares_three_iteration_project_with_s0_cache(monkeypatch, tmp_path: Path) -> None:
+    source_repo = _fake_c2c_repo(tmp_path)
+    ref_paper = tmp_path / "paper.txt"
+    ref_rebuttal = tmp_path / "rebuttal.md"
+    ref_paper.write_text("paper text", encoding="utf-8")
+    ref_rebuttal.write_text("review text", encoding="utf-8")
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    monkeypatch.setattr(config_module, "load_root_config", lambda: config)
+    monkeypatch.setattr(cli_module, "load_root_config", lambda: config)
+    monkeypatch.setattr(orchestrator_module, "load_root_config", lambda: config)
+
+    orchestrator = Orchestrator()
+    source_project = orchestrator.init_c2c_project(
+        "source cache",
+        target_repo=source_repo,
+        ref_paper=ref_paper,
+        ref_rebuttal=ref_rebuttal,
+        env_python=Path("/usr/bin/python3"),
+        project_id="source_cache_project",
+        simulate=False,
+    )
+    source_root = tmp_path / "workspace" / source_project
+    code_chunk = {
+        "chunk_id": "code:rosetta/model/aligner.py::align",
+        "path": "rosetta/model/aligner.py",
+        "source_type": "code",
+        "source_path": "rosetta/model/aligner.py",
+        "section": "align",
+        "text": "def align():\n    return True\n",
+    }
+    bundle = {
+        "schema_version": "c2c_static_intake_bundle_v1",
+        "metadata": [],
+        "reference_result": {},
+        "paper_full_manifest": [],
+        "repo_manifest": {
+            "core_files": [
+                {
+                    "path": "rosetta/model/aligner.py",
+                    "sha256": sha256_file(source_root / "external/c2c_snapshot/rosetta/model/aligner.py"),
+                }
+            ]
+        },
+        "historical_results": {"results": []},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "repo_card": {},
+        "paper_cards": [],
+        "paper_chunks": [{"chunk_id": "paper:1", "source_type": "paper", "source_path": "paper.md", "text": "paper"}],
+        "bibliography_cards": [],
+        "rebuttal_matrix": {},
+        "rebuttal_chunks": [{"chunk_id": "rebuttal:1", "source_type": "rebuttal", "source_path": "rebuttal.md", "text": "review"}],
+        "code_cards": [],
+        "code_file_manifest": {"files": []},
+        "code_symbols": [],
+        "code_chunks": [code_chunk],
+        "code_edges": [],
+        "code_repo_map": {},
+        "code_intake_report": {},
+        "implementation_surface_map": {},
+        "code_retrieval_index": {},
+        "cache_summary": {},
+        "chunk_index": {
+            "counts": {"paper": 1, "rebuttal": 1, "code": 1, "total": 3},
+            "entries": [
+                {"chunk_id": "paper:1", "source_type": "paper", "source_path": "paper.md", "text": "paper"},
+                {"chunk_id": "rebuttal:1", "source_type": "rebuttal", "source_path": "rebuttal.md", "text": "review"},
+                code_chunk,
+            ],
+        },
+        "result_ledger_csv": "id,mean\n",
+        "negative_memory": {},
+        "retrieval_plan": {},
+        "followup_bundle": {},
+        "evidence_brief": {"schema_version": "c2c_evidence_brief_v1"},
+    }
+    write_json(source_root / "intake/c2c/static_bundle.json", bundle)
+    sidecar = source_root / "references/c2c/ref_paper/demo/paper_full.md"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text("# Cached Paper\n\nMethod.\n", encoding="utf-8")
+    bundle["paper_full_manifest"] = [
+        {
+            "paper_id": "demo",
+            "paper_full_md_path": "references/c2c/ref_paper/demo/paper_full.md",
+            "parser_artifacts": ["references/c2c/ref_paper/demo/paper_full.md"],
+        }
+    ]
+    write_json(source_root / "intake/c2c/static_bundle.json", bundle)
+
+    args = SimpleNamespace(
+        topic="cross tokenizer cache communication",
+        project_id="new_run_project",
+        target_repo=str(source_repo),
+        ref_paper=str(ref_paper),
+        ref_rebuttal=str(ref_rebuttal),
+        env_python="/usr/bin/python3",
+        max_iterations=3,
+        stop_after_stage="S3_experiment",
+        simulate=False,
+        hitl=False,
+        no_s0_cache=False,
+        s0_cache_project=source_project,
+        s0_cache_path=None,
+        s0_force_refresh=False,
+        prepare_only=True,
+    )
+
+    result = _run_c2c_command(args, orchestrator)
+
+    new_root = tmp_path / "workspace/new_run_project"
+    project_config = yaml.safe_load((new_root / "meta/project_config.yaml").read_text(encoding="utf-8"))
+    registry = yaml.safe_load((new_root / "meta/registry.yaml").read_text(encoding="utf-8"))
+    restored_bundle = json.loads((new_root / "intake/c2c/static_bundle.json").read_text(encoding="utf-8"))
+    assert result["status"] == "prepared"
+    assert project_config["c2c"]["enabled"] is True
+    assert project_config["orchestration"]["auto_mode"] is True
+    assert project_config["orchestration"]["stop_after_stage"] == "S3_experiment"
+    assert project_config["review"]["max_iterations"] == 3
+    assert registry["max_iterations"] == 3
+    assert restored_bundle["project_id"] == "new_run_project"
+    assert result["s0_cache"]["status"] == "restored"
+    assert result["s0_cache"]["sidecars"]["copied_count"] == 1
+    assert (new_root / "references/c2c/ref_paper/demo/paper_full.md").exists()
 
 
 def test_c2c_importers_parse_refs_and_historical_results(tmp_path: Path) -> None:
@@ -391,9 +683,12 @@ def test_tree_sitter_code_intake_builds_symbol_chunks_and_edges(tmp_path: Path) 
     assert any(edge["edge_type"] == "config_key_defined_in" and edge["config_key"] == "confidence_gate" for edge in intake.edges)
     assert any(edge["edge_type"] == "tests_symbol" for edge in intake.edges)
     assert intake.file_manifest["schema_version"] == "code_intake_v1"
+    assert intake.file_manifest["parser_fingerprint"]["parser_config_hash"]
+    assert intake.file_manifest["parser_fingerprint"]["chunking_config_hash"]
     assert intake.repo_map["counts"]["symbols"] == len(intake.symbols)
     assert intake.report["counts"]["chunks_with_config_keys"] >= 1
     assert intake.report["cache"]["counts"]["miss"] > 0
+    assert intake.report["cache"]["parser_config_hash"] == intake.file_manifest["parser_fingerprint"]["parser_config_hash"]
     assert not intake.report["coverage"]["missing_allowed_files"]
     alignment_surface = intake.surface_map["surfaces"]["alignment_core"]
     assert any(item["symbol"] == "CacheRouter.route" for item in alignment_surface)
@@ -579,7 +874,10 @@ def test_c2c_pdf_ref_reuses_mineru_sha_cache(monkeypatch, tmp_path: Path) -> Non
 
     assert calls["count"] == 1
     assert first["paper_full_manifest"][0]["cache_status"] == "miss"
+    assert first["paper_full_manifest"][0]["parser_config_hash"]
+    assert first["paper_full_manifest"][0]["prompt_schema_version"] == "c2c_paper_full_markdown_v1"
     assert second["paper_full_manifest"][0]["cache_status"] in {"local_hit", "sha_hit"}
+    assert second["paper_full_manifest"][0]["parser_config_hash"]
     assert "Cached Paper" in second["cards"][0]["text"]
 
 
@@ -766,6 +1064,7 @@ def _code_patch_test_config(workspace_root: Path, repo: Path, *, require_targete
         "validation": {
             "require_py_compile": True,
             "require_targeted_tests": require_targeted_tests,
+            "runtime_smoke": {"enabled": False},
             "mechanism_self_review": {"enabled": False},
         },
     }
@@ -802,6 +1101,10 @@ def test_code_patch_agent_generates_artifacts_from_temp_repo_without_polluting_s
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=MockBackend()).run({"candidate_ideas": ideas}, ideas)
 
     assert manifest["status"] == "ok"
+    assert manifest["selected_candidate_id"] == "idea_patch"
+    assert manifest["valid_patch_ids"] == ["idea_patch"]
+    assert manifest["selected_patch"]["candidate_id"] == "idea_patch"
+    assert manifest["selected_patch"]["patch_json"].endswith("plan/code_patches/idea_patch/patch.json")
     assert ideas[0]["code_patch"]["status"] == "ok"
     assert ideas[0]["code_patch"]["has_executable_change"] is True
     assert set(ideas[0]["code_patch"]["changed_files"]) == {
@@ -1090,6 +1393,368 @@ def test_code_patch_persistent_backend_resume_failure_falls_back_to_new_session(
     assert "123e4567-e89b-12d3-a456-426614174000" in (session_dir / "codex_session.json").read_text(encoding="utf-8")
 
 
+def test_code_patch_implementation_failure_reuses_patch_session(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_git_c2c_repo(tmp_path)
+    snapshot = tmp_path / "snapshot"
+    import shutil
+
+    shutil.copytree(repo, snapshot, ignore=lambda directory, names: {".git"} & set(names))
+    config = _code_patch_test_config(tmp_path / "workspace", snapshot)
+    config["c2c"]["target_repo"] = str(repo)
+    config["code_patch"]["backend"] = "codex_persistent_cli"
+    config["code_patch"]["persistent_session"] = True
+    config["code_patch"]["use_git_worktree"] = True
+    config["code_patch"]["validation"]["require_py_compile"] = False
+    config["code_patch"]["validation"]["runtime_smoke"] = {"enabled": False}
+    config["c2c"]["env_python"] = "/home/lijunsi/miniconda3/envs/c2c-py310-cu124/bin/python"
+    paths = init_workspace(config, "topic", project_id="proj_fresh_patch_session", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    write_json(
+        paths.root / "plan" / "code_patches" / "fresh" / "validation.json",
+        {
+            "status": "validation_failed",
+            "checks": [
+                {
+                    "name": "runtime_smoke:mechanism_activation_forward_probe",
+                    "returncode": 1,
+                    "failure_category": "mechanism_activation_forward_probe_failed",
+                    "probe": {
+                        "tensor_checks": [
+                            {
+                                "name": "projector_output",
+                                "changed": False,
+                                "enabled_sha256": "aaa",
+                                "disabled_sha256": "aaa",
+                            }
+                        ],
+                        "switch_seen_by_forward": False,
+                        "cache_key_diff": 0.0,
+                        "cache_value_diff": 0.0,
+                        "projector_called": True,
+                        "projector_output_identical": True,
+                    },
+                }
+            ],
+        },
+    )
+    write_json(
+        paths.root / "plan" / "code_patches" / "patch_manifest.json",
+        {
+            "status": "no_valid_patch",
+            "candidates": [
+                {
+                    "candidate_id": "fresh",
+                    "status": "validation_failed",
+                    "changed_files": ["rosetta/model/projector.py"],
+                    "validation": "plan/code_patches/fresh/validation.json",
+                }
+            ],
+        },
+    )
+    session_dir = paths.root / "plan/code_worktrees/fresh/v1"
+    existing_repo = session_dir / "repo"
+    session_dir.mkdir(parents=True)
+    shutil.copytree(snapshot, existing_repo)
+    (session_dir / "codex_session.json").write_text(json.dumps({"session_id": "old-session"}), encoding="utf-8")
+    codex_commands: list[list[str]] = []
+    codex_prompts: list[str] = []
+
+    def fake_run(command, **kwargs):
+        if command[:3] == ["git", "-C", str(repo)] and command[3:5] == ["rev-parse", "--is-inside-work-tree"]:
+            return SimpleNamespace(returncode=0, stdout="true\n", stderr="")
+        if command[:3] == ["git", "-C", str(repo)] and command[3:5] == ["rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        if command[:3] == ["git", "-C", str(repo)] and command[3:5] == ["worktree", "add"]:
+            raise AssertionError("existing worktree should be reused")
+        if command and command[0] == "codex":
+            command_text = [str(part) for part in command]
+            prompt = str(kwargs.get("input") or "")
+            codex_commands.append(command_text)
+            codex_prompts.append(prompt)
+            assert "resume" in command_text
+            assert "old-session" in command_text
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            if "root-cause diagnosis pre-pass" in prompt:
+                assert "/home/lijunsi/miniconda3/envs/c2c-py310-cu124/bin/python" in prompt
+                assert "Do not edit files in this turn" in prompt
+                assert "Do not run full train" in prompt
+                assert "repeated_failure_context" in prompt
+                assert "same_switch_seen_by_forward_false" in prompt
+                assert "same_identical_tensors:projector_output" in prompt
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "root_cause": "ablation switch reaches config but projector.forward never reads it",
+                            "evidence": ["config_overrides has disable_x=true"],
+                            "repair_target": ["rosetta/model/projector.py"],
+                            "forbidden": ["do not change evaluator"],
+                            "lightweight_commands_run": [
+                                "/home/lijunsi/miniconda3/envs/c2c-py310-cu124/bin/python -m py_compile rosetta/model/projector.py"
+                            ],
+                            "env_python_used": "/home/lijunsi/miniconda3/envs/c2c-py310-cu124/bin/python",
+                            "confidence": "high",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+            assert "repair_diagnosis" in prompt
+            assert "repeated_failure_context" in prompt
+            assert "ordinary same-path repair has already failed" in prompt
+            (Path(kwargs["cwd"]) / "rosetta/model/aligner.py").write_text("VALUE = 'reused patch session'\n", encoding="utf-8")
+            output_path.write_text("patched\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    import auto_research.code_patch as code_patch_module
+
+    monkeypatch.setattr(code_patch_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(code_patch_module.subprocess, "run", fake_run)
+
+    ideas = [
+        {
+            "id": "fresh",
+            "title": "Fresh",
+            "hypothesis": "h",
+            "previous_patch_failure": {
+                "failure_class": "implementation_failure",
+                "s2_5_repair_dispatch": {
+                    "mode": "s2_5_only_implementation_repair",
+                    "selected_candidate_id": "fresh",
+                    "changed_files": ["rosetta/model/projector.py"],
+                    "activation_forward_probe_diagnostics": {
+                        "identical_tensors": ["projector_output"],
+                        "changed_tensors": [],
+                        "switch_seen_by_forward": False,
+                        "cache_key_diff": 0.0,
+                        "cache_value_diff": 0.0,
+                        "projector_output_identical": True,
+                    },
+                    "tensor_checks": {"identical_tensors": ["projector_output"], "changed_tensors": []},
+                },
+                "proxy_effect_repair_contract": {
+                    "mode": "s2_5_only_implementation_repair",
+                },
+            },
+        }
+    ]
+    manifest = CodePatchAgent(paths.root, config, artifacts).run({"candidate_ideas": ideas}, ideas)
+
+    assert manifest["status"] == "ok"
+    assert len(codex_commands) == 2
+    assert "resume" in codex_commands[0]
+    assert "old-session" in codex_commands[0]
+    assert "resume" in codex_commands[1]
+    assert "old-session" in codex_commands[1]
+    assert "root-cause diagnosis pre-pass" in codex_prompts[0]
+    assert "repair_diagnosis" in codex_prompts[1]
+    actions = ideas[0]["code_patch"].get("recovery_actions") or []
+    assert any(action.get("action") == "s2_5_implementation_repair_diagnosis" for action in actions)
+    assert not any(action.get("action") == "discard_patch_codex_session_for_implementation_repair" for action in actions)
+    metadata = json.loads((session_dir / "worktree_metadata.json").read_text(encoding="utf-8"))
+    assert metadata["session_policy"] == "persistent_resume_required"
+    assert ideas[0]["code_patch"]["codex_session_id"] == "old-session"
+    diagnosis = json.loads((paths.root / "plan" / "code_patches" / "fresh" / "repair_diagnosis.json").read_text(encoding="utf-8"))
+    assert diagnosis["root_cause"] == "ablation switch reaches config but projector.forward never reads it"
+    assert diagnosis["env_python_used"] == "/home/lijunsi/miniconda3/envs/c2c-py310-cu124/bin/python"
+    assert diagnosis["same_session_reused"] is True
+    repeated = diagnosis["implementation_repair_diagnosis"]["repeated_failure_context"]
+    assert repeated["is_repeated"] is True
+    assert "same_switch_seen_by_forward_false" in repeated["repeated_signals"]
+    assert "same_identical_tensors:projector_output" in repeated["repeated_signals"]
+    patch = json.loads((paths.root / "plan" / "code_patches" / "fresh" / "patch.json").read_text(encoding="utf-8"))
+    assert patch["repair_diagnosis"]["root_cause"] == diagnosis["root_cause"]
+    assert patch["implementation_contract"]["repeated_failure_context"]["is_repeated"] is True
+
+
+def test_code_patch_persistent_validation_repair_uses_same_codex_session(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_git_c2c_repo(tmp_path)
+    snapshot = tmp_path / "snapshot"
+    import shutil
+
+    shutil.copytree(repo, snapshot, ignore=lambda directory, names: {".git"} & set(names))
+    config = _code_patch_test_config(tmp_path / "workspace", snapshot, require_targeted_tests=True)
+    config["c2c"]["target_repo"] = str(repo)
+    config["code_patch"]["backend"] = "codex_persistent_cli"
+    config["code_patch"]["persistent_session"] = True
+    config["code_patch"]["use_git_worktree"] = True
+    config["code_patch"]["codex_json_events"] = True
+    config["code_patch"]["validation"]["require_py_compile"] = False
+    config["code_patch"]["validation"]["runtime_smoke"] = {"enabled": False}
+    paths = init_workspace(config, "topic", project_id="proj_persistent_repair_session", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    codex_commands: list[list[str]] = []
+    codex_prompts: list[str] = []
+
+    def fake_run(command, **kwargs):
+        if command[:3] == ["git", "-C", str(repo)] and command[3:5] == ["rev-parse", "--is-inside-work-tree"]:
+            return SimpleNamespace(returncode=0, stdout="true\n", stderr="")
+        if command[:3] == ["git", "-C", str(repo)] and command[3:5] == ["rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        if command[:3] == ["git", "-C", str(repo)] and command[3:5] == ["worktree", "add"]:
+            shutil.copytree(snapshot, Path(command[-2]))
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        if command and command[0] == "codex":
+            command_text = [str(part) for part in command]
+            prompt = str(kwargs.get("input") or "")
+            codex_commands.append(command_text)
+            codex_prompts.append(prompt)
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            worktree_repo = Path(kwargs["cwd"])
+            if "Persistent S2.5 Codex session bootstrap" in prompt:
+                output_path.write_text("blueprint\n", encoding="utf-8")
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout='{"type":"thread.started","thread_id":"repair-session"}\n',
+                    stderr="",
+                )
+            if "codex_repair_packet" in prompt:
+                (worktree_repo / "test/test_aligner_span_overlap.py").write_text(
+                    "def test_span():\n    assert True\n",
+                    encoding="utf-8",
+                )
+                output_path.write_text("repaired\n", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="session id: repair-session\n")
+            (worktree_repo / "rosetta/model/aligner.py").write_text("VALUE = 'persistent validation repair'\n", encoding="utf-8")
+            (worktree_repo / "test/test_aligner_span_overlap.py").write_text(
+                "def test_span():\n    assert False\n",
+                encoding="utf-8",
+            )
+            output_path.write_text("initial patch\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="session id: repair-session\n")
+        if "-m" in command and "pytest" in command:
+            test_path = Path(kwargs["cwd"]) / command[-1]
+            if "assert False" in test_path.read_text(encoding="utf-8"):
+                return SimpleNamespace(returncode=1, stdout="FAILED test_span\n", stderr="")
+            return SimpleNamespace(returncode=0, stdout="1 passed\n", stderr="")
+        raise AssertionError(f"unexpected command: {command}")
+
+    import auto_research.code_patch as code_patch_module
+
+    monkeypatch.setattr(code_patch_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(code_patch_module.subprocess, "run", fake_run)
+
+    ideas = [{"id": "persistent_repair", "title": "Persistent Repair", "hypothesis": "h"}]
+    manifest = CodePatchAgent(paths.root, config, artifacts).run({"candidate_ideas": ideas}, ideas)
+    patch = json.loads((paths.root / ideas[0]["code_patch"]["patch_json"]).read_text(encoding="utf-8"))
+
+    assert manifest["status"] == "ok"
+    assert len(codex_commands) == 3
+    assert "resume" not in codex_commands[0]
+    assert codex_commands[1][-3:] == ["resume", "repair-session", "-"]
+    assert codex_commands[2][-3:] == ["resume", "repair-session", "-"]
+    assert "codex_repair_packet" in codex_prompts[2]
+    action = next(
+        action
+        for action in patch["recovery_actions"]
+        if action.get("action") == "retry_codex_after_validation_failure"
+    )
+    assert action["action"] == "retry_codex_after_validation_failure"
+    assert action["repair_session"]["same_session_reused"] is True
+    assert action["repair_session"]["session_id_before"] == "repair-session"
+    assert action["repair_session"]["session_id_after"] == "repair-session"
+
+
+def test_code_patch_prunes_persistent_worktree_before_codex(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_git_c2c_repo(tmp_path)
+    snapshot = tmp_path / "snapshot"
+    import shutil
+
+    shutil.copytree(repo, snapshot, ignore=lambda directory, names: {".git"} & set(names))
+    (snapshot / "rosetta/train").mkdir(parents=True, exist_ok=True)
+    (snapshot / "rosetta/train/model_utils.py").write_text("VALUE = 'model utils baseline'\n", encoding="utf-8")
+    config = _code_patch_test_config(tmp_path / "workspace", snapshot)
+    config["c2c"]["target_repo"] = str(repo)
+    config["code_patch"]["backend"] = "codex_persistent_cli"
+    config["code_patch"]["persistent_session"] = True
+    config["code_patch"]["use_git_worktree"] = True
+    config["code_patch"]["validation"]["require_py_compile"] = False
+    config["code_patch"]["validation"]["runtime_smoke"] = {"enabled": False}
+    config["code_patch"]["validation"]["max_changed_files"] = 4
+    paths = init_workspace(config, "topic", project_id="proj_prune_before_codex", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    session_dir = paths.root / "plan/code_worktrees/prune_before/v1"
+    existing_repo = session_dir / "repo"
+    session_dir.mkdir(parents=True)
+    shutil.copytree(snapshot, existing_repo)
+    (session_dir / "codex_session.json").write_text(json.dumps({"session_id": "stale-session"}), encoding="utf-8")
+    (session_dir / "worktree_metadata.json").write_text(
+        json.dumps(
+            {
+                "baseline_materialized_from_snapshot": True,
+                "baseline_guard": {"snapshot_root": str(snapshot.resolve())},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (existing_repo / "script/evaluation/unified_evaluator.py").write_text("print('stale eval edit')\n", encoding="utf-8")
+    (existing_repo / "script/train/SFT_train.py").write_text("print('stale train edit')\n", encoding="utf-8")
+    (existing_repo / "rosetta/train/model_utils.py").write_text("VALUE = 'stale helper edit'\n", encoding="utf-8")
+    baseline_eval = (snapshot / "script/evaluation/unified_evaluator.py").read_text(encoding="utf-8")
+    baseline_train = (snapshot / "script/train/SFT_train.py").read_text(encoding="utf-8")
+    baseline_helper = (snapshot / "rosetta/train/model_utils.py").read_text(encoding="utf-8")
+    codex_calls = 0
+
+    def fake_run(command, **kwargs):
+        nonlocal codex_calls
+        if command[:3] == ["git", "-C", str(repo)] and command[3:5] == ["rev-parse", "--is-inside-work-tree"]:
+            return SimpleNamespace(returncode=0, stdout="true\n", stderr="")
+        if command[:3] == ["git", "-C", str(repo)] and command[3:5] == ["rev-parse", "HEAD"]:
+            return SimpleNamespace(returncode=0, stdout="abc123\n", stderr="")
+        if command[:3] == ["git", "-C", str(repo)] and command[3:5] == ["worktree", "add"]:
+            raise AssertionError("existing worktree should be reused")
+        if command and command[0] == "codex":
+            worktree_repo = Path(kwargs["cwd"])
+            output_path = Path(command[command.index("--output-last-message") + 1])
+            prompt = str(kwargs.get("input") or "")
+            if "Persistent S2.5 Codex session bootstrap" in prompt:
+                output_path.write_text("preload\n", encoding="utf-8")
+                return SimpleNamespace(returncode=0, stdout="", stderr="session id: preload-session\n")
+            codex_calls += 1
+            assert (worktree_repo / "script/evaluation/unified_evaluator.py").read_text(encoding="utf-8") == baseline_eval
+            assert (worktree_repo / "script/train/SFT_train.py").read_text(encoding="utf-8") == baseline_train
+            assert (worktree_repo / "rosetta/train/model_utils.py").read_text(encoding="utf-8") == baseline_helper
+            (worktree_repo / "rosetta/model/aligner.py").write_text("VALUE = 'focused patch'\n", encoding="utf-8")
+            output_path.write_text("patched\n", encoding="utf-8")
+            return SimpleNamespace(returncode=0, stdout="", stderr="session id: focused-session\n")
+        raise AssertionError(f"unexpected command: {command}")
+
+    import auto_research.code_patch as code_patch_module
+
+    monkeypatch.setattr(code_patch_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    monkeypatch.setattr(code_patch_module.subprocess, "run", fake_run)
+
+    ideas = [
+        {
+            "id": "prune_before",
+            "title": "Prune Before",
+            "hypothesis": "h",
+            "experiment_contract": {
+                "expected_files": ["rosetta/model/aligner.py", "test/test_aligner_span_overlap.py"]
+            },
+            "previous_patch_failure": {
+                "failure_class": "implementation_failure",
+                "proxy_effect_repair_contract": {
+                    "mode": "implementation_patch_repair",
+                },
+            },
+        }
+    ]
+    manifest = CodePatchAgent(paths.root, config, artifacts).run({"candidate_ideas": ideas}, ideas)
+    patch = json.loads((paths.root / ideas[0]["code_patch"]["patch_json"]).read_text(encoding="utf-8"))
+
+    assert codex_calls == 1
+    assert manifest["status"] == "ok"
+    assert patch["changed_files"] == ["rosetta/model/aligner.py"]
+    actions = patch.get("recovery_actions") or []
+    prune_action = next(action for action in actions if action.get("action") == "auto_prune_worktree_scope_before_codex")
+    assert set(prune_action["restored_files"]) == {
+        "script/evaluation/unified_evaluator.py",
+        "script/train/SFT_train.py",
+        "rosetta/train/model_utils.py",
+    }
+
+
 def test_code_patch_persistent_backend_rejects_non_git_target_repo(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _code_patch_test_config(tmp_path / "workspace", repo)
@@ -1216,7 +1881,58 @@ def test_code_patch_contract_includes_c2c_mechanism_and_ablation(tmp_path: Path)
     assert any("matched-coverage" in requirement for requirement in contract["s2_5_requirements"])
 
 
-def test_code_patch_contract_large_scope_uses_mvp_slice(tmp_path: Path) -> None:
+def test_code_patch_contract_includes_s2_variant_fingerprint(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    paths = init_workspace(config, "topic", project_id="proj_patch_variant_contract", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    captured: dict[str, object] = {}
+
+    class InspectingBackend:
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del edit_policy
+            captured["implementation_contract"] = implementation_contract
+            (temp_repo / "rosetta/model/wrapper.py").write_text("VALUE = 'variant contract'\n", encoding="utf-8")
+            return {"status": "ok", "rationale": "Patched selected variant."}
+
+    ideas = [
+        {
+            "id": "wrapper_arc_recovery_residual",
+            "title": "Wrapper ARC recovery residual",
+            "hypothesis": "h",
+            "mechanism_type": "utility_predicted_cache_routing",
+            "variant_fingerprint": "abc123variant",
+            "s2_variant": {
+                "variant_fingerprint": "abc123variant",
+                "mechanism_axis": "normalization",
+                "integration_point": "wrapper",
+                "control_signal": "span_agreement",
+                "variant_score": {"score": 5.0},
+            },
+            "experiment_contract": {
+                "expected_files": ["rosetta/model/wrapper.py"],
+                "ablation_switch": "ablation_disable_wrapper_arc_recovery_residual",
+                "config_overrides": {
+                    "train": {"model": {"cache_routing_mode": "wrapper_arc_recovery_residual"}},
+                    "eval": {"model": {"rosetta_config": {"cache_routing_mode": "wrapper_arc_recovery_residual"}}},
+                },
+            },
+        }
+    ]
+    manifest = CodePatchAgent(paths.root, config, artifacts, backend=InspectingBackend()).run({"candidate_ideas": ideas}, ideas)
+
+    contract = captured["implementation_contract"]
+    assert isinstance(contract, dict)
+    assert contract["variant_fingerprint"] == "abc123variant"
+    assert contract["s2_variant"]["integration_point"] == "wrapper"
+    assert any("variant_fingerprint" in item for item in contract["s2_5_requirements"])
+    assert manifest["selected_patch"]["variant_fingerprint"] == "abc123variant"
+    patch = json.loads((paths.root / ideas[0]["code_patch"]["patch_json"]).read_text(encoding="utf-8"))
+    assert patch["variant_fingerprint"] == "abc123variant"
+    assert patch["s2_variant"]["control_signal"] == "span_agreement"
+
+
+def test_code_patch_contract_large_scope_uses_decomposition_guidance(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _code_patch_test_config(tmp_path / "workspace", repo)
     paths = init_workspace(config, "topic", project_id="proj_patch_large_scope_contract", simulate=False)
@@ -1227,8 +1943,8 @@ def test_code_patch_contract_large_scope_uses_mvp_slice(tmp_path: Path) -> None:
         def generate(self, implementation_contract, temp_repo, edit_policy):
             del edit_policy
             captured.setdefault("implementation_contract", implementation_contract)
-            (temp_repo / "rosetta/model/projector.py").write_text("VALUE = 'large scope mvp'\n", encoding="utf-8")
-            return {"status": "ok", "rationale": "Patched first MVP slice."}
+            (temp_repo / "rosetta/model/projector.py").write_text("VALUE = 'large scope coherent slice'\n", encoding="utf-8")
+            return {"status": "ok", "rationale": "Patched coherent mechanism slice."}
 
     ideas = default_c2c_ideas("topic", {"name": "base", "mean": 50.0, "datasets": {}})
     candidate = ideas[1]
@@ -1263,6 +1979,11 @@ def test_code_patch_agent_repairs_validation_failed_patch_once(tmp_path: Path) -
                 )
                 return {"status": "ok", "rationale": "Initial patch has a failing focused test."}
             assert implementation_contract["validation_failure_feedback"]["failed_checks"]
+            assert implementation_contract["s2_5_repair_session_policy"]["same_resume_session_required"] is True
+            repair_packet = implementation_contract["codex_repair_packet"]
+            assert repair_packet["repair_kind"] == "validation_or_activation_failure"
+            assert repair_packet["failed_command_evidence"]
+            assert repair_packet["changed_files"]
             (temp_repo / "test/test_aligner_span_overlap.py").write_text(
                 "def test_span():\n    assert True\n",
                 encoding="utf-8",
@@ -1279,8 +2000,10 @@ def test_code_patch_agent_repairs_validation_failed_patch_once(tmp_path: Path) -
     assert ideas[0]["code_patch"]["status"] == "ok"
     assert len(backend.calls) == 2
     assert "validation_failure_feedback" in backend.calls[1]
+    assert "codex_repair_packet" in backend.calls[1]
     assert validation["status"] == "ok"
     assert validation["recovery_actions"][0]["action"] == "retry_codex_after_validation_failure"
+    assert validation["recovery_actions"][0]["repair_packet_summary"]["repair_kind"] == "validation_or_activation_failure"
     assert patch["recovery_actions"][0]["action"] == "retry_codex_after_validation_failure"
 
 
@@ -1311,7 +2034,13 @@ def test_code_patch_runtime_smoke_repairs_dtype_failure_before_proxy_train(tmp_p
         encoding="utf-8",
     )
     config = _code_patch_test_config(tmp_path / "workspace", repo)
-    config["code_patch"]["validation"]["runtime_smoke"] = {"enabled": True, "train_samples": 1, "timeout_seconds": 20, "gpu_ids": []}
+    config["code_patch"]["validation"]["runtime_smoke"] = {
+        "enabled": True,
+        "train_samples": 1,
+        "timeout_seconds": 20,
+        "gpu_ids": [],
+        "mechanism_activation": {"enabled": False},
+    }
     config["code_patch"]["validation"]["max_repair_attempts"] = 1
     paths = init_workspace(config, "topic", project_id="proj_patch_runtime_smoke", simulate=False)
     artifacts = ArtifactManager(paths.root)
@@ -1341,6 +2070,702 @@ def test_code_patch_runtime_smoke_repairs_dtype_failure_before_proxy_train(tmp_p
     assert len(backend.calls) == 2
     assert any(check["name"] == "runtime_smoke:first_batch_train" and check["returncode"] == 0 for check in validation["checks"])
     assert any(action["action"] == "retry_codex_after_validation_failure" for action in validation["recovery_actions"])
+
+
+def test_code_patch_runtime_smoke_repairs_missing_mechanism_activation_wiring(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "script/train/SFT_train.py").write_text(
+        "from pathlib import Path\n"
+        "import json, os, sys\n"
+        "config_path = Path(sys.argv[sys.argv.index('--config') + 1])\n"
+        "cfg = json.loads(config_path.read_text(encoding='utf-8'))\n"
+        "Path(cfg['output']['output_dir']).mkdir(parents=True, exist_ok=True)\n"
+        "print('first batch ok')\n",
+        encoding="utf-8",
+    )
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["validation"]["runtime_smoke"] = {
+        "enabled": True,
+        "train_samples": 2,
+        "timeout_seconds": 20,
+        "gpu_ids": [],
+        "mechanism_activation": {"enabled": True, "hard_gate": True},
+    }
+    config["code_patch"]["validation"]["max_repair_attempts"] = 1
+    paths = init_workspace(config, "topic", project_id="proj_patch_activation_wiring_smoke", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+
+    class WiringRepairBackend:
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del edit_policy
+            self.calls.append(implementation_contract)
+            if len(self.calls) == 1:
+                (temp_repo / "rosetta/model/projector.py").write_text(
+                    "VALUE = 'mechanism without switch wiring'\n",
+                    encoding="utf-8",
+                )
+                return {"status": "ok", "rationale": "Initial patch forgets eval switch wiring."}
+            feedback = implementation_contract["validation_failure_feedback"]
+            assert feedback["failed_checks"][0]["name"] == "runtime_smoke:mechanism_activation_wiring"
+            assert feedback["failed_checks"][0]["failure_category"] == "mechanism_activation_wiring_failed"
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "class Projector:\n"
+                "    def forward(self, rosetta_config=None):\n"
+                "        rosetta_config = rosetta_config or {}\n"
+                "        if rosetta_config.get('disable_mechanism'):\n"
+                "            return 'disabled'\n"
+                "        return 'enabled'\n",
+                encoding="utf-8",
+            )
+            return {"status": "ok", "rationale": "Repaired by reading ablation switch in projector forward path."}
+
+    ideas = [
+        {
+            "id": "activation_wiring_repair",
+            "title": "Activation Wiring Repair",
+            "hypothesis": "h",
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"eval": {"model": {"rosetta_config": {"mechanism_enabled": True}}}},
+            },
+        }
+    ]
+    backend = WiringRepairBackend()
+    CodePatchAgent(paths.root, config, artifacts, backend=backend).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+
+    assert ideas[0]["code_patch"]["status"] == "validation_failed"
+    assert len(backend.calls) == 2
+    wiring_checks = [check for check in validation["checks"] if check["name"] == "runtime_smoke:mechanism_activation_wiring"]
+    assert wiring_checks[-1]["status"] == "ok"
+    assert wiring_checks[-1]["rosetta_config"]["disabled_switch_value"] is True
+    assert wiring_checks[-1]["runtime_code_refs"]["switch_refs"] == ["rosetta/model/projector.py"]
+    forward_checks = [check for check in validation["checks"] if check["name"] == "runtime_smoke:mechanism_activation_forward_probe"]
+    assert forward_checks[-1]["status"] == "failed"
+    assert forward_checks[-1]["blocking"] is True
+    assert set(forward_checks[-1]["probe"]["failures"]) & {
+        "enabled_disabled_forward_outputs_identical",
+        "torch_import_failed",
+        "projector_import_failed",
+        "small_batch_forward_failed",
+    }
+
+
+def test_code_patch_runtime_smoke_uses_builtin_forward_probe_when_repo_script_missing(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "script/train/SFT_train.py").write_text(
+        "from pathlib import Path\n"
+        "import json, sys\n"
+        "config_path = Path(sys.argv[sys.argv.index('--config') + 1])\n"
+        "cfg = json.loads(config_path.read_text(encoding='utf-8'))\n"
+        "Path(cfg['output']['output_dir']).mkdir(parents=True, exist_ok=True)\n"
+        "print('first batch ok')\n",
+        encoding="utf-8",
+    )
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["validation"]["runtime_smoke"] = {
+        "enabled": True,
+        "train_samples": 2,
+        "timeout_seconds": 20,
+        "gpu_ids": [],
+        "mechanism_activation": {
+            "enabled": True,
+            "hard_gate": True,
+            "forward_probe": {"enabled": True, "hard_gate": True, "timeout_seconds": 20},
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_patch_activation_forward_probe_builtin", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+
+    class ForwardProbeMissingBackend:
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "class Projector:\n"
+                "    def forward(self, rosetta_config=None):\n"
+                "        rosetta_config = rosetta_config or {}\n"
+                "        if rosetta_config.get('disable_mechanism'):\n"
+                "            return 'disabled'\n"
+                "        return 'enabled'\n",
+                encoding="utf-8",
+            )
+            return {"status": "ok", "rationale": "Patch wires the switch but the optional forward probe script is absent."}
+
+    ideas = [
+        {
+            "id": "forward_probe_missing",
+            "title": "Forward Probe Missing",
+            "hypothesis": "h",
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"eval": {"model": {"rosetta_config": {"mechanism_enabled": True}}}},
+            },
+        }
+    ]
+    CodePatchAgent(paths.root, config, artifacts, backend=ForwardProbeMissingBackend()).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+
+    assert ideas[0]["code_patch"]["status"] == "validation_failed"
+    forward_checks = [check for check in validation["checks"] if check["name"] == "runtime_smoke:mechanism_activation_forward_probe"]
+    assert forward_checks[-1]["status"] == "failed"
+    assert forward_checks[-1]["returncode"] == 1
+    assert forward_checks[-1]["probe_source"] == "builtin"
+    assert forward_checks[-1]["probe_environment"]["probe_python"]
+    assert "torch_available" in forward_checks[-1]["probe_environment"]
+    assert "torch_version" in forward_checks[-1]["probe_environment"]
+    assert "repo_import_ok" in forward_checks[-1]["probe_environment"]
+    assert "using_c2c_env_python" in forward_checks[-1]["probe_environment"]
+    assert forward_checks[-1]["probe"]["probe_type"] == "repo_small_batch_forward_failed_static_trace"
+    assert forward_checks[-1]["probe"]["fallback_reason"] in {"torch_import_failed", "projector_import_failed", "small_batch_forward_failed"}
+
+
+def test_code_patch_runtime_smoke_skips_forward_probe_when_no_script_and_no_builtin(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "script/train/SFT_train.py").write_text(
+        "from pathlib import Path\n"
+        "import json, sys\n"
+        "config_path = Path(sys.argv[sys.argv.index('--config') + 1])\n"
+        "cfg = json.loads(config_path.read_text(encoding='utf-8'))\n"
+        "Path(cfg['output']['output_dir']).mkdir(parents=True, exist_ok=True)\n"
+        "print('first batch ok')\n",
+        encoding="utf-8",
+    )
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["validation"]["runtime_smoke"] = {
+        "enabled": True,
+        "train_samples": 2,
+        "timeout_seconds": 20,
+        "gpu_ids": [],
+        "mechanism_activation": {
+            "enabled": True,
+            "hard_gate": True,
+            "forward_probe": {"enabled": True, "hard_gate": True, "builtin_fallback": False, "timeout_seconds": 20},
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_patch_activation_forward_probe_missing", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+
+    class ForwardProbeMissingBackend:
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "class Projector:\n"
+                "    def forward(self, rosetta_config=None):\n"
+                "        rosetta_config = rosetta_config or {}\n"
+                "        if rosetta_config.get('disable_mechanism'):\n"
+                "            return 'disabled'\n"
+                "        return 'enabled'\n",
+                encoding="utf-8",
+            )
+            return {"status": "ok", "rationale": "Patch wires the switch but the optional forward probe script is absent."}
+
+    ideas = [
+        {
+            "id": "forward_probe_missing",
+            "title": "Forward Probe Missing",
+            "hypothesis": "h",
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"eval": {"model": {"rosetta_config": {"mechanism_enabled": True}}}},
+            },
+        }
+    ]
+    CodePatchAgent(paths.root, config, artifacts, backend=ForwardProbeMissingBackend()).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+
+    assert ideas[0]["code_patch"]["status"] == "ok"
+    forward_checks = [check for check in validation["checks"] if check["name"] == "runtime_smoke:mechanism_activation_forward_probe"]
+    assert forward_checks[-1]["status"] == "skipped"
+    assert forward_checks[-1]["returncode"] == 0
+    assert forward_checks[-1]["blocking"] is False
+
+
+def test_code_patch_runtime_smoke_repairs_forward_probe_no_effect(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "script/auto_research").mkdir(parents=True, exist_ok=True)
+    (repo / "script/auto_research/activation_forward_probe.py").write_text(
+        "import argparse, json\n"
+        "from pathlib import Path\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--enabled-config')\n"
+        "parser.add_argument('--disabled-config')\n"
+        "parser.add_argument('--switch')\n"
+        "parser.add_argument('--output')\n"
+        "args = parser.parse_args()\n"
+        "projector = Path('rosetta/model/projector.py').read_text(encoding='utf-8')\n"
+        "observed = 'FORWARD_PROBE_ACTIVE_PATH' in projector\n"
+        "payload = {\n"
+        "    'compared_fields': ['projector_output_checksum'],\n"
+        "    'changed_fields': ['projector_output_checksum'] if observed else [],\n"
+        "    'unchanged_fields': [] if observed else ['projector_output_checksum'],\n"
+        "    'mechanism_observed': observed,\n"
+        "}\n"
+        "open(args.output, 'w', encoding='utf-8').write(json.dumps(payload))\n",
+        encoding="utf-8",
+    )
+    (repo / "script/train/SFT_train.py").write_text(
+        "from pathlib import Path\n"
+        "import json, sys\n"
+        "config_path = Path(sys.argv[sys.argv.index('--config') + 1])\n"
+        "cfg = json.loads(config_path.read_text(encoding='utf-8'))\n"
+        "Path(cfg['output']['output_dir']).mkdir(parents=True, exist_ok=True)\n"
+        "print('first batch ok')\n",
+        encoding="utf-8",
+    )
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["validation"]["runtime_smoke"] = {
+        "enabled": True,
+        "train_samples": 2,
+        "timeout_seconds": 20,
+        "gpu_ids": [],
+        "mechanism_activation": {
+            "enabled": True,
+            "hard_gate": True,
+            "forward_probe": {"enabled": True, "hard_gate": True, "timeout_seconds": 20},
+        },
+    }
+    config["code_patch"]["validation"]["max_repair_attempts"] = 1
+    paths = init_workspace(config, "topic", project_id="proj_patch_activation_forward_probe_repair", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+
+    class ForwardProbeRepairBackend:
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del edit_policy
+            self.calls.append(implementation_contract)
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "class Projector:\n"
+                "    def forward(self, rosetta_config=None):\n"
+                "        rosetta_config = rosetta_config or {}\n"
+                "        if rosetta_config.get('disable_mechanism'):\n"
+                "            return 'disabled'\n"
+                "        return 'enabled'\n",
+                encoding="utf-8",
+            )
+            if len(self.calls) == 1:
+                return {"status": "ok", "rationale": "Initial patch wires config but leaves the probe unchanged."}
+            feedback = implementation_contract["validation_failure_feedback"]
+            failed = feedback["failed_checks"][0]
+            assert failed["name"] == "runtime_smoke:mechanism_activation_forward_probe"
+            assert failed["failure_category"] == "mechanism_activation_forward_probe_failed"
+            assert "forward-level causal activation" in feedback["instruction"]
+            assert any("Forward activation probe is mandatory" in requirement for requirement in implementation_contract["s2_5_requirements"])
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "FORWARD_PROBE_ACTIVE_PATH = True\n"
+                "class Projector:\n"
+                "    def forward(self, rosetta_config=None):\n"
+                "        rosetta_config = rosetta_config or {}\n"
+                "        if rosetta_config.get('disable_mechanism'):\n"
+                "            return 'disabled'\n"
+                "        return 'enabled_with_probe_effect'\n",
+                encoding="utf-8",
+            )
+            return {"status": "ok", "rationale": "Repaired forward path so enabled/disabled probe observes a tensor change."}
+
+    ideas = [
+        {
+            "id": "forward_probe_repair",
+            "title": "Forward Probe Repair",
+            "hypothesis": "h",
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"eval": {"model": {"rosetta_config": {"mechanism_enabled": True}}}},
+            },
+        }
+    ]
+    backend = ForwardProbeRepairBackend()
+    CodePatchAgent(paths.root, config, artifacts, backend=backend).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+
+    assert ideas[0]["code_patch"]["status"] == "ok"
+    assert len(backend.calls) == 2
+    forward_checks = [check for check in validation["checks"] if check["name"] == "runtime_smoke:mechanism_activation_forward_probe"]
+    assert forward_checks[-1]["status"] == "ok"
+    assert forward_checks[-1]["probe_source"] == "repo"
+    assert forward_checks[-1]["probe"]["mechanism_observed"] is True
+    assert forward_checks[-1]["probe"]["changed_fields"] == ["projector_output_checksum"]
+    assert "script/auto_research/activation_forward_probe.py" not in ideas[0]["code_patch"]["changed_files"]
+    assert any(action["action"] == "retry_codex_after_validation_failure" for action in validation["recovery_actions"])
+
+
+def test_code_patch_repair_packet_includes_forward_probe_tensor_diagnostics(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "script/auto_research").mkdir(parents=True, exist_ok=True)
+    (repo / "script/auto_research/activation_forward_probe.py").write_text(
+        "import argparse, json\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--enabled-config')\n"
+        "parser.add_argument('--disabled-config')\n"
+        "parser.add_argument('--switch')\n"
+        "parser.add_argument('--output')\n"
+        "args = parser.parse_args()\n"
+        "payload = {\n"
+        "    'probe_type': 'repo_small_batch_forward',\n"
+        "    'mechanism_observed': False,\n"
+        "    'changed_fields': [],\n"
+        "    'unchanged_fields': ['projector_output.key', 'wrapper_cache.layer0.key'],\n"
+        "    'compared_fields': ['projector_output.key', 'wrapper_cache.layer0.key'],\n"
+        "    'projector_called': True,\n"
+        "    'switch_seen_by_forward': False,\n"
+        "    'cache_key_diff': 0.0,\n"
+        "    'cache_value_diff': 0.0,\n"
+        "    'enabled': {'switch_value': None, 'rosetta_hash': 'enabled_hash'},\n"
+        "    'disabled': {'switch_value': True, 'rosetta_hash': 'disabled_hash'},\n"
+        "    'wrapper_probe': {'status': 'ok', 'projector_called': True, 'switch_seen_by_forward': False, 'cache_key_diff': 0.0, 'cache_value_diff': 0.0, 'failures': ['enabled_disabled_wrapper_cache_identical']},\n"
+        "    'tensor_checks': [\n"
+        "        {'name': 'projector_output.key', 'changed': False, 'max_abs_diff': 0.0, 'mean_abs_diff': 0.0, 'enabled_sha256': 'aaa', 'disabled_sha256': 'aaa', 'shape': [1, 2, 4, 4]},\n"
+        "        {'name': 'wrapper_cache.layer0.key', 'changed': False, 'max_abs_diff': 0.0, 'mean_abs_diff': 0.0, 'enabled_sha256': 'bbb', 'disabled_sha256': 'bbb', 'shape': [1, 2, 4, 4]}\n"
+        "    ],\n"
+        "    'failures': ['enabled_disabled_wrapper_cache_identical']\n"
+        "}\n"
+        "open(args.output, 'w', encoding='utf-8').write(json.dumps(payload))\n",
+        encoding="utf-8",
+    )
+    (repo / "script/train/SFT_train.py").write_text(
+        "from pathlib import Path\n"
+        "import json, sys\n"
+        "config_path = Path(sys.argv[sys.argv.index('--config') + 1])\n"
+        "cfg = json.loads(config_path.read_text(encoding='utf-8'))\n"
+        "Path(cfg['output']['output_dir']).mkdir(parents=True, exist_ok=True)\n"
+        "print('first batch ok')\n",
+        encoding="utf-8",
+    )
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["validation"]["runtime_smoke"] = {
+        "enabled": True,
+        "train_samples": 2,
+        "timeout_seconds": 20,
+        "gpu_ids": [],
+        "mechanism_activation": {
+            "enabled": True,
+            "hard_gate": True,
+            "forward_probe": {"enabled": True, "hard_gate": True, "timeout_seconds": 20},
+        },
+    }
+    config["code_patch"]["validation"]["max_repair_attempts"] = 1
+    paths = init_workspace(config, "topic", project_id="proj_patch_forward_probe_tensor_packet", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+
+    class InspectForwardProbePacketBackend:
+        def __init__(self):
+            self.calls = []
+
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del edit_policy
+            self.calls.append(implementation_contract)
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "class Projector:\n"
+                "    def forward(self, rosetta_config=None):\n"
+                "        rosetta_config = rosetta_config or {}\n"
+                "        if rosetta_config.get('disable_mechanism'):\n"
+                "            return 'disabled_noop'\n"
+                "        return 'enabled_noop'\n",
+                encoding="utf-8",
+            )
+            if len(self.calls) == 1:
+                return {"status": "ok", "rationale": "Initial no-op patch."}
+
+            packet = implementation_contract["codex_repair_packet"]
+            diagnostics = packet["activation_forward_probe_diagnostics"]
+            assert diagnostics["probe_environment"]["probe_python"]
+            assert "torch_available" in diagnostics["probe_environment"]
+            assert "repo_import_ok" in diagnostics["probe_environment"]
+            assert diagnostics["projector_called"] is True
+            assert diagnostics["switch_seen_by_forward"] is False
+            assert diagnostics["projector_output_identical"] is True
+            assert diagnostics["wrapper_cache_identical"] is True
+            assert diagnostics["identical_tensors"][0]["name"] == "projector_output.key"
+            assert diagnostics["identical_tensors"][0]["enabled_sha256"] == "aaa"
+            assert diagnostics["identical_tensors"][1]["disabled_sha256"] == "bbb"
+            assert "forward_branch_missing_switch_or_rosetta_config_read" in diagnostics["repair_focus"]
+            assert "constructor_params_or_projector_forward_branch_noop" in diagnostics["repair_focus"]
+            assert "wrapper_cache_key_value_identical_enabled_disabled" in diagnostics["repair_focus"]
+            feedback = implementation_contract["validation_failure_feedback"]
+            failed = feedback["failed_checks"][0]
+            assert failed["forward_probe_diagnostics"]["identical_tensors"][0]["enabled_sha256"] == "aaa"
+            assert "activation_forward_probe_diagnostics" in feedback["instruction"]
+            return {"status": "codex_failed", "reason": "stop after inspecting repair packet"}
+
+    ideas = [
+        {
+            "id": "forward_probe_tensor_packet",
+            "title": "Forward Probe Tensor Packet",
+            "hypothesis": "h",
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"eval": {"model": {"rosetta_config": {"mechanism_enabled": True}}}},
+            },
+        }
+    ]
+    backend = InspectForwardProbePacketBackend()
+    CodePatchAgent(paths.root, config, artifacts, backend=backend).run({"candidate_ideas": ideas}, ideas)
+
+    assert len(backend.calls) == 2
+
+
+def test_builtin_c2c_activation_forward_probe_detects_missing_forward_switch(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    enabled = repo / "enabled.yaml"
+    disabled = repo / "disabled.yaml"
+    enabled.write_text(
+        yaml.safe_dump({"model": {"rosetta_config": {"mechanism_enabled": True}}}),
+        encoding="utf-8",
+    )
+    disabled.write_text(
+        yaml.safe_dump({"model": {"rosetta_config": {"mechanism_enabled": True, "disable_mechanism": True}}}),
+        encoding="utf-8",
+    )
+    output = repo / "probe.json"
+    probe = Path("src/auto_research/probes/c2c_activation_forward_probe.py").resolve()
+
+    failed = subprocess.run(
+        [
+            sys.executable,
+            str(probe),
+            "--enabled-config",
+            "enabled.yaml",
+            "--disabled-config",
+            "disabled.yaml",
+            "--switch",
+            "disable_mechanism",
+            "--output",
+            str(output),
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert failed.returncode == 1
+    assert payload["mechanism_observed"] is False
+    assert "runtime_forward_missing_switch_ref" in payload["failures"]
+
+    (repo / "rosetta/model/projector.py").write_text(
+        "class Projector:\n"
+        "    def forward(self, rosetta_config=None):\n"
+        "        rosetta_config = rosetta_config or {}\n"
+        "        if rosetta_config.get('disable_mechanism'):\n"
+        "            return 'disabled'\n"
+        "        return 'enabled'\n",
+        encoding="utf-8",
+    )
+    passed = subprocess.run(
+        [
+            sys.executable,
+            str(probe),
+            "--enabled-config",
+            "enabled.yaml",
+            "--disabled-config",
+            "disabled.yaml",
+            "--switch",
+            "disable_mechanism",
+            "--output",
+            str(output),
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert passed.returncode == 1
+    assert payload["mechanism_observed"] is False
+    assert payload["probe_type"] == "repo_small_batch_forward_failed_static_trace"
+    assert payload["trace"]["forward_refs"] == ["rosetta/model/projector.py"]
+
+
+def test_builtin_c2c_activation_forward_probe_runs_repo_small_batch_forward(tmp_path: Path) -> None:
+    if not _torch_available() or not _transformers_available():
+        pytest.skip("torch and transformers are required for repo small-batch forward probe")
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "rosetta/__init__.py").write_text("", encoding="utf-8")
+    (repo / "rosetta/model/__init__.py").write_text("", encoding="utf-8")
+    (repo / "rosetta/model/projector.py").write_text(
+        "import torch\n"
+        "class TinyProbeProjector(torch.nn.Module):\n"
+        "    def __init__(self, source_dim, target_dim, disable_mechanism=False, **kwargs):\n"
+        "        super().__init__()\n"
+        "        self.disable_mechanism = disable_mechanism\n"
+        "        self.scale = torch.nn.Parameter(torch.tensor(1.0))\n"
+        "    def forward(self, source_kv, target_kv):\n"
+        "        source_key, source_value = source_kv\n"
+        "        target_key, target_value = target_kv\n"
+        "        factor = 0.0 if self.disable_mechanism else self.scale\n"
+        "        return target_key + factor * source_key, target_value + factor * source_value\n"
+        "def create_projector(projector_type, **kwargs):\n"
+        "    return TinyProbeProjector(**kwargs)\n",
+        encoding="utf-8",
+    )
+    (repo / "rosetta/model/wrapper.py").write_text(
+        "import torch\n"
+        "class RosettaModel(torch.nn.Module):\n"
+        "    def __init__(self, model_list, base_model_idx=0, projector_list=None, **kwargs):\n"
+        "        super().__init__()\n"
+        "        self.model_list = torch.nn.ModuleList(model_list)\n"
+        "        self.base_model_idx = base_model_idx\n"
+        "        self.projector_list = torch.nn.ModuleList(projector_list or [])\n"
+        "        self.projector_dict = {}\n"
+        "    def set_projector_config(self, source_model_idx, source_model_layer_idx, target_model_idx, target_model_layer_idx, projector_idx):\n"
+        "        self.projector_dict[(source_model_idx, source_model_layer_idx, target_model_idx, target_model_layer_idx)] = projector_idx\n"
+        "    def forward(self, input_ids=None, **kwargs):\n"
+        "        del kwargs\n"
+        "        base = self.model_list[0](input_ids=input_ids[:, :1], use_cache=True).past_key_values\n"
+        "        source = self.model_list[1](input_ids=input_ids[:, :1], use_cache=True).past_key_values\n"
+        "        projector = self.projector_list[0]\n"
+        "        key, value = projector((source.key_cache[0], source.value_cache[0]), (base.key_cache[0], base.value_cache[0]))\n"
+        "        base.key_cache[0] = key\n"
+        "        base.value_cache[0] = value\n"
+        "        return type('Output', (), {'past_key_values': base})()\n",
+        encoding="utf-8",
+    )
+    enabled = repo / "enabled.yaml"
+    disabled = repo / "disabled.yaml"
+    enabled.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "rosetta_config": {
+                        "mechanism_enabled": True,
+                        "projector": {"type": "TinyProbeProjector", "params": {}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    disabled.write_text(
+        yaml.safe_dump(
+            {
+                "model": {
+                    "rosetta_config": {
+                        "mechanism_enabled": True,
+                        "disable_mechanism": True,
+                        "projector": {"type": "TinyProbeProjector", "params": {}},
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    output = repo / "probe.json"
+    probe = Path("src/auto_research/probes/c2c_activation_forward_probe.py").resolve()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(probe),
+            "--enabled-config",
+            "enabled.yaml",
+            "--disabled-config",
+            "disabled.yaml",
+            "--switch",
+            "disable_mechanism",
+            "--output",
+            str(output),
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert result.returncode == 0
+    assert payload["probe_type"] == "repo_small_batch_forward"
+    assert payload["mechanism_observed"] is True
+    assert "projector_output.key" in payload["changed_fields"]
+    assert "wrapper_cache.layer0.key" in payload["changed_fields"]
+    assert payload["tensor_checks"][0]["max_abs_diff"] > 0
+    assert payload["wrapper_probe"]["status"] == "ok"
+    assert payload["wrapper_probe"]["projector_called"] is True
+    assert payload["cache_key_diff"] > 0
+    assert payload["cache_value_diff"] > 0
+    assert payload["static_trace"]["mechanism_observed"] is False
+
+
+def test_builtin_c2c_activation_forward_probe_fails_when_small_batch_forward_identical(tmp_path: Path) -> None:
+    if not _torch_available():
+        pytest.skip("torch is required for repo small-batch forward probe")
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "rosetta/__init__.py").write_text("", encoding="utf-8")
+    (repo / "rosetta/model/__init__.py").write_text("", encoding="utf-8")
+    (repo / "rosetta/model/projector.py").write_text(
+        "import torch\n"
+        "class TinyProbeProjector(torch.nn.Module):\n"
+        "    def __init__(self, source_dim, target_dim, disable_mechanism=False, **kwargs):\n"
+        "        super().__init__()\n"
+        "    def forward(self, source_kv, target_kv):\n"
+        "        return target_kv\n"
+        "def create_projector(projector_type, **kwargs):\n"
+        "    return TinyProbeProjector(**kwargs)\n",
+        encoding="utf-8",
+    )
+    enabled = repo / "enabled.yaml"
+    disabled = repo / "disabled.yaml"
+    enabled.write_text(
+        yaml.safe_dump({"model": {"rosetta_config": {"projector": {"type": "TinyProbeProjector", "params": {}}}}}),
+        encoding="utf-8",
+    )
+    disabled.write_text(
+        yaml.safe_dump({"model": {"rosetta_config": {"disable_mechanism": True, "projector": {"type": "TinyProbeProjector", "params": {}}}}}),
+        encoding="utf-8",
+    )
+    output = repo / "probe.json"
+    probe = Path("src/auto_research/probes/c2c_activation_forward_probe.py").resolve()
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(probe),
+            "--enabled-config",
+            "enabled.yaml",
+            "--disabled-config",
+            "disabled.yaml",
+            "--switch",
+            "disable_mechanism",
+            "--output",
+            str(output),
+        ],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    payload = json.loads(output.read_text(encoding="utf-8"))
+
+    assert result.returncode == 1
+    assert payload["probe_type"] == "repo_small_batch_forward"
+    assert payload["mechanism_observed"] is False
+    assert "enabled_disabled_forward_tensors_identical" in payload["failures"]
+    assert payload["unchanged_fields"] == ["projector_output.key", "projector_output.value"]
+
+
+def test_forward_probe_normalization_trusts_explicit_wrapper_noop() -> None:
+    evidence = _normalize_activation_forward_probe_payload(
+        {
+            "mechanism_observed": False,
+            "changed_fields": ["projector_output.key"],
+            "compared_fields": ["projector_output.key", "wrapper_cache.layer0.key"],
+            "wrapper_probe": {
+                "status": "ok",
+                "projector_called": True,
+                "cache_key_diff": 0.0,
+                "cache_value_diff": 0.0,
+            },
+        },
+        min_changed_fields=1,
+    )
+
+    assert evidence["mechanism_observed"] is False
+    assert evidence["status"] == "unchanged"
+    assert "enabled_disabled_forward_outputs_identical" in evidence["failures"]
+    assert evidence["wrapper_probe"]["cache_key_diff"] == 0.0
 
 
 def test_code_patch_validation_preserves_pytest_failure_context(tmp_path: Path) -> None:
@@ -1433,7 +2858,7 @@ def test_code_patch_agent_marks_py_compile_failure_as_validation_failed(tmp_path
     assert any(check["returncode"] != 0 for check in validation["checks"])
 
 
-def test_code_patch_agent_blocks_unactivated_new_config_parameter(tmp_path: Path) -> None:
+def test_code_patch_agent_blocks_unactivated_new_config_parameter_by_default(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     (repo / "rosetta/model/projector.py").write_text(
         "class C2CProjector:\n"
@@ -1442,7 +2867,7 @@ def test_code_patch_agent_blocks_unactivated_new_config_parameter(tmp_path: Path
         encoding="utf-8",
     )
     config = _code_patch_test_config(tmp_path / "workspace", repo)
-    paths = init_workspace(config, "topic", project_id="proj_patch_activation", simulate=False)
+    paths = init_workspace(config, "topic", project_id="proj_patch_activation_default_block", simulate=False)
     artifacts = ArtifactManager(paths.root)
 
     class NewParamBackend:
@@ -1468,6 +2893,89 @@ def test_code_patch_agent_blocks_unactivated_new_config_parameter(tmp_path: Path
     assert manifest["status"] == "no_valid_patch"
     assert ideas[0]["code_patch"]["status"] == "config_activation_missing"
     assert ideas[0]["code_patch"]["has_executable_change"] is False
+    assert validation["activation_check"]["blocking"] is True
+    assert validation["activation_check"]["missing_parameters"] == ["alignment_confidence_head_group_count"]
+    assert validation["activation_check"]["blocking_missing_parameters"] == ["alignment_confidence_head_group_count"]
+
+
+def test_code_patch_agent_can_track_unactivated_config_parameter_as_soft_debt(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "rosetta/model/projector.py").write_text(
+        "class C2CProjector:\n"
+        "    def __init__(self, hidden_dim: int = 4):\n"
+        "        self.hidden_dim = hidden_dim\n",
+        encoding="utf-8",
+    )
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["validation"]["require_config_activation"] = "soft"
+    paths = init_workspace(config, "topic", project_id="proj_patch_activation_soft_debt", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+
+    class NewParamBackend:
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "class C2CProjector:\n"
+                "    def __init__(\n"
+                "        self,\n"
+                "        hidden_dim: int = 4,\n"
+                "        alignment_confidence_head_group_count: int = 2,\n"
+                "    ):\n"
+                "        self.hidden_dim = hidden_dim\n"
+                "        self.alignment_confidence_head_group_count = alignment_confidence_head_group_count\n",
+                encoding="utf-8",
+            )
+            return {"status": "ok", "rationale": "Added a configurable head group count."}
+
+    ideas = [{"id": "unactivated_param_soft", "title": "Unactivated Param Soft", "hypothesis": "h"}]
+    manifest = CodePatchAgent(paths.root, config, artifacts, backend=NewParamBackend()).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+
+    assert manifest["status"] == "ok"
+    assert ideas[0]["code_patch"]["status"] == "ok"
+    assert ideas[0]["code_patch"]["has_executable_change"] is True
+    assert validation["activation_check"]["missing_parameters"] == ["alignment_confidence_head_group_count"]
+    assert validation["activation_check"]["soft_issues"] == ["unactivated_config_parameter"]
+    assert any(item["label"] == "unactivated_config_parameter" for item in ideas[0]["code_patch"]["quality_debt"])
+
+
+def test_code_patch_agent_blocks_unactivated_new_config_parameter_in_strict_mode(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "rosetta/model/projector.py").write_text(
+        "class C2CProjector:\n"
+        "    def __init__(self, hidden_dim: int = 4):\n"
+        "        self.hidden_dim = hidden_dim\n",
+        encoding="utf-8",
+    )
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["validation"]["gate_mode"] = "strict"
+    paths = init_workspace(config, "topic", project_id="proj_patch_activation_strict", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+
+    class NewParamBackend:
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "class C2CProjector:\n"
+                "    def __init__(\n"
+                "        self,\n"
+                "        hidden_dim: int = 4,\n"
+                "        alignment_confidence_head_group_count: int = 2,\n"
+                "    ):\n"
+                "        self.hidden_dim = hidden_dim\n"
+                "        self.alignment_confidence_head_group_count = alignment_confidence_head_group_count\n",
+                encoding="utf-8",
+            )
+            return {"status": "ok", "rationale": "Added a configurable head group count."}
+
+    ideas = [{"id": "unactivated_param_strict", "title": "Unactivated Param Strict", "hypothesis": "h"}]
+    manifest = CodePatchAgent(paths.root, config, artifacts, backend=NewParamBackend()).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+
+    assert manifest["status"] == "no_valid_patch"
+    assert ideas[0]["code_patch"]["status"] == "config_activation_missing"
+    assert ideas[0]["code_patch"]["has_executable_change"] is False
+    assert validation["activation_check"]["blocking"] is True
     assert validation["activation_check"]["missing_parameters"] == ["alignment_confidence_head_group_count"]
 
 
@@ -1506,6 +3014,7 @@ def test_code_patch_agent_repairs_unactivated_new_config_parameter(tmp_path: Pat
             feedback = implementation_contract["validation_failure_feedback"]
             assert feedback["activation_check"]["status"] == "config_activation_missing"
             assert feedback["activation_check"]["missing_parameters"] == ["alignment_confidence_head_group_count"]
+            assert any("Config activation is mandatory" in requirement for requirement in implementation_contract["s2_5_requirements"])
             (temp_repo / "rosetta/model/projector.py").write_text(
                 "class C2CProjector:\n"
                 "    def __init__(self, hidden_dim: int = 4):\n"
@@ -1513,7 +3022,7 @@ def test_code_patch_agent_repairs_unactivated_new_config_parameter(tmp_path: Pat
                 "        self.alignment_confidence_head_group_count = 2\n",
                 encoding="utf-8",
             )
-            return {"status": "ok", "rationale": "Repaired by keeping the value internal for the MVP."}
+            return {"status": "ok", "rationale": "Repaired by keeping the value internal for the current implementation."}
 
     backend = RepairingParamBackend()
     ideas = [{"id": "activation_repair", "title": "Activation Repair", "hypothesis": "h"}]
@@ -1705,6 +3214,17 @@ def test_code_patch_agent_includes_proxy_effect_repair_contract(tmp_path: Path) 
         "dragging_datasets": [{"dataset": "mmlu-redux", "delta": -0.2, "regression": 0.2}],
         "patch_risk_labels": ["test_change"],
         "repair_priorities": ["Target dragging proxy datasets: mmlu-redux"],
+        "activation_smoke": {
+            "status": "failed",
+            "reason": "ablation switch produced no observable proxy eval metric or prediction change",
+            "switch": "disable_mechanism",
+            "datasets": ["mmlu-redux"],
+            "eval_configs": {"mmlu-redux": "local/auto_research_runs/proxy_retry/proxy/activation_smoke_disabled/eval_mmlu-redux.yaml"},
+            "enabled_metrics": {"mean": 50.5, "datasets": {"mmlu-redux": 50.5}},
+            "disabled_metrics": {"mean": 50.5, "datasets": {"mmlu-redux": 50.5}},
+            "metric_comparison": {"enabled_minus_disabled_mean": 0.0},
+            "prediction_comparison": {"prediction_diff_rate": 0.0, "answer_diff_rate": 0.0},
+        },
     }
     (results_dir / "main_results.json").write_text(
         json.dumps(
@@ -1751,6 +3271,9 @@ def test_code_patch_agent_includes_proxy_effect_repair_contract(tmp_path: Path) 
     assert any("effect-first cheap-proxy repair" in requirement for requirement in requirements)
     assert any("mmlu-redux" in requirement for requirement in requirements)
     assert any("paperization-only" in requirement for requirement in requirements)
+    assert any("Activation smoke failed" in requirement and "disable_mechanism" in requirement for requirement in requirements)
+    assert any("prediction_comparison" in requirement for requirement in requirements)
+    assert any("activation_smoke_disabled/eval_mmlu-redux.yaml" in requirement for requirement in requirements)
 
 
 def test_code_patch_agent_marks_codex_429_as_retryable(tmp_path: Path) -> None:
@@ -1778,12 +3301,11 @@ def test_code_patch_agent_marks_codex_429_as_retryable(tmp_path: Path) -> None:
                 "baselines": [{"name": "base"}, {"name": "candidate"}],
                 "datasets": [{"name": "mmlu-redux"}],
                 "task_graph": {},
-                "resource_budget": {"peak_concurrent_gpus": 1},
+                "resource_budget": {},
                 "execution": {
                     "collector": "c2c_small_loop",
                     "min_delta_to_pass": 0.1,
                     "max_dataset_regression": 2.0,
-                    "selected_gpu_ids": [0],
                 },
                 "acceptance_criteria": {
                     "minimum_mean_delta": 0.1,
@@ -1811,47 +3333,123 @@ def test_code_patch_agent_marks_codex_429_as_retryable(tmp_path: Path) -> None:
     assert patch_status["status"] == "NEEDS_RETRY"
 
 
-def test_code_patch_agent_retries_noop_sandbox_error_with_fallback_sandbox(tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _code_patch_test_config(tmp_path / "workspace", repo)
-    config["code_patch"]["codex_sandbox"] = "workspace-write"
-    config["code_patch"]["codex_sandbox_fallback"] = "danger-full-access"
-    paths = init_workspace(config, "topic", project_id="proj_patch_sandbox_retry", simulate=False)
-    artifacts = ArtifactManager(paths.root)
+def test_codex_retryable_detection_ignores_plain_quota_text() -> None:
+    assert _codex_retryable_error_text("429 Too Many Requests") is True
+    assert _codex_retryable_error_text("ERROR: insufficient_quota") is True
+    assert _codex_retryable_error_text("Which sample type is called a quota sample?") is False
+    assert _codex_retryable_error_text("apply_patch verification failed near quota sample text") is False
 
-    class SandboxBackend(CodexPatchBackend):
-        def __init__(self):
-            self.calls = []
 
-        def generate(self, implementation_contract, temp_repo, edit_policy):
-            del implementation_contract, temp_repo, edit_policy
-            self.calls.append("primary")
-            return {
-                "status": "ok",
-                "sandbox": "workspace-write",
-                "rationale": "Blocked by the execution sandbox: bwrap: Can't bind mount /oldroot/ on /newroot/: No such device",
+def test_runtime_smoke_gpu_attempts_auto_selects_most_free_gpu(monkeypatch) -> None:
+    snapshot = [
+        {"index": 0, "memory_total_mb": 24576, "memory_free_mb": 1024, "memory_used_mb": 23552, "utilization_gpu": 95},
+        {"index": 1, "memory_total_mb": 24576, "memory_free_mb": 16000, "memory_used_mb": 8576, "utilization_gpu": 5},
+        {"index": 2, "memory_total_mb": 24576, "memory_free_mb": 12000, "memory_used_mb": 12576, "utilization_gpu": 0},
+    ]
+    monkeypatch.setattr("auto_research.adapters.runner.ExperimentRunner._gpu_snapshot", staticmethod(lambda: snapshot))
+
+    attempts = _runtime_smoke_gpu_attempts(
+        {"experiment": {"gpu_policy": {"max_gpus": 6}}},
+        {"gpu_ids": "auto", "min_free_mb": 8192, "resource_wait": {"enabled": False}},
+    )
+
+    assert attempts[0]["selected_gpu_ids"] == [1]
+    assert attempts[0]["memory_free_mb"] == 16000
+    assert attempts[0]["reason"] == "runtime_smoke_auto_selected_by_free_memory"
+
+
+def test_c2c_runtime_smoke_ignores_legacy_fixed_gpu_by_default() -> None:
+    config = {
+        "c2c": {"enabled": True},
+        "code_patch": {
+            "validation": {
+                "runtime_smoke": {
+                    "gpu_ids": [0],
+                    "min_free_mb": 8192,
+                }
             }
+        },
+    }
 
-        def _run_codex_once(self, implementation_contract, temp_repo, edit_policy, *, sandbox):
-            del implementation_contract, edit_policy
-            self.calls.append(sandbox)
-            assert sandbox == "danger-full-access"
-            (temp_repo / "rosetta/model/aligner.py").write_text("VALUE = 'fallback patched'\n", encoding="utf-8")
-            return {"status": "ok", "sandbox": sandbox, "rationale": "Fallback sandbox patch succeeded."}
+    smoke_cfg = _code_patch_config(config)["validation"]["runtime_smoke"]
 
-    backend = SandboxBackend()
-    ideas = [{"id": "sandbox_retry", "title": "Sandbox Retry", "hypothesis": "h"}]
-    manifest = CodePatchAgent(paths.root, config, artifacts, backend=backend).run({"candidate_ideas": ideas}, ideas)
-    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
-    patch = json.loads((paths.root / ideas[0]["code_patch"]["patch_json"]).read_text(encoding="utf-8"))
+    assert smoke_cfg["gpu_ids"] == "auto"
+    assert smoke_cfg["gpu_selection_policy"] == "auto_free_memory"
+    assert smoke_cfg["legacy_configured_gpu_ids"] == [0]
 
-    assert manifest["status"] == "ok"
-    assert ideas[0]["code_patch"]["status"] == "ok"
-    assert backend.calls == ["primary", "danger-full-access"]
-    assert validation["recovery_actions"][0]["action"] == "retry_codex_noop_with_fallback_sandbox"
-    assert patch["backend_sandbox"] == "danger-full-access"
-    assert patch["recovery_actions"][0]["fallback_sandbox"] == "danger-full-access"
-    assert "fallback patched" not in (repo / "rosetta/model/aligner.py").read_text(encoding="utf-8")
+
+def test_c2c_runtime_smoke_can_respect_explicit_fixed_gpu_opt_in() -> None:
+    config = {
+        "c2c": {"enabled": True},
+        "code_patch": {
+            "validation": {
+                "runtime_smoke": {
+                    "gpu_ids": [0],
+                    "respect_configured_gpu_ids": True,
+                }
+            }
+        },
+    }
+
+    smoke_cfg = _code_patch_config(config)["validation"]["runtime_smoke"]
+
+    assert smoke_cfg["gpu_ids"] == [0]
+    assert "legacy_configured_gpu_ids" not in smoke_cfg
+
+
+def test_runtime_smoke_gpu_attempts_resource_unavailable_waits_then_pauses(monkeypatch) -> None:
+    snapshot = [
+        {"index": 0, "memory_total_mb": 24576, "memory_free_mb": 1024, "memory_used_mb": 23552, "utilization_gpu": 95},
+        {"index": 1, "memory_total_mb": 24576, "memory_free_mb": 4096, "memory_used_mb": 20480, "utilization_gpu": 5},
+    ]
+    monkeypatch.setattr("auto_research.adapters.runner.ExperimentRunner._gpu_snapshot", staticmethod(lambda: snapshot))
+
+    attempts = _runtime_smoke_gpu_attempts(
+        {"experiment": {"gpu_policy": {"max_gpus": 6}}},
+        {"gpu_ids": "auto", "min_free_mb": 8192, "resource_wait": {"enabled": True, "timeout_seconds": 0, "poll_seconds": 1}},
+    )
+
+    assert attempts[0]["resource_unavailable"] is True
+    assert attempts[0]["reason"] == "runtime_smoke_resource_wait_timeout"
+    assert attempts[0]["selected_gpu_ids"] == [1]
+    assert attempts[0]["resource_wait"]["status"] == "timeout"
+
+
+def test_runtime_smoke_oom_retry_switches_to_untried_free_gpu(monkeypatch) -> None:
+    snapshot = [
+        {"index": 0, "memory_total_mb": 24576, "memory_free_mb": 16000, "memory_used_mb": 8576, "utilization_gpu": 0},
+        {"index": 1, "memory_total_mb": 24576, "memory_free_mb": 15000, "memory_used_mb": 9576, "utilization_gpu": 0},
+    ]
+    monkeypatch.setattr("auto_research.adapters.runner.ExperimentRunner._gpu_snapshot", staticmethod(lambda: snapshot))
+
+    retry = _runtime_smoke_oom_retry_attempt(
+        {"experiment": {"gpu_policy": {"max_gpus": 6}}},
+        {"gpu_ids": "auto", "min_free_mb": 8192, "resource_wait": {"enabled": False}},
+        tried_gpu_ids={0},
+    )
+
+    assert retry is not None
+    assert retry["selected_gpu_ids"] == [1]
+    assert retry["reason"] == "runtime_smoke_oom_retry_auto_selected_by_free_memory"
+
+
+def test_patch_failure_retryable_treats_runtime_smoke_resource_retry_as_retryable() -> None:
+    entry = {
+        "status": "validation_failed",
+        "validation": {
+            "status": "validation_failed",
+            "checks": [
+                {
+                    "name": "runtime_smoke:first_batch_train",
+                    "returncode": 75,
+                    "failure_category": "runtime_smoke_resource_retry",
+                    "resource_retry": True,
+                }
+            ],
+        },
+    }
+
+    assert _patch_failure_retryable(entry) is True
 
 
 def test_code_patch_agent_repairs_blocked_no_executable_change(tmp_path: Path) -> None:
@@ -1872,6 +3470,10 @@ def test_code_patch_agent_repairs_blocked_no_executable_change(tmp_path: Path) -
             feedback = implementation_contract["contract_failure_feedback"]
             assert feedback["status"] == "blocked_no_executable_change"
             assert "no allowed file changes" in feedback["reason"]
+            assert implementation_contract["s2_5_repair_session_policy"]["same_resume_session_required"] is True
+            repair_packet = implementation_contract["codex_repair_packet"]
+            assert repair_packet["repair_kind"] == "contract_failure"
+            assert repair_packet["failed_status"] == "blocked_no_executable_change"
             (temp_repo / "rosetta/model/aligner.py").write_text("VALUE = 'contract repaired'\n", encoding="utf-8")
             return {"status": "ok", "rationale": "Repaired by editing an allowed integration point."}
 
@@ -1883,24 +3485,28 @@ def test_code_patch_agent_repairs_blocked_no_executable_change(tmp_path: Path) -
 
     assert manifest["status"] == "ok"
     assert manifest["valid_patch_count"] == 1
+    assert manifest["selected_candidate_id"] == "noop_contract_repair"
+    assert manifest["selected_patch"]["candidate_id"] == "noop_contract_repair"
     assert ideas[0]["code_patch"]["status"] == "ok"
     assert len(backend.calls) == 2
+    assert "codex_repair_packet" in backend.calls[1]
     assert validation["status"] == "ok"
     assert patch["recovery_actions"][0]["action"] == "retry_codex_after_contract_failure"
     assert patch["recovery_actions"][0]["failed_status"] == "blocked_no_executable_change"
+    assert patch["recovery_actions"][0]["repair_packet_summary"]["repair_kind"] == "contract_failure"
 
 
-def test_code_patch_agent_uses_second_variant_after_first_validation_failure(tmp_path: Path) -> None:
+def test_code_patch_agent_repairs_selected_variant_after_validation_failure(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _code_patch_test_config(tmp_path / "workspace", repo)
     config["code_patch"]["variants_per_candidate"] = 2
-    config["code_patch"]["validation"]["max_repair_attempts"] = 0
+    config["code_patch"]["validation"]["max_repair_attempts"] = 1
     config["code_patch"]["validation"]["max_contract_repair_attempts"] = 0
-    paths = init_workspace(config, "topic", project_id="proj_best_of_n", simulate=False)
+    paths = init_workspace(config, "topic", project_id="proj_single_variant_repair", simulate=False)
     artifacts = ArtifactManager(paths.root)
-    ideas = [{"id": "best_of_n", "title": "Best Of N", "hypothesis": "h"}]
+    ideas = [{"id": "single_variant_repair", "title": "Single Variant Repair", "hypothesis": "h"}]
 
-    class VariantBackend:
+    class RepairBackend:
         def __init__(self):
             self.contracts = []
 
@@ -1909,40 +3515,47 @@ def test_code_patch_agent_uses_second_variant_after_first_validation_failure(tmp
             self.contracts.append(implementation_contract)
             if len(self.contracts) == 1:
                 (temp_repo / "rosetta/model/aligner.py").write_text("def broken(:\n", encoding="utf-8")
-                return {"status": "ok", "rationale": "broken first variant"}
-            (temp_repo / "rosetta/model/aligner.py").write_text("VALUE = 'second variant'\n", encoding="utf-8")
-            return {"status": "ok", "rationale": "valid second variant"}
+                return {"status": "ok", "rationale": "broken initial implementation"}
+            assert "validation_failure_feedback" in implementation_contract
+            assert "patch_variant" not in implementation_contract
+            (temp_repo / "rosetta/model/aligner.py").write_text("VALUE = 'validation repaired'\n", encoding="utf-8")
+            return {"status": "ok", "rationale": "valid repair for the same selected variant"}
 
-    backend = VariantBackend()
+    backend = RepairBackend()
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=backend).run({"candidate_ideas": ideas}, ideas)
 
     assert manifest["status"] == "ok"
+    assert manifest["selection_policy"]["mode"] == "single_s2_selected_variant"
+    assert manifest["selection_policy"]["ignored_legacy_config"]["variants_per_candidate"] == 2
     assert len(backend.contracts) == 2
+    assert manifest["selected_candidate_id"] == "single_variant_repair"
+    assert manifest["selected_patch"]["selected_variant"] == 1
     assert ideas[0]["code_patch"]["status"] == "ok"
-    assert ideas[0]["code_patch"]["selected_variant"] == 2
-    assert ideas[0]["code_patch"]["patch_json"].endswith("plan/code_patches/best_of_n/variants/v2/patch.json")
-    assert backend.contracts[1]["patch_variant"]["previous_variant_attempts"][0]["status"] == "validation_failed"
+    assert ideas[0]["code_patch"]["selected_variant"] == 1
+    assert ideas[0]["code_patch"]["selection_reason"] == "single_s2_selected_variant"
+    assert ideas[0]["code_patch"]["patch_json"].endswith("plan/code_patches/single_variant_repair/patch.json")
 
 
-def test_code_patch_agent_scores_all_ok_variants_and_selects_best_quality(tmp_path: Path) -> None:
+def test_code_patch_agent_does_not_best_of_n_score_ok_variants(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _code_patch_test_config(tmp_path / "workspace", repo)
     config["code_patch"]["variants_per_candidate"] = 2
+    config["code_patch"]["stop_after_first_ok_score"] = 0
     config["code_patch"]["validation"]["max_repair_attempts"] = 0
     config["code_patch"]["validation"]["mechanism_self_review"] = {"enabled": True}
-    paths = init_workspace(config, "topic", project_id="proj_best_quality", simulate=False)
+    paths = init_workspace(config, "topic", project_id="proj_no_best_quality", simulate=False)
     artifacts = ArtifactManager(paths.root)
     ideas = [
         {
-            "id": "quality_best",
-            "title": "Quality Best",
+            "id": "quality_single",
+            "title": "Quality Single",
             "hypothesis": "h",
             "mechanism_type": "utility_predicted_cache_routing",
-            "ablation_plan": {"switch": "ablation_disable_quality_best"},
+            "ablation_plan": {"switch": "ablation_disable_quality_single"},
             "coverage_diagnostics": {"required": True},
             "matched_coverage_ablation": {"required": True},
             "experiment_contract": {
-                "ablation_switch": "ablation_disable_quality_best",
+                "ablation_switch": "ablation_disable_quality_single",
                 "coverage_diagnostics": {"required": True},
                 "matched_coverage_ablation": {"required": True},
                 "expected_files": ["rosetta/model/projector.py"],
@@ -1957,17 +3570,71 @@ def test_code_patch_agent_scores_all_ok_variants_and_selects_best_quality(tmp_pa
         def generate(self, implementation_contract, temp_repo, edit_policy):
             del implementation_contract, edit_policy
             self.calls += 1
-            if self.calls == 1:
-                (temp_repo / "rosetta/model/projector.py").write_text(
-                    "QUALITY = 'ok but weaker core mechanism path'\n",
-                    encoding="utf-8",
-                )
-                return {"status": "ok", "rationale": "First valid but low-evidence variant."}
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "QUALITY = 'single ok implementation without a second scored variant'\n",
+                encoding="utf-8",
+            )
+            return {"status": "ok", "rationale": "First valid implementation is kept; S2.5 repair handles failures."}
+
+    backend = QualityBackend()
+    manifest = CodePatchAgent(paths.root, config, artifacts, backend=backend).run({"candidate_ideas": ideas}, ideas)
+
+    assert manifest["status"] == "ok"
+    assert backend.calls == 1
+    assert manifest["selected_candidate_id"] == "quality_single"
+    assert manifest["selected_patch"]["selected_variant"] == 1
+    assert manifest["selected_patch"]["quality_score"]["score"] > 0
+    assert ideas[0]["code_patch"]["status"] == "ok"
+    assert ideas[0]["code_patch"]["selected_variant"] == 1
+    assert ideas[0]["code_patch"]["selection_reason"] == "single_s2_selected_variant"
+    attempts = ideas[0]["code_patch"]["variant_attempts"]
+    assert len(attempts) == 1
+    assert attempts[0]["status"] == "ok"
+    assert "ablation_switch_not_wired" in attempts[0]["quality_score"]["soft_issues"]
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+    assert validation["mechanism_review"]["status"] == "ok"
+    assert validation["mechanism_review"]["mechanism_evidence_map"]
+
+
+def test_code_patch_agent_ignores_legacy_variant_budget_after_first_ok_patch(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["variants_per_candidate"] = 2
+    config["code_patch"]["stop_after_first_ok_score"] = 100
+    config["code_patch"]["validation"]["max_repair_attempts"] = 0
+    config["code_patch"]["validation"]["mechanism_self_review"] = {"enabled": True}
+    paths = init_workspace(config, "topic", project_id="proj_best_quality_early_stop", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    ideas = [
+        {
+            "id": "early_stop_quality",
+            "title": "Early Stop Quality",
+            "hypothesis": "h",
+            "mechanism_type": "utility_predicted_cache_routing",
+            "ablation_plan": {"switch": "ablation_disable_early_stop_quality"},
+            "coverage_diagnostics": {"required": True},
+            "matched_coverage_ablation": {"required": True},
+            "experiment_contract": {
+                "ablation_switch": "ablation_disable_early_stop_quality",
+                "coverage_diagnostics": {"required": True},
+                "matched_coverage_ablation": {"required": True},
+                "expected_files": ["rosetta/model/projector.py"],
+            },
+        }
+    ]
+
+    class HighQualityBackend:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            self.calls += 1
             (temp_repo / "rosetta/model/projector.py").write_text(
                 "\n".join(
                     [
-                        "ablation_disable_quality_best = False",
-                        "def route_cache(control_mode='matched_coverage_quality_best'):",
+                        "ablation_disable_early_stop_quality = False",
+                        "def route_cache(control_mode='matched_coverage_early_stop_quality'):",
                         "    coverage_diagnostics = {'accepted_span_rate': 0.5}",
                         "    matched_coverage_delta = 0.0",
                         "    return coverage_diagnostics, matched_coverage_delta",
@@ -1976,24 +3643,141 @@ def test_code_patch_agent_scores_all_ok_variants_and_selects_best_quality(tmp_pa
                 + "\n",
                 encoding="utf-8",
             )
-            return {"status": "ok", "rationale": "Second valid variant has explicit mechanism evidence."}
+            return {"status": "ok", "rationale": "First variant is already high quality."}
 
-    backend = QualityBackend()
+    backend = HighQualityBackend()
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=backend).run({"candidate_ideas": ideas}, ideas)
 
     assert manifest["status"] == "ok"
-    assert backend.calls == 2
+    assert backend.calls == 1
+    assert manifest["selected_candidate_id"] == "early_stop_quality"
+    assert manifest["selected_patch"]["selected_variant"] == 1
     assert ideas[0]["code_patch"]["status"] == "ok"
-    assert ideas[0]["code_patch"]["selected_variant"] == 2
-    assert ideas[0]["code_patch"]["selection_reason"] == "quality_score"
-    attempts = ideas[0]["code_patch"]["variant_attempts"]
-    assert len(attempts) == 2
-    assert attempts[0]["status"] == "ok"
-    assert "ablation_switch_not_wired" in attempts[0]["quality_score"]["soft_issues"]
-    assert attempts[1]["quality_score"]["score"] > attempts[0]["quality_score"]["score"]
-    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
-    assert validation["mechanism_review"]["status"] == "ok"
-    assert validation["mechanism_review"]["mechanism_evidence_map"]
+    assert ideas[0]["code_patch"]["selected_variant"] == 1
+    assert len(ideas[0]["code_patch"]["variant_attempts"]) == 1
+    assert ideas[0]["code_patch"]["quality_score"]["score"] >= 100
+
+
+def test_code_patch_agent_skips_later_candidates_after_high_quality_patch(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["max_candidates"] = 2
+    config["code_patch"]["variants_per_candidate"] = 1
+    config["code_patch"]["stop_after_first_ok_score"] = 100
+    config["code_patch"]["validation"]["max_repair_attempts"] = 0
+    config["code_patch"]["validation"]["mechanism_self_review"] = {"enabled": True}
+    paths = init_workspace(config, "topic", project_id="proj_candidate_early_stop", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    first = {
+        "id": "candidate_winner",
+        "title": "Candidate Winner",
+        "hypothesis": "h",
+        "mechanism_type": "utility_predicted_cache_routing",
+        "ablation_plan": {"switch": "ablation_disable_candidate_winner"},
+        "coverage_diagnostics": {"required": True},
+        "matched_coverage_ablation": {"required": True},
+        "experiment_contract": {
+            "ablation_switch": "ablation_disable_candidate_winner",
+            "coverage_diagnostics": {"required": True},
+            "matched_coverage_ablation": {"required": True},
+            "expected_files": ["rosetta/model/projector.py"],
+        },
+    }
+    second = {"id": "candidate_should_skip", "title": "Candidate Should Skip", "hypothesis": "h"}
+    ideas = [first, second]
+
+    class HighQualityBackend:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            self.calls += 1
+            (temp_repo / "rosetta/model/projector.py").write_text(
+                "\n".join(
+                    [
+                        "ablation_disable_candidate_winner = False",
+                        "def route_cache(control_mode='matched_coverage_candidate_winner'):",
+                        "    coverage_diagnostics = {'accepted_span_rate': 0.5}",
+                        "    matched_coverage_delta = 0.0",
+                        "    return coverage_diagnostics, matched_coverage_delta",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return {"status": "ok", "rationale": "First candidate is enough for effect-first discovery."}
+
+    backend = HighQualityBackend()
+    manifest = CodePatchAgent(paths.root, config, artifacts, backend=backend).run({"candidate_ideas": ideas}, ideas)
+
+    assert manifest["status"] == "ok"
+    assert manifest["selection_policy"]["mode"] == "single_s2_selected_variant"
+    assert backend.calls == 1
+    assert manifest["candidate_count"] == 1
+    assert manifest["selected_candidate_id"] == "candidate_winner"
+    assert ideas[0]["code_patch"]["status"] == "ok"
+    assert ideas[1]["code_patch"]["status"] == "skipped_s2_5_single_candidate_mode"
+
+
+def test_code_patch_agent_implements_only_plan_selected_s2_variant(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["max_candidates"] = 3
+    config["code_patch"]["variants_per_candidate"] = 2
+    paths = init_workspace(config, "topic", project_id="proj_selected_s2_variant_only", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    first = {
+        "id": "unselected_first",
+        "title": "Unselected First",
+        "hypothesis": "h",
+        "variant_fingerprint": "fp_unselected",
+    }
+    second = {
+        "id": "selected_second",
+        "title": "Selected Second",
+        "hypothesis": "h",
+        "variant_fingerprint": "fp_selected",
+    }
+    third = {
+        "id": "unselected_third",
+        "title": "Unselected Third",
+        "hypothesis": "h",
+        "variant_fingerprint": "fp_third",
+    }
+    ideas = [first, second, third]
+
+    class SelectedBackend:
+        def __init__(self):
+            self.contracts = []
+
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del edit_policy
+            self.contracts.append(implementation_contract)
+            assert implementation_contract["candidate_id"] == "selected_second"
+            (temp_repo / "rosetta/model/aligner.py").write_text("VALUE = 'selected second only'\n", encoding="utf-8")
+            return {"status": "ok", "rationale": "Implemented S2-selected variant."}
+
+    backend = SelectedBackend()
+    manifest = CodePatchAgent(paths.root, config, artifacts, backend=backend).run(
+        {
+            "candidate_ideas": ideas,
+            "selected_idea": second,
+            "selected_variant_candidates": [{"id": "selected_second", "variant_fingerprint": "fp_selected"}],
+        },
+        ideas,
+    )
+
+    assert manifest["status"] == "ok"
+    assert manifest["selection_policy"]["selected_by"] == "plan.selected_idea"
+    assert manifest["selected_candidate_id"] == "selected_second"
+    assert manifest["candidate_count"] == 1
+    assert manifest["input_candidate_count"] == 3
+    assert manifest["skipped_candidate_count"] == 2
+    assert len(backend.contracts) == 1
+    assert first["code_patch"]["status"] == "skipped_s2_5_single_candidate_mode"
+    assert second["code_patch"]["status"] == "ok"
+    assert third["code_patch"]["status"] == "skipped_s2_5_single_candidate_mode"
 
 
 def test_code_patch_mechanism_self_review_keeps_diagnostics_soft_by_default(tmp_path: Path) -> None:
@@ -2056,6 +3840,7 @@ def test_code_patch_mechanism_self_review_can_be_strict_for_diagnostics(tmp_path
     config = _code_patch_test_config(tmp_path / "workspace", repo)
     config["code_patch"]["variants_per_candidate"] = 1
     config["code_patch"]["validation"]["max_repair_attempts"] = 0
+    config["code_patch"]["validation"]["gate_mode"] = "strict"
     config["code_patch"]["validation"]["mechanism_self_review"] = {
         "enabled": True,
         "require_ablation_wired": True,
@@ -2104,6 +3889,7 @@ def test_code_patch_agent_repairs_evaluator_proxy_risk(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _code_patch_test_config(tmp_path / "workspace", repo)
     config["code_patch"]["variants_per_candidate"] = 1
+    config["code_patch"]["validation"]["auto_prune_scope"] = False
     paths = init_workspace(config, "topic", project_id="proj_eval_repair", simulate=False)
     artifacts = ArtifactManager(paths.root)
     ideas = [{"id": "eval_repair", "title": "Eval Repair", "hypothesis": "h"}]
@@ -2136,11 +3922,73 @@ def test_code_patch_agent_repairs_evaluator_proxy_risk(tmp_path: Path) -> None:
     assert any(action["action"] == "restore_evaluator_files_before_repair" for action in validation["recovery_actions"])
 
 
+def test_code_patch_soft_allows_over_scope_file_count_by_default(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "rosetta/model/helper_a.py").write_text("VALUE = 'a'\n", encoding="utf-8")
+    (repo / "rosetta/model/helper_b.py").write_text("VALUE = 'b'\n", encoding="utf-8")
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["variants_per_candidate"] = 1
+    config["code_patch"]["validation"]["max_changed_files"] = 2
+    paths = init_workspace(config, "topic", project_id="proj_soft_over_scope", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    ideas = [{"id": "soft_over_scope", "title": "Soft Over Scope", "hypothesis": "h"}]
+
+    class BroadButSafeBackend:
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            (temp_repo / "rosetta/model/aligner.py").write_text("VALUE = 'aligner patch'\n", encoding="utf-8")
+            (temp_repo / "rosetta/model/projector.py").write_text("VALUE = 'projector patch'\n", encoding="utf-8")
+            (temp_repo / "rosetta/model/helper_a.py").write_text("VALUE = 'helper a patch'\n", encoding="utf-8")
+            return {"status": "ok", "rationale": "Broad but safe mechanism patch."}
+
+    manifest = CodePatchAgent(paths.root, config, artifacts, backend=BroadButSafeBackend()).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+    patch = json.loads((paths.root / ideas[0]["code_patch"]["patch_json"]).read_text(encoding="utf-8"))
+
+    assert manifest["status"] == "ok"
+    assert ideas[0]["code_patch"]["status"] == "ok"
+    assert len(patch["changed_files"]) == 3
+    assert validation["risk_check"]["status"] == "ok"
+    assert "patch_too_broad" in validation["risk_check"]["risk_labels"]
+    assert validation["risk_check"]["warnings"]
+    assert "patch_too_broad" in patch["quality_score"]["risk_labels"]
+
+
+def test_code_patch_strict_max_changed_files_still_blocks(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "rosetta/model/helper_a.py").write_text("VALUE = 'a'\n", encoding="utf-8")
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["variants_per_candidate"] = 1
+    config["code_patch"]["validation"]["max_changed_files"] = 2
+    config["code_patch"]["validation"]["strict_max_changed_files"] = True
+    config["code_patch"]["validation"]["auto_prune_over_scope_files"] = False
+    paths = init_workspace(config, "topic", project_id="proj_strict_over_scope", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    ideas = [{"id": "strict_over_scope", "title": "Strict Over Scope", "hypothesis": "h"}]
+
+    class BroadBackend:
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            (temp_repo / "rosetta/model/aligner.py").write_text("VALUE = 'aligner patch'\n", encoding="utf-8")
+            (temp_repo / "rosetta/model/projector.py").write_text("VALUE = 'projector patch'\n", encoding="utf-8")
+            (temp_repo / "rosetta/model/helper_a.py").write_text("VALUE = 'helper a patch'\n", encoding="utf-8")
+            return {"status": "ok", "rationale": "Over strict file budget."}
+
+    manifest = CodePatchAgent(paths.root, config, artifacts, backend=BroadBackend()).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+
+    assert manifest["status"] == "no_valid_patch"
+    assert ideas[0]["code_patch"]["status"] == "patch_too_broad"
+    assert validation["risk_check"]["status"] == "patch_too_broad"
+    assert validation["risk_check"]["risk_labels"] == ["patch_too_broad"]
+
+
 def test_code_patch_agent_blocks_evaluator_repair_that_recontaminates(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _code_patch_test_config(tmp_path / "workspace", repo)
     config["code_patch"]["variants_per_candidate"] = 1
     config["code_patch"]["validation"]["max_contract_repair_attempts"] = 1
+    config["code_patch"]["validation"]["auto_prune_scope"] = False
     paths = init_workspace(config, "topic", project_id="proj_eval_repair_recontaminate", simulate=False)
     artifacts = ArtifactManager(paths.root)
     ideas = [{"id": "eval_recontaminate", "title": "Eval Recontaminate", "hypothesis": "h"}]
@@ -2165,6 +4013,155 @@ def test_code_patch_agent_blocks_evaluator_repair_that_recontaminates(tmp_path: 
     assert backend.contracts[1]["forbidden_repair_files"] == ["script/evaluation/"]
     assert validation["risk_check"]["risk_labels"] == ["evaluation_code_changed"]
     assert any(action["action"] == "restore_evaluator_files_before_repair" for action in validation["recovery_actions"])
+
+
+def test_code_patch_auto_prunes_evaluator_and_low_priority_over_scope_files(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "rosetta/train").mkdir(parents=True, exist_ok=True)
+    (repo / "rosetta/train/model_utils.py").write_text("VALUE = 'model utils'\n", encoding="utf-8")
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["variants_per_candidate"] = 1
+    config["code_patch"]["validation"]["max_changed_files"] = 4
+    config["code_patch"]["validation"]["auto_prune_over_scope_files"] = True
+    paths = init_workspace(config, "topic", project_id="proj_auto_prune_scope", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    ideas = [
+        {
+            "id": "auto_prune_scope",
+            "title": "Auto Prune Scope",
+            "hypothesis": "h",
+            "experiment_contract": {
+                "expected_files": [
+                    "rosetta/model/aligner.py",
+                    "rosetta/model/projector.py",
+                    "rosetta/model/auto_prune_scope.py",
+                    "test/test_aligner_span_overlap.py",
+                ]
+            },
+            "implementation_plan": {
+                "required_new_files": ["rosetta/model/auto_prune_scope.py"],
+                "smoke_tests": ["test/test_aligner_span_overlap.py"],
+            },
+        }
+    ]
+
+    class BroadBackend:
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            (temp_repo / "rosetta/model/aligner.py").write_text("VALUE = 'aligner mechanism'\n", encoding="utf-8")
+            (temp_repo / "rosetta/model/projector.py").write_text("VALUE = 'projector mechanism'\n", encoding="utf-8")
+            (temp_repo / "rosetta/model/auto_prune_scope.py").write_text("VALUE = 'new mechanism'\n", encoding="utf-8")
+            (temp_repo / "test/test_aligner_span_overlap.py").write_text("def test_scope():\n    assert True\n", encoding="utf-8")
+            (temp_repo / "script/train/SFT_train.py").write_text("print('broad train edit')\n", encoding="utf-8")
+            (temp_repo / "script/evaluation/unified_evaluator.py").write_text("print('bad eval edit')\n", encoding="utf-8")
+            (temp_repo / "rosetta/train/model_utils.py").write_text("VALUE = 'low priority helper'\n", encoding="utf-8")
+            return {"status": "ok", "rationale": "broad implementation"}
+
+    CodePatchAgent(paths.root, config, artifacts, backend=BroadBackend()).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+    patch = json.loads((paths.root / ideas[0]["code_patch"]["patch_json"]).read_text(encoding="utf-8"))
+
+    assert ideas[0]["code_patch"]["status"] == "ok"
+    assert patch["changed_files"] == [
+        "rosetta/model/aligner.py",
+        "rosetta/model/auto_prune_scope.py",
+        "rosetta/model/projector.py",
+        "test/test_aligner_span_overlap.py",
+    ]
+    assert validation["risk_check"]["status"] == "ok"
+    prune_actions = [
+        action
+        for action in patch["recovery_actions"]
+        if action["action"] in {
+            "auto_prune_worktree_scope_before_build",
+            "auto_prune_patch_scope_before_freeze",
+            "auto_prune_worktree_and_patch_scope",
+        }
+    ]
+    assert prune_actions
+    assert set(prune_actions[0]["restored_files"]) == {
+        "script/evaluation/unified_evaluator.py",
+        "script/train/SFT_train.py",
+        "rosetta/train/model_utils.py",
+    }
+
+
+def test_code_patch_auto_prunes_deleted_files_before_patch_build(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "rosetta/train").mkdir(parents=True, exist_ok=True)
+    (repo / "rosetta/train/answer_prior.py").write_text("VALUE = 'prior'\n", encoding="utf-8")
+    (repo / "script/analysis").mkdir(parents=True, exist_ok=True)
+    (repo / "script/analysis/route1_eval_flip_diagnostics.py").write_text("VALUE = 'analysis'\n", encoding="utf-8")
+    config = _code_patch_test_config(tmp_path / "workspace", repo)
+    config["code_patch"]["variants_per_candidate"] = 1
+    config["code_patch"]["validation"]["max_contract_repair_attempts"] = 1
+    config["code_patch"]["validation"]["max_changed_files"] = 4
+    config["code_patch"]["validation"]["auto_prune_over_scope_files"] = True
+    paths = init_workspace(config, "topic", project_id="proj_auto_prune_deleted_before_build", simulate=False)
+    artifacts = ArtifactManager(paths.root)
+    ideas = [
+        {
+            "id": "auto_prune_deleted",
+            "title": "Auto Prune Deleted",
+            "hypothesis": "h",
+            "experiment_contract": {
+                "expected_files": [
+                    "rosetta/model/aligner.py",
+                    "rosetta/model/projector.py",
+                    "rosetta/model/auto_prune_deleted.py",
+                    "test/test_aligner_span_overlap.py",
+                ]
+            },
+            "implementation_plan": {
+                "required_new_files": ["rosetta/model/auto_prune_deleted.py"],
+                "smoke_tests": ["test/test_aligner_span_overlap.py"],
+            },
+        }
+    ]
+
+    class DeleteAndBroadBackend:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            del implementation_contract, edit_policy
+            self.calls += 1
+            (temp_repo / "rosetta/train/answer_prior.py").unlink()
+            (temp_repo / "script/analysis/route1_eval_flip_diagnostics.py").unlink()
+            (temp_repo / "rosetta/model/aligner.py").write_text("VALUE = 'aligner mechanism'\n", encoding="utf-8")
+            (temp_repo / "rosetta/model/projector.py").write_text("VALUE = 'projector mechanism'\n", encoding="utf-8")
+            (temp_repo / "rosetta/model/auto_prune_deleted.py").write_text("VALUE = 'new mechanism'\n", encoding="utf-8")
+            (temp_repo / "test/test_aligner_span_overlap.py").write_text("def test_scope():\n    assert True\n", encoding="utf-8")
+            (temp_repo / "script/evaluation/unified_evaluator.py").write_text("print('bad eval edit')\n", encoding="utf-8")
+            return {"status": "ok", "rationale": "deleted unrelated files and touched evaluator"}
+
+    backend = DeleteAndBroadBackend()
+    CodePatchAgent(paths.root, config, artifacts, backend=backend).run({"candidate_ideas": ideas}, ideas)
+    validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
+    patch = json.loads((paths.root / ideas[0]["code_patch"]["patch_json"]).read_text(encoding="utf-8"))
+
+    assert backend.calls == 1
+    assert ideas[0]["code_patch"]["status"] == "ok"
+    assert patch["changed_files"] == [
+        "rosetta/model/aligner.py",
+        "rosetta/model/auto_prune_deleted.py",
+        "rosetta/model/projector.py",
+        "test/test_aligner_span_overlap.py",
+    ]
+    assert validation["risk_check"]["status"] == "ok"
+    prune_actions = [
+        action
+        for action in patch["recovery_actions"]
+        if action["action"] in {
+            "auto_prune_worktree_scope_before_build",
+            "auto_prune_worktree_and_patch_scope",
+        }
+    ]
+    assert prune_actions
+    restored = set(prune_actions[0]["restored_files"])
+    assert "rosetta/train/answer_prior.py" in restored
+    assert "script/analysis/route1_eval_flip_diagnostics.py" in restored
+    assert "script/evaluation/unified_evaluator.py" in restored
 
 
 def test_c2c_pipeline_blocks_with_missing_reference_path(monkeypatch, tmp_path: Path) -> None:
@@ -2193,6 +4190,206 @@ def test_c2c_pipeline_blocks_with_missing_reference_path(monkeypatch, tmp_path: 
     assert "ref_paper" in result["reason"]
 
 
+def test_c2c_s0_reuses_cached_static_bundle_and_restores_sidecars(monkeypatch, tmp_path: Path) -> None:
+    source_repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(source_repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "allowed_files": ["rosetta/model/aligner.py"],
+    }
+    shared_memory_path = tmp_path / "shared_method_memory.jsonl"
+    config["orchestration"] = {
+        "shared_method_memory": {
+            "enabled": True,
+            "path": str(shared_memory_path),
+            "summary_path": str(tmp_path / "shared_method_memory.md"),
+        }
+    }
+    shared_memory_path.write_text(
+        json.dumps(
+            {
+                "schema_version": "shared_method_failure_memory_v1",
+                "timestamp": "2026-06-09T00:00:00+00:00",
+                "memory_id": "shared-mmlu-regression",
+                "project_id": "old_project",
+                "kind": "shared_c2c_method_failure",
+                "failure_class": "method_failure",
+                "route": "proxy_rejected_same_direction",
+                "summary": {
+                    "failed_idea_ids": ["old_bad_method"],
+                    "dataset_regressions": {"mmlu-redux": 2.5},
+                    "dragging_datasets": [
+                        {"dataset": "mmlu-redux", "sample_family": "multi_domain_knowledge_reasoning", "regression": 2.5}
+                    ],
+                    "avoid_repeat_rules": ["Do not repeat old_bad_method without fixing mmlu-redux regression."],
+                },
+                "entries": [
+                    {
+                        "kind": "c2c_performance_feedback",
+                        "idea_id": "old_bad_method",
+                        "decision": "proxy_rejected",
+                        "proxy_screen": {
+                            "proxy_dataset_deltas": {"mmlu-redux": -2.5},
+                            "proxy_delta_vs_baseline": -0.8,
+                        },
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    paths = init_workspace(config, "topic", project_id="proj_c2c_cached_s0", simulate=False)
+    project_root = paths.root
+    paper_full = project_root / "intake" / "papers" / "paper_full.md"
+    paper_full.parent.mkdir(parents=True, exist_ok=True)
+    paper_full.write_text("# Cached Paper\n\nMethod text.\n", encoding="utf-8")
+    code_chunk = {
+        "chunk_id": "code:rosetta/model/aligner.py::align",
+        "path": "rosetta/model/aligner.py",
+        "node_type": "function_definition",
+        "symbol": "align",
+        "start_line": 1,
+        "end_line": 3,
+        "edit_surface": "allowed",
+        "text": "def align():\n    return True\n",
+        "text_preview": "def align(): return True",
+        "keywords": ["align", "cache"],
+    }
+    paper_chunk = {
+        "chunk_id": "paper:cached:method",
+        "source_type": "paper",
+        "source_path": "intake/papers/paper_full.md",
+        "section": "Method",
+        "keywords": ["cache"],
+        "text_preview": "Method text.",
+        "text": "Method text.",
+    }
+    rebuttal_chunk = {
+        "chunk_id": "rebuttal:cached:review",
+        "source_type": "rebuttal",
+        "source_path": "intake/papers/rebuttal.md",
+        "section": "Review",
+        "keywords": ["risk"],
+        "text_preview": "Reviewer concern.",
+        "text": "Reviewer concern.",
+    }
+    chunk_index = {
+        "schema_version": "c2c_full_chunk_index_v1",
+        "counts": {"paper": 1, "rebuttal": 1, "code": 1, "total": 3},
+        "entries": [paper_chunk, rebuttal_chunk, {**code_chunk, "source_type": "code", "source_path": "rosetta/model/aligner.py", "section": "align"}],
+    }
+    bundle = {
+        "schema_version": "c2c_static_intake_bundle_v1",
+        "metadata": [{"paper_id": "cached", "title": "Cached Paper", "source_path": "paper.pdf", "local_path": "intake/papers/paper_full.md", "kind": "ref_paper"}],
+        "reference_result": {"cards": [{"paper_id": "cached", "kind": "ref_paper", "local_path": "intake/papers/paper_full.md"}]},
+        "paper_full_manifest": [{"paper_id": "cached", "paper_full_md_path": "intake/papers/paper_full.md", "cache_status": "local_hit"}],
+        "repo_manifest": {"files": []},
+        "historical_results": {"results": []},
+        "baseline": config["c2c"]["baseline"],
+        "repo_card": {"allowed_surface": ["rosetta/model/aligner.py"], "constraints": []},
+        "paper_cards": [{"paper_id": "cached", "title": "Cached Paper", "kind": "ref_paper", "text": "Method text."}],
+        "paper_chunks": [paper_chunk],
+        "bibliography_cards": [],
+        "rebuttal_matrix": {"top_concerns": []},
+        "rebuttal_chunks": [rebuttal_chunk],
+        "code_cards": [{"path": "rosetta/model/aligner.py", "summary": "Aligner", "symbols": ["align"]}],
+        "code_file_manifest": {"files": [{"path": "rosetta/model/aligner.py"}]},
+        "code_symbols": [{"symbol_id": "rosetta/model/aligner.py::align", "path": "rosetta/model/aligner.py", "symbol": "align"}],
+        "code_chunks": [code_chunk],
+        "code_edges": [],
+        "code_repo_map": {"counts": {"files": 1, "symbols": 1, "chunks": 1, "edges": 0}, "top_editable_symbols": [{"path": "rosetta/model/aligner.py", "symbol": "align"}]},
+        "code_intake_report": {"counts": {"files": 1, "python_files": 1, "symbols": 1, "chunks": 1, "edges": 0, "editable_chunks": 1}, "cache": {"enabled": True, "counts": {"hit": 1}}},
+        "implementation_surface_map": {"surfaces": {"rosetta/model/aligner.py": {"symbols": ["align"]}}},
+        "code_retrieval_index": {"default_queries": [{"query": "aligner", "chunk_ids": [code_chunk["chunk_id"]]}]},
+        "cache_summary": {"schema_version": "c2c_static_cache_summary_v1", "code_intake": {"counts": {"hit": 1}}},
+        "chunk_index": chunk_index,
+        "result_ledger_csv": "id,mean\n",
+        "negative_memory": {"blocked_idea_patterns": []},
+        "retrieval_plan": {"primary_questions": []},
+        "followup_bundle": {"cross_source_targets": []},
+        "evidence_brief": {"schema_version": "c2c_evidence_brief_v1", "topic": "topic"},
+    }
+    write_json(project_root / "intake" / "c2c" / "static_bundle.json", bundle)
+
+    def fail_import(self):
+        raise AssertionError("S0 should reuse cached static_bundle instead of re-importing references")
+
+    monkeypatch.setattr(C2CAdapter, "import_reference_materials", fail_import)
+    context = AgentContext(project_root, config, ArtifactManager(project_root), ModelClient(config, project_root=project_root))
+
+    result = IntakeAgent(context).run("topic")
+
+    assert result["status"] == "ok"
+    assert result["cache_status"] == "reused"
+    assert (project_root / "intake/c2c/chunk_index.jsonl").exists()
+    assert (project_root / "intake/c2c/code_chunks.jsonl").exists()
+    assert (project_root / "intake/c2c/code_repo_map.md").exists()
+    assert (project_root / "intake/c2c/code_intake_report.md").exists()
+    shared_snapshot = json.loads((project_root / "intake/shared_method_failure_memory.json").read_text(encoding="utf-8"))
+    negative_memory = json.loads((project_root / "intake/c2c/negative_result_memory.json").read_text(encoding="utf-8"))
+    evidence_brief = json.loads((project_root / "intake/c2c/evidence_brief.json").read_text(encoding="utf-8"))
+    assert shared_snapshot["entry_count"] == 1
+    assert "old_bad_method" in shared_snapshot["entries"][0]["summary"]["failed_idea_ids"]
+    assert shared_snapshot["retrieval_policy"]["mode"] == "quality_weighted_top_k_retrieval"
+    assert shared_snapshot["retrieval_context"]["datasets"] == ["mmlu-redux"]
+    assert shared_snapshot["ranking_policy"]["sort"] == "descending memory_quality.priority"
+    assert "shared-mmlu-regression" in shared_snapshot["quality_summary"]["high_quality_memory_ids"]
+    assert negative_memory["shared_method_memory"]["entry_count"] == 1
+    assert "shared-mmlu-regression" in negative_memory["shared_method_memory"]["high_quality_memory_ids"]
+    assert negative_memory["shared_method_memory"]["memory_catalog"][0]["memory_id"] == "shared-mmlu-regression"
+    assert "read_hint" in negative_memory["shared_method_memory"]["memory_catalog"][0]
+    assert "dataset_regression" in negative_memory["shared_method_memory"]["quality_summary"]["signal_counts"]
+    assert "shared-mmlu-regression" in evidence_brief["shared_method_memory"]["high_quality_memory_ids"]
+    assert evidence_brief["shared_method_memory"]["memory_catalog"][0]["memory_id"] == "shared-mmlu-regression"
+    assert "Do not repeat old_bad_method" in negative_memory["blocked_idea_patterns"][0]
+    manifest = json.loads((project_root / "intake/stage_manifest.json").read_text(encoding="utf-8"))
+    artifact_paths = {item["path"] for item in manifest["artifacts"]}
+    assert "intake/c2c/static_bundle.json" in artifact_paths
+    assert "intake/c2c/chunk_index.jsonl" in artifact_paths
+    assert gate_s0(project_root, config).passed is True
+
+
+def test_c2c_s0_semantic_enrichment_missing_key_fails_open(monkeypatch, tmp_path: Path) -> None:
+    source_repo = _fake_c2c_repo(tmp_path)
+    ref_paper = tmp_path / "paper.txt"
+    ref_rebuttal = tmp_path / "rebuttal.md"
+    ref_paper.write_text("paper method text", encoding="utf-8")
+    ref_rebuttal.write_text("review concern text", encoding="utf-8")
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["intake"] = {"semantic_enrichment": {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}}
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(source_repo),
+        "ref_paper": str(ref_paper),
+        "ref_rebuttal": str(ref_rebuttal),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "allowed_files": ["rosetta/model/aligner.py"],
+    }
+    paths = init_workspace(config, "topic", project_id="proj_c2c_s0_enrich_fail_open", simulate=False)
+
+    def fail_enrichment(self, **kwargs):
+        raise S0SemanticEnrichmentError("DEEPSEEK_API_KEY is missing")
+
+    monkeypatch.setattr(DeepSeekS0SemanticEnricher, "enrich_c2c_chunks", fail_enrichment)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+
+    result = IntakeAgent(context).run("topic")
+
+    assert result["status"] == "ok"
+    bundle = json.loads((paths.root / "intake/c2c/static_bundle.json").read_text(encoding="utf-8"))
+    assert bundle["semantic_enrichment"]["status"] == "failed_open"
+    assert bundle["semantic_enrichment"]["fallback"] == "raw_chunks_without_semantic_enrichment"
+    assert bundle["chunk_index"]["counts"]["paper"] > 0
+    assert bundle["chunk_index"]["counts"]["code"] > 0
+    assert gate_s0(paths.root, config).passed is True
+
+
 def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Path) -> None:
     source_repo = _fake_c2c_repo(tmp_path)
     ref_paper = tmp_path / "paper.txt"
@@ -2201,6 +4398,28 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     ref_rebuttal.write_text("review text", encoding="utf-8")
     config = _base_config(tmp_path / "workspace", simulate=True)
     config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
+    config.setdefault("orchestration", {})["shared_method_memory"] = {
+        "enabled": True,
+        "path": str(tmp_path / "s1_shared_memory.jsonl"),
+        "summary_path": str(tmp_path / "s1_shared_memory.md"),
+    }
+    shared_memory_entry = {
+        "schema_version": "shared_method_failure_memory_v1",
+        "memory_id": "mem_s1_avoid_hard_gate",
+        "timestamp": "2026-06-10T00:00:00Z",
+        "project_id": "old_project",
+        "topic": "cross tokenizer cache",
+        "kind": "shared_c2c_method_failure",
+        "route": "proxy_rejected_same_direction",
+        "failure_class": "method_failure",
+        "summary": {
+            "failed_idea_ids": ["hard_gate_stack"],
+            "dragging_datasets": [{"dataset": "mmlu-redux", "regression": 2.0}],
+            "avoid_repeat_rules": ["Avoid extra hard accept/reject gates that collapse transfer coverage."],
+        },
+        "entries": [{"id": "hard_gate_stack", "decision": "proxy_rejected"}],
+    }
+    Path(config["orchestration"]["shared_method_memory"]["path"]).write_text(json.dumps(shared_memory_entry, ensure_ascii=False) + "\n", encoding="utf-8")
     monkeypatch.setattr(config_module, "load_root_config", lambda: config)
     monkeypatch.setattr(orchestrator_module, "load_root_config", lambda: config)
     monkeypatch.setattr(literature_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
@@ -2219,7 +4438,22 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
             stdout = '{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174001"}\n'
         else:
             assert "resume" in command
-            output_path.write_text(json.dumps(_s1_codex_direction_payload()), encoding="utf-8")
+            chunk_index_path = Path(kwargs["cwd"]) / "intake/c2c/chunk_index.json"
+            chunk_index = json.loads(chunk_index_path.read_text(encoding="utf-8"))
+            code_chunk_id = next(
+                entry["chunk_id"]
+                for entry in chunk_index["entries"]
+                if entry.get("source_type") == "code" and entry.get("path") == "rosetta/model/aligner.py"
+            )
+            output_path.write_text(
+                json.dumps(
+                    _s1_codex_direction_payload(
+                        code_chunk_id=code_chunk_id,
+                        used_shared_memory_refs=["mem_s1_avoid_hard_gate"],
+                    )
+                ),
+                encoding="utf-8",
+            )
             stdout = ""
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
@@ -2280,11 +4514,19 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     ideas = json.loads((root / "literature/ideas.json").read_text(encoding="utf-8"))
     assert len(ideas) == 1
     assert ideas[0]["id"] == "utility_predicted_cache_routing"
+    assert ideas[0]["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     assert ideas[0]["s1_evidence_agent"]["source"] == "codex_resume_evidence_agent"
+    assert ideas[0]["s1_evidence_agent"]["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     direction = json.loads((root / "literature/c2c/direction_decision.json").read_text(encoding="utf-8"))
     assert direction["direction_id"] == "utility_predicted_cache_routing"
+    assert direction["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
+    debate = json.loads((root / "literature/idea_debate.json").read_text(encoding="utf-8"))
+    assert debate["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
+    constraints = json.loads((root / "literature/negative_constraints.json").read_text(encoding="utf-8"))
+    assert constraints["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     evidence_session = json.loads((root / "literature/c2c/evidence_session.json").read_text(encoding="utf-8"))
     assert evidence_session["repair_count"] == 1
+    assert evidence_session["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     assert len(evidence_session["attempts"]) == 2
     assert "resume" in s1_codex_commands[1]
     assert "errors_to_fix" in s1_codex_prompts[1]
@@ -2428,6 +4670,52 @@ def test_c2c_materialized_train_configs_disable_wandb_without_service_token(tmp_
     assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in combined_commands
 
 
+def test_c2c_materializes_proxy_activation_smoke_ablation_config(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = {
+        "c2c": {
+            "enabled": True,
+            "snapshot_path": str(repo),
+            "env_python": "/usr/bin/python3",
+            "datasets": ["mmlu-redux", "ai2-arc"],
+            "small_loop": {
+                "eval_datasets": ["mmlu-redux", "ai2-arc"],
+                "train_samples": 1,
+                "gpu_ids": [0],
+                "proxy_screen": {
+                    "enabled": True,
+                    "eval_limit": 7,
+                    "eval_datasets": ["mmlu-redux", "ai2-arc"],
+                    "activation_smoke": {"enabled": True, "max_datasets": 1},
+                },
+            },
+        }
+    }
+    adapter = C2CAdapter(tmp_path / "project", config)
+    selection = ExperimentRunner(config).select_gpus({"gpu_ids": [0], "max_gpus": 1})
+    candidate = {
+        "id": "activation_config",
+        "experiment_contract": {
+            "ablation_switch": "disable_mechanism",
+            "config_overrides": {
+                "eval": {"model": {"rosetta_config": {"mechanism_enabled": True}}},
+            },
+        },
+    }
+
+    run_spec = adapter.materialize_candidate_configs(candidate, selection)
+    smoke = adapter.materialize_proxy_activation_smoke_configs(candidate, run_spec, selection)
+    disabled_eval = yaml.safe_load(Path(smoke["eval_configs"]["mmlu-redux"]).read_text(encoding="utf-8"))
+
+    assert smoke["status"] == "materialized"
+    assert smoke["datasets"] == ["mmlu-redux"]
+    assert disabled_eval["model"]["rosetta_config"]["checkpoints_dir"] == "local/auto_research_runs/activation_config/proxy/checkpoints/final"
+    assert disabled_eval["model"]["rosetta_config"]["disable_mechanism"] is True
+    assert disabled_eval["model"]["rosetta_config"]["mechanism_enabled"] is True
+    assert disabled_eval["output"]["output_dir"] == "local/auto_research_runs/activation_config/proxy/activation_smoke_disabled/results/mmlu-redux"
+    assert disabled_eval["eval"]["limit"] == 7
+
+
 def test_c2c_proxy_batch_auto_uses_gpu_memory(monkeypatch, tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     snapshot = [
@@ -2457,6 +4745,163 @@ def test_c2c_proxy_batch_auto_uses_gpu_memory(monkeypatch, tmp_path: Path) -> No
 
     assert proxy_train["training"]["per_device_train_batch_size"] == 2
     assert baseline_train["training"]["per_device_train_batch_size"] == 2
+
+
+def test_runner_select_gpus_filters_busy_cards_when_requested(monkeypatch) -> None:
+    snapshot = [
+        {"index": 0, "memory_total_mb": 24564, "memory_free_mb": 24000, "memory_used_mb": 0, "utilization_gpu": 98},
+        {"index": 1, "memory_total_mb": 24564, "memory_free_mb": 18000, "memory_used_mb": 6500, "utilization_gpu": 5},
+        {"index": 2, "memory_total_mb": 24564, "memory_free_mb": 9000, "memory_used_mb": 15500, "utilization_gpu": 0},
+    ]
+    monkeypatch.setattr(ExperimentRunner, "_gpu_snapshot", staticmethod(lambda: snapshot))
+
+    selection = ExperimentRunner({"experiment": {"gpu_policy": {"max_gpus": 2}}}).select_gpus(
+        {"gpu_ids": "auto", "max_gpus": 2, "min_free_mb": 8192, "max_utilization_gpu": 40, "respect_resource_filters": True}
+    )
+
+    assert selection.selected_ids == [1, 2]
+    assert selection.reason == "auto_selected_by_free_memory"
+
+
+def test_runner_select_gpus_can_disable_busy_card_fallback(monkeypatch) -> None:
+    snapshot = [
+        {"index": 0, "memory_total_mb": 24564, "memory_free_mb": 24000, "memory_used_mb": 0, "utilization_gpu": 98},
+    ]
+    monkeypatch.setattr(ExperimentRunner, "_gpu_snapshot", staticmethod(lambda: snapshot))
+
+    selection = ExperimentRunner({"experiment": {"gpu_policy": {"max_gpus": 1}}}).select_gpus(
+        {
+            "gpu_ids": "auto",
+            "max_gpus": 1,
+            "min_free_mb": 8192,
+            "max_utilization_gpu": 40,
+            "respect_resource_filters": True,
+            "disable_resource_fallback": True,
+        }
+    )
+
+    assert selection.selected_ids == []
+    assert selection.reason == "auto_selected_by_free_memory"
+
+
+def test_runner_select_gpus_can_disable_explicit_busy_card_fallback(monkeypatch) -> None:
+    snapshot = [
+        {"index": 0, "memory_total_mb": 24564, "memory_free_mb": 24000, "memory_used_mb": 0, "utilization_gpu": 98},
+        {"index": 1, "memory_total_mb": 24564, "memory_free_mb": 24000, "memory_used_mb": 0, "utilization_gpu": 0},
+    ]
+    monkeypatch.setattr(ExperimentRunner, "_gpu_snapshot", staticmethod(lambda: snapshot))
+
+    selection = ExperimentRunner({"experiment": {"gpu_policy": {"max_gpus": 1}}}).select_gpus(
+        {
+            "gpu_ids": [0],
+            "max_gpus": 1,
+            "min_free_mb": 8192,
+            "max_utilization_gpu": 40,
+            "respect_resource_filters": True,
+            "disable_resource_fallback": True,
+        }
+    )
+
+    assert selection.selected_ids == []
+    assert selection.reason == "explicit_gpu_ids_no_resource_match"
+
+
+def test_c2c_proxy_gpu_policy_defaults_to_single_clean_gpu(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    snapshot = [
+        {"index": 0, "memory_total_mb": 24564, "memory_free_mb": 24000, "memory_used_mb": 0, "utilization_gpu": 95},
+        {"index": 1, "memory_total_mb": 24564, "memory_free_mb": 21000, "memory_used_mb": 3000, "utilization_gpu": 0},
+        {"index": 2, "memory_total_mb": 24564, "memory_free_mb": 20000, "memory_used_mb": 4000, "utilization_gpu": 0},
+    ]
+    monkeypatch.setattr(ExperimentRunner, "_gpu_snapshot", staticmethod(lambda: snapshot))
+    config = {
+        "c2c": {
+            "enabled": True,
+            "snapshot_path": str(repo),
+            "env_python": "/usr/bin/python3",
+            "datasets": ["mmlu-redux"],
+            "small_loop": {
+                "eval_datasets": ["mmlu-redux"],
+                "gpu_ids": "auto",
+                "proxy_screen": {"enabled": True, "eval_datasets": ["mmlu-redux"], "train_samples": 2},
+            },
+        },
+        "experiment": {"gpu_policy": {"max_gpus": 3, "min_free_mb": 8192, "max_utilization_gpu": 40}},
+    }
+    project_root = tmp_path / "project"
+    context = AgentContext(project_root, config, ArtifactManager(project_root), ModelClient(config, project_root=project_root))
+    agent = ExperimentAgent(context)
+
+    full_selection = ExperimentRunner(config).select_gpus({"gpu_ids": "auto", "max_gpus": 3, "min_free_mb": 8192, "max_utilization_gpu": 40})
+    proxy_selection = agent._select_c2c_proxy_gpus(agent._c2c_proxy_gpu_policy(execution={}))
+    run_spec = C2CAdapter(project_root, config).materialize_candidate_configs({"id": "idea"}, full_selection, proxy_gpu_selection=proxy_selection)
+
+    assert full_selection.selected_ids == [1, 2]
+    assert proxy_selection.selected_ids == [1]
+    assert "CUDA_VISIBLE_DEVICES=1,2" in run_spec["commands"]["train"]
+    assert "CUDA_VISIBLE_DEVICES=1 " in run_spec["proxy_screen"]["commands"]["train"]
+    assert "torch.distributed.run" not in run_spec["proxy_screen"]["commands"]["train"]
+    assert all("CUDA_VISIBLE_DEVICES=1,2" not in command for command in run_spec["commands"]["preflight"])
+    assert all("CUDA_VISIBLE_DEVICES=1 " not in command for command in run_spec["commands"]["preflight"])
+    assert any("--no-cov" in command for command in run_spec["commands"]["preflight"])
+
+
+def test_c2c_full_train_resource_policy_sets_batch_grad_and_lr(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "recipe/train_recipe/C2C_0.6+0.5.json").write_text(
+        json.dumps(
+            {
+                "output": {},
+                "data": {"kwargs": {}},
+                "training": {
+                    "learning_rate": 1e-4,
+                    "per_device_train_batch_size": 4,
+                    "gradient_accumulation_steps": 8,
+                },
+                "model": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    snapshot = [
+        {"index": 5, "memory_total_mb": 24564, "memory_free_mb": 24000, "memory_used_mb": 0, "utilization_gpu": 0},
+        {"index": 6, "memory_total_mb": 24564, "memory_free_mb": 17000, "memory_used_mb": 7000, "utilization_gpu": 0},
+    ]
+    monkeypatch.setattr(ExperimentRunner, "_gpu_snapshot", staticmethod(lambda: snapshot))
+    config = {
+        "c2c": {
+            "enabled": True,
+            "snapshot_path": str(repo),
+            "env_python": "/usr/bin/python3",
+            "datasets": ["mmlu-redux"],
+            "small_loop": {
+                "eval_datasets": ["mmlu-redux"],
+                "gpu_ids": "auto",
+                "train_resource_policy": {
+                    "enabled": True,
+                    "per_device_train_batch_size": "auto",
+                    "reference_per_device_train_batch_size": 4,
+                    "reference_gradient_accumulation_steps": 8,
+                    "reference_num_gpus": 1,
+                    "learning_rate_scale": "effective_batch_ratio",
+                },
+                "proxy_screen": {"enabled": False},
+            },
+        },
+        "experiment": {"gpu_policy": {"max_gpus": 2, "min_free_mb": 8192, "max_utilization_gpu": 40}},
+    }
+    adapter = C2CAdapter(tmp_path / "project", config)
+    selection = ExperimentRunner(config).select_gpus({"gpu_ids": "auto", "max_gpus": 2, "min_free_mb": 8192, "max_utilization_gpu": 40})
+
+    run_spec = adapter.materialize_candidate_configs({"id": "idea"}, selection)
+    train = json.loads(Path(run_spec["train_config"]).read_text(encoding="utf-8"))
+
+    assert selection.selected_ids == [5, 6]
+    assert train["training"]["per_device_train_batch_size"] == 3
+    assert train["training"]["gradient_accumulation_steps"] == 6
+    assert train["training"]["learning_rate"] == pytest.approx(1.125e-4)
+    assert run_spec["train_resource_adjustment"]["selected_gpu_free_mb"] == 17000
+    assert run_spec["train_resource_adjustment"]["effective_batch_size"] == 36
 
 
 def test_c2c_proxy_batch_explicit_override_wins(monkeypatch, tmp_path: Path) -> None:
@@ -2672,6 +5117,264 @@ def test_c2c_s1_codex_evidence_agent_blocks_without_fallback(monkeypatch, tmp_pa
     assert (project_root / "literature/c2c/s1_codex_events.jsonl").exists()
 
 
+def test_c2c_s1_codex_evidence_agent_repairs_unresolved_refs(monkeypatch, tmp_path: Path) -> None:
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {"enabled": True}
+    config["agents"] = {"s1_evidence_agent": {"max_json_repairs": 1, "timeout_seconds": 5}}
+    project_root = tmp_path / "workspace" / "p_refs"
+    project_root.mkdir(parents=True)
+    _write_minimal_s1_ref_catalog(project_root)
+    monkeypatch.setattr(literature_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    prompts = []
+
+    def fake_codex(command, **kwargs):
+        prompts.append(kwargs.get("input") or "")
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        payload = _s1_codex_direction_payload()
+        if "resume" not in command:
+            payload["evidence_bundle"]["items"][0]["chunk_id"] = "missing:chunk"
+            payload["selected_ideas"][0]["code_refs"] = [{"source_type": "code", "source_label": "missing/file.py", "claim": "bad ref"}]
+            stdout = '{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174333"}\n'
+        else:
+            stdout = ""
+        output_path.write_text(json.dumps(payload), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(literature_module.subprocess, "run", fake_codex)
+
+    result = literature_module._run_s1_codex_evidence_agent(
+        project_root=project_root,
+        config=config,
+        prompt="return valid json",
+        max_repairs=1,
+        timeout_seconds=5,
+    )
+
+    assert result["status"] == "ok"
+    assert result["repair_count"] == 1
+    assert result["evidence_ref_report"]["status"] == "pass"
+    assert "chunk_id_not_in_chunk_index" in prompts[1]
+    assert "code_ref_missing_file_or_symbol" in prompts[1]
+
+
+def test_c2c_s1_codex_evidence_agent_accepts_artifact_anchor_refs(monkeypatch, tmp_path: Path) -> None:
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {"enabled": True}
+    config["agents"] = {"s1_evidence_agent": {"max_json_repairs": 1, "timeout_seconds": 5}}
+    project_root = tmp_path / "workspace" / "p_anchor_refs"
+    project_root.mkdir(parents=True)
+    _write_minimal_s1_ref_catalog(project_root)
+    for rel in [
+        "experiment/results/failure_feedback.json",
+        "plan/direction_scorecard.json",
+        "intake/c2c/negative_result_memory.json",
+    ]:
+        path = project_root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(literature_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    calls = []
+
+    def fake_codex(command, **kwargs):
+        calls.append(command)
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        payload = _s1_codex_direction_payload()
+        payload["evidence_bundle"]["items"].extend(
+            [
+                {
+                    "source_type": "artifact",
+                    "source_path": "experiment/results/failure_feedback.json#entry",
+                    "summary": "latest failure feedback",
+                    "supports": ["direction"],
+                    "risks": [],
+                },
+                {
+                    "source_type": "artifact",
+                    "source_path": "plan/direction_scorecard.json#candidate_constrained",
+                    "summary": "prior direction exhausted",
+                    "supports": [],
+                    "risks": ["repeat risk"],
+                },
+            ]
+        )
+        payload["selected_ideas"][0]["evidence_refs"].append(
+            {
+                "source_type": "artifact",
+                "source_label": "experiment/results/failure_feedback.json#entry",
+                "claim": "anchor refs should resolve by artifact path",
+            }
+        )
+        payload["selected_ideas"][0]["counterevidence_refs"].append(
+            {
+                "source_type": "artifact",
+                "source_label": "intake/c2c/negative_result_memory.json#blocked_idea_patterns",
+                "claim": "anchor refs should not force JSON repair",
+            }
+        )
+        output_path.write_text(json.dumps(payload), encoding="utf-8")
+        return SimpleNamespace(
+            returncode=0,
+            stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174555"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(literature_module.subprocess, "run", fake_codex)
+
+    result = literature_module._run_s1_codex_evidence_agent(
+        project_root=project_root,
+        config=config,
+        prompt="return valid json",
+        max_repairs=1,
+        timeout_seconds=5,
+    )
+
+    assert result["status"] == "ok"
+    assert result["repair_count"] == 0
+    assert len(calls) == 1
+    assert result["evidence_ref_report"]["status"] == "pass"
+
+
+def test_c2c_s1_novelty_auditor_rejects_and_revises_direction(monkeypatch, tmp_path: Path) -> None:
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {"enabled": True}
+    config["agents"] = {
+        "s1_evidence_agent": {"max_json_repairs": 0, "timeout_seconds": 5},
+        "s1_novelty_auditor": {"enabled": True, "threshold": 0.6, "max_revision_rounds": 1, "timeout_seconds": 5},
+    }
+    project_root = tmp_path / "workspace" / "p_novelty"
+    project_root.mkdir(parents=True)
+    _write_minimal_s1_ref_catalog(project_root)
+    monkeypatch.setattr(literature_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    prompts: list[str] = []
+    s1_call_count = 0
+    audit_call_count = 0
+
+    def revised_payload() -> dict:
+        payload = _s1_codex_direction_payload()
+        payload["direction_decision"]["direction_id"] = "pathology_conditioned_controller"
+        payload["direction_decision"]["mechanism_direction"] = "Pathology Conditioned Controller"
+        payload["direction_decision"]["mechanism_type"] = "pathology_conditioned_controller"
+        payload["direction_decision"]["core_hypothesis"] = "Condition transfer behavior on detected alignment pathology rather than utility routing."
+        payload["selected_ideas"][0]["id"] = "pathology_conditioned_controller"
+        payload["selected_ideas"][0]["title"] = "Pathology Conditioned Controller"
+        payload["selected_ideas"][0]["mechanism_type"] = "pathology_conditioned_controller"
+        payload["selected_ideas"][0]["hypothesis"] = "Detect alignment pathology and modulate transfer behavior only when pathology is present."
+        return payload
+
+    def fake_codex(command, **kwargs):
+        nonlocal s1_call_count, audit_call_count
+        prompt = kwargs.get("input") or ""
+        prompts.append(prompt)
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        if "auditing S1 novelty" in prompt:
+            audit_call_count += 1
+            if audit_call_count == 1:
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "c2c_s1_novelty_audit_v1",
+                            "status": "ok",
+                            "novelty_score": 0.22,
+                            "max_similarity_score": 0.88,
+                            "passed": False,
+                            "threshold": 0.6,
+                            "most_similar_sources": [{"source_type": "shared_memory", "source_id": "mem_old_utility", "similarity_score": 0.88, "overlap": ["mechanism"], "why_similar": "same utility routing mechanism"}],
+                            "distinctive_elements": [],
+                            "repeated_patterns": ["utility routing"],
+                            "revision_guidance": ["Switch away from utility routing toward pathology-conditioned control."],
+                            "decision": "revise",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                output_path.write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "c2c_s1_novelty_audit_v1",
+                            "status": "ok",
+                            "novelty_score": 0.78,
+                            "max_similarity_score": 0.31,
+                            "passed": True,
+                            "threshold": 0.6,
+                            "most_similar_sources": [],
+                            "distinctive_elements": ["pathology-conditioned control"],
+                            "repeated_patterns": [],
+                            "revision_guidance": [],
+                            "decision": "pass",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return SimpleNamespace(returncode=0, stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614179999"}\n', stderr="")
+        s1_call_count += 1
+        output_path.write_text(json.dumps(_s1_codex_direction_payload() if s1_call_count == 1 else revised_payload()), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614170000"}\n', stderr="")
+
+    monkeypatch.setattr(literature_module.subprocess, "run", fake_codex)
+
+    result = literature_module._run_s1_codex_evidence_agent(
+        project_root=project_root,
+        config=config,
+        prompt="return valid json",
+        max_repairs=0,
+        timeout_seconds=5,
+    )
+
+    assert result["status"] == "ok"
+    assert s1_call_count == 2
+    assert audit_call_count == 2
+    assert len(result["novelty_audits"]) == 2
+    assert result["novelty_audits"][0]["passed"] is False
+    assert result["novelty_audits"][1]["passed"] is True
+    assert result["payload"]["direction_decision"]["direction_id"] == "pathology_conditioned_controller"
+    assert any("previous S1 direction was rejected" in prompt for prompt in prompts)
+
+
+def test_c2c_s1_codex_resets_duplicate_direction_session(monkeypatch, tmp_path: Path) -> None:
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {"enabled": True}
+    config["agents"] = {"s1_evidence_agent": {"duplicate_direction_reset_threshold": 1, "timeout_seconds": 5}}
+    project_root = tmp_path / "workspace" / "p_duplicate_s1"
+    project_root.mkdir(parents=True)
+    _write_minimal_s1_ref_catalog(project_root)
+    monkeypatch.setattr(literature_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+
+    def fake_codex(command, **kwargs):
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text(json.dumps(_s1_codex_direction_payload()), encoding="utf-8")
+        return SimpleNamespace(
+            returncode=0,
+            stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174444"}\n',
+            stderr="",
+        )
+
+    monkeypatch.setattr(literature_module.subprocess, "run", fake_codex)
+
+    first = literature_module._run_s1_codex_evidence_agent(
+        project_root=project_root,
+        config=config,
+        prompt="return valid json",
+        max_repairs=0,
+        timeout_seconds=5,
+    )
+    second = literature_module._run_s1_codex_evidence_agent(
+        project_root=project_root,
+        config=config,
+        prompt="return valid json",
+        max_repairs=0,
+        timeout_seconds=5,
+    )
+
+    assert first["status"] == "ok"
+    assert second["status"] == "ok"
+    assert second["session_reset"] is True
+    assert second["session_reset_reason"] == "duplicate_direction_streak"
+    sessions = yaml.safe_load((project_root / "meta" / "codex_sessions.yaml").read_text(encoding="utf-8"))
+    assert "s1:c2c_evidence_direction" not in sessions.get("sessions", {})
+    assert sessions["session_reset_history"][-1]["reason"] == "duplicate_direction_streak"
+
+
 def test_c2c_s2_directional_planner_falls_back_without_real_llm(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
@@ -2699,6 +5402,45 @@ def test_c2c_s2_directional_planner_falls_back_without_real_llm(tmp_path: Path) 
     assert result["plan"]["directional_planning"]["status"] == "fallback_no_real_llm"
 
 
+def test_c2c_s2_planner_current_direction_fallback_gets_execution_contract(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
+        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
+        "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
+    }
+    config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
+    config["code_patch"] = {"enabled": False}
+    paths = init_workspace(config, "topic", project_id="proj_s2_direction_contract_fallback", simulate=False)
+    s1_direction = {
+        "id": "pathology_conditioned_transfer_controller",
+        "title": "Pathology-Conditioned Transfer Controller",
+        "selected": True,
+        "hypothesis": "Condition transfer on alignment pathology buckets.",
+        "description": "Use pathology statistics to abstain or attenuate harmful transfer.",
+        "mechanism_type": "pathology_conditioned_controller",
+        "expected_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
+    }
+    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", [s1_direction], artifact_type="ideas", summary="ideas")
+    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
+
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    result = PlanAgent(context).run()
+
+    planned = result["plan"]["candidate_ideas"]
+    assert planned[0]["id"] == "pathology_conditioned_transfer_controller"
+    assert planned[0]["mechanism_type"] == "pathology_conditioned_controller"
+    assert planned[0]["novelty_gate"]["status"] == "pass"
+    assert planned[0]["implementation_scope_gate"]["status"] == "pass"
+    assert planned[0]["experiment_contract"]["ablation_switch"]
+    assert planned[0]["experiment_contract"]["config_overrides"]["train"]["model"]["cache_controller_mode"] == "pathology_conditioned_transfer_controller"
+
+
 def test_c2c_s2_directional_planner_uses_direction_variants(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
@@ -2713,6 +5455,28 @@ def test_c2c_s2_directional_planner_uses_direction_variants(tmp_path: Path) -> N
     }
     config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
     config["code_patch"] = {"enabled": False}
+    config.setdefault("orchestration", {})["shared_method_memory"] = {
+        "enabled": True,
+        "path": str(tmp_path / "s2_shared_memory.jsonl"),
+        "summary_path": str(tmp_path / "s2_shared_memory.md"),
+    }
+    shared_memory_entry = {
+        "schema_version": "shared_method_failure_memory_v1",
+        "memory_id": "mem_s2_proxy_collapse",
+        "timestamp": "2026-06-10T00:00:00Z",
+        "project_id": "old_project",
+        "topic": "cross tokenizer cache",
+        "kind": "shared_c2c_method_failure",
+        "route": "proxy_rejected_same_direction",
+        "failure_class": "method_failure",
+        "summary": {
+            "failed_idea_ids": ["old_hard_gate"],
+            "dragging_datasets": [{"dataset": "mmlu-redux", "regression": 2.0}],
+            "avoid_repeat_rules": ["Avoid hard gates that collapse coverage."],
+        },
+        "entries": [{"id": "old_hard_gate", "decision": "proxy_rejected", "proxy_screen": {"proxy_dataset_deltas": {"mmlu-redux": -2.0}}}],
+    }
+    Path(config["orchestration"]["shared_method_memory"]["path"]).write_text(json.dumps(shared_memory_entry, ensure_ascii=False) + "\n", encoding="utf-8")
     paths = init_workspace(config, "topic", project_id="proj_s2_planner_variants", simulate=False)
     ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
     ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
@@ -2729,10 +5493,17 @@ def test_c2c_s2_directional_planner_uses_direction_variants(tmp_path: Path) -> N
             return {
                 "planner_summary": "Create two utility-routing implementation variants within the S1 direction.",
                 "planning_mode": "same_direction_variant",
-                "candidates": [
+                "used_shared_memory_refs": ["mem_s2_proxy_collapse"],
+                "variant_candidates": [
                     {
                         "id": "utility_router_soft_residual_variant",
                         "title": "Utility router soft residual variant",
+                        "mechanism_axis": "normalization",
+                        "integration_point": "wrapper",
+                        "control_signal": "utility",
+                        "expected_dataset_tradeoff": {"mmlu-redux": "flat", "ai2-arc": "up", "openbookqa": "flat"},
+                        "risk_budget": {"max_changed_files": 2, "forbidden_files": ["script/evaluation/*"]},
+                        "anti_repeat": "Moves away from projector hard routing toward wrapper residual scaling.",
                         "description": "Keep baseline transfer as the default path and use predicted utility to scale a residual correction rather than adding a hard accept/reject gate.",
                         "motivation": "Previous proxy failures collapsed all datasets, so the variant should preserve baseline coverage while only attenuating harmful residual transfer.",
                         "hypothesis": "A soft residual utility router improves proxy mean without lowering transfer coverage across mmlu-redux, ai2-arc, and openbookqa.",
@@ -2748,6 +5519,7 @@ def test_c2c_s2_directional_planner_uses_direction_variants(tmp_path: Path) -> N
                         },
                         "failure_avoidance": ["Do not add another hard gate", "Preserve baseline transfer coverage"],
                         "failure_feedback_refs": [{"source_type": "failure_feedback", "source_label": "proxy collapsed all datasets"}],
+                        "used_shared_memory_refs": ["mem_s2_proxy_collapse"],
                     }
                 ],
             }
@@ -2762,12 +5534,29 @@ def test_c2c_s2_directional_planner_uses_direction_variants(tmp_path: Path) -> N
     assert planned[0]["id"] == "utility_router_soft_residual_variant"
     assert planned[0]["mechanism_type"] == "utility_predicted_cache_routing"
     assert planned[0]["selected"] is True
+    assert planned[0]["variant_fingerprint"]
+    assert planned[0]["s2_variant"]["integration_point"] == "wrapper"
+    assert planned[0]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
+    assert planned[0]["s2_variant"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
+    assert planned[0]["s2_variant"]["variant_score"]["score"] > 0
     assert planned[0]["s2_planner"]["source"] == "directional_planner"
+    assert planned[0]["s2_planner"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
+    assert result["plan"]["directional_planning"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
+    assert result["plan"]["next_variant"]["variant_fingerprint"] == planned[0]["variant_fingerprint"]
+    assert result["plan"]["next_variant"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
+    assert (paths.root / "plan" / "next_variant.json").exists()
     saved = json.loads((paths.root / "plan" / "candidate_ideas.json").read_text(encoding="utf-8"))
     assert saved[0]["id"] == "utility_router_soft_residual_variant"
+    assert saved[0]["s2_variant"]["variant_fingerprint"] == planned[0]["variant_fingerprint"]
+    assert saved[0]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
+    variant_artifact = json.loads((paths.root / "plan" / "next_variant.json").read_text(encoding="utf-8"))
+    assert variant_artifact["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
+    assert variant_artifact["next_variant"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
     memory = json.loads((paths.root / "plan" / "s2_planner_memory.json").read_text(encoding="utf-8"))
     assert memory["entry_count"] == 1
     assert memory["entries"][0]["selected_candidate"]["id"] == "utility_router_soft_residual_variant"
+    assert memory["entries"][0]["selected_candidate"]["variant_fingerprint"] == planned[0]["variant_fingerprint"]
+    assert memory["entries"][0]["selected_candidate"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
 
     second = PlanAgent(context).run()
 
@@ -2775,6 +5564,426 @@ def test_c2c_s2_directional_planner_uses_direction_variants(tmp_path: Path) -> N
     assert "utility_router_soft_residual_variant" in llm.prompts[-1]
     memory = json.loads((paths.root / "plan" / "s2_planner_memory.json").read_text(encoding="utf-8"))
     assert memory["entry_count"] == 2
+
+
+def test_c2c_implementation_failure_reruns_only_s2_5_patch_repair(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
+        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+        "small_loop": {"eval_datasets": ["mmlu-redux"], "gpu_ids": [0], "max_candidates": 1},
+        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py"],
+    }
+    config["agents"] = {"s2_directional_planner": {"resume_enabled": True}}
+    config["code_patch"] = {
+        "enabled": True,
+        "backend": "mock_codex",
+        "max_candidates": 1,
+        "validation": {
+            "require_py_compile": True,
+            "require_targeted_tests": False,
+            "runtime_smoke": {"enabled": False},
+            "mechanism_self_review": {"enabled": False},
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_s2_5_patch_only", simulate=False)
+    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
+    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
+    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
+    existing_candidate = dict(ideas[0])
+    existing_candidate["selected"] = True
+    existing_candidate["variant_fingerprint"] = "vf-implementation-repair"
+    other_candidate = dict(ideas[1])
+    other_candidate["id"] = "must_not_patch"
+    other_candidate["selected"] = False
+    write_json(paths.root / "plan" / "candidate_ideas.json", [existing_candidate, other_candidate])
+    write_json(
+        paths.root / "plan" / "s2_5_repair_dispatch.json",
+        {
+            "schema_version": "c2c_s2_5_only_repair_dispatch_v1",
+            "mode": "s2_5_only_implementation_repair",
+            "repair_lane": "s2_5_only_implementation_repair",
+            "selected_candidate_id": existing_candidate["id"],
+            "variant_fingerprint": "vf-implementation-repair",
+            "same_candidate_required": True,
+            "same_variant_fingerprint_required": True,
+            "reuse_persistent_codex_session": True,
+            "do_not_replan_method": True,
+            "repair_until": "patch_eligible_for_s3_or_implementation_blocked",
+            "changed_files": ["rosetta/model/projector.py"],
+            "implementation_failure_signals": ["mechanism_activation_wiring_failed", "forward_missing_switch_read"],
+            "activation_forward_probe_diagnostics": {"switch_seen_by_forward": False, "projector_output_identical": True},
+            "tensor_checks": {"identical_tensors": ["projector_output"], "changed_tensors": []},
+            "patch_manifest": {"selected_candidate_id": existing_candidate["id"], "status": "no_valid_patch"},
+            "performance_feedback_path": "plan/performance_feedback.json",
+            "patch_manifest_path": "plan/code_patches/patch_manifest.json",
+        },
+    )
+    write_json(
+        paths.root / "plan" / "performance_feedback.json",
+        {
+            "summary": {
+                "failure_class": "implementation_failure",
+                "recommended_s2_action": "patch_repair",
+                "does_not_consume_same_direction_attempt": True,
+            },
+            "reason": "runtime_smoke:mechanism_activation_wiring failed",
+        },
+    )
+    write_json(
+        paths.root / "plan" / "s2_planner_memory.json",
+        {"schema_version": "c2c_s2_planner_memory_v1", "entries": [{"selected_candidate": {"id": "old"}}]},
+    )
+
+    class PlannerMustNotRun(ModelClient):
+        def __init__(self, config, project_root=None):
+            super().__init__(config, project_root=project_root)
+            self.use_real_api = True
+
+        def generate_json_with_schema(self, **kwargs):
+            raise AssertionError("S2 planner must be skipped for implementation_failure patch-only repair")
+
+    class PatchBackend:
+        def generate(self, implementation_contract, temp_repo, edit_policy):
+            assert implementation_contract["candidate_id"] == existing_candidate["id"]
+            assert implementation_contract["variant_fingerprint"] == "vf-implementation-repair"
+            assert implementation_contract["previous_failure"]["proxy_screen"]["reason"] == "runtime_smoke:mechanism_activation_wiring failed"
+            previous_failure = implementation_contract["previous_failure"]
+            dispatch = previous_failure["s2_5_repair_dispatch"]
+            assert dispatch["selected_candidate_id"] == existing_candidate["id"]
+            assert dispatch["tensor_checks"]["identical_tensors"] == ["projector_output"]
+            contract = previous_failure["proxy_effect_repair_contract"]
+            assert contract["mode"] == "s2_5_only_implementation_repair"
+            assert contract["force_new_codex_session"] is False
+            assert contract["reuse_persistent_codex_session"] is True
+            assert contract["same_candidate_required"] is True
+            assert contract["same_variant_fingerprint_required"] is True
+            assert "forward_missing_switch_read" in contract["implementation_failure_signals"]
+            assert edit_policy.allowed("rosetta/model/projector.py", repo_root=temp_repo)
+            (temp_repo / "rosetta/model/projector.py").write_text("VALUE = 's2.5 repaired projector'\n", encoding="utf-8")
+            return {"status": "ok", "rationale": "S2.5 patch-only implementation repair."}
+
+    monkeypatch.setattr("auto_research.agents.plan.CodePatchAgent", lambda project_root, config, artifacts: CodePatchAgent(project_root, config, artifacts, backend=PatchBackend()))
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerMustNotRun(config, project_root=paths.root))
+    result = PlanAgent(context).run()
+
+    assert result["plan"]["s2_5_patch_only_repair"]["enabled"] is True
+    assert result["plan"]["s2_5_patch_only_repair"]["repair_lane"] == "s2_5_only_implementation_repair"
+    assert result["plan"]["s2_5_patch_only_repair"]["skips_s2_planner"] is True
+    assert result["plan"]["s2_5_patch_only_repair"]["reuse_persistent_codex_session"] is True
+    assert (paths.root / "plan" / "s2_5_patch_only_repair.json").exists()
+    assert (paths.root / "plan" / "code_patches" / existing_candidate["id"] / "patch.json").exists()
+    assert not (paths.root / "plan" / "code_patches" / other_candidate["id"] / "patch.json").exists()
+    plan_yaml = yaml.safe_load((paths.root / "plan" / "plan.yaml").read_text(encoding="utf-8"))
+    assert plan_yaml["selected_idea"]["id"] == existing_candidate["id"]
+    assert plan_yaml["s2_5_patch_only_repair"]["patch_eligible_for_s3"] is True
+    assert len(plan_yaml["candidate_ideas"]) == 1
+    assert plan_yaml["candidate_ideas"][0]["id"] == existing_candidate["id"]
+    manifest = json.loads((paths.root / "plan" / "code_patches" / "patch_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "ok"
+    assert manifest["selected_candidate_id"] == existing_candidate["id"]
+    patch_only_record = json.loads((paths.root / "plan" / "s2_5_patch_only_repair.json").read_text(encoding="utf-8"))
+    assert patch_only_record["repair_lane"] == "s2_5_only_implementation_repair"
+    assert patch_only_record["patch_eligible_for_s3"] is True
+    assert patch_only_record["implementation_blocked"] is False
+    assert patch_only_record["selected_candidate_id"] == existing_candidate["id"]
+    assert patch_only_record["requested_variant_fingerprint"] == "vf-implementation-repair"
+    memory = json.loads((paths.root / "plan" / "s2_planner_memory.json").read_text(encoding="utf-8"))
+    assert memory["entries"] == [{"selected_candidate": {"id": "old"}}]
+
+
+def test_c2c_implementation_failure_missing_candidate_blocks_without_s2_planner(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {"eval_datasets": ["mmlu-redux"], "gpu_ids": [0], "max_candidates": 1},
+        "allowed_files": ["rosetta/model/projector.py"],
+    }
+    config["agents"] = {"s2_directional_planner": {"resume_enabled": True}}
+    config["code_patch"] = {"enabled": True, "backend": "mock_codex"}
+    paths = init_workspace(config, "topic", project_id="proj_s2_5_missing_candidate", simulate=False)
+    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
+    existing_candidate = dict(ideas[0])
+    existing_candidate["id"] = "actual_candidate"
+    existing_candidate["selected"] = True
+    write_json(paths.root / "plan" / "candidate_ideas.json", [existing_candidate])
+    write_json(
+        paths.root / "plan" / "s2_5_repair_dispatch.json",
+        {
+            "mode": "s2_5_only_implementation_repair",
+            "selected_candidate_id": "missing_candidate",
+            "variant_fingerprint": "missing-fingerprint",
+            "reuse_persistent_codex_session": True,
+        },
+    )
+    write_json(
+        paths.root / "plan" / "performance_feedback.json",
+        {
+            "summary": {
+                "failure_class": "implementation_failure",
+                "recommended_s2_action": "patch_repair",
+                "does_not_consume_same_direction_attempt": True,
+            },
+            "reason": "target candidate missing after S3 implementation failure",
+        },
+    )
+
+    class PlannerMustNotRun(ModelClient):
+        def __init__(self, config, project_root=None):
+            super().__init__(config, project_root=project_root)
+            self.use_real_api = True
+
+        def generate_json_with_schema(self, **kwargs):
+            raise AssertionError("S2 planner must not run for missing-candidate implementation repair")
+
+    class PatchMustNotRun:
+        def run(self, plan, patch_ideas):
+            raise AssertionError("S2.5 patch generation must not run without the locked candidate")
+
+    monkeypatch.setattr("auto_research.agents.plan.CodePatchAgent", lambda project_root, config, artifacts: PatchMustNotRun())
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerMustNotRun(config, project_root=paths.root))
+    result = PlanAgent(context).run()
+
+    assert result["plan"]["s2_5_patch_only_repair"]["status"] == "implementation_blocked"
+    assert result["plan"]["s2_5_patch_only_repair"]["patch_eligible_for_s3"] is False
+    assert result["plan"]["s2_5_patch_only_repair"]["selected_candidate_id"] == "missing_candidate"
+    blocked = json.loads((paths.root / "plan" / "s2_5_patch_only_repair.json").read_text(encoding="utf-8"))
+    assert blocked["implementation_blocked"] is True
+    manifest = json.loads((paths.root / "plan" / "code_patches" / "patch_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["status"] == "no_valid_patch"
+    assert manifest["implementation_blocked"] is True
+
+
+def test_c2c_s2_variant_scorer_prefers_diverse_failure_targeted_variant(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
+        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 1},
+        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py"],
+    }
+    config["agents"] = {"s2_directional_planner": {"resume_enabled": False, "max_variant_candidates": 3}}
+    config["code_patch"] = {"enabled": False}
+    paths = init_workspace(config, "topic", project_id="proj_s2_variant_scorer", simulate=False)
+    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
+    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
+    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
+    write_json(
+        paths.root / "plan" / "performance_feedback.json",
+        {
+            "summary": {
+                "recommended_s2_action": "mechanism_repair",
+                "repair_vs_variant_signals": ["single_dataset_small_drop"],
+            },
+            "candidate_results": [
+                {
+                    "id": "old_projector_variant",
+                    "proxy_screen": {"proxy_dataset_deltas": {"mmlu-redux": 0.2, "ai2-arc": -0.8, "openbookqa": 0.1}},
+                    "failure_attribution": {
+                        "patch_risk": {
+                            "risk_files": [{"path": "rosetta/model/projector.py"}],
+                            "risk_labels": ["projector_mechanism_changed"],
+                        }
+                    },
+                }
+            ],
+        },
+    )
+    write_json(
+        paths.root / "plan" / "s2_planner_memory.json",
+        {
+            "schema_version": "c2c_s2_planner_memory_v1",
+            "entries": [
+                {
+                    "selected_candidate": {
+                        "id": "old_projector_variant",
+                        "variant_fingerprint": "oldfp",
+                        "mechanism_axis": "routing",
+                        "integration_point": "projector",
+                        "control_signal": "utility",
+                    },
+                    "candidate_summaries": [],
+                    "feedback_digest": {"patch_risk_files": ["rosetta/model/projector.py"]},
+                }
+            ],
+        },
+    )
+
+    class PlannerLLM(ModelClient):
+        def __init__(self, config, project_root=None):
+            super().__init__(config, project_root=project_root)
+            self.use_real_api = True
+
+        def generate_json_with_schema(self, **kwargs):
+            return {
+                "planner_summary": "Generate projector repeat and wrapper repair variants.",
+                "planning_mode": "same_direction_variant",
+                "variant_candidates": [
+                    {
+                        "id": "repeat_projector_router",
+                        "title": "Repeat projector router",
+                        "mechanism_axis": "routing",
+                        "integration_point": "projector",
+                        "control_signal": "utility",
+                        "expected_dataset_tradeoff": {"mmlu-redux": "up", "ai2-arc": "risk", "openbookqa": "up"},
+                        "risk_budget": {"max_changed_files": 3, "forbidden_files": ["script/evaluation/*"]},
+                        "anti_repeat": "Still mostly projector routing.",
+                        "description": "Repeat projector routing.",
+                        "hypothesis": "Projector router improves utility.",
+                        "mechanism_type": "utility_predicted_cache_routing",
+                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"]},
+                        "implementation_plan": {"integration_points": ["rosetta/model/projector.py"]},
+                    },
+                    {
+                        "id": "wrapper_arc_recovery_residual",
+                        "title": "Wrapper ARC recovery residual",
+                        "mechanism_axis": "normalization",
+                        "integration_point": "wrapper",
+                        "control_signal": "span_agreement",
+                        "expected_dataset_tradeoff": {"mmlu-redux": "flat", "ai2-arc": "up", "openbookqa": "flat"},
+                        "risk_budget": {"max_changed_files": 2, "forbidden_files": ["script/evaluation/*"]},
+                        "anti_repeat": "Moves integration from projector to wrapper and targets AI2-ARC regression.",
+                        "description": "Use wrapper residual normalization to preserve positive datasets while recovering AI2-ARC.",
+                        "hypothesis": "Wrapper residual normalization reduces AI2-ARC regression without losing MMLU/OpenBook gains.",
+                        "mechanism_type": "utility_predicted_cache_routing",
+                        "experiment_contract": {"expected_files": ["rosetta/model/wrapper.py"]},
+                        "implementation_plan": {"integration_points": ["rosetta/model/wrapper.py"]},
+                    },
+                ],
+            }
+
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerLLM(config, project_root=paths.root))
+    result = PlanAgent(context).run()
+
+    planned = result["plan"]["candidate_ideas"]
+    assert len(planned) == 1
+    assert planned[0]["id"] == "wrapper_arc_recovery_residual"
+    assert planned[0]["s2_variant"]["integration_point"] == "wrapper"
+    assert planned[0]["s2_variant"]["variant_score"]["score"] > 0
+    variant_artifact = json.loads((paths.root / "plan" / "next_variant.json").read_text(encoding="utf-8"))
+    assert variant_artifact["next_variant"]["id"] == "wrapper_arc_recovery_residual"
+    assert "wrapper_arc_recovery_residual" in variant_artifact["considered_variant_ids"]
+    assert "repeat_projector_router" in variant_artifact["considered_variant_ids"]
+    assert "targets_dragging_dataset" in variant_artifact["next_variant"]["variant_score"]["reasons"]
+
+
+def test_c2c_s2_variant_scorer_penalizes_repeated_failed_integration_point_and_proxy_calibration(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
+        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 1},
+        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py"],
+    }
+    config["agents"] = {"s2_directional_planner": {"resume_enabled": False, "max_variant_candidates": 3}}
+    config["code_patch"] = {"enabled": False}
+    paths = init_workspace(config, "topic", project_id="proj_s2_calibration_penalty", simulate=False)
+    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
+    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
+    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
+    write_json(
+        paths.root / "plan" / "performance_feedback.json",
+        {
+            "proxy_calibration": {
+                "summary": {
+                    "method_feedback": {
+                        "risky_datasets": [{"dataset": "mmlu-redux", "misprediction_rate": 1.0}],
+                        "risky_mechanisms": [{"mechanism_type": "utility_predicted_cache_routing", "false_positive_rate": 1.0}],
+                        "risky_integration_points": [{"integration_point": "projector", "false_positive_rate": 1.0}],
+                    }
+                }
+            }
+        },
+    )
+    write_json(
+        paths.root / "plan" / "s2_planner_memory.json",
+        {
+            "schema_version": "c2c_s2_planner_memory_v1",
+            "entries": [
+                {
+                    "selected_candidate": {
+                        "id": "failed_projector_1",
+                        "integration_point": "projector",
+                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"]},
+                    },
+                    "feedback_digest": {"latest_decision": "proxy_repairable"},
+                },
+                {
+                    "selected_candidate": {
+                        "id": "failed_projector_2",
+                        "integration_point": "projector",
+                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"]},
+                    },
+                    "feedback_digest": {"latest_decision": "not_viable"},
+                },
+            ],
+        },
+    )
+
+    class PlannerLLM(ModelClient):
+        def __init__(self, config, project_root=None):
+            super().__init__(config, project_root=project_root)
+            self.use_real_api = True
+
+        def generate_json_with_schema(self, **kwargs):
+            return {
+                "planner_summary": "Compare failed projector reuse with wrapper alternative.",
+                "planning_mode": "same_direction_variant",
+                "variant_candidates": [
+                    {
+                        "id": "projector_proxy_overtrust",
+                        "title": "Projector proxy overtrust",
+                        "mechanism_axis": "routing",
+                        "integration_point": "projector",
+                        "control_signal": "utility",
+                        "expected_dataset_tradeoff": {"mmlu-redux": "up", "ai2-arc": "flat", "openbookqa": "flat"},
+                        "risk_budget": {"max_changed_files": 2},
+                        "description": "Projector utility routing.",
+                        "hypothesis": "Projector utility routing improves proxy.",
+                        "mechanism_type": "utility_predicted_cache_routing",
+                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"]},
+                    },
+                    {
+                        "id": "wrapper_calibrated_variant",
+                        "title": "Wrapper calibrated variant",
+                        "mechanism_axis": "normalization",
+                        "integration_point": "wrapper",
+                        "control_signal": "span_agreement",
+                        "expected_dataset_tradeoff": {"mmlu-redux": "flat", "ai2-arc": "up", "openbookqa": "flat"},
+                        "risk_budget": {"max_changed_files": 2},
+                        "description": "Wrapper normalization addresses calibration risk.",
+                        "hypothesis": "Wrapper normalization avoids projector false positives.",
+                        "mechanism_type": "semantic_span_graph_alignment",
+                        "experiment_contract": {"expected_files": ["rosetta/model/wrapper.py"]},
+                    },
+                ],
+            }
+
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerLLM(config, project_root=paths.root))
+    result = PlanAgent(context).run()
+    planned = result["plan"]["candidate_ideas"]
+    artifact = json.loads((paths.root / "plan" / "next_variant.json").read_text(encoding="utf-8"))
+
+    assert planned[0]["id"] == "wrapper_calibrated_variant"
+    assert artifact["next_variant"]["id"] == "wrapper_calibrated_variant"
+    assert "projector_proxy_overtrust" in artifact["considered_variant_ids"]
 
 
 def test_c2c_s2_resume_planner_uses_codex_session(monkeypatch, tmp_path: Path) -> None:
@@ -2871,6 +6080,79 @@ def test_c2c_s2_resume_planner_uses_codex_session(monkeypatch, tmp_path: Path) -
     assert memory["entry_count"] == 2
 
 
+def test_c2c_s2_resume_planner_inherits_mechanism_type_from_s1_direction(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["llm"]["codex_cli"] = {"use_resume": True, "sandbox": "read-only", "approval_policy": "never", "json_events": True}
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
+        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
+        "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
+    }
+    config["code_patch"] = {"enabled": False}
+    paths = init_workspace(config, "topic", project_id="proj_s2_resume_inherit_mechanism", simulate=False)
+    s1_direction = {
+        "id": "pathology_conditioned_transfer_controller",
+        "title": "Pathology-Conditioned Transfer Controller",
+        "selected": True,
+        "hypothesis": "Condition transfer on alignment pathology buckets.",
+        "description": "Use pathology statistics to abstain or attenuate harmful transfer.",
+        "mechanism_type": "pathology_conditioned_controller",
+        "expected_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
+    }
+    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", [s1_direction], artifact_type="ideas", summary="ideas")
+    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
+    monkeypatch.setattr("auto_research.agents.plan.shutil.which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+
+    def fake_run(command, **kwargs):
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "planner_summary": "Make a bucketed abstain variant.",
+                    "planning_mode": "new_direction_after_budget",
+                    "candidates": [
+                        {
+                            "id": "pathology_conditioned_transfer_controller_bucketed_abstain_v1",
+                            "title": "Bucketed pathology abstain",
+                            "description": "Abstain only on high-pathology alignment buckets.",
+                            "hypothesis": "High-pathology abstention removes localized harmful transfer.",
+                            "mechanism_type": "pathology_conditioned_transfer_controller",
+                            "experiment_contract": {},
+                            "implementation_plan": {},
+                            "failure_avoidance": ["no evaluator changes"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            returncode=0,
+            stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174333"}\n',
+            stderr="",
+        )
+
+    import auto_research.agents.plan as plan_module
+
+    monkeypatch.setattr(plan_module.subprocess, "run", fake_run)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+
+    result = PlanAgent(context).run()
+
+    planned = result["plan"]["candidate_ideas"]
+    assert result["plan"]["directional_planning"]["status"] == "ok"
+    assert planned[0]["id"] == "pathology_conditioned_transfer_controller_bucketed_abstain_v1"
+    assert planned[0]["mechanism_type"] == "pathology_conditioned_controller"
+    assert planned[0]["novelty_gate"]["status"] == "pass"
+    assert planned[0]["implementation_scope_gate"]["status"] == "pass"
+    assert planned[0]["experiment_contract"]["config_overrides"]["train"]["model"]["cache_controller_mode"] == "pathology_conditioned_transfer_controller_bucketed_abstain_v1"
+
+
 def test_c2c_s2_resume_planner_resets_duplicate_session_but_keeps_memory(monkeypatch, tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
@@ -2953,6 +6235,84 @@ def test_c2c_s2_resume_planner_resets_duplicate_session_but_keeps_memory(monkeyp
     assert "session_reset" in events
 
 
+def test_c2c_s2_resume_planner_real_api_skips_gpt_fallback_after_duplicate_reset(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["llm"]["use_real_api"] = True
+    config["llm"]["codex_cli"] = {"use_resume": True, "sandbox": "read-only", "approval_policy": "never", "json_events": True}
+    config["agents"] = {"s2_directional_planner": {"session_reset_duplicate_streak": 1}}
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
+        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
+        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py", "test/test_aligner_span_overlap.py"],
+    }
+    config["code_patch"] = {"enabled": False}
+    paths = init_workspace(config, "topic", project_id="proj_s2_resume_real_api_no_gpt_fallback", simulate=False)
+    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
+    artifacts = ArtifactManager(paths.root)
+    artifacts.write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
+    artifacts.write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
+
+    monkeypatch.setattr("auto_research.agents.plan.shutil.which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+
+    def fake_run(command, **kwargs):
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text(
+            json.dumps(
+                {
+                    "planner_summary": "Duplicate reset test.",
+                    "planning_mode": "same_direction_variant",
+                    "candidates": [
+                        {
+                            "id": "utility_duplicate_candidate",
+                            "title": "Utility duplicate candidate",
+                            "description": "Use utility prediction to softly scale residual transfer while preserving baseline cache coverage.",
+                            "hypothesis": "Soft residual utility routing avoids all-dataset collapse in cheap proxy.",
+                            "mechanism_type": "utility_predicted_cache_routing",
+                            "experiment_contract": {
+                                "config_overrides": {
+                                    "train": {"model": {"cache_routing_mode": "utility_duplicate_candidate"}},
+                                    "eval": {"model": {"rosetta_config": {"cache_routing_mode": "utility_duplicate_candidate"}}},
+                                }
+                            },
+                            "failure_avoidance": ["preserve baseline coverage"],
+                        }
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+        return SimpleNamespace(
+            returncode=0,
+            stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174333"}\n',
+            stderr="",
+        )
+
+    import auto_research.agents.plan as plan_module
+
+    monkeypatch.setattr(plan_module.subprocess, "run", fake_run)
+    client = ModelClient(config, project_root=paths.root)
+    client.use_real_api = True
+
+    def fail_gpt_fallback(**_kwargs):
+        raise AssertionError("S2 should not call GPT fallback after Codex resume duplicate reset in real API mode")
+
+    client.generate_json_with_schema = fail_gpt_fallback
+    context = AgentContext(paths.root, config, artifacts, client)
+
+    first = PlanAgent(context).run()
+    second = PlanAgent(context).run()
+
+    assert first["plan"]["directional_planning"]["source"] == "codex_resume_planner"
+    assert second["plan"]["directional_planning"]["status"] == "fallback_resume_planner_unavailable"
+    assert second["plan"]["directional_planning"]["resume_planner"]["session_reset"] is True
+    assert second["plan"]["candidate_ideas"][0]["s2_planner"]["source"] == "fallback_s1_ideas"
+
+
 def test_c2c_novelty_report_rejects_pure_local_tuning() -> None:
     report = c2c_idea_novelty_report(
         {
@@ -3005,7 +6365,7 @@ def test_c2c_novelty_report_accepts_default_mechanism_idea() -> None:
     assert "matched_coverage_ablation" in report["signals"]
 
 
-def test_s2_gate_requires_coverage_controls(tmp_path: Path) -> None:
+def test_s2_gate_tracks_missing_coverage_controls_as_debt_by_default(tmp_path: Path) -> None:
     project = tmp_path / "project"
     (project / "plan").mkdir(parents=True)
     (project / "plan" / "short_loop_plan.yaml").write_text("collector: c2c_small_loop\n", encoding="utf-8")
@@ -3014,19 +6374,18 @@ def test_s2_gate_requires_coverage_controls(tmp_path: Path) -> None:
     plan = {
         "selected_idea": ideas[0],
         "candidate_ideas": ideas,
-        "hypotheses": [],
-        "baselines": [],
-        "datasets": [],
+        "hypotheses": [{"id": "h1"}],
+        "baselines": [{"name": "base"}, {"name": "candidate"}],
+        "datasets": [{"name": "mmlu-redux"}],
         "metrics": [],
         "statistical_testing": {},
         "ablation_matrix": [],
         "task_graph": {},
-        "resource_budget": {"peak_concurrent_gpus": 0},
+        "resource_budget": {},
         "execution": {
             "collector": "c2c_small_loop",
             "min_delta_to_pass": 0.1,
             "max_dataset_regression": 2.0,
-            "selected_gpu_ids": [],
         },
         "acceptance_criteria": {
             "minimum_mean_delta": 0.1,
@@ -3037,6 +6396,46 @@ def test_s2_gate_requires_coverage_controls(tmp_path: Path) -> None:
     (project / "plan" / "plan.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
 
     report = S2GateValidator(project, {}).validate()
+
+    assert report.status == "PASS"
+    check_names = {check.name for check in report.checks if check.status == "PASS"}
+    assert "c2c_coverage_control_requirements" in check_names
+    assert "c2c_matched_coverage_ablation" in check_names
+    debt_checks = [check for check in report.checks if check.name == "c2c_coverage_control_requirements"]
+    assert debt_checks[0].details["quality_debt"] is True
+
+
+def test_s2_gate_requires_coverage_controls_in_strict_mode(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    (project / "plan").mkdir(parents=True)
+    (project / "plan" / "short_loop_plan.yaml").write_text("collector: c2c_small_loop\n", encoding="utf-8")
+    ideas = default_c2c_ideas("topic", {"name": "base", "mean": 50.0, "datasets": {}})
+    (project / "plan" / "candidate_ideas.json").write_text(json.dumps(ideas), encoding="utf-8")
+    plan = {
+        "selected_idea": ideas[0],
+        "candidate_ideas": ideas,
+        "hypotheses": [{"id": "h1"}],
+        "baselines": [{"name": "base"}, {"name": "candidate"}],
+        "datasets": [{"name": "mmlu-redux"}],
+        "metrics": [],
+        "statistical_testing": {},
+        "ablation_matrix": [],
+        "task_graph": {},
+        "resource_budget": {},
+        "execution": {
+            "collector": "c2c_small_loop",
+            "min_delta_to_pass": 0.1,
+            "max_dataset_regression": 2.0,
+        },
+        "acceptance_criteria": {
+            "minimum_mean_delta": 0.1,
+            "max_dataset_regression": 2.0,
+        },
+        "reviewer_risk_controls": {"top_concerns": []},
+    }
+    (project / "plan" / "plan.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
+
+    report = S2GateValidator(project, {"code_patch": {"validation": {"gate_mode": "strict"}}}).validate()
 
     assert report.status == "NEEDS_RETRY"
     check_names = {check.name for check in report.checks if check.status == "NEEDS_RETRY"}
@@ -3509,15 +6908,16 @@ def test_c2c_train_failure_with_checkpoint_continues_eval(monkeypatch, tmp_path:
     agent = ExperimentAgent(context)
 
     def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        run_repo = Path(working_dir)
         if name == "train":
             run_id = "idea"
-            final = repo / "local" / "auto_research_runs" / run_id / "checkpoints" / "final"
+            final = run_repo / "local" / "auto_research_runs" / run_id / "checkpoints" / "final"
             final.mkdir(parents=True, exist_ok=True)
             (final / "marker.txt").write_text("ok", encoding="utf-8")
             return {"step": name, "status": "failed", "attempts": [{"stdout": "", "stderr": "train crashed", "returncode": 1}], "returncode": 1}
         if name.startswith("eval_"):
             dataset = name.replace("eval_", "")
-            out = repo / "local" / "auto_research_runs" / "idea" / "results" / dataset
+            out = run_repo / "local" / "auto_research_runs" / "idea" / "results" / dataset
             out.mkdir(parents=True, exist_ok=True)
             (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
                 json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": 0.51}),
@@ -3541,11 +6941,113 @@ def test_c2c_train_failure_with_checkpoint_continues_eval(monkeypatch, tmp_path:
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
     assert result["command_status"] in {"partial", "ok"}
     assert result["metrics"]["mean"] == 51.0
     state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
     assert any(action["action"] == "skip_failed_train_with_existing_final_checkpoint" for action in state["recovery_actions"])
+
+
+def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    (repo / "recipe/train_recipe/C2C_0.6+0.5.json").write_text(
+        json.dumps(
+            {
+                "output": {},
+                "data": {"kwargs": {}},
+                "training": {"learning_rate": 1e-4, "per_device_train_batch_size": 4, "gradient_accumulation_steps": 8},
+                "model": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["llm"]["use_real_api"] = False
+    config["experiment"]["disable_llm_during_execution"] = True
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {
+            "eval_datasets": ["mmlu-redux"],
+            "train_samples": 1,
+            "gpu_ids": [0, 1],
+            "full_train_oom_recovery": {
+                "enabled": True,
+                "per_device_train_batch_size": 1,
+                "preserve_effective_batch": True,
+            },
+            "proxy_screen": {"enabled": False},
+        },
+        "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
+        "allowed_prefixes": ["recipe/", "local/auto_research_runs/"],
+    }
+    paths = init_workspace(config, "topic", project_id="proj_oom_memory_safe", simulate=False)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+    seen_steps: list[str] = []
+
+    def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        del retry_policy
+        run_repo = Path(working_dir)
+        seen_steps.append(name)
+        if name in {"train", "train_recovery_reduced_concurrency"}:
+            return {
+                "step": name,
+                "status": "failed",
+                "attempts": [{"stdout": "", "stderr": "torch.OutOfMemoryError: CUDA out of memory", "returncode": 1}],
+                "returncode": 1,
+            }
+        if name == "train_recovery_memory_safe":
+            assert "train_recipe_memory_safe.json" in command
+            run_id = "idea"
+            final = run_repo / "local" / "auto_research_runs" / run_id / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+            return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
+        if name == "eval_mmlu-redux":
+            out = run_repo / "local" / "auto_research_runs" / "idea" / "results" / "mmlu-redux"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
+                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.51}),
+                encoding="utf-8",
+            )
+        return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
+
+    monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
+    result = agent._run_single_c2c_candidate(
+        adapter=C2CAdapter(paths.root, config),
+        candidate={
+            "id": "idea",
+            "title": "Idea",
+            "hypothesis": "h",
+            "experiment_contract": {"config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}}},
+        },
+        index=0,
+        simulate=False,
+        baseline_mean=50.0,
+        min_delta=0.1,
+        max_regression=2.0,
+        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0, 1], "max_gpus": 2}),
+    )
+
+    memory_safe_config = Path(result["execution_repo"]["repo_root"]) / "local" / "auto_research_runs" / "idea" / "train_recipe_memory_safe.json"
+    memory_safe_payload = json.loads(memory_safe_config.read_text(encoding="utf-8"))
+    state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+
+    assert seen_steps.index("train_recovery_memory_safe") < seen_steps.index("eval_mmlu-redux")
+    assert result["command_status"] == "ok"
+    assert result["metrics"]["mean"] == 51.0
+    assert memory_safe_payload["training"]["per_device_train_batch_size"] == 1
+    assert memory_safe_payload["training"]["gradient_accumulation_steps"] == 16
+    assert memory_safe_payload["training"]["learning_rate"] == pytest.approx(1e-4)
+    assert any(action["action"] == "retry_train_memory_safe_recipe" and action["recovery_status"] == "ok" for action in state["recovery_actions"])
+    memory_safe_action = next(action for action in state["recovery_actions"] if action["action"] == "retry_train_memory_safe_recipe")
+    assert memory_safe_action["config_changes"]["learning_rate_adjustment"]["status"] == "unchanged"
 
 
 def test_deterministic_s3_blocks_noop_candidate(monkeypatch, tmp_path: Path) -> None:
@@ -3585,6 +7087,7 @@ def test_deterministic_s3_blocks_noop_candidate(monkeypatch, tmp_path: Path) -> 
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     assert result["decision"] == "blocked"
@@ -3662,6 +7165,7 @@ def test_s3_applies_frozen_patch_archives_snapshot_and_does_not_call_llm(tmp_pat
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     snapshot = paths.root / "experiment/code_snapshots/frozen_idea/rosetta/model/aligner.py"
@@ -3675,6 +7179,288 @@ def test_s3_applies_frozen_patch_archives_snapshot_and_does_not_call_llm(tmp_pat
     assert "frozen patch" in snapshot.read_text(encoding="utf-8")
     assert manifest.exists()
     assert state["code_snapshot"]["status"] == "ok"
+
+
+def test_s3_prefers_patched_repo_snapshot_over_patch_json(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    original_text = (repo / "rosetta/model/aligner.py").read_text(encoding="utf-8")
+    config = _base_config(tmp_path / "workspace", simulate=True)
+    config["experiment"]["disable_llm_during_execution"] = True
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {"eval_datasets": ["mmlu-redux"], "train_samples": 1, "gpu_ids": [0]},
+    }
+    paths = init_workspace(config, "topic", project_id="proj_s3_snapshot", simulate=True)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+
+    patch_dir = paths.root / "plan/code_patches/snapshot_idea"
+    patched_snapshot = patch_dir / "patched_repo_snapshot"
+    shutil.copytree(repo, patched_snapshot)
+    (patched_snapshot / "rosetta/model/aligner.py").write_text("VALUE = 'snapshot truth'\n", encoding="utf-8")
+    write_json(
+        patch_dir / "patched_repo_snapshot_manifest.json",
+        {"schema_version": "patched_repo_snapshot_v1", "sha256": "snapshot-sha", "file_count": 1},
+    )
+    patch_payload = {
+        "schema_version": 1,
+        "candidate_id": "snapshot_idea",
+        "operations": [
+            {
+                "op": "replace_file",
+                "path": "rosetta/model/aligner.py",
+                "old_sha256": sha256_file(repo / "rosetta/model/aligner.py"),
+                "new": "VALUE = 'patch fallback should not run'\n",
+            }
+        ],
+        "changed_files": ["rosetta/model/aligner.py"],
+        "patched_repo_snapshot": {
+            "status": "ok",
+            "path": "plan/code_patches/snapshot_idea/patched_repo_snapshot",
+            "manifest": "plan/code_patches/snapshot_idea/patched_repo_snapshot_manifest.json",
+            "sha256": "snapshot-sha",
+            "changed_files": ["rosetta/model/aligner.py"],
+        },
+        "rationale": "Snapshot should be S3 execution truth.",
+    }
+    write_json(patch_dir / "patch.json", patch_payload)
+    candidate = {
+        "id": "snapshot_idea",
+        "title": "Snapshot Idea",
+        "hypothesis": "h",
+        "code_patch": {
+            "status": "ok",
+            "patch_json": "plan/code_patches/snapshot_idea/patch.json",
+            "patched_repo_snapshot": patch_payload["patched_repo_snapshot"],
+            "changed_files": ["rosetta/model/aligner.py"],
+            "has_executable_change": True,
+        },
+    }
+
+    agent = ExperimentAgent(context)
+    result = agent._run_single_c2c_candidate(
+        adapter=C2CAdapter(paths.root, config),
+        candidate=candidate,
+        index=0,
+        simulate=True,
+        baseline_mean=50.0,
+        min_delta=0.1,
+        max_regression=2.0,
+        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+    )
+
+    execution_repo = Path(result["execution_repo"]["repo_root"])
+    archived = paths.root / "experiment/code_snapshots/snapshot_idea/rosetta/model/aligner.py"
+
+    assert result["patch_result"]["status"] == "snapshot_applied"
+    assert result["execution_repo"]["source"] == "patched_repo_snapshot"
+    assert "snapshot truth" in (execution_repo / "rosetta/model/aligner.py").read_text(encoding="utf-8")
+    assert "snapshot truth" in archived.read_text(encoding="utf-8")
+    assert "patch fallback should not run" not in archived.read_text(encoding="utf-8")
+    assert (repo / "rosetta/model/aligner.py").read_text(encoding="utf-8") == original_text
+
+
+def test_s3_blocks_outputs_written_to_original_snapshot(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["experiment"]["disable_llm_during_execution"] = True
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {
+            "eval_datasets": ["mmlu-redux"],
+            "train_samples": 1,
+            "gpu_ids": [0],
+            "proxy_screen": {"enabled": False},
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_s3_pollution", simulate=False)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+
+    def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        del command, working_dir, retry_policy
+        if name == "train":
+            final = repo / "local" / "auto_research_runs" / "polluter" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("polluted", encoding="utf-8")
+        return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
+
+    monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
+    result = agent._run_single_c2c_candidate(
+        adapter=C2CAdapter(paths.root, config),
+        candidate={
+            "id": "polluter",
+            "title": "Polluter",
+            "experiment_contract": {"config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}}},
+        },
+        index=0,
+        simulate=False,
+        baseline_mean=50.0,
+        min_delta=0.1,
+        max_regression=2.0,
+        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+    )
+
+    audit = result["execution_repo_audit"]
+    state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+
+    assert result["command_status"] == "blocked"
+    assert result["decision"] == "blocked"
+    assert result["failure_attribution"]["primary_failure"] == "execution_repo_output_pollution"
+    assert audit["status"] == "failed"
+    assert "local/auto_research_runs/polluter/checkpoints/final/marker.txt" in audit["output_pollution"]["added_files"]
+    assert any(action["action"] == "block_original_snapshot_output_pollution" for action in state["recovery_actions"])
+
+
+def test_c2c_small_loop_locks_to_selected_patch_manifest_candidate(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["experiment"]["disable_llm_during_execution"] = True
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {
+            "eval_datasets": ["mmlu-redux"],
+            "train_samples": 1,
+            "gpu_ids": [0],
+            "proxy_screen": {"enabled": False},
+            "max_candidates": 3,
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_s3_manifest_lock", simulate=False)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+    plan = {
+        "selected_idea": {"title": "Selected"},
+        "candidate_ideas": [
+            {
+                "id": "local_monotonic_neighbor_window_router",
+                "title": "Old Local Monotonic",
+                "code_patch": {"status": "ok", "patch_json": "plan/code_patches/local_monotonic_neighbor_window_router/patch.json", "changed_files": ["rosetta/model/aligner.py"], "has_executable_change": True},
+                "hypothesis": "old",
+            },
+            {
+                "id": "pathology_triggered_prior_fallback",
+                "title": "Selected Pathology",
+                "code_patch": {"status": "ok", "patch_json": "plan/code_patches/pathology_triggered_prior_fallback/patch.json", "changed_files": ["rosetta/model/projector.py"], "has_executable_change": True},
+                "hypothesis": "new",
+            },
+        ],
+    }
+    (paths.root / "plan" / "code_patches").mkdir(parents=True, exist_ok=True)
+    selected_patch_dir = paths.root / "plan" / "code_patches" / "pathology_triggered_prior_fallback"
+    selected_patch_dir.mkdir(parents=True, exist_ok=True)
+    write_json(
+        selected_patch_dir / "implementation_contract.json",
+        {
+            "candidate_id": "pathology_triggered_prior_fallback",
+            "hypothesis": "new",
+            "mechanism_contract": {"mechanism_type": "pathology_triggered_prior_fallback"},
+            "experiment_contract": {"config_overrides": {}, "ablation_switch": "disable_pathology"},
+        },
+    )
+    write_json(
+        selected_patch_dir / "patch.json",
+        {
+            "schema_version": 1,
+            "candidate_id": "pathology_triggered_prior_fallback",
+            "operations": [],
+            "changed_files": ["rosetta/model/projector.py"],
+            "implementation_contract": {"candidate_id": "pathology_triggered_prior_fallback"},
+        },
+    )
+    write_json(
+        paths.root / "plan" / "code_patches" / "patch_manifest.json",
+        {
+            "status": "ok",
+            "selected_candidate_id": "pathology_triggered_prior_fallback",
+            "selected_patch": {
+                "candidate_id": "pathology_triggered_prior_fallback",
+                "title": "Selected Pathology",
+                "status": "ok",
+                "patch_json": "plan/code_patches/pathology_triggered_prior_fallback/patch.json",
+                "implementation_contract": "plan/code_patches/pathology_triggered_prior_fallback/implementation_contract.json",
+                "changed_files": ["rosetta/model/projector.py"],
+                "has_executable_change": True,
+                "quality_score": {"score": 99},
+            },
+            "candidates": [
+                {
+                    "candidate_id": "local_monotonic_neighbor_window_router",
+                    "title": "Old Local Monotonic",
+                    "status": "ok",
+                    "patch_json": "plan/code_patches/local_monotonic_neighbor_window_router/patch.json",
+                    "changed_files": ["rosetta/model/aligner.py"],
+                    "has_executable_change": True,
+                    "quality_score": {"score": 10},
+                },
+                {
+                    "candidate_id": "pathology_triggered_prior_fallback",
+                    "title": "Selected Pathology",
+                    "status": "ok",
+                    "patch_json": "plan/code_patches/pathology_triggered_prior_fallback/patch.json",
+                    "implementation_contract": "plan/code_patches/pathology_triggered_prior_fallback/implementation_contract.json",
+                    "changed_files": ["rosetta/model/projector.py"],
+                    "has_executable_change": True,
+                    "quality_score": {"score": 99},
+                },
+            ],
+        },
+    )
+
+    seen_candidates: list[str] = []
+
+    def fake_run_single_c2c_candidate(*, candidate, **kwargs):
+        seen_candidates.append(candidate["id"])
+        return {
+            "id": candidate["id"],
+            "title": candidate["title"],
+            "decision": "candidate_win" if candidate["id"] == "pathology_triggered_prior_fallback" else "not_viable",
+            "command_status": "ok",
+            "metrics": {"mean": 51.0 if candidate["id"] == "pathology_triggered_prior_fallback" else 49.0},
+            "proxy_screen": {"metrics": {"mean": 49.0}, "status": "passed"},
+            "activation_smoke": {"status": "passed"},
+            "full_s3_readiness": {"status": "ready", "full_train_allowed": False, "worth_full_train": {"decision": "no", "reason": "blocked"}},
+            "ablation": {"comparison": {"mechanism_supported": True}},
+            "delta_vs_baseline": 1.0 if candidate["id"] == "pathology_triggered_prior_fallback" else -1.0,
+            "worst_dataset_regression": 0.0,
+            "patch_result": {"status": "ok"},
+            "command_logs": [],
+            "run_state_path": str(paths.root / "dummy_run_state.json"),
+            "has_executable_change": True,
+            "decision_reason": "",
+        }
+
+    monkeypatch.setattr(agent, "_run_single_c2c_candidate", fake_run_single_c2c_candidate)
+    result = agent._run_c2c_small_loop(
+        plan,
+        {"baseline": {"mean": 50.0}, "max_candidates": 3, "min_delta_to_pass": 0.1, "max_dataset_regression": 2.0, "selected_gpu_ids": [0], "gpu_policy": {}},
+        "env.md",
+        None,
+    )
+
+    selection = json.loads((paths.root / "experiment" / "results" / "s3_candidate_selection.json").read_text(encoding="utf-8"))
+    assert seen_candidates == ["pathology_triggered_prior_fallback"]
+    assert selection["mode"] == "patch_manifest_selected"
+    assert selection["executed_candidate_ids"] == ["pathology_triggered_prior_fallback"]
+    assert selection["skipped_candidate_ids"] == ["local_monotonic_neighbor_window_router"]
+    assert selection["patch_manifest"]["sha256"]
+    assert selection["selected_patch"]["sha256"] == sha256_file(selected_patch_dir / "patch.json")
+    assert selection["selected_implementation_contract"]["sha256"] == sha256_file(selected_patch_dir / "implementation_contract.json")
+    assert result["artifacts"]
 
 
 def test_s3_runs_ablation_switch_disabled_eval(monkeypatch, tmp_path: Path) -> None:
@@ -3692,7 +7478,18 @@ def test_s3_runs_ablation_switch_disabled_eval(monkeypatch, tmp_path: Path) -> N
             "eval_datasets": ["mmlu-redux"],
             "train_samples": 1,
             "gpu_ids": [0],
-            "proxy_screen": {"enabled": False},
+            "proxy_screen": {
+                "enabled": True,
+                "mode": "replay",
+                "eval_datasets": ["mmlu-redux"],
+                "eval_limit": 1,
+                "train_samples": 1,
+                "require_proxy_metrics": True,
+                "require_paired_baseline": True,
+                "run_baseline_if_missing": True,
+                "min_proxy_mean_delta": -0.3,
+                "activation_smoke": {"enabled": True, "max_datasets": 1, "min_abs_metric_delta": 0.01},
+            },
         },
         "allowed_prefixes": ["local/auto_research_runs/"],
     }
@@ -3709,11 +7506,37 @@ def test_s3_runs_ablation_switch_disabled_eval(monkeypatch, tmp_path: Path) -> N
             encoding="utf-8",
         )
 
+    def write_predictions(root: Path, dataset: str, labels: list[str]) -> None:
+        out = root / dataset
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "prediction_outputs.jsonl").write_text(
+            "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in labels) + "\n",
+            encoding="utf-8",
+        )
+
     def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, working_dir, retry_policy
+        del command, retry_policy
         seen_steps.append(name)
-        run_root = repo / "local" / "auto_research_runs" / "mechanism"
-        if name == "train":
+        run_root = Path(working_dir) / "local" / "auto_research_runs" / "mechanism"
+        if name == "proxy_baseline_train":
+            final = Path(working_dir) / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_baseline_eval_mmlu-redux":
+            write_summary(Path(working_dir) / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50)
+        elif name == "proxy_command_0":
+            final = run_root / "proxy" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_command_1":
+            root = run_root / "proxy" / "results"
+            write_summary(root, "mmlu-redux", 0.505)
+            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
+        elif name == "activation_smoke_eval_mmlu-redux":
+            root = run_root / "proxy" / "activation_smoke_disabled" / "results"
+            write_summary(root, "mmlu-redux", 0.49)
+            write_predictions(root, "mmlu-redux", ["B", "B", "C", "D"])
+        elif name == "train":
             final = run_root / "checkpoints" / "final"
             final.mkdir(parents=True, exist_ok=True)
             (final / "marker.txt").write_text("ok", encoding="utf-8")
@@ -3752,7 +7575,7 @@ def test_s3_runs_ablation_switch_disabled_eval(monkeypatch, tmp_path: Path) -> N
 
     ablation = result["ablation"]
     comparison = ablation["comparison"]
-    disabled_eval = yaml.safe_load((repo / "local/auto_research_runs/mechanism/ablation_disabled/eval_mmlu-redux.yaml").read_text(encoding="utf-8"))
+    disabled_eval = yaml.safe_load((Path(result["execution_repo"]["repo_root"]) / "local/auto_research_runs/mechanism/ablation_disabled/eval_mmlu-redux.yaml").read_text(encoding="utf-8"))
 
     assert "ablation_eval_mmlu-redux" in seen_steps
     assert result["metrics"]["mean"] == 55.0
@@ -4016,6 +7839,7 @@ def test_c2c_proxy_carries_instrumentation_quality_repair_request(monkeypatch, t
                 "soft_proxy_mean_delta": None,
                 "soft_max_proxy_dataset_regression": None,
                 "soft_min_proxy_score": None,
+                "activation_smoke": {"enabled": False},
             },
         },
     }
@@ -4088,7 +7912,8 @@ def test_c2c_proxy_carries_instrumentation_quality_repair_request(monkeypatch, t
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
-    assert result["proxy_screen"]["status"] == "passed"
+    assert result["proxy_screen"]["status"] == "repairable_proxy_risk"
+    assert result["proxy_screen"]["repair_mode"] == "full_s3_readiness_repair"
     assert result["proxy_screen"]["quality_repair"]["needed"] is False
     assert result["proxy_screen"]["quality_repair"]["deferred"] is True
     assert result["proxy_screen"]["quality_repair"]["repair_route"] == "paperization"
@@ -4134,8 +7959,15 @@ def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch,
         "title": "Proxy Resume",
         "experiment_contract": {"config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}}},
     }
-    run_spec = adapter.materialize_candidate_configs(candidate, gpu_selection)
-    patch_fingerprint = ExperimentAgent._c2c_patch_fingerprint(adapter, {"status": "skipped", "changed_files": []}, run_spec)
+    patch = {"operations": [], "changed_files": [], "summary": "config-only cached proxy test"}
+    execution_repo = agent._prepare_c2c_execution_repo(candidate, adapter, patch)
+    execution_adapter = C2CAdapter(paths.root, {**config, "c2c": {**config["c2c"], "snapshot_path": execution_repo["repo_root"]}})
+    run_spec = execution_adapter.materialize_candidate_configs(candidate, gpu_selection)
+    patch_fingerprint = ExperimentAgent._c2c_patch_fingerprint(
+        execution_adapter,
+        {"status": "skipped", "changed_files": [], "execution_repo": execution_repo},
+        run_spec,
+    )
     state_path = Path(run_spec["run_state_path"])
     state_path.write_text(
         json.dumps(
@@ -4186,6 +8018,9 @@ def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch,
     assert result["decision"] == "proxy_rejected"
     assert result["command_status"] == "proxy_rejected"
     assert result["proxy_screen"]["proxy_delta_vs_baseline"] == -1.0
+    assert result["proxy_screen"]["comparison_baseline_mean"] == 50.0
+    assert result["proxy_screen"]["proxy_delta_vs_comparison_baseline"] == -1.0
+    assert result["proxy_screen"]["artifact_paths"]["run_state"].endswith("run_state.json")
     assert result["patch_fingerprint"] == patch_fingerprint
     assert result["metrics"] is None
     saved = json.loads(state_path.read_text(encoding="utf-8"))
@@ -4260,9 +8095,14 @@ def test_c2c_proxy_metric_near_threshold_is_repairable() -> None:
     assert decision["status"] == "repairable_proxy_risk"
     assert decision["repair_route"] == "S2_plan"
     assert decision["proxy_delta_vs_baseline"] == -0.2
+    assert decision["full_baseline_mean"] == 50.0
+    assert decision["proxy_baseline_mean"] == 50.0
+    assert decision["comparison_baseline_mean"] == 50.0
+    assert decision["proxy_delta_vs_comparison_baseline"] == -0.2
+    assert decision["proxy_delta_vs_proxy_baseline"] == -0.2
 
 
-def test_c2c_proxy_soft_zero_delta_is_repairable_by_default() -> None:
+def test_c2c_proxy_soft_zero_delta_is_repairable_when_configured() -> None:
     decision = ExperimentAgent._c2c_proxy_metric_decision(
         metrics={"mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
         baseline={"mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
@@ -4286,8 +8126,194 @@ def test_c2c_proxy_soft_zero_delta_is_repairable_by_default() -> None:
     repair_contract = decision["proxy_effect_repair_contract"]
     assert repair_contract["mode"] == "effect_first_proxy_repair"
     assert repair_contract["proxy_delta_vs_baseline"] == 0.0
+    assert repair_contract["proxy_delta_vs_comparison_baseline"] == 0.0
+    assert repair_contract["proxy_baseline_mean"] == 50.0
     assert "proxy mean delta" in repair_contract["soft_flags"][0]
     assert any("paperization" in item for item in repair_contract["forbidden"])
+
+
+def test_c2c_proxy_soft_warning_passes_by_default() -> None:
+    decision = ExperimentAgent._c2c_proxy_metric_decision(
+        metrics={"mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        baseline={"mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        proxy_baseline={"mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        patch_risk={"risk_labels": []},
+        proxy_cfg={
+            "require_paired_baseline": True,
+            "min_proxy_mean_delta": -0.3,
+            "soft_proxy_mean_delta": 0.1,
+            "max_proxy_dataset_regression": 1.5,
+        },
+    )
+
+    assert decision["status"] == "passed"
+    assert decision["soft_fail"] is True
+    assert "soft warnings" in decision["reason"]
+    assert "proxy mean delta" in decision["soft_flags"][0]
+
+
+def test_c2c_proxy_zero_delta_with_patch_risk_passes_lowered_effect_first_threshold() -> None:
+    decision = ExperimentAgent._c2c_proxy_metric_decision(
+        metrics={"mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0}},
+        baseline={"mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0}},
+        proxy_baseline={"mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0}},
+        patch_risk={"risk_labels": ["alignment_mechanism_changed", "projector_mechanism_changed", "training_loop_changed", "config_override_changed", "test_change"]},
+        proxy_cfg={
+            "require_paired_baseline": True,
+            "min_proxy_mean_delta": -0.3,
+            "soft_proxy_mean_delta": -0.1,
+            "max_proxy_dataset_regression": 1.5,
+            "soft_max_proxy_dataset_regression": 0.75,
+            "proxy_score_regression_weight": 0.5,
+            "risk_penalty_per_label": 0.05,
+            "soft_min_proxy_score": -0.3,
+        },
+    )
+
+    assert decision["status"] == "passed"
+    assert decision["proxy_delta_vs_proxy_baseline"] == 0.0
+    assert decision["proxy_score"] == -0.25
+    assert not decision.get("soft_fail")
+
+
+def test_c2c_neutral_proxy_policy_allows_small_negative_but_blocks_clear_regression() -> None:
+    cfg = {
+        "allow_neutral_proxy_full_s3": True,
+        "neutral_proxy_min_delta": -0.1,
+        "neutral_proxy_max_dataset_regression": 0.25,
+    }
+
+    assert experiment_module._c2c_neutral_proxy_full_s3_allowed(
+        {"status": "passed", "proxy_delta_vs_comparison_baseline": -0.05, "proxy_worst_dataset_regression": 0.2},
+        cfg,
+    )
+    assert not experiment_module._c2c_neutral_proxy_full_s3_allowed(
+        {"status": "passed", "proxy_delta_vs_comparison_baseline": -0.2, "proxy_worst_dataset_regression": 0.0},
+        cfg,
+    )
+    assert not experiment_module._c2c_neutral_proxy_full_s3_allowed(
+        {"status": "passed", "proxy_delta_vs_comparison_baseline": 0.0, "proxy_worst_dataset_regression": 0.3},
+        cfg,
+    )
+
+
+def test_c2c_proxy_positive_mean_with_borderline_dataset_regression_passes_with_warning() -> None:
+    decision = ExperimentAgent._c2c_proxy_metric_decision(
+        metrics={
+            "mean": 39.2497,
+            "datasets": {
+                "ai2-arc": 39.9471,
+                "mmlu-redux": 37.4375,
+                "openbookqa": 40.3646,
+            },
+        },
+        baseline={
+            "mean": 50.06,
+            "datasets": {
+                "ai2-arc": 42.0,
+                "mmlu-redux": 42.0,
+                "openbookqa": 52.6,
+            },
+        },
+        proxy_baseline={
+            "mean": 38.3648,
+            "datasets": {
+                "ai2-arc": 38.0952,
+                "mmlu-redux": 35.8533,
+                "openbookqa": 41.1458,
+            },
+        },
+        patch_risk={"risk_labels": []},
+        proxy_cfg={
+            "require_paired_baseline": True,
+            "min_proxy_mean_delta": -0.3,
+            "soft_proxy_mean_delta": 0.0,
+            "max_proxy_dataset_regression": 1.5,
+            "soft_max_proxy_dataset_regression": 0.75,
+            "soft_min_proxy_score": 0.0,
+            "proxy_score_regression_weight": 0.5,
+        },
+    )
+
+    assert decision["status"] == "passed"
+    assert decision["soft_fail"] is True
+    assert decision["proxy_delta_vs_proxy_baseline"] == 0.8849
+    assert decision["proxy_worst_dataset_regression"] == 0.7812
+    assert "soft warnings" in decision["reason"]
+    assert "proxy worst dataset regression" in decision["soft_flags"][0]
+
+
+def test_c2c_cached_proxy_soft_repairable_rejudges_against_current_config() -> None:
+    cached_proxy = {
+        "status": "repairable_proxy_risk",
+        "reason": "proxy worst dataset regression 0.7812 above soft threshold 0.75",
+        "metrics": {
+            "mean": 39.2497,
+            "datasets": {
+                "ai2-arc": 39.9471,
+                "mmlu-redux": 37.4375,
+                "openbookqa": 40.3646,
+            },
+        },
+        "baseline_metrics": {
+            "mean": 38.3648,
+            "datasets": {
+                "ai2-arc": 38.0952,
+                "mmlu-redux": 35.8533,
+                "openbookqa": 41.1458,
+            },
+        },
+    }
+
+    decision = ExperimentAgent._c2c_rejudge_cached_proxy_screen(
+        cached_proxy,
+        baseline={
+            "mean": 50.06,
+            "datasets": {
+                "ai2-arc": 42.0,
+                "mmlu-redux": 42.0,
+                "openbookqa": 52.6,
+            },
+        },
+        proxy_cfg={
+            "require_paired_baseline": True,
+            "min_proxy_mean_delta": -0.3,
+            "soft_proxy_mean_delta": 0.0,
+            "max_proxy_dataset_regression": 1.5,
+            "soft_max_proxy_dataset_regression": 0.75,
+            "soft_min_proxy_score": 0.0,
+            "proxy_score_regression_weight": 0.5,
+            "repair_soft_proxy_fail": False,
+        },
+    )
+
+    assert decision is not None
+    assert decision["status"] == "passed"
+    assert decision["soft_fail"] is True
+    assert decision["proxy_delta_vs_proxy_baseline"] == 0.8849
+
+
+def test_c2c_proxy_metric_fallback_names_full_and_comparison_baseline() -> None:
+    decision = ExperimentAgent._c2c_proxy_metric_decision(
+        metrics={"mean": 49.5, "datasets": {"mmlu-redux": 49.5}},
+        baseline={"mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        proxy_baseline=None,
+        patch_risk={"risk_labels": []},
+        proxy_cfg={
+            "require_paired_baseline": False,
+            "min_proxy_mean_delta": -1.0,
+            "max_proxy_dataset_regression": 1.5,
+        },
+    )
+
+    assert decision["status"] == "passed"
+    assert decision["proxy_decision_mode"] == "configured_full_baseline"
+    assert decision["full_baseline_mean"] == 50.0
+    assert decision["proxy_baseline"] is None
+    assert decision["proxy_baseline_mean"] is None
+    assert decision["comparison_baseline_mean"] == 50.0
+    assert decision["proxy_delta_vs_comparison_baseline"] == -0.5
+    assert decision["proxy_delta_vs_proxy_baseline"] is None
 
 
 def test_c2c_proxy_command_failure_classifies_runtime_errors() -> None:
@@ -4316,6 +8342,49 @@ def test_c2c_proxy_command_failure_classifies_runtime_errors() -> None:
     assert shape_failure["category"] == "schema_shape_mismatch"
 
 
+def test_c2c_proxy_command_failure_classifies_oom_as_resource_retry() -> None:
+    failure = ExperimentAgent._c2c_proxy_command_failure(
+        {
+            "step": "proxy_command_0",
+            "returncode": 1,
+            "attempts": [
+                {
+                    "stdout": "Starting training",
+                    "stderr": "torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 12.00 MiB.",
+                    "elapsed_seconds": 373.0,
+                    "timeout_seconds": 1800,
+                }
+            ],
+        }
+    )
+
+    assert failure["category"] == "resource_oom"
+    assert "do not repair the S2.5 patch" in failure["repair_hint"]
+    assert failure["elapsed_seconds"] == 373.0
+
+
+def test_normalize_c2c_proxy_screen_promotes_legacy_oom_to_resource_retry() -> None:
+    normalized = experiment_module._normalize_c2c_proxy_screen_artifacts(
+        {
+            "enabled": True,
+            "status": "repairable_proxy_risk",
+            "reason": "proxy command 0 failed: CUDA out of memory",
+            "command_failure": {
+                "category": "resource_oom",
+                "summary": "torch.OutOfMemoryError: CUDA out of memory",
+            },
+        },
+        full_baseline={"mean": 50.0, "datasets": {}},
+        run_spec={"run_state_path": "run_state.json", "proxy_screen": {"metrics_path": "proxy.json"}},
+    )
+
+    assert normalized["status"] == "resource_retry"
+    assert normalized["resource_retry"] is True
+    assert normalized["failure_category"] == "s3_proxy_resource_oom"
+    assert normalized["repair_route"] == "resource_retry"
+    assert "do not repair the S2.5 patch" in normalized["repair_hint"]
+
+
 def test_c2c_proxy_command_failure_classifies_timeout() -> None:
     failure = ExperimentAgent._c2c_proxy_command_failure(
         {
@@ -4336,6 +8405,37 @@ def test_c2c_proxy_command_failure_classifies_timeout() -> None:
     assert failure["category"] == "proxy_timeout"
     assert "inference/training cost" in failure["repair_hint"]
     assert failure["timeout_seconds"] == 1200
+
+
+def test_c2c_proxy_eval_timeout_default_allows_long_single_card_eval() -> None:
+    assert DEFAULT_C2C_PROXY_SCREEN["eval_timeout_seconds"] == 7200
+    assert DEFAULT_C2C_PROXY_SCREEN["gpu_policy"]["max_gpus"] == 1
+
+
+def test_c2c_proxy_command_failure_classifies_distributed_child_failure() -> None:
+    failure = ExperimentAgent._c2c_proxy_command_failure(
+        {
+            "step": "proxy_command_0",
+            "returncode": 1,
+            "attempts": [
+                {
+                    "stdout": "training started",
+                    "stderr": (
+                        "torch.distributed.elastic.multiprocessing.errors.ChildFailedError:\n"
+                        "Root Cause (first observed failure):\n"
+                        "  rank      : 3 (local_rank: 3)\n"
+                        "  exitcode  : 1 (pid: 12345)\n"
+                    ),
+                    "elapsed_seconds": 42.0,
+                }
+            ],
+        }
+    )
+
+    assert failure["category"] == "distributed_child_failed"
+    assert "single auto-selected GPU" in failure["repair_hint"]
+    assert failure["rank_failure"] == {"local_rank": 3, "exitcode": 1, "pid": 12345}
+    assert "ChildFailedError" in failure["stderr_tail"]
 
 
 def test_c2c_result_payload_compacts_patch_state_and_proxy_logs(tmp_path: Path, monkeypatch) -> None:
@@ -4401,14 +8501,15 @@ def test_c2c_result_payload_compacts_patch_state_and_proxy_logs(tmp_path: Path, 
         return payload
 
     def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, working_dir, retry_policy
+        del command, retry_policy
+        run_repo = Path(working_dir)
         if name.startswith("preflight_command_") or name.startswith("proxy_baseline_"):
             if name == "proxy_baseline_train":
-                final = repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
+                final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
                 final.mkdir(parents=True, exist_ok=True)
                 (final / "marker.txt").write_text("ok", encoding="utf-8")
             if name == "proxy_baseline_eval_mmlu-redux":
-                out = repo / "local" / "auto_research_runs" / "proxy_baseline" / "results" / "mmlu-redux"
+                out = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results" / "mmlu-redux"
                 out.mkdir(parents=True, exist_ok=True)
                 (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
                     json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.5}),
@@ -4485,6 +8586,7 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
                 "run_baseline_if_missing": True,
                 "min_proxy_mean_delta": -0.3,
                 "max_proxy_dataset_regression": 1.5,
+                "activation_smoke": {"enabled": True, "max_datasets": 1, "min_abs_metric_delta": 0.01},
             },
         },
     }
@@ -4494,31 +8596,47 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
     seen_steps = []
 
     def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        run_repo = Path(working_dir)
         seen_steps.append(name)
         if name == "proxy_baseline_train":
-            final = repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
+            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
             final.mkdir(parents=True, exist_ok=True)
             (final / "marker.txt").write_text("ok", encoding="utf-8")
         if name == "proxy_baseline_eval_mmlu-redux":
-            out = repo / "local" / "auto_research_runs" / "proxy_baseline" / "results" / "mmlu-redux"
+            out = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results" / "mmlu-redux"
             out.mkdir(parents=True, exist_ok=True)
             (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
                 json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.5}),
                 encoding="utf-8",
             )
         if name == "proxy_command_1":
-            out = repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "proxy" / "results" / "mmlu-redux"
+            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "proxy" / "results" / "mmlu-redux"
             out.mkdir(parents=True, exist_ok=True)
             (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
                 json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.505}),
                 encoding="utf-8",
             )
+            (out / "prediction_outputs.jsonl").write_text(
+                "\n".join(
+                    json.dumps({"prediction": f"Answer: {label}", "answer": label})
+                    for label in ["A", "B", "C", "D"]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+        if name == "activation_smoke_eval_mmlu-redux":
+            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "proxy" / "activation_smoke_disabled" / "results" / "mmlu-redux"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
+                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.49}),
+                encoding="utf-8",
+            )
         if name == "train":
-            final = repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "checkpoints" / "final"
+            final = run_repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "checkpoints" / "final"
             final.mkdir(parents=True, exist_ok=True)
             (final / "marker.txt").write_text("ok", encoding="utf-8")
         if name == "eval_mmlu-redux":
-            out = repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "results" / "mmlu-redux"
+            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "results" / "mmlu-redux"
             out.mkdir(parents=True, exist_ok=True)
             (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
                 json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.51}),
@@ -4527,11 +8645,741 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
+    gpu_selection = agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1})
     result = agent._run_single_c2c_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "idea_proxy_replay",
             "title": "Idea Proxy Replay",
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}},
+            },
+        },
+        index=0,
+        simulate=False,
+        baseline_mean=50.0,
+        min_delta=0.1,
+        max_regression=2.0,
+        gpu_selection=gpu_selection,
+        proxy_gpu_selection=gpu_selection,
+    )
+
+    proxy = result["proxy_screen"]
+    baseline_cache = paths.root / "experiment" / "results" / "c2c_proxy_baseline.json"
+    assert baseline_cache.exists()
+    assert seen_steps.index("proxy_baseline_train") < seen_steps.index("proxy_command_0")
+    assert seen_steps.index("activation_smoke_eval_mmlu-redux") < seen_steps.index("train")
+    assert seen_steps.index("proxy_command_1") < seen_steps.index("train")
+    assert proxy["status"] == "passed"
+    assert proxy["proxy_delta_vs_baseline"] == 0.5
+    assert proxy["full_baseline_mean"] == 50.0
+    assert proxy["proxy_baseline_mean"] == 50.0
+    assert proxy["comparison_baseline_mean"] == 50.0
+    assert proxy["proxy_delta_vs_comparison_baseline"] == 0.5
+    assert proxy["proxy_delta_vs_proxy_baseline"] == 0.5
+    assert proxy["artifact_paths"]["proxy_metrics"].endswith("proxy_metrics.json")
+    assert proxy["artifact_paths"]["proxy_baseline_metrics"].endswith("c2c_proxy_baseline.json")
+    assert proxy["proxy_decision_mode"] == "paired_baseline"
+    assert proxy["eval_smoke"]["status"] == "ok"
+    assert proxy["eval_smoke"]["answer_parse_rate"] == 1.0
+    assert result["activation_smoke"]["status"] == "passed"
+    assert result["activation_smoke"]["comparison"]["enabled_minus_disabled_mean"] == 1.5
+    readiness = result["full_s3_readiness"]
+    assert readiness["status"] == "ready"
+    assert readiness["full_train_allowed"] is True
+    assert readiness["static_risk"]["status"] == "clean"
+    assert readiness["proxy"]["delta"] == 0.5
+    assert readiness["eval_smoke"]["healthy"] is True
+    assert readiness["activation_smoke"]["status"] == "passed"
+    assert readiness["activation_smoke"]["no_op"] is False
+    assert readiness["ablation_switch"]["declared"] is True
+    assert readiness["worth_full_train"]["decision"] == "yes"
+    assert "experiment/results/full_s3_readiness_report.json" in readiness["artifact_paths"]["project_readiness_report"]
+    assert (paths.root / "experiment" / "results" / "full_s3_readiness_report.json").exists()
+    assert result["command_status"] == "ok"
+
+
+def test_c2c_proxy_baseline_eval_timeout_uses_configured_fallback(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {
+            "eval_datasets": ["mmlu-redux"],
+            "train_samples": 1,
+            "gpu_ids": [0],
+            "proxy_screen": {
+                "enabled": True,
+                "mode": "replay",
+                "eval_datasets": ["mmlu-redux"],
+                "eval_limit": 2,
+                "train_samples": 2,
+                "require_proxy_metrics": True,
+                "require_paired_baseline": True,
+                "run_baseline_if_missing": True,
+                "allow_configured_baseline_fallback": True,
+                "min_proxy_mean_delta": -0.3,
+                "max_proxy_dataset_regression": 1.5,
+                "activation_smoke": {"enabled": False},
+            },
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_proxy_baseline_timeout_fallback", simulate=False)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+    seen_steps = []
+
+    def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        del command, retry_policy
+        run_repo = Path(working_dir)
+        seen_steps.append(name)
+        if name == "proxy_baseline_train":
+            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        if name == "proxy_baseline_eval_mmlu-redux":
+            return {
+                "step": name,
+                "status": "failed",
+                "returncode": 124,
+                "attempts": [
+                    {
+                        "stdout": "baseline eval started",
+                        "stderr": "Command timed out after 1200s",
+                        "timed_out": True,
+                        "elapsed_seconds": 1200.0,
+                        "timeout_seconds": 1200,
+                    }
+                ],
+            }
+        if name == "proxy_command_0":
+            final = run_repo / "local" / "auto_research_runs" / "idea_proxy_timeout" / "proxy" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        if name == "proxy_command_1":
+            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_timeout" / "proxy" / "results" / "mmlu-redux"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
+                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.505}),
+                encoding="utf-8",
+            )
+            (out / "prediction_outputs.jsonl").write_text(
+                "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in ["A", "B", "C", "D"]) + "\n",
+                encoding="utf-8",
+            )
+        if name == "train":
+            final = run_repo / "local" / "auto_research_runs" / "idea_proxy_timeout" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        if name == "eval_mmlu-redux":
+            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_timeout" / "results" / "mmlu-redux"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
+                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.51}),
+                encoding="utf-8",
+            )
+        return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
+
+    monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
+    gpu_selection = agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1})
+    result = agent._run_single_c2c_candidate(
+        adapter=C2CAdapter(paths.root, config),
+        candidate={
+            "id": "idea_proxy_timeout",
+            "title": "Idea Proxy Timeout",
+            "experiment_contract": {
+                "config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}},
+            },
+        },
+        index=0,
+        simulate=False,
+        baseline_mean=50.0,
+        min_delta=0.1,
+        max_regression=2.0,
+        gpu_selection=gpu_selection,
+        proxy_gpu_selection=gpu_selection,
+    )
+
+    state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    command_log = json.loads((paths.root / "experiment" / "logs" / "c2c_idea_proxy_timeout_commands.json").read_text(encoding="utf-8"))
+    proxy = result["proxy_screen"]
+
+    assert "proxy_baseline_eval_mmlu-redux" in seen_steps
+    assert "proxy_command_0" in seen_steps
+    assert state["proxy_baseline"]["status"] == "fallback"
+    assert state["proxy_baseline"]["command_failure"]["category"] == "proxy_timeout"
+    assert proxy["status"] == "passed"
+    assert proxy["proxy_baseline"]["source"] == "configured_full_baseline_subset_fallback"
+    assert proxy["proxy_delta_vs_proxy_baseline"] == 0.5
+    assert result["command_status"] == "ok"
+    baseline_eval_run = next(item for item in command_log["runs"] if item["step"] == "proxy_baseline_eval_mmlu-redux")
+    assert baseline_eval_run["returncode"] == 124
+
+
+def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {
+            "eval_datasets": ["mmlu-redux"],
+            "train_samples": 1,
+            "gpu_ids": [0],
+            "proxy_screen": {
+                "enabled": True,
+                "mode": "replay",
+                "eval_datasets": ["mmlu-redux"],
+                "eval_limit": 2,
+                "train_samples": 2,
+                "require_proxy_metrics": True,
+                "require_paired_baseline": True,
+                "run_baseline_if_missing": True,
+                "min_proxy_mean_delta": -0.3,
+                "max_proxy_dataset_regression": 1.5,
+                "activation_smoke": {"enabled": True, "max_datasets": 1, "min_abs_metric_delta": 0.01},
+            },
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_proxy_activation_no_effect", simulate=False)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+    seen_steps: list[str] = []
+
+    def write_summary(root: Path, dataset: str, accuracy: float) -> None:
+        out = root / dataset
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
+            json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": accuracy}),
+            encoding="utf-8",
+        )
+
+    def write_predictions(root: Path, dataset: str, labels: list[str]) -> None:
+        out = root / dataset
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "prediction_outputs.jsonl").write_text(
+            "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in labels) + "\n",
+            encoding="utf-8",
+        )
+
+    def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        del command, retry_policy
+        run_repo = Path(working_dir)
+        seen_steps.append(name)
+        if name == "proxy_baseline_train":
+            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_baseline_eval_mmlu-redux":
+            write_summary(run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50)
+        elif name == "proxy_command_0":
+            final = run_repo / "local" / "auto_research_runs" / "no_effect" / "proxy" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_command_1":
+            root = run_repo / "local" / "auto_research_runs" / "no_effect" / "proxy" / "results"
+            write_summary(root, "mmlu-redux", 0.505)
+            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
+        elif name == "activation_smoke_eval_mmlu-redux":
+            root = run_repo / "local" / "auto_research_runs" / "no_effect" / "proxy" / "activation_smoke_disabled" / "results"
+            write_summary(root, "mmlu-redux", 0.505)
+            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
+        elif name == "train" or name.startswith("eval_"):
+            raise AssertionError("activation smoke no-effect must not reach full train/eval")
+        return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
+
+    monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
+    result = agent._run_single_c2c_candidate(
+        adapter=C2CAdapter(paths.root, config),
+        candidate={
+            "id": "no_effect",
+            "title": "No Effect",
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}},
+            },
+        },
+        index=0,
+        simulate=False,
+        baseline_mean=50.0,
+        min_delta=0.1,
+        max_regression=2.0,
+        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+    )
+
+    state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    assert "activation_smoke_eval_mmlu-redux" in seen_steps
+    assert "train" not in seen_steps
+    assert result["decision"] == "proxy_repairable"
+    assert result["command_status"] == "proxy_repairable"
+    assert result["activation_smoke"]["status"] == "failed"
+    assert result["activation_smoke"]["comparison"]["enabled_minus_disabled_mean"] == 0.0
+    assert result["activation_smoke"]["comparison"]["prediction_comparison"]["prediction_diff_rate"] == 0.0
+    assert result["proxy_screen"]["status"] == "repairable_proxy_risk"
+    assert result["failure_attribution"]["primary_failure"] == "proxy_activation_smoke_no_effect"
+    assert state["train"] is None
+
+
+def test_c2c_full_s3_readiness_blocks_train_when_not_ready(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {
+            "eval_datasets": ["mmlu-redux"],
+            "train_samples": 1,
+            "gpu_ids": [0],
+            "proxy_screen": {
+                "enabled": True,
+                "mode": "replay",
+                "eval_datasets": ["mmlu-redux"],
+                "eval_limit": 2,
+                "train_samples": 2,
+                "require_proxy_metrics": True,
+                "require_paired_baseline": True,
+                "run_baseline_if_missing": True,
+                "min_proxy_mean_delta": -0.3,
+                "max_proxy_dataset_regression": 1.5,
+                "activation_smoke": {
+                    "enabled": True,
+                    "hard_gate": False,
+                    "max_datasets": 1,
+                    "min_abs_metric_delta": 0.01,
+                },
+            },
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_full_readiness_blocks_train", simulate=False)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+    seen_steps: list[str] = []
+
+    def write_summary(root: Path, dataset: str, accuracy: float) -> None:
+        out = root / dataset
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
+            json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": accuracy}),
+            encoding="utf-8",
+        )
+
+    def write_predictions(root: Path, dataset: str, labels: list[str]) -> None:
+        out = root / dataset
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "prediction_outputs.jsonl").write_text(
+            "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in labels) + "\n",
+            encoding="utf-8",
+        )
+
+    def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        del command, retry_policy
+        run_repo = Path(working_dir)
+        seen_steps.append(name)
+        if name == "proxy_baseline_train":
+            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_baseline_eval_mmlu-redux":
+            write_summary(run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50)
+        elif name == "proxy_command_0":
+            final = run_repo / "local" / "auto_research_runs" / "readiness_not_ready" / "proxy" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_command_1":
+            root = run_repo / "local" / "auto_research_runs" / "readiness_not_ready" / "proxy" / "results"
+            write_summary(root, "mmlu-redux", 0.505)
+            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
+        elif name == "activation_smoke_eval_mmlu-redux":
+            root = run_repo / "local" / "auto_research_runs" / "readiness_not_ready" / "proxy" / "activation_smoke_disabled" / "results"
+            write_summary(root, "mmlu-redux", 0.505)
+            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
+        elif name == "train" or name.startswith("eval_") or name.startswith("ablation_eval_"):
+            raise AssertionError("full_s3_readiness not_ready must not reach full train/eval/ablation")
+        return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
+
+    monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
+    result = agent._run_single_c2c_candidate(
+        adapter=C2CAdapter(paths.root, config),
+        candidate={
+            "id": "readiness_not_ready",
+            "title": "Readiness Not Ready",
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}},
+            },
+        },
+        index=0,
+        simulate=False,
+        baseline_mean=50.0,
+        min_delta=0.1,
+        max_regression=2.0,
+        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+    )
+
+    state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    readiness = result["full_s3_readiness"]
+    assert "activation_smoke_eval_mmlu-redux" in seen_steps
+    assert "train" not in seen_steps
+    assert not any(step.startswith("eval_") for step in seen_steps)
+    assert readiness["status"] == "not_ready"
+    assert readiness["full_train_allowed"] is False
+    assert result["decision"] == "proxy_repairable"
+    assert result["command_status"] == "proxy_repairable"
+    assert result["proxy_screen"]["status"] == "repairable_proxy_risk"
+    assert result["proxy_screen"]["repair_mode"] == "full_s3_readiness_repair"
+    assert result["proxy_screen"]["proxy_effect_repair_contract"]["source"] == "full_s3_readiness"
+    assert result["failure_attribution"]["primary_failure"] == "full_s3_readiness_not_ready"
+    assert state["train"] is None
+    assert any(action["action"] == "block_full_train_until_readiness" for action in state["recovery_actions"])
+
+
+def test_c2c_proxy_activation_smoke_allows_metric_neutral_when_wiring_trace_passed(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {
+            "eval_datasets": ["mmlu-redux"],
+            "train_samples": 1,
+            "gpu_ids": [0],
+            "proxy_screen": {
+                "enabled": True,
+                "mode": "replay",
+                "eval_datasets": ["mmlu-redux"],
+                "eval_limit": 2,
+                "train_samples": 2,
+                "require_proxy_metrics": True,
+                "require_paired_baseline": True,
+                "run_baseline_if_missing": True,
+                "min_proxy_mean_delta": -0.3,
+                "max_proxy_dataset_regression": 1.5,
+                "activation_smoke": {"enabled": True, "max_datasets": 1, "min_abs_metric_delta": 0.01},
+            },
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_proxy_activation_wired_metric_neutral", simulate=False)
+    validation_path = paths.root / "plan" / "code_patches" / "wired" / "validation.json"
+    validation_path.parent.mkdir(parents=True, exist_ok=True)
+    validation_path.write_text(
+        json.dumps(
+            {
+                "checks": [
+                    {
+                        "name": "runtime_smoke:mechanism_activation_wiring",
+                        "status": "ok",
+                        "returncode": 0,
+                        "switch": "disable_mechanism",
+                        "runtime_code_refs": {"switch_refs": ["rosetta/model/projector.py"]},
+                        "rosetta_config": {"disabled_switch_value": True},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+    seen_steps: list[str] = []
+
+    def write_summary(root: Path, dataset: str, accuracy: float) -> None:
+        out = root / dataset
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
+            json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": accuracy}),
+            encoding="utf-8",
+        )
+
+    def write_predictions(root: Path, dataset: str, labels: list[str]) -> None:
+        out = root / dataset
+        out.mkdir(parents=True, exist_ok=True)
+        (out / "prediction_outputs.jsonl").write_text(
+            "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in labels) + "\n",
+            encoding="utf-8",
+        )
+
+    def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        del command, retry_policy
+        run_repo = Path(working_dir)
+        seen_steps.append(name)
+        if name == "proxy_baseline_train":
+            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_baseline_eval_mmlu-redux":
+            write_summary(run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50)
+        elif name == "proxy_command_0":
+            final = run_repo / "local" / "auto_research_runs" / "wired_neutral" / "proxy" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_command_1":
+            root = run_repo / "local" / "auto_research_runs" / "wired_neutral" / "proxy" / "results"
+            write_summary(root, "mmlu-redux", 0.505)
+            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
+        elif name == "activation_smoke_eval_mmlu-redux":
+            root = run_repo / "local" / "auto_research_runs" / "wired_neutral" / "proxy" / "activation_smoke_disabled" / "results"
+            write_summary(root, "mmlu-redux", 0.505)
+            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
+        elif name == "train":
+            final = run_repo / "local" / "auto_research_runs" / "wired_neutral" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "eval_mmlu-redux":
+            write_summary(run_repo / "local" / "auto_research_runs" / "wired_neutral" / "results", "mmlu-redux", 0.51)
+        elif name == "ablation_eval_mmlu-redux":
+            write_summary(run_repo / "local" / "auto_research_runs" / "wired_neutral" / "ablation_disabled" / "results", "mmlu-redux", 0.50)
+        return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
+
+    monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
+    result = agent._run_single_c2c_candidate(
+        adapter=C2CAdapter(paths.root, config),
+        candidate={
+            "id": "wired_neutral",
+            "title": "Wired Neutral",
+            "code_patch": {"status": "ok", "validation": validation_path.relative_to(paths.root).as_posix()},
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"eval": {"model": {"rosetta_config": {"mechanism_enabled": True}}}},
+            },
+        },
+        index=0,
+        simulate=False,
+        baseline_mean=50.0,
+        min_delta=0.1,
+        max_regression=2.0,
+        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+    )
+
+    comparison = result["activation_smoke"]["comparison"]
+    assert result["activation_smoke"]["status"] == "passed"
+    assert comparison["mechanism_observed"] is False
+    assert comparison["mechanism_wired_metric_neutral"] is True
+    assert result["activation_smoke"]["mechanism_trace"]["status"] == "wired"
+    assert "train" in seen_steps
+    assert result["command_status"] == "ok"
+
+
+def test_c2c_proxy_activation_smoke_passes_metric_neutral_prediction_change(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {
+            "eval_datasets": ["mmlu-redux"],
+            "train_samples": 1,
+            "gpu_ids": [0],
+            "proxy_screen": {
+                "enabled": True,
+                "mode": "replay",
+                "eval_datasets": ["mmlu-redux"],
+                "eval_limit": 4,
+                "train_samples": 2,
+                "require_proxy_metrics": True,
+                "require_paired_baseline": True,
+                "run_baseline_if_missing": True,
+                "min_proxy_mean_delta": -0.3,
+                "max_proxy_dataset_regression": 1.5,
+                "activation_smoke": {
+                    "enabled": True,
+                    "max_datasets": 1,
+                    "min_abs_metric_delta": 0.01,
+                    "min_prediction_diff_rate": 0.25,
+                },
+            },
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_proxy_activation_prediction_change", simulate=False)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+    seen_steps: list[str] = []
+
+    def write_summary_and_predictions(root: Path, dataset: str, accuracy: float, labels: list[str]) -> None:
+        out = root / dataset
+        out.mkdir(parents=True, exist_ok=True)
+        (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
+            json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": accuracy}),
+            encoding="utf-8",
+        )
+        (out / "prediction_outputs.jsonl").write_text(
+            "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in labels) + "\n",
+            encoding="utf-8",
+        )
+
+    def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        del command, retry_policy
+        run_repo = Path(working_dir)
+        seen_steps.append(name)
+        if name == "proxy_baseline_train":
+            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_baseline_eval_mmlu-redux":
+            write_summary_and_predictions(run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50, ["A", "B", "C", "D"])
+        elif name == "proxy_command_0":
+            final = run_repo / "local" / "auto_research_runs" / "prediction_change" / "proxy" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "proxy_command_1":
+            write_summary_and_predictions(run_repo / "local" / "auto_research_runs" / "prediction_change" / "proxy" / "results", "mmlu-redux", 0.505, ["A", "B", "C", "D"])
+        elif name == "activation_smoke_eval_mmlu-redux":
+            write_summary_and_predictions(
+                run_repo / "local" / "auto_research_runs" / "prediction_change" / "proxy" / "activation_smoke_disabled" / "results",
+                "mmlu-redux",
+                0.505,
+                ["A", "A", "C", "D"],
+            )
+        elif name == "train":
+            final = run_repo / "local" / "auto_research_runs" / "prediction_change" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        elif name == "eval_mmlu-redux":
+            write_summary_and_predictions(run_repo / "local" / "auto_research_runs" / "prediction_change" / "results", "mmlu-redux", 0.51, ["A", "B", "C", "D"])
+        return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
+
+    monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
+    result = agent._run_single_c2c_candidate(
+        adapter=C2CAdapter(paths.root, config),
+        candidate={
+            "id": "prediction_change",
+            "title": "Prediction Change",
+            "experiment_contract": {
+                "ablation_switch": "disable_mechanism",
+                "config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}},
+            },
+        },
+        index=0,
+        simulate=False,
+        baseline_mean=50.0,
+        min_delta=0.1,
+        max_regression=2.0,
+        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+    )
+
+    comparison = result["activation_smoke"]["comparison"]
+    assert seen_steps.index("activation_smoke_eval_mmlu-redux") < seen_steps.index("train")
+    assert result["activation_smoke"]["status"] == "passed"
+    assert comparison["enabled_minus_disabled_mean"] == 0.0
+    assert comparison["prediction_comparison"]["prediction_diff_rate"] == 0.25
+    assert comparison["prediction_comparison"]["answer_diff_rate"] == 0.25
+    assert comparison["mechanism_observed"] is True
+    assert result["command_status"] == "ok"
+
+
+def test_c2c_eval_smoke_detects_all_zero_empty_outputs(tmp_path: Path) -> None:
+    result_root = tmp_path / "results"
+    out = result_root / "mmlu-redux"
+    out.mkdir(parents=True)
+    (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
+        json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.0}),
+        encoding="utf-8",
+    )
+    (out / "prediction_outputs.jsonl").write_text(
+        "\n".join(json.dumps({"prediction": "", "answer": "A"}) for _ in range(4)) + "\n",
+        encoding="utf-8",
+    )
+
+    smoke = collect_c2c_eval_smoke(result_root, repo_root=tmp_path)
+
+    assert smoke["status"] == "warning"
+    assert smoke["summary_datasets"]["mmlu-redux"]["accuracy_percent"] == 0.0
+    assert smoke["sample_count"] == 4
+    assert smoke["nonempty_prediction_rate"] == 0.0
+    assert "all_summary_scores_zero" in smoke["red_flags"]
+    assert "low_nonempty_prediction_rate" in smoke["red_flags"]
+
+
+def test_c2c_proxy_all_zero_records_eval_smoke_failure(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "model_map": {},
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "small_loop": {
+            "eval_datasets": ["mmlu-redux"],
+            "train_samples": 1,
+            "gpu_ids": [0],
+            "proxy_screen": {
+                "enabled": True,
+                "mode": "replay",
+                "eval_datasets": ["mmlu-redux"],
+                "eval_limit": 2,
+                "train_samples": 2,
+                "require_proxy_metrics": True,
+                "require_paired_baseline": True,
+                "run_baseline_if_missing": True,
+                "min_proxy_mean_delta": -0.3,
+                "max_proxy_dataset_regression": 1.5,
+                "eval_smoke": {"enabled": True, "min_nonempty_prediction_rate": 0.5, "min_answer_parse_rate": 0.2},
+            },
+        },
+    }
+    paths = init_workspace(config, "topic", project_id="proj_proxy_all_zero_smoke", simulate=False)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+
+    def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        run_repo = Path(working_dir)
+        if name == "proxy_baseline_train":
+            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
+            final.mkdir(parents=True, exist_ok=True)
+            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        if name == "proxy_baseline_eval_mmlu-redux":
+            out = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results" / "mmlu-redux"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
+                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.5}),
+                encoding="utf-8",
+            )
+        if name == "proxy_command_1":
+            out = run_repo / "local" / "auto_research_runs" / "all_zero_proxy" / "proxy" / "results" / "mmlu-redux"
+            out.mkdir(parents=True, exist_ok=True)
+            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
+                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.0}),
+                encoding="utf-8",
+            )
+            (out / "prediction_outputs.jsonl").write_text(
+                "\n".join(json.dumps({"prediction": "", "answer": "A"}) for _ in range(4)) + "\n",
+                encoding="utf-8",
+            )
+        if name == "train" or name.startswith("eval_"):
+            raise AssertionError("hard proxy reject must not reach full train/eval")
+        return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
+
+    monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
+    result = agent._run_single_c2c_candidate(
+        adapter=C2CAdapter(paths.root, config),
+        candidate={
+            "id": "all_zero_proxy",
+            "title": "All Zero Proxy",
             "experiment_contract": {"config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}}},
         },
         index=0,
@@ -4543,14 +9391,14 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
     )
 
     proxy = result["proxy_screen"]
-    baseline_cache = paths.root / "experiment" / "results" / "c2c_proxy_baseline.json"
-    assert baseline_cache.exists()
-    assert seen_steps.index("proxy_baseline_train") < seen_steps.index("proxy_command_0")
-    assert seen_steps.index("proxy_command_1") < seen_steps.index("train")
-    assert proxy["status"] == "passed"
-    assert proxy["proxy_delta_vs_baseline"] == 0.5
-    assert proxy["proxy_decision_mode"] == "paired_baseline"
-    assert result["command_status"] == "ok"
+    assert result["decision"] == "proxy_rejected"
+    assert proxy["status"] == "rejected"
+    assert proxy["metrics"]["mean"] == 0.0
+    assert proxy["eval_smoke"]["status"] == "warning"
+    assert "all_summary_scores_zero" in proxy["eval_smoke"]["red_flags"]
+    assert proxy["proxy_eval_health_failure"]["status"] == "suspected_output_or_parser_failure"
+    assert result["failure_attribution"]["primary_failure"] == "proxy_eval_output_health_failure"
+    assert result["failure_attribution"]["proxy_eval_health_failure"]["red_flags"]
 
 
 def test_c2c_failure_attribution_records_dataset_sample_and_patch_risk() -> None:
@@ -4692,6 +9540,21 @@ def test_c2c_proxy_calibration_marks_false_positive_and_dataset_errors() -> None
                     "proxy_dataset_deltas": {"mmlu-redux": 0.9, "ai2-arc": 0.2, "openbookqa": 0.3},
                     "metrics": {"mean": 50.8, "datasets": {"mmlu-redux": 50.9, "ai2-arc": 50.2, "openbookqa": 50.3}},
                 },
+            },
+            {
+                "id": "semantic_proxy_pass_full_win",
+                "title": "Semantic proxy pass full win",
+                "mechanism_type": "semantic_span_graph_alignment",
+                "decision": "candidate_win",
+                "metrics": {"mean": 51.0, "datasets": {"mmlu-redux": 51.0, "ai2-arc": 51.0, "openbookqa": 51.0}},
+                "delta_vs_baseline": 1.0,
+                "proxy_screen": {
+                    "status": "passed",
+                    "proxy_delta_vs_baseline": 0.5,
+                    "proxy_score": 0.7,
+                    "proxy_dataset_deltas": {"mmlu-redux": 0.4, "ai2-arc": 0.6, "openbookqa": 0.5},
+                    "metrics": {"mean": 50.5, "datasets": {"mmlu-redux": 50.4, "ai2-arc": 50.6, "openbookqa": 50.5}},
+                },
             }
         ],
     }
@@ -4700,13 +9563,22 @@ def test_c2c_proxy_calibration_marks_false_positive_and_dataset_errors() -> None
     summary = experiment_module._c2c_proxy_calibration_summary([iteration])
 
     candidate = iteration["candidates"][0]
+    assert iteration["full_s3_completed_candidate_count"] == 2
     assert candidate["proxy_false_positive"] is True
+    assert candidate["false_positive_reason"] == "proxy_mean_positive_full_mean_nonpositive"
     assert candidate["mispredicted_datasets"] == ["mmlu-redux"]
     assert candidate["dataset_calibration"]["mmlu-redux"]["proxy_delta"] == 0.9
     assert candidate["dataset_calibration"]["mmlu-redux"]["full_delta"] == -1.5
-    assert summary["proxy_false_positive_rate"] == 1.0
+    assert summary["proxy_false_positive_rate"] == 0.5
+    assert summary["proxy_full_delta_correlation"] is not None
     assert summary["dataset_error_summary"]["mmlu-redux"]["misprediction_count"] == 1
     assert summary["mechanism_false_positive_summary"]["utility_predicted_cache_routing"]["false_positive_rate"] == 1.0
+    assert summary["mechanism_false_positive_summary"]["utility_predicted_cache_routing"]["proxy_positive_full_nonpositive_rate"] == 1.0
+    assert summary["mechanism_false_positive_summary"]["utility_predicted_cache_routing"]["mispredicted_datasets"]["mmlu-redux"] == 1
+    method_feedback = summary["method_feedback"]
+    assert method_feedback["risky_datasets"][0]["dataset"] == "mmlu-redux"
+    assert method_feedback["risky_mechanisms"][0]["mechanism_type"] == "utility_predicted_cache_routing"
+    assert any("risky datasets" in item for item in method_feedback["recommendations"])
 
 
 def test_c2c_paperization_readiness_after_effect_win() -> None:
@@ -4848,6 +9720,58 @@ def test_c2c_posthoc_review_uses_deterministic_feedback_without_llm(tmp_path: Pa
     review = agent._c2c_posthoc_review(payload)
 
     assert review["status"] == "deterministic_no_llm"
+    assert review["next_round_suggestions"]
+    assert review["avoid_repeat_rules"]
+    assert review["feedback_entries"][0]["idea_id"] == "weak_gate"
+
+
+def test_c2c_posthoc_review_respects_disable_llm_during_execution(tmp_path: Path) -> None:
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["experiment"]["disable_llm_during_execution"] = True
+    paths = init_workspace(config, "topic", project_id="proj_posthoc_execution_no_llm", simulate=False)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+    agent = ExperimentAgent(context)
+
+    class BombLLM:
+        use_real_api = True
+
+        def generate_json_with_schema(self, **kwargs):
+            raise AssertionError("S3 execution posthoc should not call the LLM when disabled")
+
+    context.llm = BombLLM()
+    payload = {
+        "baseline": {"mean": 50.82, "datasets": {"mmlu-redux": 47.07}},
+        "acceptance": {
+            "passed": False,
+            "baseline_mean": 50.82,
+            "best_mean": 48.0,
+            "delta": -2.82,
+            "min_delta_to_pass": 0.1,
+            "max_dataset_regression": 2.0,
+            "reason": "mean delta or dataset regression threshold not met",
+        },
+        "best_candidate": {
+            "id": "weak_gate",
+            "title": "Weak gate",
+            "decision": "not_viable",
+            "metrics": {"mean": 48.0, "datasets": {"mmlu-redux": 43.0}},
+            "dataset_regressions": {"mmlu-redux": 4.07},
+        },
+        "candidate_results": [
+            {
+                "id": "weak_gate",
+                "title": "Weak gate",
+                "decision": "not_viable",
+                "metrics": {"mean": 48.0, "datasets": {"mmlu-redux": 43.0}},
+                "dataset_regressions": {"mmlu-redux": 4.07},
+            }
+        ],
+    }
+
+    review = agent._c2c_posthoc_review(payload)
+
+    assert review["status"] == "deterministic_execution_feedback"
+    assert "disable_llm_during_execution=true" in review["reason"]
     assert review["next_round_suggestions"]
     assert review["avoid_repeat_rules"]
     assert review["feedback_entries"][0]["idea_id"] == "weak_gate"

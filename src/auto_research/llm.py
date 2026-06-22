@@ -31,6 +31,7 @@ class GenerationResult:
 class ModelClient:
     def __init__(self, config: dict[str, Any], project_root: Path | None = None):
         llm_config = config.get("llm", {})
+        self.llm_config = dict(llm_config)
         self.provider = llm_config.get("provider", "openai")
         self.reasoning_provider = llm_config.get("reasoning_provider", self.provider)
         self.execution_provider = llm_config.get("execution_provider", self.provider)
@@ -271,6 +272,7 @@ class ModelClient:
                 text=True,
                 cwd=working_root,
                 timeout=self.timeout_seconds,
+                env=codex_subprocess_env({"llm": self.llm_config}),
             )
         except subprocess.TimeoutExpired as exc:
             output_text = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
@@ -414,6 +416,18 @@ def _collect_openai_api_keys(llm_config: dict[str, Any]) -> list[str]:
         if text and text not in keys:
             keys.append(text)
 
+    api_key_env = _normalize_optional_str(
+        llm_config.get("api_key_env") or llm_config.get("openai_api_key_env")
+    )
+    strict_env = bool(
+        llm_config.get("disable_api_key_fallback")
+        or llm_config.get("api_key_env_strict")
+    )
+    if api_key_env:
+        add(os.environ.get(api_key_env))
+        if strict_env:
+            return keys
+
     add(llm_config.get("api_key"))
     add(os.environ.get("OPENAI_API_KEY"))
     numbered: list[tuple[int, str]] = []
@@ -429,6 +443,33 @@ def _collect_openai_api_keys(llm_config: dict[str, Any]) -> list[str]:
         add(value)
     add(os.environ.get("OPENAI_API_TOKEN"))
     return keys
+
+
+def codex_subprocess_env(config: dict[str, Any]) -> dict[str, str]:
+    """Build an OpenAI-key-scoped environment for Codex CLI subprocesses."""
+    env = os.environ.copy()
+    llm_config = config.get("llm", {}) if isinstance(config.get("llm"), dict) else {}
+    api_key_env = _normalize_optional_str(
+        llm_config.get("api_key_env") or llm_config.get("openai_api_key_env")
+    )
+    strict_env = bool(
+        llm_config.get("disable_api_key_fallback")
+        or llm_config.get("api_key_env_strict")
+    )
+    selected_key = _normalize_optional_str(env.get(api_key_env)) if api_key_env else None
+
+    if strict_env:
+        for key in list(env):
+            if re.fullmatch(r"OPENAI_API_KEY(_\d+)?", key) and key != api_key_env:
+                env.pop(key, None)
+        env.pop("OPENAI_API_TOKEN", None)
+
+    if selected_key:
+        env["OPENAI_API_KEY"] = selected_key
+        if api_key_env:
+            env[api_key_env] = selected_key
+
+    return env
 
 
 def _is_openai_key_fallback_error(exc: Exception) -> bool:

@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import json
 import shlex
+import copy
+import shutil
+import re
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,9 +16,9 @@ import yaml
 from ..c2c import C2CAdapter, DEFAULT_BASELINE, c2c_candidate_config_overrides, c2c_proxy_screen_config, default_c2c_ideas
 from ..code_patch import DynamicEditPolicy, FrozenPatchGuard, archive_patched_code_snapshot
 from ..adapters.runner import ExperimentRunner
-from ..failure_log import FailureLogManager, build_c2c_feedback_bundle
+from ..failure_log import FailureLogManager, build_c2c_feedback_bundle, is_retryable_c2c_candidate
 from ..itr_ideas import screening_summary_markdown
-from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sha256_file, write_json
+from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, sha256_file, write_json
 from .base import AgentContext
 
 
@@ -603,8 +607,12 @@ class ExperimentAgent:
         revision_source: str | None,
     ) -> dict[str, Any]:
         adapter = C2CAdapter(self.context.project_root, self.context.config)
-        candidates = list(plan.get("candidate_ideas") or default_c2c_ideas(plan.get("selected_idea", {}).get("title", "C2C"), adapter.baseline))
-        candidates = candidates[: int(execution.get("max_candidates") or 3)]
+        raw_candidates = list(plan.get("candidate_ideas") or default_c2c_ideas(plan.get("selected_idea", {}).get("title", "C2C"), adapter.baseline))
+        candidate_selection = self._c2c_s3_candidate_selection(
+            raw_candidates,
+            max_candidates=int(execution.get("max_candidates") or 3),
+        )
+        candidates = candidate_selection["candidates"]
         run_results = []
         command_logs = []
         copied_sources = [env_source]
@@ -616,14 +624,37 @@ class ExperimentAgent:
         baseline_mean = float((execution.get("baseline") or adapter.baseline).get("mean") or DEFAULT_BASELINE["mean"])
         min_delta = float(execution.get("min_delta_to_pass", self.context.config.get("c2c", {}).get("small_loop", {}).get("min_delta_to_pass", 0.1)))
         max_regression = float(execution.get("max_dataset_regression", self.context.config.get("c2c", {}).get("small_loop", {}).get("max_dataset_regression", 2.0)))
-        original_files = self._snapshot_c2c_repo_state(adapter)
         gpu_policy = dict(execution.get("gpu_policy") or self.context.config.get("experiment", {}).get("gpu_policy", {}))
-        if execution.get("selected_gpu_ids"):
+        c2c_small_loop = self.context.config.get("c2c", {}).get("small_loop", {})
+        configured_gpus = c2c_small_loop.get("gpu_ids", "auto")
+        if configured_gpus not in (None, "", "auto"):
+            gpu_policy["gpu_ids"] = configured_gpus
+        elif execution.get("selected_gpu_ids") and gpu_policy.get("reuse_plan_selected_gpu_ids", False):
             gpu_policy["gpu_ids"] = execution["selected_gpu_ids"]
+        else:
+            gpu_policy["gpu_ids"] = "auto"
+        gpu_policy.setdefault("min_free_mb", 8192)
+        gpu_policy.setdefault("max_utilization_gpu", 40)
+        gpu_policy.setdefault("respect_resource_filters", True)
         gpu_selection = self.runner.select_gpus(gpu_policy)
+        proxy_gpu_policy = self._c2c_proxy_gpu_policy(execution=execution)
+        proxy_gpu_selection = self._select_c2c_proxy_gpus(proxy_gpu_policy)
+
+        selection_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "results/s3_candidate_selection.json",
+            {
+                **candidate_selection["report"],
+                "execution_max_candidates": execution.get("max_candidates"),
+                "effective_candidate_count": len(candidates),
+            },
+            artifact_type="c2c_s3_candidate_selection",
+            summary="Locked C2C S3 candidate selection from S2.5 patch manifest",
+            source_paths=[path for path in ["plan/code_patches/patch_manifest.json", "plan/plan.yaml", "plan/candidate_ideas.json"] if (self.context.project_root / path).exists()],
+        )
+        copied_sources.append(selection_record["path"])
 
         for idx, candidate in enumerate(candidates):
-            self._restore_c2c_repo_state(adapter, original_files)
             candidate_result = self._run_single_c2c_candidate(
                 adapter=adapter,
                 candidate=candidate,
@@ -633,6 +664,7 @@ class ExperimentAgent:
                 min_delta=min_delta,
                 max_regression=max_regression,
                 gpu_selection=gpu_selection,
+                proxy_gpu_selection=proxy_gpu_selection,
             )
             run_results.append(candidate_result)
             command_logs.extend(candidate_result.get("command_logs", []))
@@ -640,7 +672,6 @@ class ExperimentAgent:
                 break
             if candidate_result.get("decision") == "candidate_win":
                 break
-        self._restore_c2c_repo_state(adapter, original_files)
 
         best_proxy = self._best_c2c_proxy_candidate(run_results)
         best = self._best_c2c_candidate(run_results)
@@ -651,6 +682,7 @@ class ExperimentAgent:
             "best_candidate": best,
             "best_proxy_candidate": best_proxy,
             "candidate_results": run_results,
+            "s3_candidate_selection": candidate_selection["report"],
             "acceptance": comparison,
             "workflow_goal": self.context.config.get("c2c", {}).get("workflow_goal", "effect_first_discovery"),
             "gpu_selection": {
@@ -659,6 +691,16 @@ class ExperimentAgent:
                 "policy": gpu_selection.policy,
                 "snapshot": gpu_selection.snapshot,
                 "reason": gpu_selection.reason,
+                "resource_aware": True,
+                "plan_selected_gpu_ids": execution.get("selected_gpu_ids"),
+            },
+            "proxy_gpu_selection": {
+                "selected_gpu_ids": proxy_gpu_selection.selected_ids,
+                "cuda_visible_devices": proxy_gpu_selection.cuda_visible_devices,
+                "policy": proxy_gpu_selection.policy,
+                "snapshot": proxy_gpu_selection.snapshot,
+                "reason": proxy_gpu_selection.reason,
+                "resource_aware": True,
             },
         }
         main_payload["strong_reference_comparisons"] = self._c2c_strong_reference_comparisons(best, adapter)
@@ -784,6 +826,188 @@ class ExperimentAgent:
             ],
             "status": "ok" if comparison.get("passed") else "not_viable",
         }
+
+    def _c2c_proxy_gpu_policy(self, *, execution: dict[str, Any]) -> dict[str, Any]:
+        experiment_policy = self.context.config.get("experiment", {}).get("gpu_policy", {})
+        policy = dict(experiment_policy if isinstance(experiment_policy, dict) else {})
+        proxy_cfg = c2c_proxy_screen_config(self.context.config)
+        proxy_policy = proxy_cfg.get("gpu_policy") if isinstance(proxy_cfg.get("gpu_policy"), dict) else {}
+        policy.update(proxy_policy)
+        configured = policy.get("gpu_ids", "auto")
+        if configured in (None, ""):
+            configured = "auto"
+        policy["gpu_ids"] = configured
+        policy.setdefault("max_gpus", 1)
+        policy.setdefault("min_free_mb", 8192)
+        policy.setdefault("max_utilization_gpu", 40)
+        policy.setdefault("respect_resource_filters", True)
+        policy.setdefault("disable_resource_fallback", True)
+        policy["selection_scope"] = "c2c_proxy_screen"
+        if execution.get("selected_gpu_ids") and policy.get("reuse_plan_selected_gpu_ids", False):
+            policy["gpu_ids"] = execution["selected_gpu_ids"]
+        return policy
+
+    def _select_c2c_proxy_gpus(self, policy: dict[str, Any]) -> Any:
+        selection = self.runner.select_gpus(policy)
+        if selection.selected_ids or not _c2c_gpu_resource_wait_enabled(policy) or not selection.snapshot:
+            return selection
+        wait_cfg = policy.get("resource_wait") if isinstance(policy.get("resource_wait"), dict) else {}
+        timeout_seconds = max(0, int(wait_cfg.get("timeout_seconds") or 0))
+        poll_seconds = max(1, int(wait_cfg.get("poll_seconds") or 60))
+        started = time.monotonic()
+        while time.monotonic() - started < timeout_seconds:
+            time.sleep(min(poll_seconds, max(0.0, timeout_seconds - (time.monotonic() - started))))
+            selection = self.runner.select_gpus(policy)
+            if selection.selected_ids:
+                selection.reason = "proxy_resource_wait_then_auto_selected_by_free_memory"
+                return selection
+        selection.reason = "proxy_resource_wait_timeout"
+        return selection
+
+    def _c2c_s3_candidate_selection(self, candidates: list[dict[str, Any]], *, max_candidates: int) -> dict[str, Any]:
+        candidates = [copy.deepcopy(candidate) for candidate in candidates if isinstance(candidate, dict)]
+        manifest_path = self.context.project_root / "plan" / "code_patches" / "patch_manifest.json"
+        manifest = read_json(manifest_path, default={}) if manifest_path.exists() else {}
+        selected_candidate_id = str(manifest.get("selected_candidate_id") or "").strip() if isinstance(manifest, dict) else ""
+        report = {
+            "schema_version": "c2c_s3_candidate_selection_v1",
+            "created_at": now_utc(),
+            "lock_source": "plan/code_patches/patch_manifest.json" if manifest_path.exists() else "plan.candidate_ideas",
+            "lock_policy": "s2_5_artifacts_are_execution_truth; plan.yaml supplies experiment protocol only",
+            "patch_manifest": _c2c_selection_artifact_lock(self.context.project_root, "plan/code_patches/patch_manifest.json"),
+            "manifest_status": manifest.get("status") if isinstance(manifest, dict) else None,
+            "selected_candidate_id": selected_candidate_id or None,
+            "candidate_ids_before_lock": [candidate.get("id") for candidate in candidates if candidate.get("id")],
+            "skipped_candidate_ids": [],
+            "selected_candidate_found_in_plan": False,
+            "selected_candidate_recovered_from_manifest": False,
+        }
+        if not selected_candidate_id:
+            selected = candidates[: max(0, max_candidates)]
+            report.update(
+                {
+                    "mode": "plan_candidate_budget",
+                    "executed_candidate_ids": [candidate.get("id") for candidate in selected if candidate.get("id")],
+                    "reason": "No selected_candidate_id in patch_manifest; using existing plan candidate budget.",
+                }
+            )
+            return {"candidates": selected, "report": report}
+
+        selected_entry = _c2c_manifest_selected_patch_entry(manifest, selected_candidate_id)
+        selected_candidate = next((candidate for candidate in candidates if str(candidate.get("id") or "") == selected_candidate_id), None)
+        if selected_candidate is not None:
+            report["selected_candidate_found_in_plan"] = True
+            selected = self._c2c_candidate_with_locked_patch(selected_candidate, selected_entry)
+        else:
+            selected = self._c2c_candidate_from_locked_patch(selected_entry, selected_candidate_id)
+            report["selected_candidate_recovered_from_manifest"] = bool(selected)
+
+        if not selected:
+            report.update(
+                {
+                    "mode": "manifest_lock_failed",
+                    "executed_candidate_ids": [],
+                    "reason": f"patch_manifest selected_candidate_id={selected_candidate_id} but no matching plan candidate or selected patch entry was found.",
+                }
+            )
+            return {"candidates": [], "report": report}
+
+        report.update(
+            {
+                "mode": "patch_manifest_selected",
+                "executed_candidate_ids": [selected.get("id")],
+                "skipped_candidate_ids": [
+                    candidate.get("id")
+                    for candidate in candidates
+                    if candidate.get("id") and str(candidate.get("id")) != selected_candidate_id
+                ],
+                "selected_patch_json": (selected.get("code_patch") or {}).get("patch_json") if isinstance(selected.get("code_patch"), dict) else None,
+                "selected_patch_validation": (selected.get("code_patch") or {}).get("validation") if isinstance(selected.get("code_patch"), dict) else None,
+                "selected_patched_repo_snapshot": (
+                    ((selected.get("code_patch") or {}).get("patched_repo_snapshot") or {}).get("path")
+                    if isinstance((selected.get("code_patch") or {}).get("patched_repo_snapshot"), dict)
+                    else None
+                ),
+                "selected_patch": _c2c_selection_artifact_lock(
+                    self.context.project_root,
+                    ((selected.get("code_patch") or {}).get("patch_json") if isinstance(selected.get("code_patch"), dict) else None),
+                ),
+                "selected_patched_repo_snapshot_lock": _c2c_selection_artifact_lock(
+                    self.context.project_root,
+                    (
+                        ((selected.get("code_patch") or {}).get("patched_repo_snapshot") or {}).get("manifest")
+                        if isinstance((selected.get("code_patch") or {}).get("patched_repo_snapshot"), dict)
+                        else None
+                    ),
+                ),
+                "selected_implementation_contract": _c2c_selection_artifact_lock(
+                    self.context.project_root,
+                    ((selected.get("code_patch") or {}).get("implementation_contract") if isinstance(selected.get("code_patch"), dict) else None),
+                ),
+                "selected_patch_status": (selected.get("code_patch") or {}).get("status") if isinstance(selected.get("code_patch"), dict) else None,
+                "reason": "S3 is locked to the S2.5 patch_manifest selected candidate.",
+            }
+        )
+        return {"candidates": [selected], "report": report}
+
+    @staticmethod
+    def _c2c_candidate_with_locked_patch(candidate: dict[str, Any], selected_entry: dict[str, Any]) -> dict[str, Any]:
+        selected = copy.deepcopy(candidate)
+        if selected_entry:
+            selected["code_patch"] = _c2c_code_patch_from_manifest_entry(selected_entry)
+            selected["id"] = selected.get("id") or selected_entry.get("candidate_id") or selected_entry.get("id")
+            selected["title"] = selected.get("title") or selected_entry.get("title")
+            if selected_entry.get("variant_fingerprint"):
+                selected["variant_fingerprint"] = selected_entry.get("variant_fingerprint")
+            if isinstance(selected_entry.get("s2_variant"), dict) and selected_entry.get("s2_variant"):
+                selected["s2_variant"] = selected_entry.get("s2_variant")
+        selected["selected"] = True
+        return selected
+
+    def _c2c_candidate_from_locked_patch(self, selected_entry: dict[str, Any], selected_candidate_id: str) -> dict[str, Any] | None:
+        if not selected_entry:
+            return None
+        candidate = {
+            "id": selected_candidate_id,
+            "title": selected_entry.get("title") or selected_candidate_id,
+            "selected": True,
+            "code_patch": _c2c_code_patch_from_manifest_entry(selected_entry),
+        }
+        if selected_entry.get("variant_fingerprint"):
+            candidate["variant_fingerprint"] = selected_entry.get("variant_fingerprint")
+        if isinstance(selected_entry.get("s2_variant"), dict) and selected_entry.get("s2_variant"):
+            candidate["s2_variant"] = selected_entry.get("s2_variant")
+
+        contract: dict[str, Any] = {}
+        contract_path = selected_entry.get("implementation_contract") or candidate["code_patch"].get("implementation_contract")
+        if contract_path:
+            contract = read_json(self.context.project_root / str(contract_path), default={}) if isinstance(contract_path, str) else {}
+        if not contract:
+            patch_json_path = selected_entry.get("patch_json") or candidate["code_patch"].get("patch_json")
+            if patch_json_path:
+                patch_payload = read_json(self.context.project_root / str(patch_json_path), default={}) or {}
+                if isinstance(patch_payload, dict):
+                    contract = patch_payload.get("implementation_contract") if isinstance(patch_payload.get("implementation_contract"), dict) else {}
+        if isinstance(contract, dict) and contract:
+            mechanism = contract.get("mechanism_contract") if isinstance(contract.get("mechanism_contract"), dict) else {}
+            experiment_contract = contract.get("experiment_contract") if isinstance(contract.get("experiment_contract"), dict) else {}
+            candidate["hypothesis"] = contract.get("hypothesis") or candidate.get("hypothesis")
+            candidate["mechanism_type"] = mechanism.get("mechanism_type") or candidate.get("mechanism_type")
+            ablation_switch = experiment_contract.get("ablation_switch") or mechanism.get("ablation_switch")
+            candidate["experiment_contract"] = {
+                "primary_metric": experiment_contract.get("primary_metric"),
+                "baseline": experiment_contract.get("baseline"),
+                "config_overrides": experiment_contract.get("config_overrides") or {},
+                "verification_commands": experiment_contract.get("verification_commands"),
+                "ablation_switch": ablation_switch,
+                "coverage_diagnostics": experiment_contract.get("coverage_diagnostics") or mechanism.get("coverage_diagnostics") or {},
+                "matched_coverage_ablation": experiment_contract.get("matched_coverage_ablation") or mechanism.get("matched_coverage_ablation") or {},
+            }
+            if ablation_switch:
+                candidate["ablation_plan"] = {"switch": ablation_switch}
+            if mechanism.get("expected_signature"):
+                candidate["expected_signature"] = mechanism.get("expected_signature")
+        return candidate
 
     def _append_c2c_iteration_history(self, payload: dict[str, Any]) -> dict[str, Any]:
         history_path = self.context.project_root / "experiment" / "results" / "c2c_iteration_history.json"
@@ -977,21 +1201,68 @@ class ExperimentAgent:
         min_delta: float,
         max_regression: float,
         gpu_selection: Any,
+        proxy_gpu_selection: Any,
     ) -> dict[str, Any]:
-        original_repo_state = self._snapshot_c2c_repo_state(adapter)
         patch = self._load_frozen_c2c_patch(candidate)
-        patch_result = self._apply_frozen_c2c_patch(candidate, adapter, patch)
-        code_snapshot = archive_patched_code_snapshot(self.context.artifacts, adapter, candidate, patch_result) if patch_result.get("status") == "applied" else {"status": "skipped"}
-        run_spec = adapter.materialize_candidate_configs(candidate, gpu_selection)
+        original_repo_root = adapter.repo_root
+        execution_repo = self._prepare_c2c_execution_repo(candidate, adapter, patch)
+        if execution_repo.get("status") == "ok":
+            adapter = C2CAdapter(
+                self.context.project_root,
+                _config_with_c2c_snapshot_path(self.context.config, execution_repo["repo_root"]),
+            )
+        patch_result = self._apply_frozen_c2c_patch(candidate, adapter, patch, execution_repo=execution_repo)
+        code_snapshot = (
+            archive_patched_code_snapshot(self.context.artifacts, adapter, candidate, patch_result)
+            if patch_result.get("status") in {"applied", "snapshot_applied"}
+            else {"status": "skipped"}
+        )
+        run_spec = adapter.materialize_candidate_configs(candidate, gpu_selection, proxy_gpu_selection=proxy_gpu_selection)
+        output_pollution_before = _c2c_original_output_state(original_repo_root, run_spec)
+        execution_repo_audit = _c2c_execution_repo_path_audit(
+            original_repo_root=original_repo_root,
+            execution_repo=execution_repo,
+            run_spec=run_spec,
+        )
         has_executable_change = bool(patch_result.get("changed_files") or run_spec.get("has_executable_change"))
         patch_fingerprint = self._c2c_patch_fingerprint(adapter, patch_result, run_spec)
         reusable_state = self._load_reusable_c2c_proxy_state(run_spec, patch_fingerprint)
+        cached_proxy_rejudge_action = None
+        if reusable_state:
+            cached_proxy_screen = _normalize_c2c_proxy_screen_artifacts(
+                reusable_state.get("proxy_screen") or {},
+                full_baseline=adapter.baseline,
+                run_spec=run_spec,
+            )
+            current_decision = self._c2c_rejudge_cached_proxy_screen(
+                cached_proxy_screen,
+                baseline=adapter.baseline,
+                proxy_cfg=c2c_proxy_screen_config(self.context.config),
+            )
+            if current_decision and current_decision.get("status") == "passed":
+                cached_proxy_rejudge_action = {
+                    "action": "ignore_cached_proxy_block_after_threshold_rejudge",
+                    "status": "ok",
+                    "previous_status": cached_proxy_screen.get("status"),
+                    "previous_reason": cached_proxy_screen.get("reason"),
+                    "current_status": current_decision.get("status"),
+                    "current_reason": current_decision.get("reason"),
+                    "soft_flags": current_decision.get("soft_flags") or [],
+                }
+                reusable_state = None
+            else:
+                if current_decision:
+                    cached_proxy_screen.update(current_decision)
+                    cached_proxy_screen["cached_proxy_rejudged"] = True
+                reusable_state["proxy_screen"] = cached_proxy_screen
         run_state = {
             "candidate_id": candidate.get("id"),
             "run_id": run_spec["run_id"],
             "created_at": now_utc(),
             "preflight": None,
             "proxy_screen": None,
+            "activation_smoke": None,
+            "full_s3_readiness": None,
             "ablation": None,
             "train": None,
             "eval_by_dataset": {},
@@ -1005,6 +1276,8 @@ class ExperimentAgent:
             "has_executable_change": has_executable_change,
             "patch_fingerprint": patch_fingerprint,
             "code_snapshot": code_snapshot,
+            "execution_repo": execution_repo,
+            "execution_repo_audit": execution_repo_audit,
             "runtime_localization": run_spec.get("runtime_localization", {}),
         }
         logs = [
@@ -1014,6 +1287,8 @@ class ExperimentAgent:
                 "patch_summary": patch.get("summary", ""),
                 "patch_result": patch_result,
                 "code_snapshot": code_snapshot,
+                "execution_repo": execution_repo,
+                "execution_repo_audit": execution_repo_audit,
                 "config_overrides": run_spec.get("config_overrides", {}),
                 "has_executable_change": has_executable_change,
                 "patch_fingerprint": patch_fingerprint,
@@ -1021,9 +1296,50 @@ class ExperimentAgent:
                 "runtime_localization": run_spec.get("runtime_localization", {}),
             }
         ]
+        def refresh_execution_repo_audit(phase: str) -> dict[str, Any]:
+            audit = _c2c_execution_repo_output_audit(
+                original_repo_root=original_repo_root,
+                run_spec=run_spec,
+                before_state=output_pollution_before,
+                path_audit=execution_repo_audit,
+                phase=phase,
+            )
+            run_state["execution_repo_audit"] = audit
+            return audit
+
+        def block_for_execution_repo_audit(phase: str) -> bool:
+            nonlocal command_status
+            audit = refresh_execution_repo_audit(phase)
+            if audit.get("status") != "failed":
+                return False
+            reason = audit.get("reason") or "S3 output was written outside execution repo"
+            command_status = "blocked"
+            action = {
+                "action": "block_original_snapshot_output_pollution",
+                "status": "blocked",
+                "phase": phase,
+                "reason": reason,
+                "polluted_files": (audit.get("output_pollution") or {}).get("added_files", [])[:20],
+                "modified_files": (audit.get("output_pollution") or {}).get("modified_files", [])[:20],
+            }
+            run_state["recovery_actions"].append(action)
+            logs.append({"candidate_id": candidate.get("id"), "event": "execution_repo_audit_failed", **action, "audit": audit})
+            return True
+
+        if cached_proxy_rejudge_action:
+            run_state["recovery_actions"].append(cached_proxy_rejudge_action)
+            logs.append({"candidate_id": candidate.get("id"), "event": "proxy_cache_rejudge", **cached_proxy_rejudge_action})
         command_status = "skipped"
         preflight = None
-        if patch_result["status"] == "rejected":
+        if execution_repo_audit.get("status") == "failed":
+            metrics = None
+            command_status = "blocked"
+            reason = execution_repo_audit.get("reason") or "S3 execution repo path audit failed"
+            run_state["preflight"] = {"status": "blocked", "reason": reason}
+            run_state["recovery_actions"].append({"action": "block_execution_repo_path_audit", "status": "blocked", "reason": reason})
+            logs.append({"candidate_id": candidate.get("id"), "event": "blocked", "reason": reason, "execution_repo_audit": execution_repo_audit})
+            self._save_c2c_run_state(run_spec, run_state)
+        elif patch_result["status"] == "rejected":
             metrics = None
             command_status = "patch_rejected"
             self._save_c2c_run_state(run_spec, run_state)
@@ -1034,6 +1350,36 @@ class ExperimentAgent:
             run_state["preflight"] = {"status": "blocked", "reason": reason}
             run_state["recovery_actions"].append({"action": "block_noop_candidate", "status": "blocked", "reason": reason})
             logs.append({"candidate_id": candidate.get("id"), "event": "blocked", "reason": reason})
+            self._save_c2c_run_state(run_spec, run_state)
+        elif not simulate and bool(c2c_proxy_screen_config(self.context.config).get("enabled", False)) and not getattr(proxy_gpu_selection, "selected_ids", []):
+            metrics = None
+            command_status = "blocked"
+            reason = "cheap proxy resource wait timed out without an available GPU; resume after GPU resources are available"
+            proxy_screen = {
+                "enabled": True,
+                "status": "resource_retry",
+                "reason": reason,
+                "repair_hint": "do not repair the S2.5 patch for this failure; rerun S3 when proxy GPU resources are available",
+                "resource_retry": True,
+                "failure_category": "s3_proxy_gpu_resource_retry",
+                "gpu_selection": {
+                    "selected_gpu_ids": list(getattr(proxy_gpu_selection, "selected_ids", []) or []),
+                    "policy": getattr(proxy_gpu_selection, "policy", {}),
+                    "snapshot": getattr(proxy_gpu_selection, "snapshot", []),
+                    "reason": getattr(proxy_gpu_selection, "reason", ""),
+                },
+            }
+            run_state["proxy_screen"] = proxy_screen
+            run_state["preflight"] = {"status": "blocked", "reason": reason}
+            run_state["recovery_actions"].append(
+                {
+                    "action": "pause_for_proxy_gpu_resources",
+                    "status": "resource_retry",
+                    "reason": reason,
+                    "gpu_selection": proxy_screen["gpu_selection"],
+                }
+            )
+            logs.append({"candidate_id": candidate.get("id"), "event": "proxy_gpu_resource_retry", "proxy_screen": proxy_screen})
             self._save_c2c_run_state(run_spec, run_state)
         elif simulate:
             metrics = adapter.write_mock_candidate_results(run_spec["run_id"], offset=max(min_delta + 0.15, 0.25) if index == 0 else -0.25)
@@ -1056,7 +1402,12 @@ class ExperimentAgent:
             self._save_c2c_run_state(run_spec, run_state)
         elif reusable_state:
             metrics = reusable_state.get("metrics")
-            proxy_screen = reusable_state.get("proxy_screen") or {}
+            proxy_screen = _normalize_c2c_proxy_screen_artifacts(
+                reusable_state.get("proxy_screen") or {},
+                full_baseline=adapter.baseline,
+                run_spec=run_spec,
+            )
+            reusable_state["proxy_screen"] = proxy_screen
             preflight = reusable_state.get("preflight")
             run_state.update(reusable_state)
             run_state["patch_fingerprint"] = patch_fingerprint
@@ -1069,7 +1420,9 @@ class ExperimentAgent:
                     "reason": "existing run_state has complete proxy_screen for matching frozen hashes and patch fingerprint",
                 }
             )
-            if proxy_screen.get("status") == "rejected":
+            if proxy_screen.get("status") in {"resource_retry", "blocked"}:
+                command_status = "blocked"
+            elif proxy_screen.get("status") == "rejected":
                 command_status = "proxy_rejected"
             elif proxy_screen.get("status") == "repairable_proxy_risk":
                 command_status = "proxy_repairable"
@@ -1092,6 +1445,7 @@ class ExperimentAgent:
                     "max_attempts": int(self.context.config.get("experiment", {}).get("self_heal", {}).get("max_attempts", 1) or 1)
                 }
                 step_runs = []
+                proxy_enabled = bool(c2c_proxy_screen_config(self.context.config).get("enabled", False))
                 for step_idx, command in enumerate(run_spec["commands"]["preflight"]):
                     result = self.runner.run_step(
                         name=f"preflight_command_{step_idx}",
@@ -1104,42 +1458,235 @@ class ExperimentAgent:
                     if result["status"] != "ok":
                         command_status = "failed"
                         break
-                if command_status != "failed":
+                if command_status != "failed" and proxy_enabled:
                     baseline_proxy = self._ensure_c2c_proxy_baseline(
                         adapter,
                         run_spec,
-                        gpu_selection,
+                        proxy_gpu_selection,
                         retry_policy,
-                        baseline_repo_state=original_repo_state,
+                        baseline_repo_state=None,
                     )
+                    baseline_attempts = baseline_proxy.get("attempts") or []
+                    step_runs.extend(baseline_attempts)
+                    run_state["attempts"].extend(baseline_attempts)
                     if baseline_proxy.get("status") in {"failed", "blocked"}:
-                        step_runs.extend(baseline_proxy.get("attempts") or [])
-                        run_state["attempts"].extend(baseline_proxy.get("attempts") or [])
                         run_state["proxy_baseline"] = baseline_proxy
-                        command_status = "failed"
+                        command_status = "blocked"
+                        run_state["proxy_screen"] = {
+                            "enabled": True,
+                            "status": "baseline_blocked",
+                            "reason": baseline_proxy.get("reason") or "proxy baseline could not be established",
+                            "baseline_status": baseline_proxy.get("status"),
+                            "baseline_failure": baseline_proxy.get("command_failure") or {},
+                            "baseline_attempt_count": len(baseline_proxy.get("attempts") or []),
+                            "patch_fingerprint": patch_fingerprint,
+                        }
                         logs.append({"candidate_id": candidate.get("id"), "event": "proxy_baseline", "status": baseline_proxy.get("status"), "proxy_baseline": baseline_proxy})
-                if command_status != "failed":
-                    proxy_screen = self._run_c2c_proxy_screen(
-                        adapter=adapter,
-                        candidate=candidate,
-                        run_spec=run_spec,
-                        patch_result=patch_result,
-                        has_executable_change=has_executable_change,
-                        baseline=adapter.baseline,
-                    )
+                    elif baseline_proxy.get("status") in {"fallback", "cached", "ok"}:
+                        run_state["proxy_baseline"] = baseline_proxy
+                        logs.append({"candidate_id": candidate.get("id"), "event": "proxy_baseline", "status": baseline_proxy.get("status"), "proxy_baseline": baseline_proxy})
+                    if command_status not in {"failed", "blocked"} and block_for_execution_repo_audit("proxy_baseline"):
+                        metrics = None
+                if command_status not in {"failed", "blocked"}:
+                    if proxy_enabled:
+                        proxy_screen = self._run_c2c_proxy_screen(
+                            adapter=adapter,
+                            candidate=candidate,
+                            run_spec=run_spec,
+                            patch_result=patch_result,
+                            has_executable_change=has_executable_change,
+                            baseline=adapter.baseline,
+                        )
+                    else:
+                        proxy_screen = {"enabled": False, "status": "skipped", "reason": "proxy_screen disabled"}
                     proxy_screen["patch_fingerprint"] = patch_fingerprint
                     run_state["proxy_screen"] = proxy_screen
                     logs.append({"candidate_id": candidate.get("id"), "event": "proxy_screen", "status": proxy_screen.get("status"), "proxy_screen": proxy_screen})
                     proxy_attempts = proxy_screen.get("attempts") or []
                     step_runs.extend(proxy_attempts)
                     run_state["attempts"].extend(proxy_attempts)
-                    if proxy_screen.get("status") == "failed":
+                    if proxy_screen.get("status") in {"resource_retry", "blocked"}:
+                        command_status = "blocked"
+                    elif proxy_screen.get("status") == "failed":
                         command_status = "failed"
                     elif proxy_screen.get("status") == "rejected":
                         command_status = "proxy_rejected"
                     elif proxy_screen.get("status") == "repairable_proxy_risk":
                         command_status = "proxy_repairable"
-                if command_status not in {"failed", "proxy_rejected", "proxy_repairable"}:
+                    if command_status not in {"failed", "proxy_rejected", "proxy_repairable", "blocked"} and block_for_execution_repo_audit("proxy_screen"):
+                        metrics = None
+                if proxy_enabled and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
+                    activation_smoke = self._run_c2c_proxy_activation_smoke(
+                        adapter=adapter,
+                        candidate=candidate,
+                            run_spec=run_spec,
+                            gpu_selection=proxy_gpu_selection,
+                        )
+                    run_state["activation_smoke"] = activation_smoke
+                    activation_attempts = activation_smoke.get("attempts") or []
+                    step_runs.extend(activation_attempts)
+                    run_state["attempts"].extend(activation_attempts)
+                    logs.append(
+                        {
+                            "candidate_id": candidate.get("id"),
+                            "event": "activation_smoke",
+                            "status": activation_smoke.get("status"),
+                            "activation_smoke": activation_smoke,
+                        }
+                    )
+                    if activation_smoke.get("status") == "failed" and activation_smoke.get("hard_gate", True):
+                        proxy_screen = run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else {}
+                        reason = activation_smoke.get("reason") or "proxy activation smoke failed"
+                        repair_hint = activation_smoke.get("repair_hint") or "repair S2.5 patch activation before full S3"
+                        trace = activation_smoke.get("mechanism_trace") if isinstance(activation_smoke.get("mechanism_trace"), dict) else {}
+                        if trace.get("status") == "wired":
+                            if _c2c_neutral_proxy_full_s3_allowed(
+                                proxy_screen,
+                                c2c_proxy_screen_config(self.context.config),
+                            ):
+                                reason = "metric-neutral activation smoke allowed for exploratory full S3 because proxy is near-neutral and mechanism wiring is present"
+                                comparison = activation_smoke.setdefault("comparison", {})
+                                if isinstance(comparison, dict):
+                                    comparison["mechanism_wired_metric_neutral"] = True
+                                activation_smoke.update(
+                                    {
+                                        "status": "passed",
+                                        "hard_gate_overridden": True,
+                                        "reason": reason,
+                                        "full_s3_allowed_reason": reason,
+                                    }
+                                )
+                                proxy_screen.update(
+                                    {
+                                        "activation_smoke": activation_smoke,
+                                        "activation_metric_neutral_allowed_for_full_s3": True,
+                                        "neutral_proxy_policy": _c2c_neutral_proxy_policy_summary(
+                                            proxy_screen,
+                                            c2c_proxy_screen_config(self.context.config),
+                                        ),
+                                    }
+                                )
+                                run_state["activation_smoke"] = activation_smoke
+                                run_state["proxy_screen"] = proxy_screen
+                                run_state["recovery_actions"].append(
+                                    {
+                                        "action": "allow_metric_neutral_activation_for_full_s3",
+                                        "status": "warning",
+                                        "reason": reason,
+                                        "neutral_proxy_policy": proxy_screen.get("neutral_proxy_policy"),
+                                    }
+                                )
+                            else:
+                                command_status = "proxy_repairable"
+                                reason = "mechanism is wired into eval path but produced metric-neutral proxy activation smoke"
+                                repair_hint = "repair proxy effect or dataset tradeoff; eval-path wiring is present, so do not spend this repair on ablation switch plumbing"
+                                proxy_screen.update(
+                                    {
+                                        "status": "repairable_proxy_risk",
+                                        "reason": reason,
+                                        "repair_hint": repair_hint,
+                                        "repair_route": "S2_plan",
+                                        "repair_mode": "effect_first_proxy_repair",
+                                        "activation_smoke": activation_smoke,
+                                        "proxy_effect_repair_contract": _proxy_effect_repair_contract(
+                                            reason=reason,
+                                            repair_hint=repair_hint,
+                                            evidence={"activation_smoke": activation_smoke, "mechanism_trace": trace},
+                                            patch_risk=(proxy_screen.get("patch_risk") or {}),
+                                            source="proxy_activation_smoke",
+                                        ),
+                                    }
+                                )
+                                run_state["proxy_screen"] = proxy_screen
+                        else:
+                            command_status = "proxy_repairable"
+                            proxy_screen.update(
+                                {
+                                    "status": "repairable_proxy_risk",
+                                    "reason": reason,
+                                    "repair_hint": repair_hint,
+                                    "repair_route": "S2_plan",
+                                    "repair_mode": "effect_first_proxy_repair",
+                                    "activation_smoke": activation_smoke,
+                                    "proxy_effect_repair_contract": _proxy_effect_repair_contract(
+                                        reason=reason,
+                                        repair_hint=repair_hint,
+                                        evidence={"activation_smoke": activation_smoke, "mechanism_trace": trace},
+                                        patch_risk=(proxy_screen.get("patch_risk") or {}),
+                                        source="proxy_activation_smoke",
+                                    ),
+                                }
+                            )
+                            run_state["proxy_screen"] = proxy_screen
+                    if command_status not in {"failed", "proxy_rejected", "proxy_repairable", "blocked"} and block_for_execution_repo_audit("activation_smoke"):
+                        metrics = None
+                if proxy_enabled and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
+                    readiness = self._record_c2c_full_s3_readiness(
+                        candidate=candidate,
+                        run_spec=run_spec,
+                        patch_result=patch_result,
+                        run_state=run_state,
+                        baseline=adapter.baseline,
+                        min_delta=min_delta,
+                        max_regression=max_regression,
+                    )
+                    run_state["full_s3_readiness"] = readiness
+                    logs.append(
+                        {
+                            "candidate_id": candidate.get("id"),
+                            "event": "full_s3_readiness",
+                            "status": readiness.get("status"),
+                            "worth_full_train": (readiness.get("worth_full_train") or {}).get("decision"),
+                            "full_train_allowed": readiness.get("full_train_allowed"),
+                            "readiness_report_path": (readiness.get("artifact_paths") or {}).get("project_readiness_report"),
+                        }
+                    )
+                    if readiness.get("full_train_allowed") is not True:
+                        command_status = "proxy_repairable"
+                        proxy_screen = run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else {}
+                        reason = _c2c_full_s3_readiness_block_reason(readiness)
+                        repair_hint = "repair S2.5 patch or proxy/eval wiring until full_s3_readiness.full_train_allowed=true before full S3"
+                        proxy_screen.update(
+                            {
+                                "status": "repairable_proxy_risk",
+                                "reason": reason,
+                                "repair_hint": repair_hint,
+                                "repair_route": "S2_plan",
+                                "repair_mode": "full_s3_readiness_repair",
+                                "full_s3_readiness": readiness,
+                                "proxy_effect_repair_contract": _proxy_effect_repair_contract(
+                                    reason=reason,
+                                    repair_hint=repair_hint,
+                                    evidence={
+                                        "full_s3_readiness": readiness,
+                                        "eval_smoke": readiness.get("eval_smoke") if isinstance(readiness.get("eval_smoke"), dict) else {},
+                                        "activation_smoke": readiness.get("activation_smoke") if isinstance(readiness.get("activation_smoke"), dict) else {},
+                                    },
+                                    patch_risk=((readiness.get("static_risk") or {}) if isinstance(readiness.get("static_risk"), dict) else {}),
+                                    source="full_s3_readiness",
+                                ),
+                            }
+                        )
+                        run_state["proxy_screen"] = proxy_screen
+                        run_state["recovery_actions"].append(
+                            {
+                                "action": "block_full_train_until_readiness",
+                                "status": "blocked",
+                                "reason": reason,
+                                "readiness_report_path": (readiness.get("artifact_paths") or {}).get("project_readiness_report"),
+                            }
+                        )
+                        logs.append(
+                            {
+                                "candidate_id": candidate.get("id"),
+                                "event": "full_s3_readiness_blocked_train",
+                                "status": "proxy_repairable",
+                                "reason": reason,
+                            }
+                        )
+                    if command_status == "proxy_repairable":
+                        metrics = None
+                if command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
                     train_result = self.runner.run_step(
                         name="train",
                         command=run_spec["commands"]["train"],
@@ -1152,7 +1699,16 @@ class ExperimentAgent:
                     if train_result["status"] != "ok":
                         oom_action = self._c2c_oom_recovery_hint(train_result)
                         if oom_action and len(getattr(gpu_selection, "selected_ids", []) or []) > 1:
-                            recovery_gpu_ids = [gpu_selection.selected_ids[0]]
+                            recovery_selection = self.runner.select_gpus(
+                                {
+                                    "gpu_ids": self.context.config.get("c2c", {}).get("small_loop", {}).get("gpu_ids", "auto"),
+                                    "max_gpus": 1,
+                                    "min_free_mb": self.context.config.get("experiment", {}).get("gpu_policy", {}).get("min_free_mb", 8192),
+                                    "max_utilization_gpu": self.context.config.get("experiment", {}).get("gpu_policy", {}).get("max_utilization_gpu", 40),
+                                    "respect_resource_filters": True,
+                                }
+                            )
+                            recovery_gpu_ids = list(getattr(recovery_selection, "selected_ids", []) or []) or [gpu_selection.selected_ids[0]]
                             recovery_command = adapter._candidate_commands(run_spec["train_config"], run_spec["eval_configs"], recovery_gpu_ids)["train"]
                             recovery_result = self.runner.run_step(
                                 name="train_recovery_reduced_concurrency",
@@ -1162,12 +1718,49 @@ class ExperimentAgent:
                             )
                             step_runs.append(recovery_result)
                             run_state["attempts"].append(recovery_result)
-                            oom_action.update({"recovery_gpu_ids": recovery_gpu_ids, "recovery_status": recovery_result["status"]})
+                            oom_action.update(
+                                {
+                                    "recovery_gpu_ids": recovery_gpu_ids,
+                                    "recovery_status": recovery_result["status"],
+                                    "recovery_gpu_selection": {
+                                        "selected_gpu_ids": list(getattr(recovery_selection, "selected_ids", []) or []),
+                                        "reason": getattr(recovery_selection, "reason", ""),
+                                        "snapshot": getattr(recovery_selection, "snapshot", []),
+                                    },
+                                }
+                            )
                             run_state["recovery_actions"].append(oom_action)
                             if recovery_result["status"] == "ok":
                                 train_result = recovery_result
                                 run_state["train"] = recovery_result
-                        if self._c2c_checkpoint_final_exists(run_spec):
+                        if oom_action and train_result["status"] != "ok":
+                            recovery_gpu_ids = list(getattr(gpu_selection, "selected_ids", []) or [])
+                            memory_safe = adapter.materialize_train_oom_recovery_config(run_spec, gpu_ids=recovery_gpu_ids)
+                            action = {
+                                "action": "retry_train_memory_safe_recipe",
+                                "status": memory_safe.get("status"),
+                                "reason": "detected CUDA OOM signature; retry with a memory-safe full S3 train recipe",
+                                "recovery_gpu_ids": recovery_gpu_ids,
+                                "memory_safe_train_config": str(memory_safe.get("train_config") or ""),
+                                "config_changes": memory_safe.get("config_changes") or {},
+                            }
+                            if memory_safe.get("status") == "materialized":
+                                recovery_result = self.runner.run_step(
+                                    name="train_recovery_memory_safe",
+                                    command=str(memory_safe["command"]),
+                                    working_dir=adapter.repo_root,
+                                    retry_policy={"max_attempts": 1},
+                                )
+                                step_runs.append(recovery_result)
+                                run_state["attempts"].append(recovery_result)
+                                action["recovery_status"] = recovery_result["status"]
+                                if recovery_result["status"] == "ok":
+                                    train_result = recovery_result
+                                    run_state["train"] = recovery_result
+                            else:
+                                action["recovery_status"] = "skipped"
+                            run_state["recovery_actions"].append(self._jsonable(action))
+                        if train_result["status"] != "ok" and self._c2c_checkpoint_final_exists(run_spec):
                             command_status = "partial"
                             action = {"action": "skip_failed_train_with_existing_final_checkpoint", "status": "ok", "run_id": run_spec["run_id"]}
                             run_state["recovery_actions"].append(action)
@@ -1209,10 +1802,14 @@ class ExperimentAgent:
                         logs.append({"candidate_id": candidate.get("id"), "event": "ablation", "status": ablation.get("status"), "ablation": ablation})
                         if ablation.get("status") == "partial" and command_status == "ok":
                             command_status = "partial"
+                    if command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"} and block_for_execution_repo_audit("full_train_eval"):
+                        metrics = None
                     if command_status == "skipped":
                         command_status = "ok"
                     if metrics is None and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
                         command_status = "partial"
+                if command_status not in {"blocked"}:
+                    refresh_execution_repo_audit("final")
                 write_json(
                     log_path,
                     {
@@ -1259,10 +1856,14 @@ class ExperimentAgent:
             "run_root": str(run_spec["run_root"]),
             "patch_result": _compact_patch_result_for_payload(patch_result),
             "code_snapshot": code_snapshot,
+            "execution_repo": execution_repo,
+            "execution_repo_audit": _compact_execution_repo_audit(run_state.get("execution_repo_audit")),
             "commands": _compact_command_plan(run_spec.get("commands") or {}),
             "command_status": command_status,
             "preflight": preflight,
             "proxy_screen": _compact_proxy_screen(run_state.get("proxy_screen")),
+            "activation_smoke": _compact_activation_smoke(run_state.get("activation_smoke")),
+            "full_s3_readiness": _compact_full_s3_readiness(run_state.get("full_s3_readiness")),
             "run_state_path": str(run_spec["run_state_path"]),
             "preflight_path": str(run_spec["preflight_path"]),
             "config_overrides": run_spec.get("config_overrides", {}),
@@ -1300,6 +1901,12 @@ class ExperimentAgent:
             "patch_status": (patch_result or {}).get("status"),
             "patch_changed_files": changed_files,
             "patch_file_hashes": file_hashes,
+            "execution_repo_source": ((patch_result or {}).get("execution_repo") or {}).get("source")
+            if isinstance((patch_result or {}).get("execution_repo"), dict)
+            else None,
+            "patched_repo_snapshot_sha256": ((patch_result or {}).get("execution_repo") or {}).get("snapshot_sha256")
+            if isinstance((patch_result or {}).get("execution_repo"), dict)
+            else None,
         }
         return _sha256_text(json.dumps(payload, sort_keys=True, ensure_ascii=True))
 
@@ -1327,6 +1934,32 @@ class ExperimentAgent:
             return None
         return state
 
+    @staticmethod
+    def _c2c_rejudge_cached_proxy_screen(
+        proxy_screen: dict[str, Any],
+        *,
+        baseline: dict[str, Any],
+        proxy_cfg: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        metrics = proxy_screen.get("metrics") if isinstance(proxy_screen.get("metrics"), dict) else None
+        if not metrics:
+            return None
+        proxy_baseline = proxy_screen.get("proxy_baseline")
+        if not isinstance(proxy_baseline, dict) or not proxy_baseline:
+            proxy_baseline = proxy_screen.get("baseline_metrics")
+        if not isinstance(proxy_baseline, dict) or not proxy_baseline:
+            proxy_baseline = None
+        patch_risk = proxy_screen.get("patch_risk") if isinstance(proxy_screen.get("patch_risk"), dict) else {}
+        eval_smoke = proxy_screen.get("eval_smoke") if isinstance(proxy_screen.get("eval_smoke"), dict) else None
+        return ExperimentAgent._c2c_proxy_metric_decision(
+            metrics=metrics,
+            baseline=baseline,
+            proxy_cfg=proxy_cfg,
+            proxy_baseline=proxy_baseline,
+            patch_risk=patch_risk,
+            eval_smoke=eval_smoke,
+        )
+
     def _generate_c2c_patch(self, candidate: dict[str, Any], adapter: C2CAdapter) -> dict[str, Any]:
         del adapter
         return self._load_frozen_c2c_patch(candidate)
@@ -1349,6 +1982,9 @@ class ExperimentAgent:
         if not patch_path.exists():
             return {"summary": "Frozen S2.5 patch file is missing.", "operations": [], "changed_files": [], "status": "missing"}
         patch = json.loads(patch_path.read_text(encoding="utf-8"))
+        snapshot = code_patch.get("patched_repo_snapshot")
+        if isinstance(snapshot, dict) and snapshot:
+            patch["patched_repo_snapshot"] = snapshot
         validation_path = code_patch.get("validation")
         if validation_path:
             validation_file = self.context.project_root / str(validation_path)
@@ -1360,7 +1996,51 @@ class ExperimentAgent:
         patch.setdefault("summary", patch.get("rationale", "Frozen S2.5 patch."))
         return patch
 
-    def _apply_frozen_c2c_patch(self, candidate: dict[str, Any], adapter: C2CAdapter, patch: dict[str, Any]) -> dict[str, Any]:
+    def _prepare_c2c_execution_repo(self, candidate: dict[str, Any], adapter: C2CAdapter, patch: dict[str, Any]) -> dict[str, Any]:
+        snapshot = patch.get("patched_repo_snapshot") if isinstance(patch.get("patched_repo_snapshot"), dict) else {}
+        candidate_id = sanitize_filename(str(candidate.get("id") or patch.get("candidate_id") or "candidate"))
+        execution_rel = f"execution_repos/{candidate_id}"
+        execution_repo = self.context.project_root / "experiment" / execution_rel
+        ensure_dir(execution_repo.parent)
+        snapshot_rel = str(snapshot.get("path") or "")
+        snapshot_path = self.context.project_root / snapshot_rel if snapshot_rel else None
+        if snapshot.get("status") == "ok" and snapshot_path and snapshot_path.exists() and snapshot_path.is_dir():
+            source_lock = {
+                "source": "patched_repo_snapshot",
+                "snapshot_path": snapshot_rel,
+                "snapshot_manifest": snapshot.get("manifest"),
+                "snapshot_sha256": snapshot.get("sha256"),
+            }
+            reused = _materialize_c2c_execution_repo(execution_repo, snapshot_path, source_lock)
+            return {
+                "status": "ok",
+                "source": "patched_repo_snapshot",
+                "repo_root": str(execution_repo),
+                "repo_root_rel": f"experiment/{execution_rel}",
+                "snapshot_path": snapshot_rel,
+                "snapshot_manifest": snapshot.get("manifest"),
+                "snapshot_sha256": snapshot.get("sha256"),
+                "reused": reused,
+            }
+        source_lock = {"source": "baseline_snapshot_patch_json_fallback", "snapshot_path": str(adapter.repo_root)}
+        reused = _materialize_c2c_execution_repo(execution_repo, adapter.repo_root, source_lock)
+        return {
+            "status": "ok",
+            "source": "baseline_snapshot_patch_json_fallback",
+            "repo_root": str(execution_repo),
+            "repo_root_rel": f"experiment/{execution_rel}",
+            "reused": reused,
+            "reason": "patched_repo_snapshot missing; S3 will apply patch.json fallback to isolated execution repo",
+        }
+
+    def _apply_frozen_c2c_patch(
+        self,
+        candidate: dict[str, Any],
+        adapter: C2CAdapter,
+        patch: dict[str, Any],
+        *,
+        execution_repo: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         if patch.get("fatal_patch_status"):
             return {
                 "status": "rejected",
@@ -1370,12 +2050,37 @@ class ExperimentAgent:
                 "candidate_id": candidate.get("id"),
                 "patch_status": patch.get("status", "unknown"),
             }
+        if isinstance(execution_repo, dict) and execution_repo.get("source") == "patched_repo_snapshot":
+            result = {
+                "status": "snapshot_applied",
+                "errors": [],
+                "changed_files": list(patch.get("changed_files") or []),
+                "reason": "S3 execution repo was materialized directly from S2.5 patched_repo_snapshot",
+                "candidate_id": candidate.get("id"),
+                "patch_status": patch.get("status", "ok"),
+                "execution_repo": execution_repo,
+                "restore_state": [],
+            }
+            for key in ["risk_check", "activation_check", "mechanism_review", "quality_score", "validation"]:
+                if isinstance(patch.get(key), dict):
+                    result[key] = patch[key]
+            return result
         if not patch.get("operations"):
-            return {"status": "skipped", "errors": [], "changed_files": [], "reason": patch.get("summary", "no frozen patch operations")}
+            return {
+                "status": "skipped",
+                "errors": [],
+                "changed_files": [],
+                "reason": patch.get("summary", "no frozen patch operations"),
+                "candidate_id": candidate.get("id"),
+                "patch_status": patch.get("status", "ok"),
+                "execution_repo": execution_repo or {},
+            }
         policy = DynamicEditPolicy.from_config(self.context.config.get("code_patch", {}).get("dynamic_whitelist") or {})
         result = FrozenPatchGuard(policy).apply(adapter.repo_root, patch)
         result["candidate_id"] = candidate.get("id")
         result["patch_status"] = patch.get("status", "ok")
+        if isinstance(execution_repo, dict):
+            result["execution_repo"] = execution_repo
         for key in ["risk_check", "activation_check", "mechanism_review", "quality_score", "validation"]:
             if isinstance(patch.get(key), dict):
                 result[key] = patch[key]
@@ -1450,6 +2155,23 @@ class ExperimentAgent:
                     command_failure = self._c2c_proxy_command_failure(result)
                     reason = f"proxy command {idx} failed: {command_failure.get('summary')}"
                     repair_hint = command_failure.get("repair_hint")
+                    if command_failure.get("category") == "resource_oom":
+                        proxy.update(
+                            {
+                                "status": "resource_retry",
+                                "reason": reason,
+                                "repair_hint": repair_hint
+                                or "do not repair the S2.5 patch for this failure; rerun cheap proxy when GPU memory is available",
+                                "resource_retry": True,
+                                "failure_category": "s3_proxy_resource_oom",
+                                "repair_route": "resource_retry",
+                                "repair_mode": "resource_retry",
+                                "command_failure": command_failure,
+                                "attempts": attempts,
+                                "commands": rendered_commands,
+                            }
+                        )
+                        return proxy
                     proxy.update(
                         {
                             "status": "repairable_proxy_risk",
@@ -1472,10 +2194,12 @@ class ExperimentAgent:
                     return proxy
 
         metrics = adapter.collect_proxy_metrics(run_spec)
+        eval_smoke = adapter.collect_proxy_eval_smoke(run_spec)
         baseline_metrics = adapter.proxy_baseline_metrics(run_spec)
         proxy["attempts"] = attempts
         proxy["commands"] = rendered_commands
         proxy["metrics"] = metrics
+        proxy["eval_smoke"] = eval_smoke
         proxy["baseline_metrics"] = baseline_metrics
         threshold_decision = self._c2c_proxy_metric_decision(
             metrics=metrics,
@@ -1483,6 +2207,7 @@ class ExperimentAgent:
             proxy_cfg=proxy_cfg,
             proxy_baseline=baseline_metrics,
             patch_risk=proxy.get("patch_risk") or {},
+            eval_smoke=eval_smoke,
         )
         if threshold_decision:
             proxy.update(threshold_decision)
@@ -1509,6 +2234,45 @@ class ExperimentAgent:
         if "script/train/" in lowered or "sft_train.py" in lowered or "torch.distributed" in lowered:
             return coerce(proxy_cfg.get("train_timeout_seconds")) or coerce(proxy_cfg.get("command_timeout_seconds"))
         return coerce(proxy_cfg.get("command_timeout_seconds"))
+
+    def _run_c2c_proxy_activation_smoke(
+        self,
+        *,
+        adapter: C2CAdapter,
+        candidate: dict[str, Any],
+        run_spec: dict[str, Any],
+        gpu_selection: Any,
+    ) -> dict[str, Any]:
+        activation_spec = adapter.materialize_proxy_activation_smoke_configs(candidate, run_spec, gpu_selection)
+        if not activation_spec.get("enabled") or activation_spec.get("status") != "materialized":
+            return self._jsonable({**activation_spec, "attempts": [], "eval_by_dataset": {}})
+        attempts: list[dict[str, Any]] = []
+        eval_by_dataset: dict[str, Any] = {}
+        eval_items = list((activation_spec.get("eval_configs") or {}).items())
+        timeout_seconds = ((activation_spec.get("config") or {}).get("timeout_seconds"))
+        command_failed = False
+        for eval_idx, command in enumerate((activation_spec.get("commands") or {}).get("eval") or []):
+            dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
+            result = self.runner.run_step(
+                name=f"activation_smoke_eval_{dataset}",
+                command=command,
+                working_dir=adapter.repo_root,
+                retry_policy={"max_attempts": 1, "timeout_seconds": timeout_seconds},
+            )
+            attempts.append(result)
+            eval_by_dataset[str(dataset)] = result
+            if result.get("status") != "ok":
+                command_failed = True
+        collected = adapter.collect_proxy_activation_smoke(run_spec, activation_spec)
+        if command_failed:
+            collected.update(
+                {
+                    "status": "failed",
+                    "reason": collected.get("reason") or "proxy activation smoke eval command failed",
+                    "repair_hint": collected.get("repair_hint") or "repair eval-path/runtime activation before full S3",
+                }
+            )
+        return self._jsonable({**collected, "attempts": attempts, "eval_by_dataset": eval_by_dataset})
 
     def _run_c2c_ablation_eval(
         self,
@@ -1703,7 +2467,13 @@ class ExperimentAgent:
                 )
                 attempts.append(result)
                 if result.get("status") != "ok":
-                    return {"enabled": True, "status": "failed", "reason": f"proxy baseline preflight {step_idx} failed", "attempts": attempts}
+                    return self._c2c_proxy_baseline_failure(
+                        adapter,
+                        candidate_run_spec,
+                        attempts=attempts,
+                        reason=f"proxy baseline preflight {step_idx} failed",
+                        failed_step=result,
+                    )
             train_result = self.runner.run_step(
                 name="proxy_baseline_train",
                 command=baseline_spec["commands"]["train"],
@@ -1712,7 +2482,13 @@ class ExperimentAgent:
             )
             attempts.append(train_result)
             if train_result.get("status") != "ok" and not self._c2c_checkpoint_final_exists(baseline_spec):
-                return {"enabled": True, "status": "failed", "reason": "proxy baseline train failed", "attempts": attempts}
+                return self._c2c_proxy_baseline_failure(
+                    adapter,
+                    candidate_run_spec,
+                    attempts=attempts,
+                    reason="proxy baseline train failed",
+                    failed_step=train_result,
+                )
             eval_items = list(baseline_spec.get("eval_configs", {}).items())
             for eval_idx, command in enumerate(baseline_spec["commands"]["eval"]):
                 dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
@@ -1724,7 +2500,13 @@ class ExperimentAgent:
                 )
                 attempts.append(result)
                 if result.get("status") != "ok":
-                    return {"enabled": True, "status": "failed", "reason": f"proxy baseline eval {dataset} failed", "attempts": attempts}
+                    return self._c2c_proxy_baseline_failure(
+                        adapter,
+                        candidate_run_spec,
+                        attempts=attempts,
+                        reason=f"proxy baseline eval {dataset} failed",
+                        failed_step=result,
+                    )
             metrics = adapter.collect_proxy_baseline_run_metrics(baseline_spec)
             if not metrics:
                 if proxy_cfg.get("allow_configured_baseline_fallback", True):
@@ -1737,7 +2519,13 @@ class ExperimentAgent:
                             "metrics": fallback,
                             "attempts": attempts,
                         }
-                return {"enabled": True, "status": "failed", "reason": "proxy baseline run produced no metrics", "attempts": attempts}
+                return self._c2c_proxy_baseline_failure(
+                    adapter,
+                    candidate_run_spec,
+                    attempts=attempts,
+                    reason="proxy baseline run produced no metrics",
+                    failed_step=attempts[-1] if attempts else {},
+                )
             metrics = dict(metrics)
             metrics.setdefault("source", "proxy_baseline_run")
             write_json(Path(baseline_spec["metrics_path"]), metrics)
@@ -1745,6 +2533,38 @@ class ExperimentAgent:
         finally:
             if patched_state is not None:
                 self._restore_c2c_repo_state(adapter, patched_state)
+
+    def _c2c_proxy_baseline_failure(
+        self,
+        adapter: C2CAdapter,
+        candidate_run_spec: dict[str, Any],
+        *,
+        attempts: list[dict[str, Any]],
+        reason: str,
+        failed_step: dict[str, Any],
+    ) -> dict[str, Any]:
+        proxy_cfg = c2c_proxy_screen_config(self.context.config)
+        command_failure = self._c2c_proxy_command_failure(failed_step) if failed_step else {}
+        payload = {
+            "enabled": True,
+            "status": "blocked",
+            "reason": reason,
+            "attempts": attempts,
+            "command_failure": command_failure,
+            "failure_scope": "paired_proxy_baseline",
+        }
+        if proxy_cfg.get("allow_configured_baseline_fallback", True):
+            fallback = adapter.proxy_baseline_metrics(candidate_run_spec)
+            if fallback:
+                return {
+                    **payload,
+                    "status": "fallback",
+                    "reason": f"{reason}; using configured baseline subset fallback",
+                    "metrics": fallback,
+                    "fallback_reason": reason,
+                    "fallback_source": fallback.get("source"),
+                }
+        return payload
 
     def _c2c_static_proxy_screen(
         self,
@@ -1775,6 +2595,7 @@ class ExperimentAgent:
             "signals": signals,
             "patch_risk": patch_risk,
             "quality_repair": _instrumentation_quality_repair_request(patch_result),
+            "artifact_paths": _c2c_proxy_artifact_paths(run_spec),
         }
         static_hard_gate = bool(proxy_cfg.get("static_hard_gate", True))
         if static_hard_gate and proxy_cfg.get("reject_if_no_executable_change", True) and not has_executable_change:
@@ -1851,29 +2672,53 @@ class ExperimentAgent:
         proxy_cfg: dict[str, Any],
         proxy_baseline: dict[str, Any] | None,
         patch_risk: dict[str, Any] | None = None,
+        eval_smoke: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         if not metrics:
             if proxy_cfg.get("require_proxy_metrics"):
                 return {"status": "rejected", "reason": "proxy metrics required but not found"}
             return None
+        has_paired_proxy_baseline = bool(proxy_baseline)
         comparison_baseline = proxy_baseline or baseline
         if proxy_cfg.get("require_paired_baseline", True) and not proxy_baseline:
             return {"status": "rejected", "reason": "paired proxy baseline required but not found"}
-        baseline_mean = float(comparison_baseline.get("mean") or baseline.get("mean") or 0.0)
+        full_baseline_mean = _coerce_float(baseline.get("mean"), default=0.0)
+        proxy_baseline_mean = _coerce_float(comparison_baseline.get("mean"), default=full_baseline_mean)
         proxy_deltas = ExperimentAgent._c2c_dataset_deltas(metrics, comparison_baseline)
         regressions = ExperimentAgent._c2c_dataset_regressions(metrics, comparison_baseline)
         worst_regression = max(regressions.values()) if regressions else 0.0
-        mean_delta = round(float(metrics["mean"]) - baseline_mean, 4) if metrics.get("mean") is not None else None
+        mean_delta = round(float(metrics["mean"]) - proxy_baseline_mean, 4) if metrics.get("mean") is not None else None
         proxy_score = ExperimentAgent._c2c_proxy_score(mean_delta, worst_regression, patch_risk or {}, proxy_cfg)
         evidence = {
-            "proxy_baseline": comparison_baseline,
+            "full_baseline": baseline,
+            "full_baseline_mean": full_baseline_mean,
+            "proxy_baseline": proxy_baseline,
+            "proxy_baseline_mean": _coerce_float(proxy_baseline.get("mean"), default=None) if isinstance(proxy_baseline, dict) else None,
+            "comparison_baseline": comparison_baseline,
+            "comparison_baseline_mean": proxy_baseline_mean,
             "proxy_delta_vs_baseline": mean_delta,
+            "proxy_delta_vs_comparison_baseline": mean_delta,
+            "proxy_delta_vs_proxy_baseline": mean_delta if has_paired_proxy_baseline else None,
             "proxy_dataset_deltas": proxy_deltas,
             "proxy_dataset_regressions": regressions,
             "proxy_worst_dataset_regression": round(worst_regression, 4),
             "proxy_score": proxy_score,
-            "proxy_decision_mode": "paired_baseline" if proxy_baseline else "configured_full_baseline",
+            "proxy_decision_mode": "paired_baseline" if has_paired_proxy_baseline else "configured_full_baseline",
         }
+        if isinstance(eval_smoke, dict) and eval_smoke:
+            evidence["eval_smoke"] = eval_smoke
+            red_flags = set(eval_smoke.get("red_flags") or [])
+            if "all_summary_scores_zero" in red_flags and (
+                "low_nonempty_prediction_rate" in red_flags
+                or "low_answer_parse_rate" in red_flags
+                or "answer_distribution_collapsed" in red_flags
+                or "all_zero_without_prediction_artifacts" in red_flags
+            ):
+                evidence["proxy_eval_health_failure"] = {
+                    "status": "suspected_output_or_parser_failure",
+                    "red_flags": sorted(red_flags),
+                    "repair_hint": "inspect proxy eval outputs, answer parsing, eval recipe output paths, and mechanism activation before treating all-zero proxy as a pure method failure",
+                }
         threshold = proxy_cfg.get("min_proxy_mean_delta")
         if threshold is not None and mean_delta is not None and mean_delta < float(threshold):
             repairable_margin = float(proxy_cfg.get("repairable_proxy_mean_margin", 0.0) or 0.0)
@@ -1964,7 +2809,7 @@ class ExperimentAgent:
         if soft_score is not None and proxy_score is not None and proxy_score < float(soft_score):
             soft_flags.append(f"proxy score {proxy_score} below soft threshold {float(soft_score)}")
         if soft_flags:
-            if proxy_cfg.get("repair_soft_proxy_fail", True):
+            if proxy_cfg.get("repair_soft_proxy_fail", False):
                 reason = "; ".join(soft_flags)
                 repair_hint = "effect repair only: improve cheap-proxy mean/regression/runtime behavior before full S3; do not spend this repair on ablation, coverage, matched-coverage, or paperization diagnostics"
                 return {
@@ -1995,16 +2840,21 @@ class ExperimentAgent:
 
     @staticmethod
     def _c2c_proxy_command_failure(step_result: dict[str, Any]) -> dict[str, Any]:
-        text = "\n".join(
-            (attempt.get("stdout") or "") + "\n" + (attempt.get("stderr") or "")
-            for attempt in step_result.get("attempts", [])
-            if isinstance(attempt, dict)
-        )
+        attempts = [attempt for attempt in step_result.get("attempts", []) if isinstance(attempt, dict)]
+        text = "\n".join((attempt.get("stdout") or "") + "\n" + (attempt.get("stderr") or "") for attempt in attempts)
         lower = text.lower()
-        timed_out = any(bool(attempt.get("timed_out")) for attempt in step_result.get("attempts", []) if isinstance(attempt, dict))
+        timed_out = any(bool(attempt.get("timed_out")) for attempt in attempts)
+        distributed_failure = (
+            "childfailederror" in lower
+            or "torch.distributed.elastic" in lower
+            or "torch.distributed.run" in lower and "local_rank" in lower and "exitcode" in lower
+        )
         if timed_out or step_result.get("returncode") == 124 or "timed out" in lower:
             category = "proxy_timeout"
             repair_hint = "reduce mechanism inference/training cost or add bounded early-exit guards before rerunning cheap proxy"
+        elif distributed_failure:
+            category = "distributed_child_failed"
+            repair_hint = "rerun cheap proxy with a single auto-selected GPU or capture the child rank traceback before treating this as a patch repair"
         elif "mat1 and mat2 must have the same dtype" in lower or "same dtype" in lower:
             category = "dtype_mismatch"
             repair_hint = "cast new mechanism tensors/modules to the active model dtype/device before matmul or linear layers"
@@ -2013,7 +2863,7 @@ class ExperimentAgent:
             repair_hint = "normalize dataset adapter fields to scalar/tensor shapes expected by the existing training path"
         elif "out of memory" in lower or "cuda oom" in lower or "cublas_status_alloc_failed" in lower:
             category = "resource_oom"
-            repair_hint = "reduce proxy memory footprint or fix allocation behavior before full S3"
+            repair_hint = "do not repair the S2.5 patch for this failure; rerun cheap proxy after GPU memory is available or with a different auto-selected GPU"
         elif "traceback" in lower:
             category = "runtime_exception"
             repair_hint = "fix the proxy training runtime exception in the S2.5 patch before full S3"
@@ -2023,32 +2873,74 @@ class ExperimentAgent:
         summary = category
         for line in reversed(text.splitlines()):
             line = line.strip()
-            if line and ("error" in line.lower() or "exception" in line.lower() or "runtimeerror" in line.lower() or "typeerror" in line.lower()):
+            if line and (
+                "error" in line.lower()
+                or "exception" in line.lower()
+                or "runtimeerror" in line.lower()
+                or "typeerror" in line.lower()
+                or "childfailederror" in line.lower()
+                or "local_rank" in line.lower()
+            ):
                 summary = f"{category}: {line[-240:]}"
                 break
+        rank_failure = _parse_torch_distributed_rank_failure(text)
+        latest_attempt = attempts[-1] if attempts else {}
         return {
             "category": category,
             "summary": summary,
             "repair_hint": repair_hint,
             "returncode": step_result.get("returncode"),
             "step": step_result.get("step"),
-            "elapsed_seconds": max(
-                [
-                    float(attempt.get("elapsed_seconds") or 0.0)
-                    for attempt in step_result.get("attempts", [])
-                    if isinstance(attempt, dict)
-                ]
-                or [0.0]
-            ),
+            "rank_failure": rank_failure,
+            "stdout_tail": str(latest_attempt.get("stdout") or "")[-1200:],
+            "stderr_tail": str(latest_attempt.get("stderr") or "")[-2000:],
+            "elapsed_seconds": max([float(attempt.get("elapsed_seconds") or 0.0) for attempt in attempts] or [0.0]),
             "timeout_seconds": next(
                 (
                     attempt.get("timeout_seconds")
-                    for attempt in step_result.get("attempts", [])
-                    if isinstance(attempt, dict) and attempt.get("timeout_seconds") is not None
+                    for attempt in attempts
+                    if attempt.get("timeout_seconds") is not None
                 ),
                 None,
             ),
         }
+
+    def _record_c2c_full_s3_readiness(
+        self,
+        *,
+        candidate: dict[str, Any],
+        run_spec: dict[str, Any],
+        patch_result: dict[str, Any],
+        run_state: dict[str, Any],
+        baseline: dict[str, Any],
+        min_delta: float,
+        max_regression: float,
+    ) -> dict[str, Any]:
+        report = _c2c_full_s3_readiness_report(
+            candidate=candidate,
+            run_spec=run_spec,
+            patch_result=patch_result,
+            run_state=run_state,
+            baseline=baseline,
+            min_delta=min_delta,
+            max_regression=max_regression,
+            iteration=self._registry_iteration(),
+            project_id=self.context.project_root.name,
+        )
+        run_report_path = Path(run_spec["run_root"]) / "full_s3_readiness_report.json"
+        stage_rel = self.context.artifacts.stage_dir(self.stage_key).relative_to(self.context.project_root).as_posix()
+        report.setdefault("artifact_paths", {})
+        report["artifact_paths"]["candidate_readiness_report"] = str(run_report_path)
+        report["artifact_paths"]["project_readiness_report"] = f"{stage_rel}/results/full_s3_readiness_report.json"
+        write_json(run_report_path, report)
+        self.context.artifacts.write_json(
+            self.stage_key,
+            "results/full_s3_readiness_report.json",
+            report,
+            artifact_type="c2c_full_s3_readiness",
+            summary="Proxy-to-full readiness report before C2C full S3 training",
+        )
+        return report
 
     @staticmethod
     def _c2c_oom_recovery_hint(step_result: dict[str, Any]) -> dict[str, Any] | None:
@@ -2069,6 +2961,10 @@ class ExperimentAgent:
         if self._c2c_proxy_only_failure(payload):
             fallback["status"] = "deterministic_proxy_feedback"
             fallback["reason"] = "cheap proxy rejected or repair-routed all candidates; skipped GPT posthoc to keep effect-first loop cheap"
+            return fallback
+        if self.context.config.get("experiment", {}).get("disable_llm_during_execution"):
+            fallback["status"] = "deterministic_execution_feedback"
+            fallback["reason"] = "experiment.disable_llm_during_execution=true; deterministic posthoc feedback generated"
             return fallback
         if not self.context.llm.use_real_api:
             fallback["status"] = "deterministic_no_llm"
@@ -2256,6 +3152,28 @@ class ExperimentAgent:
         return "\n".join(lines)
 
     def _write_c2c_failure_feedback(self, payload: dict[str, Any], *, artifacts: list[str]) -> dict[str, Any]:
+        if _c2c_payload_is_retryable_pause(payload):
+            return self.context.artifacts.write_json(
+                self.stage_key,
+                "results/retryable_pause_feedback.json",
+                {
+                    "created_at": now_utc(),
+                    "kind": "c2c_retryable_pause_feedback",
+                    "reason": ((payload.get("acceptance") or {}).get("reason") or "C2C S3 paused for retryable external resources"),
+                    "candidate_results": [
+                        _compact_candidate_result(item)
+                        for item in payload.get("candidate_results", [])
+                        if isinstance(item, dict)
+                    ],
+                    "acceptance": payload.get("acceptance") or {},
+                    "posthoc_review": _compact_c2c_result_payload(payload.get("posthoc_review")),
+                    "excluded_from_failure_memory": True,
+                    "excluded_from_failure_memory_reason": "retryable_resource_or_quota_pause_is_not_method_failure",
+                },
+                artifact_type="c2c_retryable_pause_feedback",
+                summary="Retryable C2C S3 pause metadata excluded from failure memory",
+                source_paths=artifacts,
+            )
         best = payload.get("best_candidate")
         feedback_candidate = best
         if (not feedback_candidate or not feedback_candidate.get("metrics")) and isinstance(payload.get("best_proxy_candidate"), dict):
@@ -2585,9 +3503,26 @@ class ExperimentAgent:
             candidate=candidate,
         )
         quality_repair = ((candidate.get("proxy_screen") or {}).get("quality_repair") or {})
+        eval_smoke = ((candidate.get("proxy_screen") or {}).get("eval_smoke") or {})
+        proxy_eval_health_failure = ((candidate.get("proxy_screen") or {}).get("proxy_eval_health_failure") or {})
+        activation_smoke = candidate.get("activation_smoke") or ((candidate.get("proxy_screen") or {}).get("activation_smoke") or {})
+        full_s3_readiness = candidate.get("full_s3_readiness") or ((candidate.get("proxy_screen") or {}).get("full_s3_readiness") or {})
+        execution_repo_audit = candidate.get("execution_repo_audit") if isinstance(candidate.get("execution_repo_audit"), dict) else {}
         ablation_evidence = ExperimentAgent._c2c_ablation_evidence(candidate)
         primary_failure = "none"
-        if ablation_evidence.get("status") == "no_effect":
+        if execution_repo_audit.get("status") == "failed":
+            primary_failure = "execution_repo_output_pollution"
+        elif proxy_eval_health_failure:
+            primary_failure = "proxy_eval_output_health_failure"
+        elif isinstance(full_s3_readiness, dict) and full_s3_readiness.get("full_train_allowed") is False:
+            primary_failure = "full_s3_readiness_not_ready"
+        elif isinstance(activation_smoke, dict) and activation_smoke.get("status") == "failed":
+            trace = activation_smoke.get("mechanism_trace") if isinstance(activation_smoke.get("mechanism_trace"), dict) else {}
+            if trace.get("status") == "wired":
+                primary_failure = "proxy_activation_metric_neutral"
+            else:
+                primary_failure = "proxy_activation_smoke_no_effect"
+        elif ablation_evidence.get("status") == "no_effect":
             primary_failure = "ablation_no_effect"
         elif candidate.get("decision") == "proxy_rejected":
             primary_failure = "cheap_proxy_rejected_before_full_training"
@@ -2608,6 +3543,11 @@ class ExperimentAgent:
             "mixed_gain_patterns": list(dict.fromkeys(mixed_patterns)),
             "patch_risk": patch_risk,
             "proxy_screen": _proxy_screen_for_failure_attribution(proxy_screen),
+            "eval_smoke": eval_smoke,
+            "proxy_eval_health_failure": proxy_eval_health_failure,
+            "activation_smoke": activation_smoke,
+            "full_s3_readiness": full_s3_readiness,
+            "execution_repo_audit": execution_repo_audit,
             "proxy_effect_repair_contract": proxy_screen.get("proxy_effect_repair_contract") or {},
             "ablation_evidence": ablation_evidence,
             "quality_repair": quality_repair,
@@ -2837,6 +3777,17 @@ class ExperimentAgent:
     def _c2c_blocked_reason(run_results: list[dict[str, Any]]) -> str | None:
         if not run_results:
             return "C2C small-loop produced no candidate runs."
+        resource_blocked = [
+            item
+            for item in run_results
+            if item.get("decision") == "blocked"
+            and ((item.get("proxy_screen") or {}).get("status") in {"resource_retry", "blocked"})
+        ]
+        if resource_blocked and len(resource_blocked) == len(run_results):
+            return "C2C cheap proxy is waiting for GPU resources; resume after an available proxy GPU is detected."
+        blocked = [item for item in run_results if item.get("decision") == "blocked"]
+        if blocked and len(blocked) == len(run_results):
+            return "C2C small-loop blocked before metrics; inspect experiment/results/main_results.json and experiment/logs for the blocking reason."
         failed = [item for item in run_results if item.get("decision") in {"failed_no_metrics", "patch_rejected"}]
         if failed and len(failed) == len(run_results):
             return "C2C small-loop did not produce metrics; inspect experiment/logs/c2c_*_commands.json for the training or evaluation failure."
@@ -2983,6 +3934,262 @@ def _repairable_proxy_risk(
     }
 
 
+def _c2c_full_s3_readiness_report(
+    *,
+    candidate: dict[str, Any],
+    run_spec: dict[str, Any],
+    patch_result: dict[str, Any],
+    run_state: dict[str, Any],
+    baseline: dict[str, Any],
+    min_delta: float,
+    max_regression: float,
+    iteration: int,
+    project_id: str,
+) -> dict[str, Any]:
+    proxy_screen = run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else {}
+    activation_smoke = run_state.get("activation_smoke") if isinstance(run_state.get("activation_smoke"), dict) else {}
+    patch_risk = proxy_screen.get("patch_risk") if isinstance(proxy_screen.get("patch_risk"), dict) else {}
+    if not patch_risk:
+        patch_risk = ExperimentAgent._c2c_patch_risk(
+            patch_result=patch_result,
+            config_overrides=run_spec.get("config_overrides") or {},
+            candidate=candidate,
+        )
+    eval_smoke = proxy_screen.get("eval_smoke") if isinstance(proxy_screen.get("eval_smoke"), dict) else {}
+    proxy_delta = proxy_screen.get("proxy_delta_vs_comparison_baseline", proxy_screen.get("proxy_delta_vs_proxy_baseline", proxy_screen.get("proxy_delta_vs_baseline")))
+    hard_risk_labels = sorted(
+        label
+        for label in set(patch_risk.get("risk_labels") or [])
+        if label in {"evaluation_code_changed", "test_change", "patch_error"}
+    )
+    static_clean = proxy_screen.get("status") == "passed" and not hard_risk_labels
+    activation_comparison = activation_smoke.get("comparison") if isinstance(activation_smoke.get("comparison"), dict) else {}
+    mechanism_trace = activation_smoke.get("mechanism_trace") if isinstance(activation_smoke.get("mechanism_trace"), dict) else {}
+    ablation_switch = _readiness_ablation_switch(candidate, activation_smoke)
+    ablation_effective = None
+    if activation_smoke.get("status") == "passed":
+        ablation_effective = bool(activation_comparison.get("mechanism_observed", True))
+    elif activation_smoke.get("status") == "failed":
+        ablation_effective = mechanism_trace.get("status") == "wired"
+    readiness_reasons = []
+    warnings = []
+    blockers = []
+    if static_clean:
+        readiness_reasons.append("static patch risk is clean enough for effect-first full S3")
+    else:
+        warnings.append("static risk has labels: " + ", ".join(hard_risk_labels or patch_risk.get("risk_labels") or ["unknown"]))
+    if proxy_screen.get("status") == "passed":
+        readiness_reasons.append(f"cheap proxy passed with delta={_fmt_readiness_number(proxy_delta)}")
+    else:
+        blockers.append(f"cheap proxy status is {proxy_screen.get('status') or 'missing'}")
+    if eval_smoke:
+        if _eval_smoke_healthy(eval_smoke):
+            readiness_reasons.append("proxy eval smoke output health is acceptable")
+        else:
+            blockers.append("proxy eval smoke has red flags: " + ", ".join(eval_smoke.get("red_flags") or []))
+    else:
+        warnings.append("proxy eval smoke missing")
+    if activation_smoke:
+        if activation_smoke.get("status") == "passed":
+            if activation_comparison.get("mechanism_wired_metric_neutral"):
+                readiness_reasons.append("activation smoke found eval-path wiring but metric-neutral proxy outputs")
+                warnings.append("activation smoke was metric-neutral; full train is allowed under the neutral-proxy exploration policy if proxy regression is bounded")
+            else:
+                readiness_reasons.append("activation smoke observed enabled-vs-disabled change")
+        elif activation_smoke.get("status") == "skipped":
+            warnings.append("activation smoke skipped")
+        else:
+            if mechanism_trace.get("status") == "wired":
+                warnings.append("activation smoke metric/prediction output is neutral but mechanism wiring is present")
+            else:
+                blockers.append(f"activation smoke status is {activation_smoke.get('status')}")
+    else:
+        warnings.append("activation smoke missing")
+    if ablation_switch:
+        readiness_reasons.append(f"ablation switch declared: {ablation_switch}")
+    else:
+        warnings.append("ablation switch missing")
+    if proxy_screen.get("soft_fail"):
+        warnings.extend(str(item) for item in proxy_screen.get("soft_flags") or [])
+
+    allowed = proxy_screen.get("status") == "passed" and not blockers
+    return {
+        "schema_version": "c2c_proxy_to_full_readiness_v1",
+        "project_id": project_id,
+        "iteration": iteration,
+        "created_at": now_utc(),
+        "candidate_id": candidate.get("id"),
+        "candidate_title": candidate.get("title"),
+        "run_id": run_spec.get("run_id"),
+        "run_root": str(run_spec.get("run_root")),
+        "full_train_allowed": allowed,
+        "status": "ready" if allowed else "not_ready",
+        "static_risk": {
+            "status": "clean" if static_clean else "warning",
+            "hard_risk_labels": hard_risk_labels,
+            "risk_labels": patch_risk.get("risk_labels") or [],
+            "risk_files": patch_risk.get("risk_files") or [],
+            "changed_files": patch_risk.get("changed_files") or [],
+            "config_override_keys": patch_risk.get("config_override_keys") or [],
+        },
+        "proxy": {
+            "status": proxy_screen.get("status"),
+            "reason": proxy_screen.get("reason"),
+            "delta": proxy_delta,
+            "score": proxy_screen.get("proxy_score"),
+            "soft_fail": bool(proxy_screen.get("soft_fail")),
+            "soft_flags": proxy_screen.get("soft_flags") or [],
+            "dataset_deltas": proxy_screen.get("proxy_dataset_deltas") or {},
+            "worst_dataset_regression": proxy_screen.get("proxy_worst_dataset_regression"),
+            "full_baseline_mean": proxy_screen.get("full_baseline_mean"),
+            "proxy_baseline_mean": proxy_screen.get("proxy_baseline_mean"),
+            "comparison_baseline_mean": proxy_screen.get("comparison_baseline_mean"),
+        },
+        "eval_smoke": {
+            "status": eval_smoke.get("status") or "missing",
+            "healthy": _eval_smoke_healthy(eval_smoke),
+            "red_flags": eval_smoke.get("red_flags") or [],
+            "nonempty_prediction_rate": eval_smoke.get("nonempty_prediction_rate"),
+            "answer_parse_rate": eval_smoke.get("answer_parse_rate"),
+            "mean_output_length": eval_smoke.get("mean_output_length"),
+            "answer_distribution": eval_smoke.get("answer_distribution") or {},
+        },
+        "activation_smoke": {
+            "status": activation_smoke.get("status") or "missing",
+            "reason": activation_smoke.get("reason"),
+            "switch": activation_smoke.get("switch") or ablation_switch,
+            "mechanism_observed": activation_comparison.get("mechanism_observed"),
+            "mechanism_wired_metric_neutral": bool(activation_comparison.get("mechanism_wired_metric_neutral")),
+            "mechanism_trace_status": mechanism_trace.get("status"),
+            "no_op": (
+                activation_smoke.get("status") == "failed"
+                and not bool(activation_comparison.get("mechanism_observed"))
+                and mechanism_trace.get("status") != "wired"
+            ),
+            "enabled_minus_disabled_mean": activation_comparison.get("enabled_minus_disabled_mean"),
+            "prediction_diff_rate": ((activation_comparison.get("prediction_comparison") or {}).get("prediction_diff_rate") if isinstance(activation_comparison.get("prediction_comparison"), dict) else None),
+            "answer_diff_rate": ((activation_comparison.get("prediction_comparison") or {}).get("answer_diff_rate") if isinstance(activation_comparison.get("prediction_comparison"), dict) else None),
+            "output_smoke_red_flags": ((activation_smoke.get("output_smoke") or {}).get("red_flags") if isinstance(activation_smoke.get("output_smoke"), dict) else []),
+            "mechanism_trace": mechanism_trace,
+        },
+        "ablation_switch": {
+            "declared": bool(ablation_switch),
+            "switch": ablation_switch,
+            "effective_in_activation_smoke": ablation_effective,
+        },
+        "acceptance_targets": {
+            "full_baseline_mean": baseline.get("mean"),
+            "min_delta_to_pass": min_delta,
+            "max_dataset_regression": max_regression,
+        },
+        "worth_full_train": {
+            "decision": "yes" if allowed else "no",
+            "reason": _readiness_worth_reason(proxy_delta, proxy_screen, activation_smoke, eval_smoke, blockers),
+            "evidence": readiness_reasons[:8],
+            "warnings": list(dict.fromkeys(warnings))[:8],
+            "blockers": list(dict.fromkeys(blockers))[:8],
+        },
+        "artifact_paths": {
+            "run_state": str(run_spec.get("run_state_path")),
+            "proxy_metrics": str(((run_spec.get("proxy_screen") or {}).get("metrics_path") or "")),
+            "proxy_baseline_metrics": str(((run_spec.get("proxy_screen") or {}).get("baseline_metrics_path") or "")),
+            "proxy_train_config": str(((run_spec.get("proxy_screen") or {}).get("train_config") or "")),
+        },
+    }
+
+
+def _c2c_full_s3_readiness_block_reason(readiness: dict[str, Any]) -> str:
+    worth = readiness.get("worth_full_train") if isinstance(readiness.get("worth_full_train"), dict) else {}
+    blockers = [str(item) for item in (worth.get("blockers") or []) if item]
+    reason = str(worth.get("reason") or "").strip()
+    if blockers:
+        return "full S3 readiness failed: " + "; ".join(blockers[:4])
+    if reason:
+        return "full S3 readiness failed: " + _shorten_text(reason, 400)
+    return f"full S3 readiness failed with status={readiness.get('status') or 'unknown'}"
+
+
+def _c2c_neutral_proxy_full_s3_allowed(proxy_screen: dict[str, Any], proxy_cfg: dict[str, Any]) -> bool:
+    if not bool(proxy_cfg.get("allow_neutral_proxy_full_s3", True)):
+        return False
+    if not isinstance(proxy_screen, dict) or proxy_screen.get("status") != "passed":
+        return False
+    if proxy_screen.get("proxy_eval_health_failure"):
+        return False
+    delta = _coerce_float(
+        proxy_screen.get(
+            "proxy_delta_vs_comparison_baseline",
+            proxy_screen.get("proxy_delta_vs_proxy_baseline", proxy_screen.get("proxy_delta_vs_baseline")),
+        ),
+        default=None,
+    )
+    if delta is None:
+        return False
+    worst_regression = _coerce_float(proxy_screen.get("proxy_worst_dataset_regression"), default=0.0) or 0.0
+    min_delta = float(proxy_cfg.get("neutral_proxy_min_delta", -0.1) or 0.0)
+    max_regression = float(proxy_cfg.get("neutral_proxy_max_dataset_regression", 0.25) or 0.0)
+    return delta >= min_delta and worst_regression <= max_regression
+
+
+def _c2c_neutral_proxy_policy_summary(proxy_screen: dict[str, Any], proxy_cfg: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "allow_neutral_proxy_full_s3": bool(proxy_cfg.get("allow_neutral_proxy_full_s3", True)),
+        "neutral_proxy_min_delta": proxy_cfg.get("neutral_proxy_min_delta", -0.1),
+        "neutral_proxy_max_dataset_regression": proxy_cfg.get("neutral_proxy_max_dataset_regression", 0.25),
+        "proxy_delta": proxy_screen.get(
+            "proxy_delta_vs_comparison_baseline",
+            proxy_screen.get("proxy_delta_vs_proxy_baseline", proxy_screen.get("proxy_delta_vs_baseline")),
+        ),
+        "proxy_worst_dataset_regression": proxy_screen.get("proxy_worst_dataset_regression"),
+        "proxy_score": proxy_screen.get("proxy_score"),
+        "soft_fail": bool(proxy_screen.get("soft_fail")),
+        "soft_flags": proxy_screen.get("soft_flags") or [],
+    }
+
+
+def _readiness_ablation_switch(candidate: dict[str, Any], activation_smoke: dict[str, Any]) -> str | None:
+    if activation_smoke.get("switch"):
+        return str(activation_smoke["switch"])
+    contract = candidate.get("experiment_contract") if isinstance(candidate.get("experiment_contract"), dict) else {}
+    ablation_plan = candidate.get("ablation_plan") if isinstance(candidate.get("ablation_plan"), dict) else {}
+    switch = contract.get("ablation_switch") or ablation_plan.get("switch")
+    return str(switch) if switch else None
+
+
+def _eval_smoke_healthy(smoke: dict[str, Any]) -> bool:
+    if not isinstance(smoke, dict) or not smoke:
+        return False
+    return smoke.get("status") in {"ok", "skipped"} and not smoke.get("red_flags")
+
+
+def _fmt_readiness_number(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    try:
+        return f"{float(value):.4f}"
+    except (TypeError, ValueError):
+        return str(value)
+
+
+def _readiness_worth_reason(
+    proxy_delta: Any,
+    proxy_screen: dict[str, Any],
+    activation_smoke: dict[str, Any],
+    eval_smoke: dict[str, Any],
+    blockers: list[str],
+) -> str:
+    if blockers:
+        return "; ".join(blockers[:3])
+    pieces = [
+        f"cheap proxy {proxy_screen.get('status')} delta={_fmt_readiness_number(proxy_delta)}",
+        f"activation_smoke={activation_smoke.get('status') or 'missing'}",
+        f"eval_smoke={eval_smoke.get('status') or 'missing'}",
+    ]
+    if proxy_screen.get("soft_fail"):
+        pieces.append("soft warnings recorded but hard gates passed")
+    return "; ".join(pieces)
+
+
 def _proxy_effect_repair_contract(
     *,
     reason: str,
@@ -3014,13 +4221,26 @@ def _proxy_effect_repair_contract(
     changed_files = list(patch_risk.get("changed_files") or [])
     config_keys = list(patch_risk.get("config_override_keys") or [])
     command_failure = evidence.get("command_failure") if isinstance(evidence.get("command_failure"), dict) else {}
+    eval_smoke = evidence.get("eval_smoke") if isinstance(evidence.get("eval_smoke"), dict) else {}
+    proxy_eval_health_failure = evidence.get("proxy_eval_health_failure") if isinstance(evidence.get("proxy_eval_health_failure"), dict) else {}
+    activation_smoke = _activation_smoke_repair_evidence(evidence.get("activation_smoke") if isinstance(evidence.get("activation_smoke"), dict) else {})
+    full_s3_readiness = evidence.get("full_s3_readiness") if isinstance(evidence.get("full_s3_readiness"), dict) else {}
+    readiness_worth = full_s3_readiness.get("worth_full_train") if isinstance(full_s3_readiness.get("worth_full_train"), dict) else {}
+    readiness_blockers = [str(item) for item in (readiness_worth.get("blockers") or []) if item]
+    readiness_warnings = [str(item) for item in (readiness_worth.get("warnings") or []) if item]
     priorities = []
+    if readiness_blockers:
+        priorities.append("Clear full S3 readiness blockers before full training: " + "; ".join(readiness_blockers[:3]))
     if command_failure:
         priorities.append(f"Fix proxy runtime/smoke failure first: {_shorten_text(str(command_failure.get('category') or command_failure.get('summary') or 'command_failure'), 180)}")
+    if proxy_eval_health_failure:
+        priorities.append("Fix proxy eval output health before method tuning: " + ", ".join(proxy_eval_health_failure.get("red_flags") or []))
+    if activation_smoke:
+        priorities.append("Fix eval-path activation before full S3: " + _shorten_text(str(activation_smoke.get("reason") or "activation_smoke_failed"), 180))
     if dragging:
         priorities.append("Target dragging proxy datasets: " + ", ".join(item["dataset"] for item in dragging[:3]))
-    if evidence.get("proxy_delta_vs_baseline") is not None:
-        priorities.append("Raise proxy_delta_vs_baseline without increasing proxy_worst_dataset_regression.")
+    if evidence.get("proxy_delta_vs_comparison_baseline") is not None or evidence.get("proxy_delta_vs_baseline") is not None:
+        priorities.append("Raise proxy_delta_vs_comparison_baseline without increasing proxy_worst_dataset_regression.")
     if risk_labels:
         priorities.append("Reduce patch-risk labels that hurt proxy score: " + ", ".join(str(label) for label in risk_labels[:4]))
     priorities.append("Keep the same idea and produce an executable effect-first patch; do not switch to a new idea.")
@@ -3032,11 +4252,22 @@ def _proxy_effect_repair_contract(
         "reason": _shorten_text(str(reason), 500),
         "repair_hint": _shorten_text(str(repair_hint or ""), 500),
         "soft_flags": list(soft_flags or []),
+        "full_baseline_mean": evidence.get("full_baseline_mean"),
+        "proxy_baseline_mean": evidence.get("proxy_baseline_mean"),
+        "comparison_baseline_mean": evidence.get("comparison_baseline_mean"),
         "proxy_delta_vs_baseline": evidence.get("proxy_delta_vs_baseline"),
+        "proxy_delta_vs_comparison_baseline": evidence.get("proxy_delta_vs_comparison_baseline"),
+        "proxy_delta_vs_proxy_baseline": evidence.get("proxy_delta_vs_proxy_baseline"),
         "proxy_score": evidence.get("proxy_score"),
         "proxy_worst_dataset_regression": evidence.get("proxy_worst_dataset_regression"),
         "proxy_dataset_deltas": dataset_deltas,
         "proxy_dataset_regressions": dataset_regressions,
+        "eval_smoke": eval_smoke,
+        "proxy_eval_health_failure": proxy_eval_health_failure,
+        "activation_smoke": activation_smoke,
+        "full_s3_readiness": full_s3_readiness,
+        "readiness_blockers": readiness_blockers[:8],
+        "readiness_warnings": readiness_warnings[:8],
         "dragging_datasets": dragging[:5],
         "improved_datasets": improved[:5],
         "patch_risk_labels": risk_labels,
@@ -3056,6 +4287,41 @@ def _proxy_effect_repair_contract(
             "repair_hint": _shorten_text(str(command_failure.get("repair_hint") or ""), 500),
         }
     return {key: value for key, value in contract.items() if value not in (None, "", [], {})}
+
+
+def _activation_smoke_repair_evidence(smoke: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(smoke, dict) or not smoke:
+        return {}
+    comparison = smoke.get("comparison") if isinstance(smoke.get("comparison"), dict) else {}
+    output_smoke = smoke.get("output_smoke") if isinstance(smoke.get("output_smoke"), dict) else {}
+    eval_configs = smoke.get("eval_configs") if isinstance(smoke.get("eval_configs"), dict) else {}
+    return {
+        "status": smoke.get("status"),
+        "reason": smoke.get("reason"),
+        "repair_hint": smoke.get("repair_hint"),
+        "switch": smoke.get("switch"),
+        "datasets": smoke.get("datasets") or [],
+        "eval_configs": {str(dataset): str(path) for dataset, path in eval_configs.items()},
+        "enabled_metrics": smoke.get("enabled_metrics") or {},
+        "disabled_metrics": smoke.get("disabled_metrics") or {},
+        "metric_comparison": comparison.get("metric_comparison") or {
+            key: comparison.get(key)
+            for key in [
+                "enabled_mean",
+                "disabled_mean",
+                "enabled_minus_disabled_mean",
+                "dataset_enabled_minus_disabled",
+                "max_abs_dataset_delta",
+                "min_abs_metric_delta",
+            ]
+            if key in comparison
+        },
+        "prediction_comparison": comparison.get("prediction_comparison") or {},
+        "mechanism_observed": comparison.get("mechanism_observed"),
+        "mechanism_wired_metric_neutral": comparison.get("mechanism_wired_metric_neutral"),
+        "mechanism_trace": smoke.get("mechanism_trace") or {},
+        "output_smoke_red_flags": output_smoke.get("red_flags") or [],
+    }
 
 
 def _instrumentation_quality_repair_request(patch_result: dict[str, Any] | None) -> dict[str, Any]:
@@ -3172,19 +4438,25 @@ def _c2c_proxy_calibration_iteration(payload: dict[str, Any], *, iteration: int)
     ]
     false_positive_entries = [entry for entry in entries if entry.get("proxy_false_positive")]
     dataset_errors: dict[str, list[float]] = {}
+    dataset_pairs: dict[str, list[tuple[float, float]]] = {}
     for entry in entries:
         for dataset, comparison in (entry.get("dataset_calibration") or {}).items():
             error = comparison.get("proxy_full_delta_error")
             if isinstance(error, (int, float)):
                 dataset_errors.setdefault(dataset, []).append(float(error))
+            if _is_number(comparison.get("proxy_delta")) and _is_number(comparison.get("full_delta")):
+                dataset_pairs.setdefault(dataset, []).append((float(comparison["proxy_delta"]), float(comparison["full_delta"])))
     return {
         "timestamp": now_utc(),
         "iteration": iteration,
         "acceptance_passed": bool(acceptance.get("passed")),
+        "full_s3_completed_candidate_count": len(entries),
         "candidate_count": len(entries),
         "proxy_false_positive_count": len(false_positive_entries),
         "proxy_false_positive_rate": round(len(false_positive_entries) / len(entries), 4) if entries else 0.0,
-        "dataset_error_summary": _proxy_dataset_error_summary(dataset_errors),
+        "dataset_error_summary": _proxy_dataset_error_summary(dataset_errors, dataset_pairs=dataset_pairs),
+        "proxy_full_delta_correlation": _proxy_delta_correlation(entries),
+        "method_feedback": _proxy_calibration_method_feedback(entries),
         "candidates": entries,
     }
 
@@ -3224,19 +4496,34 @@ def _c2c_proxy_calibration_candidate(candidate: dict[str, Any], baseline_dataset
             "full_improved": full_delta > 0,
             "proxy_mispredicted": (proxy_delta > 0) != (full_delta > 0),
         }
-    full_passed = candidate.get("decision") == "candidate_win" and bool(acceptance.get("passed"))
+    full_passed = _candidate_full_passed(candidate, acceptance)
+    proxy_mean_delta = proxy.get("proxy_delta_vs_baseline")
+    full_mean_delta = candidate.get("delta_vs_baseline")
     mechanism_type = candidate.get("mechanism_type")
     contract = candidate.get("experiment_contract") if isinstance(candidate.get("experiment_contract"), dict) else {}
     return {
         "id": candidate.get("id"),
         "title": candidate.get("title"),
         "mechanism_type": mechanism_type or contract.get("mechanism_type"),
+        "mechanism_axis": candidate.get("mechanism_axis") or ((candidate.get("s2_variant") or {}).get("mechanism_axis") if isinstance(candidate.get("s2_variant"), dict) else None),
+        "integration_point": candidate.get("integration_point") or ((candidate.get("s2_variant") or {}).get("integration_point") if isinstance(candidate.get("s2_variant"), dict) else None),
+        "control_signal": candidate.get("control_signal") or ((candidate.get("s2_variant") or {}).get("control_signal") if isinstance(candidate.get("s2_variant"), dict) else None),
         "decision": candidate.get("decision"),
         "proxy_status": proxy.get("status"),
-        "proxy_mean_delta": proxy.get("proxy_delta_vs_baseline"),
-        "full_mean_delta": candidate.get("delta_vs_baseline"),
+        "proxy_mean_delta": proxy_mean_delta,
+        "full_mean_delta": full_mean_delta,
         "proxy_score": proxy.get("proxy_score"),
         "proxy_false_positive": not full_passed,
+        "false_positive_reason": _proxy_false_positive_reason(
+            candidate=candidate,
+            acceptance=acceptance,
+            full_passed=full_passed,
+            proxy_mean_delta=proxy_mean_delta,
+            full_mean_delta=full_mean_delta,
+            dataset_calibration=dataset_calibration,
+        ),
+        "proxy_predicted_mean_improvement": _is_number(proxy_mean_delta) and float(proxy_mean_delta) > 0,
+        "full_mean_improved": _is_number(full_mean_delta) and float(full_mean_delta) > 0,
         "dataset_calibration": dataset_calibration,
         "mispredicted_datasets": [
             dataset
@@ -3255,47 +4542,198 @@ def _c2c_proxy_calibration_summary(iterations: list[dict[str, Any]]) -> dict[str
     ]
     false_positive_entries = [entry for entry in candidate_entries if entry.get("proxy_false_positive")]
     dataset_errors: dict[str, list[float]] = {}
+    dataset_pairs: dict[str, list[tuple[float, float]]] = {}
     dataset_mispredictions: dict[str, int] = {}
     mechanism_counts: dict[str, dict[str, int]] = {}
+    mechanism_dataset_mispredictions: dict[str, dict[str, int]] = {}
+    false_positive_reasons: dict[str, int] = {}
     for entry in candidate_entries:
         mechanism = str(entry.get("mechanism_type") or "unknown")
-        stats = mechanism_counts.setdefault(mechanism, {"count": 0, "false_positive_count": 0})
+        stats = mechanism_counts.setdefault(mechanism, {"count": 0, "false_positive_count": 0, "proxy_positive_full_nonpositive_count": 0})
         stats["count"] += 1
         if entry.get("proxy_false_positive"):
             stats["false_positive_count"] += 1
+            reason = str(entry.get("false_positive_reason") or "unknown")
+            false_positive_reasons[reason] = false_positive_reasons.get(reason, 0) + 1
+        if entry.get("proxy_predicted_mean_improvement") and not entry.get("full_mean_improved"):
+            stats["proxy_positive_full_nonpositive_count"] += 1
         for dataset, comparison in (entry.get("dataset_calibration") or {}).items():
             error = comparison.get("proxy_full_delta_error")
             if isinstance(error, (int, float)):
                 dataset_errors.setdefault(dataset, []).append(float(error))
+            if _is_number(comparison.get("proxy_delta")) and _is_number(comparison.get("full_delta")):
+                dataset_pairs.setdefault(dataset, []).append((float(comparison["proxy_delta"]), float(comparison["full_delta"])))
             if comparison.get("proxy_mispredicted"):
                 dataset_mispredictions[dataset] = dataset_mispredictions.get(dataset, 0) + 1
-    return {
+                per_mechanism = mechanism_dataset_mispredictions.setdefault(mechanism, {})
+                per_mechanism[dataset] = per_mechanism.get(dataset, 0) + 1
+    summary = {
         "candidate_count": len(candidate_entries),
         "proxy_false_positive_count": len(false_positive_entries),
         "proxy_false_positive_rate": round(len(false_positive_entries) / len(candidate_entries), 4) if candidate_entries else 0.0,
-        "dataset_error_summary": _proxy_dataset_error_summary(dataset_errors, mispredictions=dataset_mispredictions),
+        "false_positive_reasons": dict(sorted(false_positive_reasons.items())),
+        "proxy_full_delta_correlation": _proxy_delta_correlation(candidate_entries),
+        "dataset_error_summary": _proxy_dataset_error_summary(dataset_errors, mispredictions=dataset_mispredictions, dataset_pairs=dataset_pairs),
         "mechanism_false_positive_summary": {
             mechanism: {
                 **stats,
                 "false_positive_rate": round(stats["false_positive_count"] / stats["count"], 4) if stats["count"] else 0.0,
+                "proxy_positive_full_nonpositive_rate": round(stats["proxy_positive_full_nonpositive_count"] / stats["count"], 4) if stats["count"] else 0.0,
+                "mispredicted_datasets": dict(sorted(mechanism_dataset_mispredictions.get(mechanism, {}).items())),
             }
             for mechanism, stats in sorted(mechanism_counts.items())
         },
     }
+    summary["method_feedback"] = _proxy_calibration_method_feedback(candidate_entries)
+    return summary
 
 
-def _proxy_dataset_error_summary(dataset_errors: dict[str, list[float]], *, mispredictions: dict[str, int] | None = None) -> dict[str, Any]:
+def _proxy_calibration_method_feedback(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    dataset_stats: dict[str, dict[str, int]] = {}
+    mechanism_stats: dict[str, dict[str, Any]] = {}
+    integration_stats: dict[str, dict[str, Any]] = {}
+    for entry in entries:
+        mechanism = str(entry.get("mechanism_type") or "unknown")
+        integration = str(entry.get("integration_point") or "unknown")
+        mech = mechanism_stats.setdefault(mechanism, {"count": 0, "false_positive_count": 0, "mispredicted_datasets": {}})
+        integ = integration_stats.setdefault(integration, {"count": 0, "false_positive_count": 0, "mechanisms": {}})
+        mech["count"] += 1
+        integ["count"] += 1
+        integ["mechanisms"][mechanism] = int(integ["mechanisms"].get(mechanism, 0)) + 1
+        if entry.get("proxy_false_positive"):
+            mech["false_positive_count"] += 1
+            integ["false_positive_count"] += 1
+        for dataset, comparison in (entry.get("dataset_calibration") or {}).items():
+            stats = dataset_stats.setdefault(str(dataset), {"count": 0, "misprediction_count": 0, "proxy_positive_full_negative_count": 0})
+            stats["count"] += 1
+            if comparison.get("proxy_mispredicted"):
+                stats["misprediction_count"] += 1
+                mech["mispredicted_datasets"][str(dataset)] = int(mech["mispredicted_datasets"].get(str(dataset), 0)) + 1
+            if comparison.get("proxy_delta", 0) > 0 and comparison.get("full_delta", 0) <= 0:
+                stats["proxy_positive_full_negative_count"] += 1
+
+    risky_datasets = [
+        {
+            "dataset": dataset,
+            **stats,
+            "misprediction_rate": round(stats["misprediction_count"] / stats["count"], 4) if stats["count"] else 0.0,
+            "proxy_positive_full_negative_rate": round(stats["proxy_positive_full_negative_count"] / stats["count"], 4) if stats["count"] else 0.0,
+        }
+        for dataset, stats in sorted(dataset_stats.items())
+        if stats.get("misprediction_count") or stats.get("proxy_positive_full_negative_count")
+    ]
+    risky_mechanisms = [
+        {
+            "mechanism_type": mechanism,
+            "count": stats["count"],
+            "false_positive_count": stats["false_positive_count"],
+            "false_positive_rate": round(stats["false_positive_count"] / stats["count"], 4) if stats["count"] else 0.0,
+            "mispredicted_datasets": dict(sorted(stats["mispredicted_datasets"].items())),
+        }
+        for mechanism, stats in sorted(mechanism_stats.items())
+        if stats.get("false_positive_count") or stats.get("mispredicted_datasets")
+    ]
+    risky_integration_points = [
+        {
+            "integration_point": point,
+            "count": stats["count"],
+            "false_positive_count": stats["false_positive_count"],
+            "false_positive_rate": round(stats["false_positive_count"] / stats["count"], 4) if stats["count"] else 0.0,
+            "mechanisms": dict(sorted(stats["mechanisms"].items())),
+        }
+        for point, stats in sorted(integration_stats.items())
+        if stats.get("false_positive_count")
+    ]
+    risky_datasets.sort(key=lambda item: (item["misprediction_rate"], item["proxy_positive_full_negative_rate"], item["dataset"]), reverse=True)
+    risky_mechanisms.sort(key=lambda item: (item["false_positive_rate"], item["false_positive_count"], item["mechanism_type"]), reverse=True)
+    risky_integration_points.sort(key=lambda item: (item["false_positive_rate"], item["false_positive_count"], item["integration_point"]), reverse=True)
+    recommendations = []
+    if risky_datasets:
+        recommendations.append("Calibrate cheap proxy around risky datasets: " + ", ".join(item["dataset"] for item in risky_datasets[:3]) + ".")
+    if risky_mechanisms:
+        recommendations.append("Downweight or demand stronger activation/full-readiness evidence for proxy false-positive mechanisms: " + ", ".join(item["mechanism_type"] for item in risky_mechanisms[:3]) + ".")
+    if risky_integration_points:
+        recommendations.append("Penalize integration points with repeated proxy false positives: " + ", ".join(item["integration_point"] for item in risky_integration_points[:3]) + ".")
+    return {
+        "status": "ok" if entries else "no_full_s3_proxy_pairs",
+        "risky_datasets": risky_datasets[:8],
+        "risky_mechanisms": risky_mechanisms[:8],
+        "risky_integration_points": risky_integration_points[:8],
+        "recommendations": recommendations,
+    }
+
+
+def _proxy_dataset_error_summary(
+    dataset_errors: dict[str, list[float]],
+    *,
+    mispredictions: dict[str, int] | None = None,
+    dataset_pairs: dict[str, list[tuple[float, float]]] | None = None,
+) -> dict[str, Any]:
     mispredictions = mispredictions or {}
+    dataset_pairs = dataset_pairs or {}
     return {
         dataset: {
             "mean_abs_proxy_full_delta_error": round(sum(abs(item) for item in values) / len(values), 4),
             "max_abs_proxy_full_delta_error": round(max(abs(item) for item in values), 4),
             "misprediction_count": mispredictions.get(dataset, 0),
+            "proxy_full_delta_correlation": _pearson_correlation(dataset_pairs.get(dataset) or []),
             "count": len(values),
         }
         for dataset, values in sorted(dataset_errors.items())
         if values
     }
+
+
+def _proxy_delta_correlation(entries: list[dict[str, Any]]) -> float | None:
+    pairs = [
+        (float(entry["proxy_mean_delta"]), float(entry["full_mean_delta"]))
+        for entry in entries
+        if _is_number(entry.get("proxy_mean_delta")) and _is_number(entry.get("full_mean_delta"))
+    ]
+    return _pearson_correlation(pairs)
+
+
+def _pearson_correlation(pairs: list[tuple[float, float]]) -> float | None:
+    if len(pairs) < 2:
+        return None
+    xs = [item[0] for item in pairs]
+    ys = [item[1] for item in pairs]
+    mean_x = sum(xs) / len(xs)
+    mean_y = sum(ys) / len(ys)
+    numerator = sum((x - mean_x) * (y - mean_y) for x, y in pairs)
+    denom_x = sum((x - mean_x) ** 2 for x in xs)
+    denom_y = sum((y - mean_y) ** 2 for y in ys)
+    if denom_x <= 0 or denom_y <= 0:
+        return None
+    return round(numerator / ((denom_x * denom_y) ** 0.5), 4)
+
+
+def _proxy_false_positive_reason(
+    *,
+    candidate: dict[str, Any],
+    acceptance: dict[str, Any],
+    full_passed: bool,
+    proxy_mean_delta: Any,
+    full_mean_delta: Any,
+    dataset_calibration: dict[str, Any],
+) -> str:
+    if full_passed:
+        return ""
+    if _is_number(proxy_mean_delta) and float(proxy_mean_delta) > 0 and _is_number(full_mean_delta) and float(full_mean_delta) <= 0:
+        return "proxy_mean_positive_full_mean_nonpositive"
+    if any(item.get("proxy_mispredicted") for item in dataset_calibration.values()):
+        return "dataset_direction_misprediction"
+    if candidate.get("decision") == "not_viable":
+        return "full_acceptance_not_viable"
+    return str(acceptance.get("reason") or candidate.get("decision") or "full_train_not_accepted")
+
+
+def _candidate_full_passed(candidate: dict[str, Any], acceptance: dict[str, Any]) -> bool:
+    if candidate.get("decision") != "candidate_win":
+        return False
+    if bool(acceptance.get("passed")):
+        return True
+    return _is_number(candidate.get("delta_vs_baseline")) and float(candidate.get("delta_vs_baseline")) > 0
 
 
 def _is_number(value: Any) -> bool:
@@ -3304,6 +4742,80 @@ def _is_number(value: Any) -> bool:
         return True
     except (TypeError, ValueError):
         return False
+
+
+def _coerce_float(value: Any, *, default: float | None = None) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _c2c_proxy_artifact_paths(run_spec: dict[str, Any]) -> dict[str, str]:
+    proxy_spec = run_spec.get("proxy_screen") if isinstance(run_spec.get("proxy_screen"), dict) else {}
+    paths = {
+        "run_state": run_spec.get("run_state_path"),
+        "candidate_run_root": run_spec.get("run_root"),
+        "proxy_run_root": proxy_spec.get("run_root"),
+        "proxy_metrics": proxy_spec.get("metrics_path"),
+        "proxy_train_config": proxy_spec.get("train_config"),
+        "proxy_baseline_metrics": proxy_spec.get("baseline_metrics_path"),
+    }
+    return {key: str(value) for key, value in paths.items() if value}
+
+
+def _normalize_c2c_proxy_screen_artifacts(
+    proxy_screen: dict[str, Any],
+    *,
+    full_baseline: dict[str, Any],
+    run_spec: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(proxy_screen, dict):
+        return proxy_screen
+    normalized = dict(proxy_screen)
+    proxy_baseline = normalized.get("proxy_baseline")
+    if not isinstance(proxy_baseline, dict) or not proxy_baseline:
+        proxy_baseline = normalized.get("baseline_metrics") if isinstance(normalized.get("baseline_metrics"), dict) else None
+    comparison_baseline = normalized.get("comparison_baseline")
+    if not isinstance(comparison_baseline, dict) or not comparison_baseline:
+        comparison_baseline = proxy_baseline or full_baseline
+    normalized.setdefault("full_baseline_mean", _coerce_float((full_baseline or {}).get("mean"), default=None))
+    normalized.setdefault("proxy_baseline", proxy_baseline)
+    normalized.setdefault("proxy_baseline_mean", _coerce_float((proxy_baseline or {}).get("mean"), default=None) if isinstance(proxy_baseline, dict) else None)
+    normalized.setdefault("comparison_baseline", comparison_baseline)
+    normalized.setdefault("comparison_baseline_mean", _coerce_float((comparison_baseline or {}).get("mean"), default=normalized.get("full_baseline_mean")) if isinstance(comparison_baseline, dict) else normalized.get("full_baseline_mean"))
+    if normalized.get("proxy_delta_vs_comparison_baseline") is None and normalized.get("proxy_delta_vs_baseline") is not None:
+        normalized["proxy_delta_vs_comparison_baseline"] = normalized.get("proxy_delta_vs_baseline")
+    if normalized.get("proxy_delta_vs_proxy_baseline") is None and proxy_baseline and normalized.get("proxy_delta_vs_baseline") is not None:
+        normalized["proxy_delta_vs_proxy_baseline"] = normalized.get("proxy_delta_vs_baseline")
+    command_failure = normalized.get("command_failure") if isinstance(normalized.get("command_failure"), dict) else {}
+    resource_retry = (
+        normalized.get("resource_retry") is True
+        or normalized.get("status") == "resource_retry"
+        or normalized.get("failure_category") in {"s3_proxy_resource_oom", "s3_proxy_gpu_resource_retry"}
+        or command_failure.get("category") == "resource_oom"
+    )
+    if resource_retry:
+        normalized["status"] = "resource_retry"
+        normalized["resource_retry"] = True
+        normalized["failure_category"] = (
+            normalized.get("failure_category")
+            if normalized.get("failure_category") in {"s3_proxy_resource_oom", "s3_proxy_gpu_resource_retry"}
+            else "s3_proxy_resource_oom"
+        )
+        normalized["repair_route"] = "resource_retry"
+        normalized["repair_mode"] = "resource_retry"
+        normalized.setdefault(
+            "reason",
+            "cheap proxy command hit a GPU resource failure; resume S3 when resources are available",
+        )
+        if not normalized.get("repair_hint"):
+            normalized["repair_hint"] = (
+                "do not repair the S2.5 patch for this failure; rerun cheap proxy after GPU memory is available"
+            )
+    if not isinstance(normalized.get("artifact_paths"), dict):
+        normalized["artifact_paths"] = _c2c_proxy_artifact_paths(run_spec)
+    return normalized
 
 
 def _compact_c2c_result_payload(value: Any) -> Any:
@@ -3316,6 +4828,241 @@ def _compact_c2c_result_payload(value: Any) -> Any:
     return value
 
 
+def _c2c_manifest_selected_patch_entry(manifest: dict[str, Any], selected_candidate_id: str) -> dict[str, Any]:
+    if not isinstance(manifest, dict) or not selected_candidate_id:
+        return {}
+    for entry in manifest.get("candidates") or manifest.get("patches") or []:
+        if isinstance(entry, dict) and str(entry.get("candidate_id") or entry.get("id") or "") == selected_candidate_id:
+            return dict(entry)
+    selected_patch = manifest.get("selected_patch") if isinstance(manifest.get("selected_patch"), dict) else {}
+    if str(selected_patch.get("candidate_id") or selected_patch.get("id") or "") == selected_candidate_id:
+        return dict(selected_patch)
+    return dict(selected_patch) if selected_patch else {}
+
+
+def _c2c_code_patch_from_manifest_entry(entry: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        return {}
+    fields = [
+        "status",
+        "patch_json",
+        "diff",
+        "rationale",
+        "validation",
+        "implementation_contract",
+        "codex_prompt",
+        "changed_files",
+        "has_executable_change",
+        "quality_score",
+        "quality_debt",
+        "recovery_actions",
+        "reason",
+        "risk_check",
+        "mechanism_review",
+        "codex_session_id",
+        "code_worktree",
+        "patched_repo_snapshot",
+    ]
+    code_patch = {key: copy.deepcopy(entry[key]) for key in fields if key in entry}
+    code_patch.setdefault("status", entry.get("status") or "missing")
+    if "has_executable_change" not in code_patch:
+        code_patch["has_executable_change"] = bool(entry.get("changed_files") or entry.get("patch_json") or entry.get("patched_repo_snapshot"))
+    return code_patch
+
+
+def _c2c_selection_artifact_lock(project_root: Path, rel_path: Any) -> dict[str, Any]:
+    if not rel_path:
+        return {"rel_path": None, "exists": False, "sha256": None}
+    rel = str(rel_path)
+    path = project_root / rel
+    exists = path.exists() and path.is_file()
+    return {
+        "rel_path": rel,
+        "exists": exists,
+        "sha256": sha256_file(path) if exists else None,
+    }
+
+
+def _config_with_c2c_snapshot_path(config: dict[str, Any], repo_root: str) -> dict[str, Any]:
+    cloned = copy.deepcopy(config)
+    cloned.setdefault("c2c", {})
+    cloned["c2c"]["snapshot_path"] = repo_root
+    return cloned
+
+
+def _c2c_execution_repo_path_audit(
+    *,
+    original_repo_root: Path,
+    execution_repo: dict[str, Any],
+    run_spec: dict[str, Any],
+) -> dict[str, Any]:
+    execution_root = Path(str(execution_repo.get("repo_root") or ""))
+    checks: list[dict[str, Any]] = []
+    errors: list[str] = []
+
+    def check_path(name: str, path_value: Any) -> None:
+        if not path_value:
+            return
+        path = Path(path_value).resolve()
+        inside_execution = _path_is_relative_to(path, execution_root.resolve())
+        inside_original = _path_is_relative_to(path, original_repo_root.resolve())
+        item = {
+            "name": name,
+            "path": str(path),
+            "inside_execution_repo": inside_execution,
+            "inside_original_snapshot": inside_original,
+        }
+        checks.append(item)
+        if not inside_execution:
+            errors.append(f"{name} is outside execution repo: {path}")
+        if inside_original:
+            errors.append(f"{name} points into original snapshot: {path}")
+
+    check_path("run_root", run_spec.get("run_root"))
+    check_path("train_config", run_spec.get("train_config"))
+    check_path("run_state_path", run_spec.get("run_state_path"))
+    check_path("preflight_path", run_spec.get("preflight_path"))
+    for dataset, path in (run_spec.get("eval_configs") or {}).items():
+        check_path(f"eval_config:{dataset}", path)
+    proxy_spec = run_spec.get("proxy_screen") if isinstance(run_spec.get("proxy_screen"), dict) else {}
+    check_path("proxy_run_root", proxy_spec.get("run_root"))
+    check_path("proxy_train_config", proxy_spec.get("train_config"))
+    for dataset, path in (proxy_spec.get("eval_configs") or {}).items():
+        check_path(f"proxy_eval_config:{dataset}", path)
+
+    return {
+        "schema_version": "c2c_execution_repo_audit_v1",
+        "status": "failed" if errors else "ok",
+        "reason": "; ".join(errors[:4]) if errors else "all C2C run/config paths are inside execution repo",
+        "original_repo_root": str(original_repo_root),
+        "execution_repo_root": str(execution_root),
+        "checks": checks,
+        "errors": errors,
+    }
+
+
+def _c2c_execution_repo_output_audit(
+    *,
+    original_repo_root: Path,
+    run_spec: dict[str, Any],
+    before_state: dict[str, dict[str, Any]],
+    path_audit: dict[str, Any],
+    phase: str,
+) -> dict[str, Any]:
+    pollution = _c2c_original_output_pollution(original_repo_root, run_spec, before_state)
+    failed = path_audit.get("status") == "failed" or bool(pollution.get("added_files") or pollution.get("modified_files"))
+    reason = ""
+    if path_audit.get("status") == "failed":
+        reason = str(path_audit.get("reason") or "run paths are outside execution repo")
+    elif failed:
+        reason = "original C2C snapshot received new or modified run-output files during S3"
+    return {
+        "schema_version": "c2c_execution_repo_audit_v1",
+        "status": "failed" if failed else "ok",
+        "phase": phase,
+        "reason": reason or "execution repo output audit passed",
+        "path_audit": path_audit,
+        "output_pollution": pollution,
+    }
+
+
+def _c2c_original_output_state(original_repo_root: Path, run_spec: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    tracked: dict[str, dict[str, Any]] = {}
+    for root in _c2c_original_output_roots(original_repo_root, run_spec):
+        if not root.exists():
+            continue
+        if root.is_file():
+            rel = root.relative_to(original_repo_root).as_posix()
+            tracked[rel] = _c2c_output_file_state(root)
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(original_repo_root).as_posix()
+            tracked[rel] = _c2c_output_file_state(path)
+    return tracked
+
+
+def _c2c_original_output_pollution(
+    original_repo_root: Path,
+    run_spec: dict[str, Any],
+    before_state: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    after_state = _c2c_original_output_state(original_repo_root, run_spec)
+    added = sorted(rel for rel in after_state if rel not in before_state)
+    modified = sorted(
+        rel
+        for rel, state in after_state.items()
+        if rel in before_state and state.get("sha256") != before_state[rel].get("sha256")
+    )
+    return {
+        "status": "failed" if added or modified else "ok",
+        "tracked_roots": [
+            _relpath_or_abs(path, original_repo_root)
+            for path in _c2c_original_output_roots(original_repo_root, run_spec)
+        ],
+        "added_files": added[:100],
+        "modified_files": modified[:100],
+        "added_count": len(added),
+        "modified_count": len(modified),
+    }
+
+
+def _c2c_original_output_roots(original_repo_root: Path, run_spec: dict[str, Any]) -> list[Path]:
+    run_id = sanitize_filename(str(run_spec.get("run_id") or ""))
+    roots = [
+        original_repo_root / "local" / "auto_research_runs" / run_id,
+        original_repo_root / "local" / "auto_research_runs" / "proxy_baseline",
+    ]
+    return list(dict.fromkeys(roots))
+
+
+def _c2c_output_file_state(path: Path) -> dict[str, Any]:
+    try:
+        return {"sha256": sha256_file(path), "size": path.stat().st_size}
+    except OSError:
+        return {"sha256": None, "size": None}
+
+
+def _path_is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _relpath_or_abs(path: Path, root: Path) -> str:
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return str(path)
+
+
+def _materialize_c2c_execution_repo(execution_repo: Path, source_repo: Path, source_lock: dict[str, Any]) -> bool:
+    metadata_path = execution_repo / ".auto_research_execution_source.json"
+    existing_lock = read_json(metadata_path, default={}) if metadata_path.exists() else {}
+    if execution_repo.exists() and existing_lock == source_lock:
+        return True
+    if execution_repo.exists():
+        shutil.rmtree(execution_repo)
+    shutil.copytree(source_repo, execution_repo, ignore=_c2c_execution_repo_ignore)
+    write_json(metadata_path, source_lock)
+    return False
+
+
+def _c2c_execution_repo_ignore(directory: str, names: list[str]) -> set[str]:
+    ignored = {".git", "wandb", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "htmlcov"}
+    if Path(directory).name == "local":
+        ignored.update({"auto_research_runs", "checkpoints", "snapshots", "final_results"})
+    for name in names:
+        if name in ignored:
+            continue
+        if Path(name).suffix in {".pyc", ".pyo", ".pt", ".pth", ".safetensors", ".bin", ".ckpt", ".parquet", ".arrow"}:
+            ignored.add(name)
+    return ignored.intersection(names)
+
+
 def _looks_like_candidate_result(value: dict[str, Any]) -> bool:
     return any(key in value for key in ["patch_result", "proxy_screen", "command_status", "run_state_path"]) and any(
         key in value for key in ["id", "candidate_id", "run_id"]
@@ -3326,16 +5073,20 @@ def _compact_candidate_result(candidate: dict[str, Any]) -> dict[str, Any]:
     compact = dict(candidate)
     if isinstance(compact.get("patch_result"), dict):
         compact["patch_result"] = _compact_patch_result_for_payload(compact["patch_result"])
-    if isinstance(compact.get("proxy_screen"), dict):
-        compact["proxy_screen"] = _compact_proxy_screen(compact["proxy_screen"])
-    if isinstance(compact.get("commands"), dict):
-        compact["commands"] = _compact_command_plan(compact["commands"])
+        if isinstance(compact.get("proxy_screen"), dict):
+            compact["proxy_screen"] = _compact_proxy_screen(compact["proxy_screen"])
+        if isinstance(compact.get("activation_smoke"), dict):
+            compact["activation_smoke"] = _compact_activation_smoke(compact["activation_smoke"])
+        if isinstance(compact.get("commands"), dict):
+            compact["commands"] = _compact_command_plan(compact["commands"])
     if isinstance(compact.get("command_logs"), list):
         compact["command_logs"] = _compact_event_logs(compact["command_logs"])
     if isinstance(compact.get("ablation"), dict):
         compact["ablation"] = _compact_ablation_payload(compact["ablation"])
     if isinstance(compact.get("failure_attribution"), dict):
         compact["failure_attribution"] = _compact_failure_attribution(compact["failure_attribution"])
+    if isinstance(compact.get("execution_repo_audit"), dict):
+        compact["execution_repo_audit"] = _compact_execution_repo_audit(compact["execution_repo_audit"])
     return compact
 
 
@@ -3383,20 +5134,32 @@ def _compact_proxy_screen(proxy_screen: dict[str, Any] | None) -> dict[str, Any]
         "repair_route",
         "repair_mode",
         "proxy_effect_repair_contract",
+        "baseline_status",
+        "baseline_failure",
+        "baseline_attempt_count",
         "metrics",
         "baseline_metrics",
+        "full_baseline_mean",
         "proxy_baseline",
+        "proxy_baseline_mean",
+        "comparison_baseline_mean",
         "proxy_delta_vs_baseline",
+        "proxy_delta_vs_comparison_baseline",
+        "proxy_delta_vs_proxy_baseline",
         "proxy_dataset_deltas",
         "proxy_dataset_regressions",
         "proxy_worst_dataset_regression",
         "proxy_score",
         "proxy_decision_mode",
+        "eval_smoke",
+        "proxy_eval_health_failure",
+        "activation_smoke",
         "soft_fail",
         "soft_flags",
         "signals",
         "patch_risk",
         "quality_repair",
+        "artifact_paths",
         "patch_fingerprint",
     ]:
         if key in proxy_screen:
@@ -3406,8 +5169,12 @@ def _compact_proxy_screen(proxy_screen: dict[str, Any] | None) -> dict[str, Any]
     if isinstance(proxy_screen.get("attempts"), list):
         compact["attempts"] = _compact_attempts(proxy_screen["attempts"])
     if isinstance(proxy_screen.get("commands"), list):
-        compact["commands"] = [_shorten_text(str(command), 600) for command in proxy_screen["commands"]]
+        compact["commands"] = [_shorten_text(str(command), 240) for command in proxy_screen["commands"]]
         compact["command_count"] = len(proxy_screen["commands"])
+    if isinstance(compact.get("activation_smoke"), dict):
+        compact["activation_smoke"] = _compact_activation_smoke(compact["activation_smoke"])
+    if isinstance(proxy_screen.get("full_s3_readiness"), dict):
+        compact["full_s3_readiness"] = _compact_full_s3_readiness(proxy_screen["full_s3_readiness"])
     if isinstance(compact.get("proxy_effect_repair_contract"), dict):
         compact["proxy_effect_repair_contract"] = _compact_proxy_effect_repair_contract(compact["proxy_effect_repair_contract"])
     return _compact_c2c_result_payload(compact)
@@ -3420,19 +5187,31 @@ def _proxy_screen_for_failure_attribution(proxy_screen: dict[str, Any]) -> dict[
         "repair_hint",
         "repair_route",
         "repair_mode",
+        "full_baseline_mean",
+        "proxy_baseline_mean",
+        "comparison_baseline_mean",
         "proxy_delta_vs_baseline",
+        "proxy_delta_vs_comparison_baseline",
+        "proxy_delta_vs_proxy_baseline",
         "proxy_dataset_deltas",
         "proxy_dataset_regressions",
         "proxy_worst_dataset_regression",
         "proxy_score",
+        "eval_smoke",
+        "proxy_eval_health_failure",
+        "activation_smoke",
+        "full_s3_readiness",
         "soft_fail",
         "soft_flags",
+        "artifact_paths",
     ]
     compact = {key: proxy_screen.get(key) for key in keep if key in proxy_screen}
     if isinstance(proxy_screen.get("command_failure"), dict):
         compact["command_failure"] = _compact_attempt(proxy_screen["command_failure"], stdout_chars=0, stderr_chars=0)
     if isinstance(proxy_screen.get("proxy_effect_repair_contract"), dict):
         compact["proxy_effect_repair_contract"] = _compact_proxy_effect_repair_contract(proxy_screen["proxy_effect_repair_contract"])
+    if isinstance(compact.get("activation_smoke"), dict):
+        compact["activation_smoke"] = _compact_activation_smoke(compact["activation_smoke"])
     return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
 
 
@@ -3444,11 +5223,21 @@ def _compact_proxy_effect_repair_contract(contract: dict[str, Any]) -> dict[str,
         "reason",
         "repair_hint",
         "soft_flags",
+        "full_baseline_mean",
+        "proxy_baseline_mean",
+        "comparison_baseline_mean",
         "proxy_delta_vs_baseline",
+        "proxy_delta_vs_comparison_baseline",
+        "proxy_delta_vs_proxy_baseline",
         "proxy_score",
         "proxy_worst_dataset_regression",
         "proxy_dataset_deltas",
         "proxy_dataset_regressions",
+        "eval_smoke",
+        "proxy_eval_health_failure",
+        "activation_smoke",
+        "readiness_blockers",
+        "readiness_warnings",
         "dragging_datasets",
         "improved_datasets",
         "patch_risk_labels",
@@ -3464,6 +5253,15 @@ def _compact_proxy_effect_repair_contract(contract: dict[str, Any]) -> dict[str,
             key: _shorten_text(str(command_failure.get(key) or ""), 500)
             for key in ["category", "summary", "repair_hint"]
             if command_failure.get(key) not in (None, "")
+        }
+    if isinstance(compact.get("activation_smoke"), dict):
+        compact["activation_smoke"] = _compact_activation_smoke(compact["activation_smoke"])
+    if isinstance(contract.get("full_s3_readiness"), dict):
+        readiness = contract["full_s3_readiness"]
+        compact["full_s3_readiness"] = {
+            key: readiness.get(key)
+            for key in ["candidate_id", "run_id", "full_train_allowed", "status"]
+            if key in readiness
         }
     return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
 
@@ -3507,6 +5305,49 @@ def _compact_attempt(attempt: dict[str, Any], *, stdout_chars: int = 1000, stder
     return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
 
 
+def _parse_torch_distributed_rank_failure(text: str) -> dict[str, Any] | None:
+    local_rank = re.search(r"local_rank:\s*(\d+)", text)
+    exitcode = re.search(r"exitcode\s*:\s*(-?\d+)", text)
+    pid = re.search(r"pid\s*:\s*(\d+)", text)
+    if not any([local_rank, exitcode, pid]):
+        return None
+    return {
+        "local_rank": int(local_rank.group(1)) if local_rank else None,
+        "exitcode": int(exitcode.group(1)) if exitcode else None,
+        "pid": int(pid.group(1)) if pid else None,
+    }
+
+
+def _c2c_gpu_resource_wait_enabled(policy: dict[str, Any]) -> bool:
+    wait_cfg = policy.get("resource_wait") if isinstance(policy.get("resource_wait"), dict) else {}
+    return bool(wait_cfg.get("enabled", False)) and int(wait_cfg.get("timeout_seconds") or 0) > 0
+
+
+def _c2c_payload_is_retryable_pause(payload: dict[str, Any]) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    candidates = [item for item in payload.get("candidate_results") or [] if isinstance(item, dict)]
+    if candidates and all(is_retryable_c2c_candidate(item) for item in candidates):
+        return True
+    for key in ["best_candidate", "best_proxy_candidate"]:
+        candidate = payload.get(key)
+        if isinstance(candidate, dict) and is_retryable_c2c_candidate(candidate):
+            return True
+    acceptance = payload.get("acceptance") if isinstance(payload.get("acceptance"), dict) else {}
+    reason = str(acceptance.get("reason") or payload.get("blocked_reason") or "").lower()
+    return any(
+        marker in reason
+        for marker in [
+            "resource retry",
+            "waiting for gpu resources",
+            "gpu resources",
+            "cuda out of memory",
+            "quota",
+            "rate limit",
+        ]
+    )
+
+
 def _compact_command_plan(commands: dict[str, Any]) -> dict[str, Any]:
     compact: dict[str, Any] = {}
     for key, value in commands.items():
@@ -3524,7 +5365,33 @@ def _compact_event_logs(logs: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if isinstance(compact.get("patch_result"), dict):
             compact["patch_result"] = _compact_patch_result_for_payload(compact["patch_result"])
         if isinstance(compact.get("proxy_screen"), dict):
-            compact["proxy_screen"] = _compact_proxy_screen(compact["proxy_screen"])
+            proxy_screen = compact["proxy_screen"]
+            compact["proxy_screen"] = {
+                key: proxy_screen.get(key)
+                for key in [
+                    "enabled",
+                    "status",
+                    "mode",
+                    "reason",
+                    "repair_mode",
+                    "proxy_delta_vs_baseline",
+                    "proxy_delta_vs_comparison_baseline",
+                    "proxy_score",
+                ]
+                if key in proxy_screen
+            }
+            if isinstance(proxy_screen.get("command_failure"), dict):
+                compact["proxy_screen"]["command_failure"] = _compact_attempt(
+                    proxy_screen["command_failure"],
+                    stdout_chars=0,
+                    stderr_chars=0,
+                )
+        if isinstance(compact.get("activation_smoke"), dict):
+            compact["activation_smoke"] = _compact_activation_smoke(compact["activation_smoke"])
+        if isinstance(compact.get("execution_repo_audit"), dict):
+            compact["execution_repo_audit"] = _compact_execution_repo_audit(compact["execution_repo_audit"])
+        if isinstance(compact.get("audit"), dict):
+            compact["audit"] = _compact_execution_repo_audit(compact["audit"])
         if isinstance(compact.get("ablation"), dict):
             compact["ablation"] = _compact_ablation_payload(compact["ablation"])
         compact_logs.append(compact)
@@ -3545,6 +5412,56 @@ def _compact_ablation_payload(ablation: dict[str, Any]) -> dict[str, Any]:
     return compact
 
 
+def _compact_activation_smoke(smoke: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(smoke, dict):
+        return smoke
+    compact = _compact_c2c_result_payload(dict(smoke))
+    if isinstance(compact.get("attempts"), list):
+        compact["attempts"] = _compact_attempts(compact["attempts"])
+    if isinstance(compact.get("eval_by_dataset"), dict):
+        compact["eval_by_dataset"] = {
+            dataset: _compact_attempt(attempt) if isinstance(attempt, dict) else attempt
+            for dataset, attempt in compact["eval_by_dataset"].items()
+        }
+    if isinstance(compact.get("commands"), dict):
+        compact["commands"] = _compact_command_plan(compact["commands"])
+    for key in ["run_root", "result_root", "metrics_path"]:
+        if key in compact:
+            compact[key] = str(compact[key])
+    if isinstance(compact.get("eval_configs"), dict):
+            compact["eval_configs"] = {str(dataset): str(path) for dataset, path in compact["eval_configs"].items()}
+    return compact
+
+
+def _compact_full_s3_readiness(readiness: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(readiness, dict):
+        return readiness
+    compact = {
+        key: readiness.get(key)
+        for key in [
+            "schema_version",
+            "project_id",
+            "iteration",
+            "created_at",
+            "candidate_id",
+            "candidate_title",
+            "run_id",
+            "full_train_allowed",
+            "status",
+            "static_risk",
+            "proxy",
+            "eval_smoke",
+            "activation_smoke",
+            "ablation_switch",
+            "acceptance_targets",
+            "worth_full_train",
+            "artifact_paths",
+        ]
+        if key in readiness
+    }
+    return _compact_c2c_result_payload(compact)
+
+
 def _compact_failure_attribution(attribution: dict[str, Any]) -> dict[str, Any]:
     keep = [
         "primary_failure",
@@ -3553,8 +5470,13 @@ def _compact_failure_attribution(attribution: dict[str, Any]) -> dict[str, Any]:
         "sample_type_failures",
         "mixed_gain_patterns",
         "patch_risk",
+        "proxy_screen",
         "ablation_evidence",
         "quality_repair",
+        "eval_smoke",
+        "proxy_eval_health_failure",
+        "activation_smoke",
+        "execution_repo_audit",
         "proxy_effect_repair_contract",
     ]
     compact = {key: attribution.get(key) for key in keep if key in attribution}
@@ -3562,7 +5484,36 @@ def _compact_failure_attribution(attribution: dict[str, Any]) -> dict[str, Any]:
         compact["proxy_screen"] = _compact_proxy_screen(compact["proxy_screen"])
     if isinstance(compact.get("proxy_effect_repair_contract"), dict):
         compact["proxy_effect_repair_contract"] = _compact_proxy_effect_repair_contract(compact["proxy_effect_repair_contract"])
+    if isinstance(compact.get("activation_smoke"), dict):
+        compact["activation_smoke"] = _compact_activation_smoke(compact["activation_smoke"])
+    if isinstance(compact.get("execution_repo_audit"), dict):
+        compact["execution_repo_audit"] = _compact_execution_repo_audit(compact["execution_repo_audit"])
     return compact
+
+
+def _compact_execution_repo_audit(audit: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(audit, dict):
+        return audit
+    pollution = audit.get("output_pollution") if isinstance(audit.get("output_pollution"), dict) else {}
+    path_audit = audit.get("path_audit") if isinstance(audit.get("path_audit"), dict) else {}
+    errors = list(audit.get("errors") or path_audit.get("errors") or [])
+    compact = {
+        "schema_version": audit.get("schema_version"),
+        "status": audit.get("status"),
+        "phase": audit.get("phase"),
+        "reason": audit.get("reason"),
+        "path_status": path_audit.get("status") or audit.get("status"),
+        "path_error_count": len(errors),
+        "path_errors": [_shorten_text(str(item), 240) for item in errors[:4]],
+        "output_pollution": {
+            "status": pollution.get("status"),
+            "added_count": pollution.get("added_count", 0),
+            "modified_count": pollution.get("modified_count", 0),
+            "added_files": list(pollution.get("added_files") or [])[:12],
+            "modified_files": list(pollution.get("modified_files") or [])[:12],
+        },
+    }
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
 
 
 def _shorten_text(text: str, max_chars: int) -> str:

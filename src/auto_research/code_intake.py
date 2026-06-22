@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.metadata
 import json
 import re
 import textwrap
@@ -15,6 +16,7 @@ from .utils import ensure_dir, now_utc, read_json, sanitize_filename, sha256_fil
 
 
 CODE_INTAKE_SCHEMA_VERSION = "code_intake_v1"
+CODE_INTAKE_PROMPT_SCHEMA_VERSION = "code_intake_prompt_schema_v1"
 CODE_TEXT_SUFFIXES = {".py", ".json", ".yaml", ".yml", ".md", ".txt", ".sh", ".cfg", ".ini", ".toml"}
 CODE_SKIP_PARTS = {
     ".git",
@@ -52,6 +54,10 @@ def build_code_intake(
     allowed_prefixes: list[str] | None = None,
     cache_dir: Path | None = None,
 ) -> CodeIntakeResult:
+    parser_fingerprint = code_intake_parser_fingerprint(
+        allowed_files=allowed_files or [],
+        allowed_prefixes=allowed_prefixes or [],
+    )
     files = _collect_code_files(repo_root)
     allowed_files = allowed_files or []
     allowed_prefixes = allowed_prefixes or []
@@ -73,9 +79,11 @@ def build_code_intake(
             "size_bytes": path.stat().st_size,
             "sha256": file_sha,
             "edit_surface": _edit_surface(rel, allowed_files=allowed_files, allowed_prefixes=allowed_prefixes),
+            "parser_config_hash": parser_fingerprint["parser_config_hash"],
+            "chunking_config_hash": parser_fingerprint["chunking_config_hash"],
         }
         manifest_entries.append(file_entry)
-        cached = _read_code_file_cache(cache_dir, file_entry) if cache_dir else None
+        cached = _read_code_file_cache(cache_dir, file_entry, parser_fingerprint) if cache_dir else None
         if cached:
             parsed = cached
             file_entry["cache_status"] = "hit"
@@ -93,7 +101,7 @@ def build_code_intake(
                 }
             file_entry["cache_status"] = "miss" if cache_dir else "disabled"
             cache_events.append({"path": rel, "sha256": file_sha, "status": file_entry["cache_status"]})
-            _write_code_file_cache(cache_dir, file_entry, parsed) if cache_dir else None
+            _write_code_file_cache(cache_dir, file_entry, parsed, parser_fingerprint) if cache_dir else None
         symbols.extend(parsed.get("symbols") or [])
         chunks.extend(parsed.get("chunks") or [])
         edges.extend(parsed.get("edges") or [])
@@ -111,11 +119,12 @@ def build_code_intake(
         allowed_files=allowed_files,
         allowed_prefixes=allowed_prefixes,
         cache_events=cache_events,
+        parser_fingerprint=parser_fingerprint,
     )
     surface_map = _build_implementation_surface_map(symbols=symbols, chunks=chunks, edges=edges)
     retrieval_index = _build_code_retrieval_index(chunks=chunks, symbols=symbols, edges=edges, surface_map=surface_map)
     return CodeIntakeResult(
-        file_manifest={"schema_version": CODE_INTAKE_SCHEMA_VERSION, "files": manifest_entries},
+        file_manifest={"schema_version": CODE_INTAKE_SCHEMA_VERSION, "parser_fingerprint": parser_fingerprint, "files": manifest_entries},
         symbols=symbols,
         chunks=chunks,
         edges=edges,
@@ -192,7 +201,7 @@ def _is_code_file(path: Path, rel: str) -> bool:
     return True
 
 
-def _read_code_file_cache(cache_dir: Path | None, file_entry: dict[str, Any]) -> dict[str, Any] | None:
+def _read_code_file_cache(cache_dir: Path | None, file_entry: dict[str, Any], parser_fingerprint: dict[str, Any]) -> dict[str, Any] | None:
     if not cache_dir:
         return None
     path = _code_file_cache_path(cache_dir, str(file_entry.get("path") or ""), str(file_entry.get("sha256") or ""))
@@ -205,6 +214,10 @@ def _read_code_file_cache(cache_dir: Path | None, file_entry: dict[str, Any]) ->
         return None
     if payload.get("path") != file_entry.get("path") or payload.get("sha256") != file_entry.get("sha256"):
         return None
+    if payload.get("parser_config_hash") != parser_fingerprint.get("parser_config_hash"):
+        return None
+    if payload.get("chunking_config_hash") != parser_fingerprint.get("chunking_config_hash"):
+        return None
     parsed = payload.get("parsed")
     if not isinstance(parsed, dict):
         return None
@@ -215,7 +228,7 @@ def _read_code_file_cache(cache_dir: Path | None, file_entry: dict[str, Any]) ->
     }
 
 
-def _write_code_file_cache(cache_dir: Path | None, file_entry: dict[str, Any], parsed: dict[str, Any]) -> None:
+def _write_code_file_cache(cache_dir: Path | None, file_entry: dict[str, Any], parsed: dict[str, Any], parser_fingerprint: dict[str, Any]) -> None:
     if not cache_dir:
         return
     path = _code_file_cache_path(cache_dir, str(file_entry.get("path") or ""), str(file_entry.get("sha256") or ""))
@@ -229,6 +242,9 @@ def _write_code_file_cache(cache_dir: Path | None, file_entry: dict[str, Any], p
             "sha256": file_entry.get("sha256"),
             "language": file_entry.get("language"),
             "edit_surface": file_entry.get("edit_surface"),
+            "parser_fingerprint": parser_fingerprint,
+            "parser_config_hash": parser_fingerprint.get("parser_config_hash"),
+            "chunking_config_hash": parser_fingerprint.get("chunking_config_hash"),
             "parsed": parsed,
         },
     )
@@ -237,6 +253,52 @@ def _write_code_file_cache(cache_dir: Path | None, file_entry: dict[str, Any], p
 def _code_file_cache_path(cache_dir: Path, rel_path: str, sha256: str) -> Path:
     slug = sanitize_filename(rel_path.replace("/", "__"), max_length=96)
     return cache_dir / f"{slug}.{sha256[:16]}.json"
+
+
+def code_intake_parser_fingerprint(*, allowed_files: list[str], allowed_prefixes: list[str]) -> dict[str, Any]:
+    parser_config = {
+        "schema_version": CODE_INTAKE_SCHEMA_VERSION,
+        "python_parser": "tree_sitter_python_with_ast_fallback",
+        "supported_suffixes": sorted(CODE_TEXT_SUFFIXES),
+        "skip_parts": sorted(CODE_SKIP_PARTS),
+        "max_code_file_bytes": MAX_CODE_FILE_BYTES,
+        "allowed_files": sorted(str(item) for item in allowed_files),
+        "allowed_prefixes": sorted(str(item) for item in allowed_prefixes),
+    }
+    chunking_config = {
+        "schema_version": CODE_INTAKE_PROMPT_SCHEMA_VERSION,
+        "chunk_strategy": "python_class_function_plus_file_prelude_nonpython_line_chunks",
+        "edge_extractors": ["same_file_neighbor", "tested_by", "resolved_call", "config_key"],
+        "retrieval_fields": ["chunk_id", "path", "symbol", "risk_tags", "keywords", "text_preview"],
+    }
+    versions = {
+        "tree_sitter": _package_version("tree_sitter"),
+        "tree_sitter_python": _package_version("tree_sitter_python"),
+    }
+    return {
+        "schema_version": "code_intake_parser_fingerprint_v1",
+        "code_intake_schema_version": CODE_INTAKE_SCHEMA_VERSION,
+        "prompt_schema_version": CODE_INTAKE_PROMPT_SCHEMA_VERSION,
+        "tree_sitter_version": versions["tree_sitter"],
+        "tree_sitter_python_version": versions["tree_sitter_python"],
+        "tree_sitter_python_language": "python",
+        "parser_config_hash": _stable_hash({"parser_config": parser_config, "versions": versions}),
+        "chunking_config_hash": _stable_hash(chunking_config),
+        "parser_config": parser_config,
+        "chunking_config": chunking_config,
+    }
+
+
+def _package_version(name: str) -> str:
+    try:
+        return importlib.metadata.version(name)
+    except importlib.metadata.PackageNotFoundError:
+        return "not_installed"
+
+
+def _stable_hash(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _parse_python_file(text: str, rel_path: str, edit_surface: str) -> dict[str, Any]:
@@ -908,6 +970,7 @@ def _build_code_intake_report(
     allowed_files: list[str],
     allowed_prefixes: list[str],
     cache_events: list[dict[str, Any]] | None = None,
+    parser_fingerprint: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     files_by_path = {item.get("path"): item for item in files}
     python_files = [item for item in files if item.get("language") == "python"]
@@ -966,6 +1029,7 @@ def _build_code_intake_report(
         cache_counts[status] = cache_counts.get(status, 0) + 1
     return {
         "schema_version": CODE_INTAKE_SCHEMA_VERSION,
+        "parser_fingerprint": parser_fingerprint or {},
         "counts": {
             "files": len(files),
             "python_files": len(python_files),
@@ -999,6 +1063,8 @@ def _build_code_intake_report(
             "enabled": bool(cache_events) and not all(event.get("status") == "disabled" for event in cache_events),
             "counts": dict(sorted(cache_counts.items())),
             "events": cache_events[:200],
+            "parser_config_hash": (parser_fingerprint or {}).get("parser_config_hash"),
+            "chunking_config_hash": (parser_fingerprint or {}).get("chunking_config_hash"),
         },
     }
 

@@ -49,19 +49,45 @@ class ExperimentRunner:
         if explicit is None:
             explicit = self.config.get("c2c", {}).get("small_loop", {}).get("gpu_ids")
         if explicit not in (None, "auto"):
-            selected = _coerce_gpu_ids(explicit)[:max_gpus]
-            return GpuSelection(selected, policy, self._gpu_snapshot(), "explicit_gpu_ids")
+            explicit_ids = _coerce_gpu_ids(explicit)
+            snapshot = self._gpu_snapshot()
+            min_free_mb = int(policy.get("min_free_mb") or self.config.get("experiment", {}).get("gpu_policy", {}).get("min_free_mb", 0))
+            max_utilization = _coerce_optional_int(policy.get("max_utilization_gpu"))
+            if max_utilization is None:
+                max_utilization = _coerce_optional_int(self.config.get("experiment", {}).get("gpu_policy", {}).get("max_utilization_gpu"))
+            if policy.get("respect_resource_filters", False) and snapshot:
+                allowed = set(explicit_ids)
+                candidates = [
+                    item
+                    for item in snapshot
+                    if int(item.get("index", -1)) in allowed
+                    and int(item.get("memory_free_mb") or 0) >= min_free_mb
+                    and (max_utilization is None or int(item.get("utilization_gpu") or 0) <= max_utilization)
+                ]
+                candidates.sort(key=lambda item: (-int(item.get("memory_free_mb") or 0), int(item.get("utilization_gpu") or 100), int(item.get("index") or 999)))
+                selected = [int(item["index"]) for item in candidates[:max_gpus]]
+                reason = "explicit_gpu_ids_filtered_by_resources"
+                if selected:
+                    return GpuSelection(selected, policy, snapshot, reason)
+                if policy.get("disable_resource_fallback", False):
+                    return GpuSelection([], policy, snapshot, "explicit_gpu_ids_no_resource_match")
+            selected = explicit_ids[:max_gpus]
+            return GpuSelection(selected, policy, snapshot, "explicit_gpu_ids")
 
         min_free_mb = int(policy.get("min_free_mb") or self.config.get("experiment", {}).get("gpu_policy", {}).get("min_free_mb", 0))
+        max_utilization = _coerce_optional_int(policy.get("max_utilization_gpu"))
+        if max_utilization is None:
+            max_utilization = _coerce_optional_int(self.config.get("experiment", {}).get("gpu_policy", {}).get("max_utilization_gpu"))
         snapshot = self._gpu_snapshot()
         candidates = [
             item
             for item in snapshot
             if item.get("memory_free_mb", 0) >= min_free_mb
+            and (max_utilization is None or int(item.get("utilization_gpu") or 0) <= max_utilization)
         ]
         candidates.sort(key=lambda item: (-item.get("memory_free_mb", 0), item.get("utilization_gpu", 100), item.get("index", 999)))
         selected = [int(item["index"]) for item in candidates[:max_gpus]]
-        if not selected and snapshot:
+        if not selected and snapshot and not policy.get("disable_resource_fallback", False):
             fallback = sorted(snapshot, key=lambda item: (-item.get("memory_free_mb", 0), item.get("index", 999)))
             selected = [int(fallback[0]["index"])]
         return GpuSelection(selected, policy, snapshot, "auto_selected_by_free_memory")
@@ -185,6 +211,15 @@ def _coerce_gpu_ids(value: Any) -> list[int]:
     if isinstance(value, str):
         return [int(item.strip()) for item in value.split(",") if item.strip()]
     return [int(item) for item in value]
+
+
+def _coerce_optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _output_excerpt(text: str, *, limit: int = 12000, edge: int = 5500) -> str:

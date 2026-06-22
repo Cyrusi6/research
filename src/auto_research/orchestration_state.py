@@ -45,6 +45,8 @@ class OrchestrationStateManager:
                 "iteration": registry.get("iteration"),
                 "max_iterations": registry.get("max_iterations"),
                 "blocked_reason": registry.get("blocked_reason"),
+                "pause_type": registry.get("pause_type"),
+                "resume_instruction": registry.get("resume_instruction"),
             }
         )
         state.setdefault("revision_loop", {}).setdefault("count", 0)
@@ -60,6 +62,8 @@ class OrchestrationStateManager:
                     "judge_retries": registry_stage.get("judge_retries", 0),
                     "judge_passed": registry_stage.get("judge_passed", False),
                     "blocked_reason": registry_stage.get("blocked_reason"),
+                    "pause_type": registry_stage.get("pause_type"),
+                    "resume_instruction": registry_stage.get("resume_instruction"),
                     "contract_path": f"orchestration/stage_contracts/{stage_key}.json",
                 }
             )
@@ -126,6 +130,8 @@ class OrchestrationStateManager:
         stage["status"] = "completed"
         stage["completed_at"] = now_utc()
         stage["last_error"] = None
+        stage.pop("pause_type", None)
+        stage.pop("resume_instruction", None)
         if artifacts is not None:
             stage["artifacts"] = self._artifact_records(artifacts)
         state["last_event"] = {"type": "stage_completed", "timestamp": now_utc(), "stage": stage_key}
@@ -137,6 +143,9 @@ class OrchestrationStateManager:
 
     def stage_failed(self, registry: dict[str, Any], stage_key: str, reason: str) -> None:
         self._stage_stopped(registry, stage_key, status="failed", reason=reason)
+
+    def stage_retryable_paused(self, registry: dict[str, Any], stage_key: str, reason: str) -> None:
+        self._stage_stopped(registry, stage_key, status="retryable_paused", reason=reason)
 
     def judge_retry(self, registry: dict[str, Any], stage_key: str, *, retries: int, reason: str) -> None:
         state = self.sync_from_registry(registry)
@@ -188,8 +197,20 @@ class OrchestrationStateManager:
         stage["status"] = status
         stage["last_error"] = reason
         stage["blocked_reason"] = reason
+        if status == "retryable_paused":
+            stage["pause_type"] = registry.get("pause_type")
+            stage["resume_instruction"] = registry.get("resume_instruction")
+        else:
+            stage.pop("pause_type", None)
+            stage.pop("resume_instruction", None)
         state["status"] = status
         state["blocked_reason"] = reason
+        if status == "retryable_paused":
+            state["pause_type"] = registry.get("pause_type")
+            state["resume_instruction"] = registry.get("resume_instruction")
+        else:
+            state.pop("pause_type", None)
+            state.pop("resume_instruction", None)
         state["running"] = None
         state["last_event"] = {"type": f"stage_{status}", "timestamp": now_utc(), "stage": stage_key, "reason": reason}
         self.save(state)

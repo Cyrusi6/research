@@ -16,11 +16,20 @@ from ..c2c import (
     is_c2c_project,
 )
 from ..adapters.literature import LiteratureProvider
+from ..evidence_refs import evidence_ref_errors_for_repair, resolve_s1_evidence_refs
 from ..importers import ConsensusImporter
 from ..itr_ideas import build_itr_theme_map, collect_consensus_entries, theme_map_markdown
 from ..failure_log import load_c2c_feedback_bundle
+from ..method_memory import collect_used_shared_memory_refs, shared_method_memory_for_prompt, shared_method_memory_query_context
+from ..llm import codex_subprocess_env
 from ..resources import discover_local_mm_resources
-from ..utils import compact_markdown, now_utc, read_yaml, sanitize_filename, split_sentences, write_yaml
+from ..s0_enrichment import (
+    DEFAULT_DEEPSEEK_MODEL,
+    S0_CODE_SEMANTIC_ENRICHMENT_PROMPT_VERSION,
+    S0_SEMANTIC_ENRICHMENT_PROMPT_VERSION,
+    S0_SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
+)
+from ..utils import compact_markdown, now_utc, read_json, read_yaml, sanitize_filename, split_sentences, write_yaml
 from .base import AgentContext
 from .debate import MultiAgentReasoningService, c2c_debate_markdown
 
@@ -145,6 +154,25 @@ class LiteratureAgent:
             source_paths=[evidence_requests_record["path"], evidence_bundle_record["path"], direction_record["path"]],
         )
         evidence_records = [evidence_requests_record, evidence_bundle_record, direction_record, evidence_session_record]
+        if evidence_result.get("novelty_audits"):
+            novelty_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "novelty_audit.json",
+                evidence_result.get("novelty_audits", []),
+                artifact_type="s1_novelty_audit",
+                summary="Independent S1 novelty audit against shared and local memory",
+                source_paths=[direction_record["path"], evidence_session_record["path"]],
+            )
+            evidence_records.append(novelty_record)
+        evidence_ref_report_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "evidence_ref_report.json",
+            evidence_result.get("evidence_ref_report", {}),
+            artifact_type="s1_evidence_ref_report",
+            summary="Resolved S1 evidence refs against local artifacts and indexes",
+            source_paths=[evidence_bundle_record["path"], direction_record["path"]],
+        )
+        evidence_records.append(evidence_ref_report_record)
         ideas_record = self.context.artifacts.write_json(
             self.stage_key,
             "ideas.json",
@@ -237,6 +265,19 @@ class LiteratureAgent:
             }
             for card in reference_cards
         ]
+        enrichment_merge = _merge_s0_semantic_enrichment_for_s1(
+            self.context.project_root,
+            paper_chunks=paper_chunks,
+            rebuttal_chunks=rebuttal_chunks,
+            code_chunks=code_chunks,
+            chunk_index=chunk_index,
+            config=self.context.config,
+        )
+        paper_chunks = enrichment_merge["paper_chunks"]
+        rebuttal_chunks = enrichment_merge["rebuttal_chunks"]
+        code_chunks = enrichment_merge["code_chunks"]
+        chunk_index = enrichment_merge["chunk_index"]
+        semantic_merge_report = enrichment_merge["report"]
         feedback = self._load_feedback()
         if self.context.config.get("ideation", {}).get("debate", {}).get("enabled", True):
             ideas = []
@@ -432,6 +473,14 @@ class LiteratureAgent:
             summary="S0 cache hit/miss summary for MinerU and code intake",
             source_paths=["intake/c2c/cache_summary.json"],
         )
+        semantic_merge_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/semantic_enrichment_merge_report.json",
+            semantic_merge_report,
+            artifact_type="c2c_s1_semantic_enrichment_merge_report",
+            summary="S1 merge report for S0 DeepSeek semantic enrichment records",
+            source_paths=semantic_merge_report.get("source_paths") or ["intake/c2c/static_bundle.json"],
+        )
         chunk_index_record = self.context.artifacts.write_json(
             self.stage_key,
             "c2c/chunk_index.json",
@@ -480,6 +529,8 @@ class LiteratureAgent:
         evidence_bundle_record = None
         direction_record = None
         evidence_session_record = None
+        evidence_ref_report_record = None
+        novelty_record = None
         if self.context.config.get("ideation", {}).get("debate", {}).get("enabled", True):
             if _use_legacy_c2c_debate(self.context.config):
                 debate = MultiAgentReasoningService(self.context).run_c2c_debate(
@@ -563,6 +614,23 @@ class LiteratureAgent:
                     summary="S1 Codex evidence-on-demand session transcript",
                     source_paths=[evidence_requests_record["path"], evidence_bundle_record["path"], direction_record["path"]],
                 )
+                evidence_ref_report_record = self.context.artifacts.write_json(
+                    self.stage_key,
+                    "c2c/evidence_ref_report.json",
+                    debate.get("evidence_ref_report", {}),
+                    artifact_type="c2c_s1_evidence_ref_report",
+                    summary="Resolved C2C S1 evidence refs against S0 chunk/code indexes",
+                    source_paths=[evidence_bundle_record["path"], chunk_index_record["path"], code_file_manifest_record["path"], code_symbols_record["path"]],
+                )
+                if debate.get("novelty_audits"):
+                    novelty_record = self.context.artifacts.write_json(
+                        self.stage_key,
+                        "c2c/novelty_audit.json",
+                        debate.get("novelty_audits", []),
+                        artifact_type="c2c_s1_novelty_audit",
+                        summary="Independent C2C S1 novelty audit against shared and local memory",
+                        source_paths=[direction_record["path"], evidence_session_record["path"], negative_record["path"]],
+                    )
             debate_record = self.context.artifacts.write_json(
                 self.stage_key,
                 "idea_debate.json",
@@ -585,6 +653,7 @@ class LiteratureAgent:
                     implementation_surface_record["path"],
                     code_retrieval_record["path"],
                     cache_summary_record["path"],
+                    semantic_merge_record["path"],
                     chunk_index_record["path"],
                     retrieval_plan_record["path"],
                     followup_bundle_record["path"],
@@ -595,8 +664,10 @@ class LiteratureAgent:
                             evidence_bundle_record["path"],
                             direction_record["path"],
                             evidence_session_record["path"],
+                            evidence_ref_report_record["path"],
+                            *( [novelty_record["path"]] if novelty_record else [] ),
                         ]
-                        if evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record
+                        if evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record and evidence_ref_report_record
                         else []
                     ),
                 ],
@@ -649,6 +720,7 @@ class LiteratureAgent:
                 implementation_surface_record["path"],
                 code_retrieval_record["path"],
                 cache_summary_record["path"],
+                semantic_merge_record["path"],
                 chunk_index_record["path"],
                 retrieval_plan_record["path"],
                 followup_bundle_record["path"],
@@ -659,11 +731,12 @@ class LiteratureAgent:
                         evidence_bundle_record["path"],
                         direction_record["path"],
                         evidence_session_record["path"],
+                        evidence_ref_report_record["path"],
                         debate_record["path"],
                         debate_md_record["path"],
                         constraints_record["path"],
                     ]
-                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record
+                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record and evidence_ref_report_record
                     else []
                 ),
             ],
@@ -701,6 +774,7 @@ class LiteratureAgent:
                 implementation_surface_record["path"],
                 code_retrieval_record["path"],
                 cache_summary_record["path"],
+                semantic_merge_record["path"],
                 chunk_index_record["path"],
                 chunk_index_jsonl_record["path"],
                 retrieval_plan_record["path"],
@@ -712,11 +786,12 @@ class LiteratureAgent:
                         evidence_bundle_record["path"],
                         direction_record["path"],
                         evidence_session_record["path"],
+                        evidence_ref_report_record["path"],
                         debate_record["path"],
                         debate_md_record["path"],
                         constraints_record["path"],
                     ]
-                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record
+                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record and evidence_ref_report_record
                     else []
                 ),
                 survey_record["path"],
@@ -763,6 +838,7 @@ class LiteratureAgent:
                 survey=survey,
                 theme_map_path=theme_map_path,
                 resources=discover_local_mm_resources(self.context.config),
+                config=self.context.config,
             ),
             max_repairs=int(cfg.get("max_json_repairs") or 2),
             timeout_seconds=int(cfg.get("timeout_seconds") or (self.context.config.get("llm", {}) or {}).get("timeout_seconds") or 1800),
@@ -775,16 +851,32 @@ class LiteratureAgent:
                 "blocked_reason": result.get("reason") or "S1 Codex evidence agent did not return valid JSON.",
                 "evidence_session": result,
                 "ideas": [],
-            }
+        }
         payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-        ideas = _generic_s1_codex_ideas(payload)
+        shared_memory = shared_method_memory_for_prompt(
+            self.context.config,
+            limit=12,
+            query_context=shared_method_memory_query_context(
+                self.context.config,
+                project_root=self.context.project_root,
+                topic=topic,
+            ),
+        )
+        used_shared_memory_refs = collect_used_shared_memory_refs(payload, shared_memory)
+        ideas = _generic_s1_codex_ideas(payload, used_shared_memory_refs=used_shared_memory_refs)
+        _attach_s1_novelty_audit_to_ideas(ideas, result.get("novelty_audits", []))
+        direction_decision = dict(payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {})
+        direction_decision["used_shared_memory_refs"] = used_shared_memory_refs
+        evidence_ref_report = result.get("evidence_ref_report") or resolve_s1_evidence_refs(self.context.project_root, payload, mode="generic")
         return {
             "status": "ok",
             "strategy": "codex_resume_evidence_agent",
             "ideas": ideas,
             "evidence_requests": payload.get("evidence_requests") if isinstance(payload.get("evidence_requests"), list) else [],
             "evidence_bundle": payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {"items": []},
-            "direction_decision": payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {},
+            "direction_decision": direction_decision,
+            "used_shared_memory_refs": used_shared_memory_refs,
+            "evidence_ref_report": evidence_ref_report,
             "evidence_session": {
                 "schema_version": "s1_codex_evidence_session_v1",
                 "status": "ok",
@@ -793,6 +885,10 @@ class LiteratureAgent:
                 "used_existing_session": result.get("used_existing_session"),
                 "attempts": result.get("attempts", []),
                 "repair_count": result.get("repair_count", 0),
+                "novelty_audits": result.get("novelty_audits", []),
+                "session_reset": result.get("session_reset"),
+                "session_reset_reason": result.get("session_reset_reason"),
+                "used_shared_memory_refs": used_shared_memory_refs,
                 "source": "codex_cli",
             },
         }
@@ -830,6 +926,7 @@ class LiteratureAgent:
                 negative_memory=negative_memory,
                 rebuttal_matrix=rebuttal_matrix,
                 feedback=feedback,
+                config=self.context.config,
             ),
             max_repairs=int(cfg.get("max_json_repairs") or 2),
             timeout_seconds=int(cfg.get("timeout_seconds") or (self.context.config.get("llm", {}) or {}).get("timeout_seconds") or 1800),
@@ -847,9 +944,25 @@ class LiteratureAgent:
         payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
         evidence_requests = payload.get("evidence_requests") if isinstance(payload.get("evidence_requests"), list) else []
         evidence_bundle = payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {"items": []}
-        direction_decision = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
-        selected_ideas = _s1_codex_direction_cards(payload)
+        shared_memory = shared_method_memory_for_prompt(
+            self.context.config,
+            limit=12,
+            query_context=shared_method_memory_query_context(
+                self.context.config,
+                project_root=self.context.project_root,
+                topic=topic,
+                feedback=feedback,
+                negative_memory=negative_memory,
+            ),
+        )
+        used_shared_memory_refs = collect_used_shared_memory_refs(payload, shared_memory)
+        direction_decision = dict(payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {})
+        direction_decision["used_shared_memory_refs"] = used_shared_memory_refs
+        selected_ideas = _s1_codex_direction_cards(payload, used_shared_memory_refs=used_shared_memory_refs)
+        _attach_s1_novelty_audit_to_ideas(selected_ideas, result.get("novelty_audits", []))
         negative_constraints = payload.get("negative_constraints") if isinstance(payload.get("negative_constraints"), dict) else {}
+        negative_constraints["used_shared_memory_refs"] = used_shared_memory_refs
+        evidence_ref_report = result.get("evidence_ref_report") or resolve_s1_evidence_refs(self.context.project_root, payload, mode="c2c")
         decision_chain = payload.get("decision_chain") if isinstance(payload.get("decision_chain"), dict) else direction_decision.get("decision_chain")
         if not isinstance(decision_chain, dict):
             decision_chain = _s1_codex_decision_chain(payload, selected_ideas)
@@ -867,10 +980,13 @@ class LiteratureAgent:
             },
             "decision_chain": decision_chain,
             "direction_decision": direction_decision,
+            "novelty_audits": result.get("novelty_audits", []),
             "selected_ideas": selected_ideas,
             "negative_constraints": negative_constraints,
+            "used_shared_memory_refs": used_shared_memory_refs,
             "evidence_requests": evidence_requests,
             "evidence_bundle": evidence_bundle,
+            "evidence_ref_report": evidence_ref_report,
             "evidence_session": {
                 "schema_version": "c2c_s1_codex_evidence_session_v1",
                 "status": "ok",
@@ -879,6 +995,10 @@ class LiteratureAgent:
                 "used_existing_session": result.get("used_existing_session"),
                 "attempts": result.get("attempts", []),
                 "repair_count": result.get("repair_count", 0),
+                "novelty_audits": result.get("novelty_audits", []),
+                "session_reset": result.get("session_reset"),
+                "session_reset_reason": result.get("session_reset_reason"),
+                "used_shared_memory_refs": used_shared_memory_refs,
                 "source": "codex_cli",
             },
             "quality_flags": [],
@@ -1157,6 +1277,254 @@ def _jsonl(items: list[dict[str, Any]]) -> str:
     return "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in items)
 
 
+def _merge_s0_semantic_enrichment_for_s1(
+    project_root: Path,
+    *,
+    paper_chunks: list[dict[str, Any]],
+    rebuttal_chunks: list[dict[str, Any]],
+    code_chunks: list[dict[str, Any]],
+    chunk_index: dict[str, Any],
+    config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    records_by_id, record_source_paths = _load_s0_semantic_records(project_root, config=config or {})
+    paper_chunks = _apply_s1_semantic_records_to_chunks(paper_chunks, records_by_id, source_type="paper")
+    rebuttal_chunks = _apply_s1_semantic_records_to_chunks(rebuttal_chunks, records_by_id, source_type="rebuttal")
+    code_chunks = _apply_s1_semantic_records_to_chunks(code_chunks, records_by_id, source_type="code")
+    chunk_by_id = {
+        str(chunk.get("chunk_id") or ""): chunk
+        for chunk in [*paper_chunks, *rebuttal_chunks, *code_chunks]
+        if isinstance(chunk, dict) and str(chunk.get("chunk_id") or "")
+    }
+    merged_chunk_index = _merge_s1_semantic_fields_into_chunk_index(chunk_index, chunk_by_id)
+    report = _s1_semantic_merge_report(
+        records_by_id=records_by_id,
+        source_paths=record_source_paths,
+        paper_chunks=paper_chunks,
+        rebuttal_chunks=rebuttal_chunks,
+        code_chunks=code_chunks,
+        chunk_index=merged_chunk_index,
+    )
+    return {
+        "paper_chunks": paper_chunks,
+        "rebuttal_chunks": rebuttal_chunks,
+        "code_chunks": code_chunks,
+        "chunk_index": merged_chunk_index,
+        "report": report,
+    }
+
+
+def _load_s0_semantic_records(project_root: Path, *, config: dict[str, Any] | None = None) -> tuple[dict[str, dict[str, Any]], list[str]]:
+    records: dict[str, dict[str, Any]] = {}
+    source_paths: list[str] = []
+    for record, source_path in _iter_s0_semantic_artifact_records(project_root):
+        _select_best_s0_semantic_record(records, record)
+        source_paths.append(source_path)
+    for record, source_path in _iter_s0_semantic_cache_records(project_root, config=config or {}):
+        _select_best_s0_semantic_record(records, record)
+        source_paths.append(source_path)
+    return records, _dedupe_texts(source_paths, max_items=2000)
+
+
+def _iter_s0_semantic_artifact_records(project_root: Path):
+    base = project_root / "intake" / "c2c"
+    json_path = base / "semantic_enrichment_sample.json"
+    payload = read_json(json_path, default={})
+    if isinstance(payload, dict):
+        for record in payload.get("records") or []:
+            if isinstance(record, dict):
+                yield record, "intake/c2c/semantic_enrichment_sample.json"
+    elif isinstance(payload, list):
+        for record in payload:
+            if isinstance(record, dict):
+                yield record, "intake/c2c/semantic_enrichment_sample.json"
+    jsonl_path = base / "semantic_enrichment_sample.jsonl"
+    if jsonl_path.exists():
+        for line in jsonl_path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                yield record, "intake/c2c/semantic_enrichment_sample.jsonl"
+
+
+def _iter_s0_semantic_cache_records(project_root: Path, *, config: dict[str, Any]):
+    model = _s0_semantic_model_from_config(config)
+    cache_roots = [
+        project_root / ".cache" / "auto_research" / "s0_semantic_enrichment" / _s1_cache_safe(model),
+        project_root / ".cache" / "auto_research" / "s0_semantic_enrichment" / _s1_cache_safe(DEFAULT_DEEPSEEK_MODEL),
+    ]
+    for cache_root in cache_roots:
+        if not cache_root.exists():
+            continue
+        for path in sorted(cache_root.glob("*.json")):
+            payload = read_json(path, default={})
+            if isinstance(payload, dict):
+                yield payload, str(path.relative_to(project_root))
+
+
+def _s0_semantic_model_from_config(config: dict[str, Any]) -> str:
+    intake = config.get("intake") if isinstance(config, dict) else {}
+    semantic = (intake or {}).get("semantic_enrichment") if isinstance(intake, dict) else {}
+    if isinstance(semantic, dict) and semantic.get("model"):
+        return str(semantic.get("model"))
+    return DEFAULT_DEEPSEEK_MODEL
+
+
+def _s1_cache_safe(value: str) -> str:
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("_") or "model"
+
+
+def _select_best_s0_semantic_record(records: dict[str, dict[str, Any]], candidate: dict[str, Any]) -> None:
+    chunk = candidate.get("chunk") if isinstance(candidate.get("chunk"), dict) else {}
+    chunk_id = str(chunk.get("chunk_id") or candidate.get("chunk_id") or "")
+    if not chunk_id:
+        return
+    current = records.get(chunk_id)
+    if current is None or _s0_semantic_record_score(candidate) >= _s0_semantic_record_score(current):
+        records[chunk_id] = candidate
+
+
+def _s0_semantic_record_score(record: dict[str, Any]) -> tuple[int, int, int, str]:
+    chunk = record.get("chunk") if isinstance(record.get("chunk"), dict) else {}
+    source_type = str(chunk.get("source_type") or record.get("source_type") or "")
+    prompt_version = str(record.get("prompt_version") or "")
+    prompt_score = 0
+    if source_type == "code" and prompt_version == S0_CODE_SEMANTIC_ENRICHMENT_PROMPT_VERSION:
+        prompt_score = 3
+    elif prompt_version == S0_SEMANTIC_ENRICHMENT_PROMPT_VERSION:
+        prompt_score = 2
+    elif prompt_version:
+        prompt_score = 1
+    enrichment = record.get("enrichment") if isinstance(record.get("enrichment"), dict) else {}
+    quality_score = 0
+    if enrichment.get("semantic_summary"):
+        quality_score += 1
+    if enrichment.get("retrieval_keywords"):
+        quality_score += 1
+    if not record.get("fallback_used"):
+        quality_score += 1
+    return (prompt_score, quality_score, 0 if record.get("cache_status") == "dry_run" else 1, str(record.get("generated_at") or ""))
+
+
+def _apply_s1_semantic_records_to_chunks(chunks: list[dict[str, Any]], records_by_id: dict[str, dict[str, Any]], *, source_type: str) -> list[dict[str, Any]]:
+    updated = []
+    for chunk in chunks:
+        item = dict(chunk)
+        item.setdefault("source_type", source_type)
+        chunk_id = str(item.get("chunk_id") or "")
+        record = records_by_id.get(chunk_id)
+        enrichment = record.get("enrichment") if isinstance(record, dict) and isinstance(record.get("enrichment"), dict) else None
+        if enrichment:
+            item["semantic_enrichment"] = {
+                "schema_version": S0_SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
+                "provider": record.get("provider"),
+                "model": record.get("model"),
+                "prompt_version": record.get("prompt_version"),
+                "cache_status": record.get("cache_status"),
+                "fallback_used": bool(record.get("fallback_used")),
+                "generated_at": record.get("generated_at"),
+                **enrichment,
+            }
+        enrichment = item.get("semantic_enrichment") if isinstance(item.get("semantic_enrichment"), dict) else enrichment
+        if isinstance(enrichment, dict):
+            item["semantic_summary"] = str(enrichment.get("semantic_summary") or item.get("semantic_summary") or "")
+            item["mechanism_tags"] = _dedupe_texts([*(item.get("mechanism_tags") or []), *(enrichment.get("mechanism_tags") or [])], max_items=20)
+            item["failure_modes"] = _dedupe_texts([*(item.get("failure_modes") or []), *(enrichment.get("failure_modes") or [])], max_items=20)
+            item["retrieval_keywords"] = _dedupe_texts(
+                [*(item.get("keywords") or []), *(item.get("retrieval_keywords") or []), *(enrichment.get("retrieval_keywords") or []), *(enrichment.get("mechanism_tags") or [])],
+                max_items=40,
+            )
+        updated.append(item)
+    return updated
+
+
+def _merge_s1_semantic_fields_into_chunk_index(chunk_index: dict[str, Any], chunk_by_id: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(chunk_index, dict):
+        return {}
+    merged = dict(chunk_index)
+    entries = []
+    enriched_count = 0
+    for entry in chunk_index.get("entries") or []:
+        if not isinstance(entry, dict):
+            continue
+        item = dict(entry)
+        chunk = chunk_by_id.get(str(item.get("chunk_id") or ""))
+        if isinstance(chunk, dict):
+            for key in ["semantic_summary", "mechanism_tags", "failure_modes", "retrieval_keywords"]:
+                value = chunk.get(key)
+                if value:
+                    item[key] = value
+            if chunk.get("semantic_enrichment"):
+                item["semantic_enrichment"] = chunk.get("semantic_enrichment")
+                enriched_count += 1
+        entries.append(item)
+    merged["entries"] = entries
+    metadata = dict(merged.get("metadata") or {})
+    metadata["s1_semantic_enrichment_entries"] = enriched_count
+    merged["metadata"] = metadata
+    return merged
+
+
+def _s1_semantic_merge_report(
+    *,
+    records_by_id: dict[str, dict[str, Any]],
+    source_paths: list[str],
+    paper_chunks: list[dict[str, Any]],
+    rebuttal_chunks: list[dict[str, Any]],
+    code_chunks: list[dict[str, Any]],
+    chunk_index: dict[str, Any],
+) -> dict[str, Any]:
+    def count_enriched(items: list[dict[str, Any]]) -> int:
+        return sum(1 for item in items if isinstance(item, dict) and isinstance(item.get("semantic_enrichment"), dict))
+
+    entries = chunk_index.get("entries") if isinstance(chunk_index, dict) and isinstance(chunk_index.get("entries"), list) else []
+    records_by_source: dict[str, int] = {}
+    fallback_count = 0
+    prompt_versions: dict[str, int] = {}
+    for record in records_by_id.values():
+        chunk = record.get("chunk") if isinstance(record.get("chunk"), dict) else {}
+        source_type = str(chunk.get("source_type") or "unknown")
+        records_by_source[source_type] = records_by_source.get(source_type, 0) + 1
+        if record.get("fallback_used"):
+            fallback_count += 1
+        prompt_version = str(record.get("prompt_version") or "unknown")
+        prompt_versions[prompt_version] = prompt_versions.get(prompt_version, 0) + 1
+    return {
+        "schema_version": "c2c_s1_semantic_enrichment_merge_report_v1",
+        "generated_at": now_utc(),
+        "status": "ok",
+        "records_loaded": len(records_by_id),
+        "records_by_source_type": records_by_source,
+        "fallback_records_loaded": fallback_count,
+        "prompt_versions": prompt_versions,
+        "source_paths": _dedupe_texts(source_paths, max_items=200),
+        "chunks_enriched": {
+            "paper": count_enriched(paper_chunks),
+            "rebuttal": count_enriched(rebuttal_chunks),
+            "code": count_enriched(code_chunks),
+        },
+        "chunk_index_entries_enriched": sum(1 for entry in entries if isinstance(entry, dict) and isinstance(entry.get("semantic_enrichment"), dict)),
+    }
+
+
+def _dedupe_texts(values: list[Any], *, max_items: int = 40) -> list[str]:
+    seen = set()
+    result = []
+    for value in values:
+        text = str(value).strip()
+        key = text.lower()
+        if not text or key in seen:
+            continue
+        seen.add(key)
+        result.append(text)
+        if len(result) >= max_items:
+            break
+    return result
+
+
 def _code_repo_map_markdown(repo_map: dict[str, Any]) -> str:
     if not isinstance(repo_map, dict):
         return "# Code Repo Map\n\nNo code repo map available.\n"
@@ -1184,12 +1552,32 @@ def _use_legacy_c2c_debate(config: dict[str, Any]) -> bool:
     return bool(debate_cfg.get("legacy_multi_agent")) or strategy in {"legacy_multi_agent", "legacy_debate", "multi_agent_debate"}
 
 
+def _s1_novelty_auditor_config(config: dict[str, Any], *, mode: str = "c2c") -> dict[str, Any]:
+    cfg = ((config.get("agents") or {}).get("s1_novelty_auditor") or {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    default_enabled = False
+    return {
+        "enabled": bool(cfg.get("enabled", default_enabled)),
+        "threshold": float(cfg.get("threshold") or 0.58),
+        "max_revision_rounds": int(cfg.get("max_revision_rounds") or 1),
+        "timeout_seconds": int(cfg.get("timeout_seconds") or (config.get("llm", {}) or {}).get("timeout_seconds") or 900),
+        "session_key": str(cfg.get("session_key") or ("s1:c2c_novelty_auditor" if mode == "c2c" else "s1:generic_novelty_auditor")),
+        "resume_enabled": bool(cfg.get("resume_enabled", True)),
+        "sandbox": str(cfg.get("sandbox") or "read-only"),
+        "approval_policy": str(cfg.get("approval_policy") or "never"),
+        "json_events": bool(cfg.get("json_events", True)),
+        "model": cfg.get("model"),
+    }
+
+
 def _s1_codex_agent_config(config: dict[str, Any], *, mode: str = "c2c") -> dict[str, Any]:
     cfg: dict[str, Any] = {
         "strategy": "codex_resume_evidence_agent",
         "session_key": "s1:c2c_evidence_direction" if mode == "c2c" else "s1:generic_evidence_direction",
         "max_json_repairs": 2,
         "resume_enabled": True,
+        "duplicate_direction_reset_threshold": 1,
     }
     agent_cfg = ((config.get("agents") or {}).get("s1_evidence_agent") or {})
     c2c_cfg = ((config.get("c2c") or {}).get("s1_evidence_agent") or {}) if mode == "c2c" else {}
@@ -1215,7 +1603,18 @@ def _s1_codex_evidence_prompt(
     negative_memory: dict[str, Any],
     rebuttal_matrix: dict[str, Any],
     feedback: list[dict[str, Any]],
+    config: dict[str, Any],
 ) -> str:
+    shared_method_memory = shared_method_memory_for_prompt(
+        config,
+        limit=12,
+        query_context=shared_method_memory_query_context(
+            config,
+            topic=topic,
+            feedback=feedback,
+            negative_memory=negative_memory,
+        ),
+    )
     context_payload = {
         "schema_version": "c2c_s1_codex_prompt_context_v1",
         "topic": topic,
@@ -1233,6 +1632,7 @@ def _s1_codex_evidence_prompt(
             "intake/c2c/code_intake_report.json",
             "intake/c2c/code_retrieval_index.json",
             "intake/c2c/negative_result_memory.json",
+            "intake/shared_method_failure_memory.json",
             "experiment/results/failure_feedback.json",
             "plan/direction_scorecard.json",
         ],
@@ -1243,6 +1643,7 @@ def _s1_codex_evidence_prompt(
         "implementation_surface_map": _compact_json_value(implementation_surface_map, max_chars=6000),
         "code_retrieval_index": _compact_json_value(code_retrieval_index, max_chars=5000),
         "negative_memory": _compact_json_value(negative_memory, max_chars=5000),
+        "shared_method_failure_memory": _compact_json_value(shared_method_memory, max_chars=7000),
         "rebuttal_matrix": _compact_json_value(rebuttal_matrix, max_chars=5000),
         "method_level_failure_feedback": _compact_json_value(feedback[:12], max_chars=7000),
     }
@@ -1281,7 +1682,9 @@ def _s1_codex_evidence_prompt(
             "expected_files": ["high-level likely edit surfaces, not a concrete patch plan"],
             "verification_commands": ["required checks S2/S3 must preserve"],
             "rationale": "why this direction is worth trying now",
+            "used_shared_memory_refs": ["memory_id values from shared_method_failure_memory that influenced this decision, or []"],
         },
+        "used_shared_memory_refs": ["memory_id values from shared_method_failure_memory that influenced this decision, or []"],
         "selected_ideas": [
             {
                 "id": "same as direction_decision.direction_id",
@@ -1301,6 +1704,7 @@ def _s1_codex_evidence_prompt(
                 "code_refs": [{"source_type": "code", "source_label": "file or symbol", "claim": "implementation surface"}],
                 "s1_allowed_variants": ["broad variant families S2 may explore"],
                 "s1_forbidden_patterns": ["method patterns S2 must avoid"],
+                "used_shared_memory_refs": ["same memory ids used by this direction, or []"],
             }
         ],
         "negative_constraints": {
@@ -1320,6 +1724,8 @@ def _s1_codex_evidence_prompt(
             "You are the S1 Codex resume evidence agent for an automated C2C research loop.",
             "Work read-only. You may inspect the listed artifacts with shell commands if the brief is not enough. Do not edit files.",
             "S1 only chooses a method direction. Ignore S2.5 implementation/runtime errors as method evidence unless they reveal an actual method-level infeasibility.",
+            "shared_method_failure_memory.memory_catalog/recent_entries is a lightweight retrieved error catalog, ranked by memory_retrieval.combined_score and memory_quality.priority; follow retrieval_policy/ranking_policy and prioritize high_quality_memory_ids, especially proxy_full_false_positive, full_train_failure, proxy_dataset_misprediction, cross_project_mechanism_failure, and ablation_evidence. If a catalog item seems decision-relevant, inspect the full memory via full_memory_access/read_hint before relying on detailed evidence.",
+            "If shared_method_failure_memory affects the direction or forbidden patterns, copy the exact memory_id values into used_shared_memory_refs. Use [] if none affected the decision.",
             "Pick exactly one mechanism direction. Do not produce concrete patch variants; S2 will do that from direction_decision.allowed_variants.",
             "Optimize for effect-first discovery: the output should help S2/S2.5 find a runnable patch with cheap proxy upside and no evaluator contamination.",
             "selected_ideas must contain exactly one selected high-level direction card. It is the S1 output passed to S2; do not make the program infer it for you.",
@@ -1339,7 +1745,13 @@ def _generic_s1_codex_evidence_prompt(
     survey: str,
     theme_map_path: str | None,
     resources: dict[str, Any],
+    config: dict[str, Any],
 ) -> str:
+    shared_method_memory = shared_method_memory_for_prompt(
+        config,
+        limit=12,
+        query_context=shared_method_memory_query_context(config, topic=topic),
+    )
     compact_papers = [
         {
             "paper_id": paper.get("paper_id"),
@@ -1361,6 +1773,7 @@ def _generic_s1_codex_evidence_prompt(
             "literature/survey.md",
             *(["literature/theme_map.md"] if theme_map_path else []),
             "meta/negative_memory.jsonl",
+            "intake/shared_method_failure_memory.json",
             "experiment/results/failure_feedback.json",
             "plan/performance_feedback.json",
         ],
@@ -1368,6 +1781,7 @@ def _generic_s1_codex_evidence_prompt(
         "survey_excerpt": survey[:10000],
         "theme_map_path": theme_map_path,
         "local_resources": _compact_json_value(resources, max_chars=6000),
+        "shared_method_failure_memory": _compact_json_value(shared_method_memory, max_chars=7000),
     }
     output_contract = {
         "schema_version": "generic_s1_codex_direction_v1",
@@ -1400,7 +1814,9 @@ def _generic_s1_codex_evidence_prompt(
             "target_datasets": ["dataset or benchmark names if known"],
             "failure_focus": ["what S2/S3 should diagnose"],
             "rationale": "why this direction is worth trying now",
+            "used_shared_memory_refs": ["memory_id values from shared_method_failure_memory that influenced this decision, or []"],
         },
+        "used_shared_memory_refs": ["memory_id values from shared_method_failure_memory that influenced this decision, or []"],
         "selected_ideas": [
             {
                 "id": "same as direction_decision.direction_id",
@@ -1417,6 +1833,7 @@ def _generic_s1_codex_evidence_prompt(
                 "key_references": ["paper ids or artifact refs"],
                 "evidence_refs": [{"source_type": "paper", "source_label": "paper id or artifact", "claim": "supporting fact"}],
                 "counterevidence_refs": [{"source_type": "artifact", "source_label": "artifact or risk", "claim": "risk fact"}],
+                "used_shared_memory_refs": ["same memory ids used by this idea, or []"],
             }
         ],
         "negative_constraints": {
@@ -1435,6 +1852,8 @@ def _generic_s1_codex_evidence_prompt(
             "You are the global S1 Codex resume evidence agent for an automated research loop.",
             "Work read-only. You may inspect listed artifacts if the brief is not enough. Do not edit files.",
             "S1 chooses one high-level research idea/direction. S2 turns it into concrete experiment candidates.",
+            "shared_method_failure_memory.memory_catalog/recent_entries is a lightweight retrieved error catalog, ranked by memory_retrieval.combined_score and memory_quality.priority; follow retrieval_policy/ranking_policy and prioritize high_quality_memory_ids, especially proxy_full_false_positive, full_train_failure, proxy_dataset_misprediction, cross_project_mechanism_failure, and ablation_evidence. If a catalog item seems decision-relevant, inspect the full memory via full_memory_access/read_hint before relying on detailed evidence.",
+            "If shared_method_failure_memory affects the idea or forbidden patterns, copy the exact memory_id values into used_shared_memory_refs. Use [] if none affected the decision.",
             "Return exactly one selected idea in selected_ideas. Do not let the program infer missing idea content.",
             "Return only one valid JSON object. No markdown, no comments, no prose outside JSON.",
             "Context JSON:",
@@ -1455,6 +1874,7 @@ def _run_s1_codex_evidence_agent(
     mode: str = "c2c",
 ) -> dict[str, Any]:
     cfg = _s1_codex_agent_config(config, mode=mode)
+    novelty_cfg = _s1_novelty_auditor_config(config, mode=mode)
     session_key = str(cfg.get("session_key") or "s1:c2c_evidence_direction")
     if not shutil.which("codex"):
         return {
@@ -1463,6 +1883,7 @@ def _run_s1_codex_evidence_agent(
             "session_key": session_key,
             "attempts": [],
         }
+    reset_info = _maybe_reset_s1_codex_session_before_run(project_root, session_key, cfg, mode=mode)
     session_record = _load_s1_codex_session_record(project_root, session_key)
     session_id = _session_id_from_record(session_record) if cfg.get("resume_enabled", True) else None
     used_existing_session = bool(session_id)
@@ -1471,14 +1892,17 @@ def _run_s1_codex_evidence_agent(
     previous_output = ""
     previous_status = ""
     total_attempts = max(1, int(max_repairs) + 1)
+    total_attempts += max(0, int(novelty_cfg.get("max_revision_rounds") or 0)) if novelty_cfg.get("enabled") else 0
+    novelty_audits: list[dict[str, Any]] = []
 
     for attempt_idx in range(total_attempts):
         repair_attempt = attempt_idx > 0
-        current_prompt = (
-            _s1_codex_json_repair_prompt(validation_errors, previous_output, previous_status, mode=mode)
-            if repair_attempt
-            else prompt
-        )
+        if repair_attempt and previous_status == "novelty_rejected":
+            current_prompt = previous_output
+        elif repair_attempt:
+            current_prompt = _s1_codex_json_repair_prompt(validation_errors, previous_output, previous_status, mode=mode)
+        else:
+            current_prompt = prompt
         call = _run_s1_codex_cli_once(
             project_root=project_root,
             config=config,
@@ -1497,15 +1921,44 @@ def _run_s1_codex_evidence_agent(
         payload = call.get("payload") if isinstance(call.get("payload"), dict) else None
         if status == "ok" and payload is not None:
             validation_errors = _validate_s1_codex_payload(payload, mode=mode)
+            evidence_ref_report = resolve_s1_evidence_refs(project_root, payload, mode=mode)
+            if evidence_ref_report.get("status") != "pass":
+                validation_errors.extend(evidence_ref_errors_for_repair(evidence_ref_report))
             if not validation_errors:
+                shared_memory = shared_method_memory_for_prompt(config, limit=12)
+                novelty_audit = _run_s1_novelty_auditor(
+                    project_root=project_root,
+                    config=config,
+                    payload=payload,
+                    shared_memory=shared_memory,
+                    mode=mode,
+                )
+                novelty_audits.append(novelty_audit)
+                if not novelty_audit.get("passed", True):
+                    validation_errors = ["s1_novelty_audit_rejected: direction too similar to prior ideas or memories"]
+                    previous_status = "novelty_rejected"
+                    previous_output = _s1_revision_feedback_prompt(novelty_audit.get("audit") or novelty_audit, payload, mode=mode)
+                    continue
+                post_reset = _record_s1_codex_session_health(
+                    project_root,
+                    session_key,
+                    session_id,
+                    cfg,
+                    payload,
+                    mode=mode,
+                )
                 return {
                     "status": "ok",
                     "payload": payload,
+                    "evidence_ref_report": evidence_ref_report,
                     "session_key": session_key,
                     "session_id": session_id,
                     "used_existing_session": used_existing_session,
                     "repair_count": attempt_idx,
                     "attempts": attempts,
+                    "novelty_audits": novelty_audits,
+                    "session_reset": bool(reset_info or post_reset),
+                    "session_reset_reason": (post_reset or reset_info or {}).get("reason"),
                 }
             previous_status = "contract_invalid"
         else:
@@ -1521,6 +1974,9 @@ def _run_s1_codex_evidence_agent(
         "used_existing_session": used_existing_session,
         "repair_count": max(0, total_attempts - 1),
         "attempts": attempts,
+        "novelty_audits": novelty_audits,
+        "session_reset": bool(reset_info),
+        "session_reset_reason": (reset_info or {}).get("reason"),
         "validation_errors": validation_errors,
         "last_output_tail": previous_output[-2000:],
     }
@@ -1537,10 +1993,12 @@ def _run_s1_codex_cli_once(
     repair_attempt: bool,
     attempt: int,
     mode: str,
+    task_prefix: str | None = None,
+    agent_config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     llm_cfg = config.get("llm", {}) or {}
     codex_cfg = llm_cfg.get("codex_cli") or {}
-    agent_cfg = _s1_codex_agent_config(config, mode=mode)
+    agent_cfg = agent_config or _s1_codex_agent_config(config, mode=mode)
     with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as handle:
         output_path = Path(handle.name)
     command = ["codex"]
@@ -1558,11 +2016,7 @@ def _run_s1_codex_cli_once(
     else:
         command.append("-")
 
-    merged_prompt = (
-        "Follow this task exactly. You are selecting an S1 method direction only. "
-        "Do not edit files. Return only valid JSON.\n\n"
-        f"{prompt}"
-    )
+    merged_prompt = f"{task_prefix or 'Follow this task exactly. You are selecting an S1 method direction only. Do not edit files. Return only valid JSON.'}\n\n{prompt}"
     started = now_utc()
     start_monotonic = time.monotonic()
     try:
@@ -1573,6 +2027,7 @@ def _run_s1_codex_cli_once(
             input=merged_prompt,
             cwd=project_root,
             timeout=max(1, int(timeout_seconds)),
+            env=codex_subprocess_env(config),
         )
         raw_text = output_path.read_text(encoding="utf-8") if output_path.exists() else ""
     except subprocess.TimeoutExpired as exc:
@@ -1639,6 +2094,175 @@ def _s1_codex_json_repair_prompt(validation_errors: list[str], previous_output: 
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
+def _s1_revision_feedback_prompt(audit: dict[str, Any], previous_payload: dict[str, Any], *, mode: str = "c2c") -> str:
+    schema_name = "c2c_s1_codex_direction_v1" if mode == "c2c" else "generic_s1_codex_direction_v1"
+    return "\n\n".join(
+        [
+            "Your previous S1 direction was rejected by the independent novelty auditor.",
+            "Generate a revised S1 direction that stays method-level but is less similar to prior ideas/memories.",
+            "Do not edit files. Return only valid JSON matching the original S1 schema.",
+            "You must explicitly address novelty_audit.revision_guidance and avoid repeated similarity sources.",
+            "Do not solve this by renaming the same mechanism; change the core mechanism hypothesis or allowed variant family.",
+            "Novelty audit JSON:",
+            json.dumps(audit, ensure_ascii=False, indent=2),
+            "Previous rejected S1 payload:",
+            json.dumps(previous_payload, ensure_ascii=False, indent=2)[:12000],
+            "Required schema:",
+            schema_name,
+        ]
+    )
+
+
+def _s1_novelty_auditor_prompt(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+    payload: dict[str, Any],
+    shared_memory: dict[str, Any],
+    threshold: float,
+    mode: str,
+) -> str:
+    ideas = payload.get("selected_ideas") if isinstance(payload.get("selected_ideas"), list) else []
+    direction = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
+    local_history = {
+        "negative_memory": _safe_read_json_artifact(project_root / ("intake/c2c/negative_result_memory.json" if mode == "c2c" else "meta/negative_memory.jsonl")),
+        "performance_feedback": _safe_read_json_artifact(project_root / "plan/performance_feedback.json"),
+        "direction_scorecard": _safe_read_json_artifact(project_root / "plan/direction_scorecard.json"),
+        "s2_planner_memory": _safe_read_json_artifact(project_root / "plan/s2_planner_memory.json"),
+    }
+    context = {
+        "schema_version": f"{mode}_s1_novelty_audit_context_v1",
+        "mode": mode,
+        "threshold": threshold,
+        "new_direction": direction,
+        "new_selected_ideas": ideas[:1],
+        "shared_method_failure_memory": _compact_json_value(shared_memory, max_chars=9000),
+        "local_history": _compact_json_value(local_history, max_chars=9000),
+    }
+    output_contract = {
+        "schema_version": f"{mode}_s1_novelty_audit_v1",
+        "status": "ok",
+        "novelty_score": "float 0.0-1.0 where higher means less similar to old ideas/memories",
+        "max_similarity_score": "float 0.0-1.0 where higher means more similar to one old idea/memory",
+        "passed": "true if novelty_score >= threshold and no high-risk near-duplicate exists",
+        "threshold": threshold,
+        "most_similar_sources": [
+            {
+                "source_type": "shared_memory|local_history|direction_scorecard|s2_planner_memory",
+                "source_id": "memory_id/path/id",
+                "similarity_score": "float 0.0-1.0",
+                "overlap": ["mechanism", "dataset", "integration point", "failure mode"],
+                "why_similar": "short factual reason",
+            }
+        ],
+        "distinctive_elements": ["what is genuinely different"],
+        "repeated_patterns": ["old pattern repeated by new idea"],
+        "revision_guidance": ["concrete method-level changes S1 should make if rejected"],
+        "decision": "pass|revise",
+    }
+    return "\n\n".join(
+        [
+            "You are an independent S1 novelty auditor.",
+            "Your job is to compare the new S1 idea/direction against shared memory and local historical failures.",
+            "Score semantic and mechanism similarity, not just string overlap.",
+            "Reject if the direction is essentially a renamed old mechanism, repeats a failed mechanism/dataset/failure-mode combination, or differs only by local tuning.",
+            "Pass if the core mechanism is meaningfully different enough for S2 to explore.",
+            "Do not edit files. Return only one valid JSON object.",
+            "Context JSON:",
+            json.dumps(context, ensure_ascii=False, indent=2),
+            "Required JSON shape:",
+            json.dumps(output_contract, ensure_ascii=False, indent=2),
+        ]
+    )
+
+
+def _run_s1_novelty_auditor(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+    payload: dict[str, Any],
+    shared_memory: dict[str, Any],
+    mode: str = "c2c",
+) -> dict[str, Any]:
+    cfg = _s1_novelty_auditor_config(config, mode=mode)
+    threshold = float(cfg.get("threshold") or 0.58)
+    if not cfg.get("enabled"):
+        return {"status": "skipped", "enabled": False, "passed": True, "threshold": threshold, "reason": "disabled"}
+    if not shutil.which("codex"):
+        return {"status": "skipped", "enabled": True, "passed": True, "threshold": threshold, "reason": "codex executable not found"}
+    session_key = str(cfg.get("session_key"))
+    prompt = _s1_novelty_auditor_prompt(project_root=project_root, config=config, payload=payload, shared_memory=shared_memory, threshold=threshold, mode=mode)
+    call = _run_s1_codex_cli_once(
+        project_root=project_root,
+        config=config,
+        session_key=session_key,
+        session_id=_session_id_from_record(_load_s1_codex_session_record(project_root, session_key)) if cfg.get("resume_enabled", True) else None,
+        prompt=prompt,
+        timeout_seconds=int(cfg.get("timeout_seconds") or 900),
+        repair_attempt=False,
+        attempt=1,
+        mode=mode,
+        task_prefix="Follow this task exactly. You are auditing S1 novelty only. Do not edit files. Return only valid JSON.",
+        agent_config=cfg,
+    )
+    audit_payload = call.get("payload") if isinstance(call.get("payload"), dict) else {}
+    errors = _validate_s1_novelty_audit_payload(audit_payload)
+    if call.get("status") != "ok" or errors:
+        return {
+            "status": "invalid" if errors else str(call.get("status") or "failed"),
+            "enabled": True,
+            "passed": True,
+            "threshold": threshold,
+            "reason": "; ".join(errors) if errors else call.get("reason"),
+            "call": _s1_codex_attempt_summary(call),
+        }
+    score = _float_or_default(audit_payload.get("novelty_score"), 0.0)
+    passed = bool(audit_payload.get("passed")) and score >= threshold
+    return {
+        "status": "ok",
+        "enabled": True,
+        "passed": passed,
+        "threshold": threshold,
+        "audit": audit_payload,
+        "call": _s1_codex_attempt_summary(call),
+    }
+
+
+def _validate_s1_novelty_audit_payload(payload: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(payload, dict) or not payload:
+        return ["audit output must be a non-empty object"]
+    if str(payload.get("status") or "ok").lower() not in {"ok", "pass", "revise"}:
+        errors.append("status must be ok/pass/revise")
+    if not isinstance(payload.get("novelty_score"), (int, float)):
+        errors.append("novelty_score must be numeric")
+    if not isinstance(payload.get("max_similarity_score"), (int, float)):
+        errors.append("max_similarity_score must be numeric")
+    if not isinstance(payload.get("passed"), bool):
+        errors.append("passed must be boolean")
+    if not isinstance(payload.get("most_similar_sources"), list):
+        errors.append("most_similar_sources must be a list")
+    if not isinstance(payload.get("revision_guidance"), list):
+        errors.append("revision_guidance must be a list")
+    return errors
+
+
+def _float_or_default(value: Any, default: float) -> float:
+    try:
+        if isinstance(value, bool):
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_read_json_artifact(path: Path) -> Any:
+    try:
+        return read_json(path, default={}) or {}
+    except Exception:
+        return {}
+
+
 def _validate_s1_codex_payload(payload: dict[str, Any], *, mode: str = "c2c") -> list[str]:
     errors: list[str] = []
     if not isinstance(payload, dict):
@@ -1698,7 +2322,7 @@ def _validate_s1_codex_payload(payload: dict[str, Any], *, mode: str = "c2c") ->
     return errors
 
 
-def _s1_codex_direction_cards(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _s1_codex_direction_cards(payload: dict[str, Any], *, used_shared_memory_refs: list[str] | None = None) -> list[dict[str, Any]]:
     raw = payload.get("selected_ideas")
     if not isinstance(raw, list):
         return []
@@ -1713,16 +2337,18 @@ def _s1_codex_direction_cards(payload: dict[str, Any]) -> list[dict[str, Any]]:
             card["s1_direction_id"] = str(card.get("s1_direction_id") or card.get("direction_id") or direction_id)
             card["direction_id"] = str(card.get("direction_id") or direction_id)
         card["selected"] = True
+        card["used_shared_memory_refs"] = list(used_shared_memory_refs if used_shared_memory_refs is not None else card.get("used_shared_memory_refs") or [])
         card["s1_evidence_agent"] = {
             "source": "codex_resume_evidence_agent",
             "direction_id": card.get("s1_direction_id") or card.get("direction_id") or direction_id,
             "evidence_bundle_items": len((payload.get("evidence_bundle") or {}).get("items") or []) if isinstance(payload.get("evidence_bundle"), dict) else 0,
+            "used_shared_memory_refs": list(used_shared_memory_refs or []),
         }
         cards.append(card)
     return cards
 
 
-def _generic_s1_codex_ideas(payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _generic_s1_codex_ideas(payload: dict[str, Any], *, used_shared_memory_refs: list[str] | None = None) -> list[dict[str, Any]]:
     raw = payload.get("selected_ideas")
     if not isinstance(raw, list):
         return []
@@ -1736,13 +2362,33 @@ def _generic_s1_codex_ideas(payload: dict[str, Any]) -> list[dict[str, Any]]:
         if direction_id:
             idea.setdefault("direction_id", direction_id)
         idea["selected"] = True
+        idea["used_shared_memory_refs"] = list(used_shared_memory_refs if used_shared_memory_refs is not None else idea.get("used_shared_memory_refs") or [])
         idea["s1_evidence_agent"] = {
             "source": "codex_resume_evidence_agent",
             "direction_id": idea.get("direction_id") or direction_id or idea.get("id"),
             "evidence_bundle_items": len((payload.get("evidence_bundle") or {}).get("items") or []) if isinstance(payload.get("evidence_bundle"), dict) else 0,
+            "used_shared_memory_refs": list(used_shared_memory_refs or []),
         }
         ideas.append(idea)
     return ideas
+
+
+def _attach_s1_novelty_audit_to_ideas(ideas: list[dict[str, Any]], audits: list[dict[str, Any]] | None) -> None:
+    if not ideas or not audits:
+        return
+    latest = next((item for item in reversed(audits) if isinstance(item, dict)), {})
+    audit = latest.get("audit") if isinstance(latest.get("audit"), dict) else {}
+    summary = {
+        "status": latest.get("status"),
+        "passed": latest.get("passed"),
+        "threshold": latest.get("threshold"),
+        "novelty_score": audit.get("novelty_score"),
+        "max_similarity_score": audit.get("max_similarity_score"),
+        "most_similar_sources": (audit.get("most_similar_sources") or [])[:5] if isinstance(audit.get("most_similar_sources"), list) else [],
+    }
+    for idea in ideas:
+        if isinstance(idea, dict):
+            idea["s1_novelty_audit"] = {key: value for key, value in summary.items() if value not in (None, "", [], {})}
 
 
 def _s1_codex_payload_refs(payload: dict[str, Any]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
@@ -1804,6 +2450,10 @@ def _summarize_chunk_index_for_prompt(chunk_index: dict[str, Any]) -> dict[str, 
                 "source_path": entry.get("source_path"),
                 "section": entry.get("section"),
                 "keywords": entry.get("keywords"),
+                "semantic_summary": entry.get("semantic_summary"),
+                "mechanism_tags": entry.get("mechanism_tags"),
+                "failure_modes": entry.get("failure_modes"),
+                "retrieval_keywords": entry.get("retrieval_keywords"),
             }
         )
     return {
@@ -1832,6 +2482,104 @@ def _session_id_from_record(session: dict[str, Any]) -> str | None:
     return None
 
 
+def _maybe_reset_s1_codex_session_before_run(project_root: Path, session_key: str, cfg: dict[str, Any], *, mode: str) -> dict[str, Any] | None:
+    if not cfg.get("resume_enabled", True):
+        return None
+    reason = ""
+    if mode == "c2c" and _s1_direction_budget_exhausted(project_root, cfg):
+        reason = "same_direction_budget_exhausted"
+    if not reason:
+        return None
+    return _reset_s1_codex_session(project_root, session_key, reason=reason, phase="before_run")
+
+
+def _s1_direction_budget_exhausted(project_root: Path, cfg: dict[str, Any]) -> bool:
+    scorecard = read_json(project_root / "plan" / "direction_scorecard.json", default={}) or {}
+    current = scorecard.get("current_direction") if isinstance(scorecard, dict) else {}
+    summary = current.get("summary") if isinstance(current, dict) else {}
+    feedback = current.get("s1_feedback") if isinstance(current, dict) else {}
+    if isinstance(feedback, dict) and feedback.get("recommendation") == "return_to_s1_new_direction":
+        return True
+    try:
+        count = int(summary.get("same_direction_failure_count") or 0)
+        budget = int(summary.get("same_direction_failure_budget") or cfg.get("same_direction_failure_reset_threshold") or 5)
+    except (TypeError, ValueError):
+        return False
+    return bool(budget and count >= budget)
+
+
+def _record_s1_codex_session_health(
+    project_root: Path,
+    session_key: str,
+    session_id: str | None,
+    cfg: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    mode: str,
+) -> dict[str, Any] | None:
+    if not session_id:
+        return None
+    direction_id = _s1_payload_direction_id(payload)
+    if not direction_id:
+        return None
+    path = project_root / "meta" / "codex_sessions.yaml"
+    sessions_payload = read_yaml(path, default={"sessions": {}}) or {"sessions": {}}
+    sessions_payload.setdefault("sessions", {})
+    record = sessions_payload["sessions"].get(session_key) if isinstance(sessions_payload["sessions"].get(session_key), dict) else {}
+    health = record.get("health") if isinstance(record.get("health"), dict) else {}
+    last_direction_id = health.get("last_direction_id")
+    duplicate_streak = int(health.get("duplicate_direction_streak") or 0)
+    duplicate_streak = duplicate_streak + 1 if last_direction_id == direction_id else 0
+    health.update(
+        {
+            "last_direction_id": direction_id,
+            "duplicate_direction_streak": duplicate_streak,
+            "updated_at": now_utc(),
+            "mode": mode,
+        }
+    )
+    record["health"] = health
+    sessions_payload["sessions"][session_key] = record
+    write_yaml(path, sessions_payload)
+    threshold = max(1, int(cfg.get("duplicate_direction_reset_threshold") or 2))
+    if duplicate_streak >= threshold:
+        return _reset_s1_codex_session(project_root, session_key, reason="duplicate_direction_streak", phase="after_run", extra={"direction_id": direction_id, "duplicate_direction_streak": duplicate_streak})
+    return None
+
+
+def _s1_payload_direction_id(payload: dict[str, Any]) -> str:
+    decision = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
+    direction_id = decision.get("direction_id")
+    if direction_id:
+        return str(direction_id)
+    for item in payload.get("selected_ideas") or []:
+        if isinstance(item, dict) and (item.get("s1_direction_id") or item.get("direction_id") or item.get("id")):
+            return str(item.get("s1_direction_id") or item.get("direction_id") or item.get("id"))
+    return ""
+
+
+def _reset_s1_codex_session(project_root: Path, session_key: str, *, reason: str, phase: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    path = project_root / "meta" / "codex_sessions.yaml"
+    payload = read_yaml(path, default={"sessions": {}}) or {"sessions": {}}
+    payload.setdefault("sessions", {})
+    previous = payload["sessions"].pop(session_key, None)
+    event = {
+        "event": "session_reset",
+        "session_key": session_key,
+        "reason": reason,
+        "phase": phase,
+        "previous_session_id": previous.get("session_id") if isinstance(previous, dict) else None,
+        "timestamp": now_utc(),
+        **(extra or {}),
+    }
+    payload.setdefault("session_reset_history", [])
+    payload["session_reset_history"].append(event)
+    payload["session_reset_history"] = payload["session_reset_history"][-50:]
+    write_yaml(path, payload)
+    _append_s1_codex_event(project_root, session_key, event)
+    return event
+
+
 def _save_s1_codex_session(project_root: Path, session_key: str, session_id: str, config: dict[str, Any], call: dict[str, Any]) -> None:
     path = project_root / "meta" / "codex_sessions.yaml"
     payload = read_yaml(path, default={"sessions": {}}) or {"sessions": {}}
@@ -1844,6 +2592,7 @@ def _save_s1_codex_session(project_root: Path, session_key: str, session_id: str
         "updated_at": now_utc(),
         "purpose": "s1_c2c_evidence_direction",
         "created_at": previous.get("created_at") or now_utc(),
+        "health": previous.get("health") if isinstance(previous.get("health"), dict) else {},
         "last_call": _s1_codex_attempt_summary(call),
     }
     write_yaml(path, payload)

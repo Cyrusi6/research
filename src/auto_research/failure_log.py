@@ -11,6 +11,18 @@ from .utils import now_utc
 
 C2C_FAILED_DECISIONS = {None, "not_viable", "failed_no_metrics", "partial", "blocked", "patch_rejected", "proxy_rejected", "proxy_repairable"}
 C2C_FEEDBACK_VIEWS = {"all", "implementation", "method"}
+C2C_RETRYABLE_PAUSE_TYPES = {
+    "runtime_smoke_resource_retry",
+    "s3_proxy_resource_retry",
+    "codex_quota_or_rate_limit",
+    "retryable_quota_or_rate_limit",
+}
+C2C_RESOURCE_FAILURE_CATEGORIES = {
+    "resource_oom",
+    "s3_proxy_resource_oom",
+    "s3_proxy_gpu_resource_retry",
+    "runtime_smoke_resource_retry",
+}
 
 
 class FailureLogManager:
@@ -240,11 +252,21 @@ def build_c2c_feedback_bundle(
     view: str = "all",
 ) -> dict[str, Any]:
     view = view if view in C2C_FEEDBACK_VIEWS else "all"
+    entries = [
+        cleaned
+        for cleaned in (_strip_retryable_c2c_feedback_noise(entry) for entry in entries if isinstance(entry, dict))
+        if cleaned
+    ]
+    traces = [
+        cleaned
+        for cleaned in (_strip_retryable_c2c_feedback_noise(trace) for trace in (traces or []) if isinstance(trace, dict))
+        if cleaned
+    ]
     normalized_entries = _dedupe_c2c_feedback_entries(
         [_normalize_feedback_entry(entry) for entry in entries if isinstance(entry, dict)]
     )
     normalized_traces = _dedupe_c2c_feedback_entries(
-        [_normalize_feedback_entry(entry) for entry in (traces or []) if isinstance(entry, dict)]
+        [_normalize_feedback_entry(entry) for entry in traces if isinstance(entry, dict)]
     )
     if view == "method":
         normalized_entries = _dedupe_c2c_feedback_entries(_method_feedback_entries(normalized_entries))
@@ -308,7 +330,108 @@ def load_c2c_feedback_bundle(project_root: Path, *, view: str = "all") -> dict[s
         _, trace_entries, trace_traces = _load_feedback_payloads(trace_path, kind="traces")
         traces.extend(trace_traces or trace_entries)
 
+    if view == "method":
+        shared_memory_path = project_root / "intake" / "shared_method_failure_memory.json"
+        if shared_memory_path.exists():
+            sources.append(_relative_path(project_root, shared_memory_path))
+            _, shared_entries, _ = _load_feedback_payloads(shared_memory_path)
+            entries.extend(shared_entries)
+
     return build_c2c_feedback_bundle(entries, project_id=project_root.name, traces=traces, sources=sources, view=view)
+
+
+def is_retryable_c2c_candidate(candidate: dict[str, Any] | None) -> bool:
+    if not isinstance(candidate, dict):
+        return False
+    if candidate.get("resource_retry") is True:
+        return True
+    if candidate.get("pause_type") in C2C_RETRYABLE_PAUSE_TYPES:
+        return True
+    if candidate.get("failure_category") in C2C_RESOURCE_FAILURE_CATEGORIES:
+        return True
+    proxy = candidate.get("proxy_screen") if isinstance(candidate.get("proxy_screen"), dict) else {}
+    if proxy.get("resource_retry") is True:
+        return True
+    if proxy.get("status") == "resource_retry":
+        return True
+    if proxy.get("failure_category") in C2C_RESOURCE_FAILURE_CATEGORIES:
+        return True
+    command_failure = proxy.get("command_failure") if isinstance(proxy.get("command_failure"), dict) else {}
+    if command_failure.get("category") in C2C_RESOURCE_FAILURE_CATEGORIES:
+        return True
+    validation = ((candidate.get("patch_result") or {}).get("validation") or {}) if isinstance(candidate.get("patch_result"), dict) else {}
+    if validation.get("resource_retry") is True or validation.get("failure_category") in C2C_RESOURCE_FAILURE_CATEGORIES:
+        return True
+    for check in validation.get("checks") or []:
+        if isinstance(check, dict) and (check.get("resource_retry") is True or check.get("failure_category") in C2C_RESOURCE_FAILURE_CATEGORIES):
+            return True
+    return False
+
+
+def is_retryable_c2c_feedback_entry(entry: dict[str, Any] | None) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    saw_candidate_list = False
+    for list_key in ["candidate_results", "feedback_entries", "entries", "feedback_items"]:
+        candidates = [item for item in entry.get(list_key) or [] if isinstance(item, dict)]
+        if candidates:
+            saw_candidate_list = True
+            if not all(is_retryable_c2c_candidate(item) or is_retryable_c2c_feedback_entry(item) for item in candidates):
+                return False
+    if saw_candidate_list:
+        return True
+    if entry.get("status") == "retryable_paused":
+        return True
+    if entry.get("pause_type") in C2C_RETRYABLE_PAUSE_TYPES:
+        return True
+    if entry.get("route") == "resource_retry" or entry.get("repair_route") == "resource_retry":
+        return True
+    if entry.get("failure_class") == "resource_retry":
+        return True
+    if entry.get("failure_mode") in {"resource_retry", "s3_proxy_resource_retry", "runtime_smoke_resource_retry"}:
+        return True
+    summary = entry.get("summary") if isinstance(entry.get("summary"), dict) else {}
+    if summary.get("failure_class") == "resource_retry" or summary.get("route") == "resource_retry":
+        return True
+    if is_retryable_c2c_candidate(entry):
+        return True
+    for key in ["entry", "candidate", "candidate_snapshot", "entry_snapshot", "best_candidate", "best_proxy_candidate"]:
+        if is_retryable_c2c_candidate(entry.get(key)):
+            return True
+    return False
+
+
+def _strip_retryable_c2c_feedback_noise(entry: dict[str, Any]) -> dict[str, Any] | None:
+    if is_retryable_c2c_feedback_entry(entry):
+        return None
+    cleaned = dict(entry)
+    removed_candidate = False
+    for key in ["entry", "candidate", "candidate_snapshot", "entry_snapshot", "best_candidate", "best_proxy_candidate"]:
+        nested = cleaned.get(key)
+        if is_retryable_c2c_candidate(nested) or (isinstance(nested, dict) and is_retryable_c2c_feedback_entry(nested)):
+            cleaned.pop(key, None)
+            removed_candidate = True
+    for key in ["candidate_results", "feedback_entries", "entries", "feedback_items"]:
+        values = cleaned.get(key)
+        if not isinstance(values, list):
+            continue
+        filtered = [
+            item
+            for item in values
+            if not (isinstance(item, dict) and (is_retryable_c2c_candidate(item) or is_retryable_c2c_feedback_entry(item)))
+        ]
+        if filtered:
+            cleaned[key] = filtered
+        else:
+            cleaned.pop(key, None)
+        if len(filtered) != len(values):
+            removed_candidate = True
+    if removed_candidate:
+        for key in ["failed_idea_ids", "failed_titles", "avoid_repeat_rules", "blocked_idea_patterns"]:
+            cleaned.pop(key, None)
+    if is_retryable_c2c_feedback_entry(cleaned):
+        return None
+    return cleaned
 
 
 def _load_feedback_payloads(path: Path, *, kind: str = "entries") -> tuple[dict[str, Any] | list[dict[str, Any]] | None, list[dict[str, Any]], list[dict[str, Any]]]:
@@ -335,7 +458,12 @@ def _load_feedback_payloads(path: Path, *, kind: str = "entries") -> tuple[dict[
     if isinstance(payload, list):
         payloads.extend(item for item in payload if isinstance(item, dict))
     elif isinstance(payload, dict):
-        if isinstance(payload.get("entries"), list) or isinstance(payload.get("summary_entry"), dict):
+        if (
+            payload.get("schema_version") == "shared_method_failure_memory_v1"
+            and isinstance(payload.get("feedback_items"), list)
+        ):
+            payloads.extend(item for item in payload.get("feedback_items", []) if isinstance(item, dict))
+        elif isinstance(payload.get("entries"), list) or isinstance(payload.get("summary_entry"), dict):
             if isinstance(payload.get("summary_entry"), dict):
                 payloads.append(payload["summary_entry"])
             payloads.extend(item for item in payload.get("entries") or [] if isinstance(item, dict))
@@ -678,6 +806,8 @@ def _sanitize_method_direction_scorecard(value: Any) -> dict[str, Any]:
 def _sanitize_method_proxy_calibration(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict):
         return {}
+    if isinstance(value.get("proxy_calibration"), dict):
+        value = value["proxy_calibration"]
     summary = value.get("summary") if isinstance(value.get("summary"), dict) else {}
     current = value.get("current_iteration") if isinstance(value.get("current_iteration"), dict) else {}
     if not summary and not current:
@@ -686,8 +816,11 @@ def _sanitize_method_proxy_calibration(value: Any) -> dict[str, Any]:
         "candidate_count",
         "proxy_false_positive_count",
         "proxy_false_positive_rate",
+        "false_positive_reasons",
+        "proxy_full_delta_correlation",
         "dataset_error_summary",
         "mechanism_false_positive_summary",
+        "method_feedback",
     ]
     allowed_current = [
         "iteration",
@@ -695,12 +828,20 @@ def _sanitize_method_proxy_calibration(value: Any) -> dict[str, Any]:
         "candidate_count",
         "proxy_false_positive_count",
         "proxy_false_positive_rate",
+        "proxy_full_delta_correlation",
         "dataset_error_summary",
     ]
     result = {
         "summary": {key: summary[key] for key in allowed_summary if summary.get(key) not in (None, "", [], {})},
         "current_iteration": {key: current[key] for key in allowed_current if current.get(key) not in (None, "", [], {})},
     }
+    false_positive_candidates = [
+        item
+        for item in value.get("false_positive_candidates") or []
+        if isinstance(item, dict)
+    ][:8]
+    if false_positive_candidates:
+        result["false_positive_candidates"] = false_positive_candidates
     if result["summary"].get("proxy_false_positive_rate", 0):
         result["avoid_repeat_rule"] = "Treat cheap proxy as suspect for mechanisms/datasets with recorded false-positive calibration."
     return {key: item for key, item in result.items() if item not in (None, "", [], {})}
@@ -1081,6 +1222,8 @@ def _dedupe_c2c_feedback_entries(entries: list[dict[str, Any]]) -> list[dict[str
         key = (
             entry.get("project_id"),
             entry.get("iteration"),
+            entry.get("kind"),
+            entry.get("source_path"),
             entry.get("idea_id"),
             entry.get("title"),
             entry.get("failure_mode"),
@@ -1088,6 +1231,8 @@ def _dedupe_c2c_feedback_entries(entries: list[dict[str, Any]]) -> list[dict[str
             entry.get("reason"),
             json.dumps(entry.get("metrics") or {}, sort_keys=True, ensure_ascii=False),
             json.dumps(entry.get("acceptance") or {}, sort_keys=True, ensure_ascii=False),
+            json.dumps(entry.get("proxy_calibration") or {}, sort_keys=True, ensure_ascii=False),
+            json.dumps(entry.get("direction_scorecard") or {}, sort_keys=True, ensure_ascii=False),
         )
         if key in seen:
             continue

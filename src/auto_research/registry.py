@@ -64,9 +64,13 @@ def begin_stage(registry: dict[str, Any], stage_key: str) -> None:
     stage["status"] = "running"
     stage["started_at"] = stage["started_at"] or now_utc()
     stage["blocked_reason"] = None
+    stage.pop("pause_type", None)
+    stage.pop("resume_instruction", None)
     registry["current_stage"] = stage_key
     registry["status"] = "running"
     registry["blocked_reason"] = None
+    registry.pop("pause_type", None)
+    registry.pop("resume_instruction", None)
 
 
 def complete_stage(registry: dict[str, Any], stage_key: str, *, artifacts: list[str] | None = None) -> None:
@@ -75,12 +79,16 @@ def complete_stage(registry: dict[str, Any], stage_key: str, *, artifacts: list[
     stage["completed_at"] = now_utc()
     stage["judge_passed"] = True
     stage["blocked_reason"] = None
+    stage.pop("pause_type", None)
+    stage.pop("resume_instruction", None)
     if artifacts is not None:
         stage["artifacts"] = artifacts
         registry.setdefault("artifacts_summary", {})[stage_key] = len(artifacts)
     next_idx = stage_index(stage_key) + 1
     registry["current_stage"] = STAGE_ORDER[next_idx] if next_idx < len(STAGE_ORDER) else "DONE"
     registry["blocked_reason"] = None
+    registry.pop("pause_type", None)
+    registry.pop("resume_instruction", None)
     if registry["current_stage"] == "DONE":
         registry["status"] = "completed"
 
@@ -89,8 +97,12 @@ def fail_stage(registry: dict[str, Any], stage_key: str, reason: str) -> None:
     stage = registry["stages"][stage_key]
     stage["status"] = "failed"
     stage["blocked_reason"] = reason
+    stage.pop("pause_type", None)
+    stage.pop("resume_instruction", None)
     registry["status"] = "failed"
     registry["blocked_reason"] = reason
+    registry.pop("pause_type", None)
+    registry.pop("resume_instruction", None)
     registry["current_stage"] = stage_key
 
 
@@ -98,8 +110,31 @@ def block_stage(registry: dict[str, Any], stage_key: str, reason: str) -> None:
     stage = registry["stages"][stage_key]
     stage["status"] = "blocked"
     stage["blocked_reason"] = reason
+    stage.pop("pause_type", None)
+    stage.pop("resume_instruction", None)
     registry["status"] = "blocked"
     registry["blocked_reason"] = reason
+    registry.pop("pause_type", None)
+    registry.pop("resume_instruction", None)
+    registry["current_stage"] = stage_key
+
+
+def pause_stage_retryable(registry: dict[str, Any], stage_key: str, reason: str, *, pause_type: str = "retryable_quota_or_rate_limit") -> None:
+    stage = registry["stages"][stage_key]
+    if pause_type in {"runtime_smoke_resource_retry", "s3_proxy_resource_retry"}:
+        resume_instruction = f"Wait for GPU resources to become available, then run auto-research resume --project-id {registry.get('project_id')}"
+    elif pause_type in {"codex_quota_or_rate_limit", "retryable_quota_or_rate_limit"}:
+        resume_instruction = f"Wait for quota/rate limit recovery, then run auto-research resume --project-id {registry.get('project_id')}"
+    else:
+        resume_instruction = f"Resolve the retryable condition, then run auto-research resume --project-id {registry.get('project_id')}"
+    stage["status"] = "retryable_paused"
+    stage["blocked_reason"] = reason
+    stage["pause_type"] = pause_type
+    stage["resume_instruction"] = resume_instruction
+    registry["status"] = "retryable_paused"
+    registry["blocked_reason"] = reason
+    registry["pause_type"] = pause_type
+    registry["resume_instruction"] = resume_instruction
     registry["current_stage"] = stage_key
 
 
@@ -123,6 +158,12 @@ def invalidate_from(registry: dict[str, Any], stage_key: str, *, invalidated_by:
         registry["stages"][current]["status"] = "pending"
         registry["stages"][current]["judge_passed"] = False
         registry["stages"][current]["completed_at"] = None
+        registry["stages"][current]["blocked_reason"] = None
+        registry["stages"][current].pop("pause_type", None)
+        registry["stages"][current].pop("resume_instruction", None)
     registry["current_stage"] = stage_key
     registry["status"] = "running"
+    registry["blocked_reason"] = None
+    registry.pop("pause_type", None)
+    registry.pop("resume_instruction", None)
     registry.setdefault("invalidated_by", []).append(invalidated_by)

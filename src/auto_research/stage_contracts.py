@@ -151,7 +151,6 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
         "optional_outputs": [
             "plan/code_patches/patch_manifest.json",
             "plan/plan_feedback.json",
-            "plan/resource_budget.md",
         ],
         "conditional_outputs": [
             {
@@ -162,7 +161,7 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
                 ],
             }
         ],
-        "required_config": ["experiment.gpu_policy"],
+        "required_config": [],
         "conditional_config": [
             {"when": "project.mode == c2c", "keys": ["c2c.small_loop", "code_patch"]},
         ],

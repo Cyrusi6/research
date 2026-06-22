@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 import time
 import zipfile
 from dataclasses import dataclass
@@ -74,6 +76,18 @@ class MinerUPdfClient:
             "data_id": data_id,
             "file_name": pdf_path.name,
             "model_version": self.model_version,
+            "client_version": "mineru_api_v4",
+            "prompt_schema_version": "c2c_paper_full_markdown_v1",
+            "parser_config_hash": _mineru_client_config_hash(
+                {
+                    "base_url": self.base_url,
+                    "model_version": self.model_version,
+                    "language": self.language,
+                    "enable_formula": self.enable_formula,
+                    "enable_table": self.enable_table,
+                    "is_ocr": self.is_ocr,
+                }
+            ),
             "language": self.language,
             "enable_formula": self.enable_formula,
             "enable_table": self.enable_table,
@@ -183,6 +197,10 @@ def normalize_mineru_markdown(markdown: str, *, title: str) -> str:
     if normalized and not any(line.lstrip().startswith("#") for line in normalized.splitlines()[:12]):
         normalized = f"# {title.strip() or 'Paper'}\n\n{normalized}"
     return normalized + ("\n" if normalized else "")
+
+
+def _mineru_client_config_hash(value: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def _select_extract_result(results: Any, *, data_id: str, file_name: str) -> dict[str, Any]:

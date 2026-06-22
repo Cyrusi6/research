@@ -9,7 +9,7 @@ This repository turns the design in `prompts.md` into a runnable Python CLI for 
 - Downloads paper PDFs into a project-local `references/papers/` directory.
 - Tracks every stage output with `stage_manifest.json`.
 - Persists pipeline state in `meta/registry.yaml`.
-- Supports `init`, `start`, `resume`, `status`, `review`, and `catchup`.
+- Supports `init`, `start`, `resume`, `status`, `report`, `enrich-s0`, `review`, and `catchup`.
 
 ## Quick Start
 
@@ -17,9 +17,19 @@ This repository turns the design in `prompts.md` into a runnable Python CLI for 
 uv run auto-research init --topic "multimodal retrieval with hard negatives"
 uv run auto-research start --project-id <project_id> --simulate
 uv run auto-research status --project-id <project_id>
+uv run auto-research report --project-id <project_id>
 ```
 
 `--simulate` makes the pipeline produce deterministic mock results for validation and tests. Without it, the experiment stage refuses to invent results and will block if no executable experiment plan is available.
+
+Optional S0 semantic enrichment runs during C2C S0 intake after deterministic chunking. The default config uses a small DeepSeek sample first (`limit: 6`) so cost and quality can be inspected before switching to full enrichment. It can also be run manually on an existing S0 bundle:
+
+```bash
+uv run auto-research enrich-s0 --project-id <project_id> --limit 6 --dry-run
+uv run auto-research enrich-s0 --project-id <project_id> --limit 6
+```
+
+The command writes `intake/c2c/semantic_enrichment_sample.json` and `.jsonl`, including token usage and projected full-run cost. During S0 intake, enriched chunks keep their deterministic `chunk_id`, `source_path`, and line/section anchors; DeepSeek only adds semantic fields.
 
 ## Layout
 
@@ -45,6 +55,7 @@ workspace/<project_id>/
 - `OPENAI_ORGANIZATION`: optional, forwarded to the OpenAI client.
 - `OPENAI_PROJECT`: optional, forwarded to the OpenAI client.
 - `.env` or `.env.local` in the repo root are loaded automatically if present.
+- `DEEPSEEK_API_KEY`: optional, used by `auto-research enrich-s0` for DeepSeek S0 semantic enrichment.
 - `SEMANTIC_SCHOLAR_API_KEY`: optional, improves literature retrieval rate limits.
 - `SERPAPI_API_KEY`: reserved for future use.
 - `MM_ROOT`: optional, points to a local multimodal research assets directory when reusing datasets, codebases, or checkpoints.

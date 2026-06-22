@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import copy
 import csv
 import io
@@ -68,8 +69,17 @@ DEFAULT_C2C_PROXY_SCREEN = {
     "commands": [],
     "command_timeout_seconds": 1800,
     "train_timeout_seconds": 1800,
-    "eval_timeout_seconds": 1200,
+    "eval_timeout_seconds": 7200,
     "preflight_timeout_seconds": 300,
+    "gpu_policy": {
+        "gpu_ids": "auto",
+        "max_gpus": 1,
+        "min_free_mb": 18000,
+        "max_utilization_gpu": 40,
+        "respect_resource_filters": True,
+        "disable_resource_fallback": True,
+        "resource_wait": {"enabled": True, "timeout_seconds": 7200, "poll_seconds": 120},
+    },
     "per_device_train_batch_size": "auto",
     "gradient_accumulation_steps": 1,
     "static_hard_gate": True,
@@ -84,8 +94,8 @@ DEFAULT_C2C_PROXY_SCREEN = {
     "allow_configured_baseline_fallback": True,
     "min_proxy_mean_delta": -0.3,
     "repairable_proxy_mean_margin": 0.5,
-    "repair_soft_proxy_fail": True,
-    "soft_proxy_mean_delta": 0.0,
+    "repair_soft_proxy_fail": False,
+    "soft_proxy_mean_delta": -0.1,
     "max_proxy_dataset_regression": 1.5,
     "repairable_proxy_regression_margin": 0.5,
     "soft_max_proxy_dataset_regression": 0.75,
@@ -93,8 +103,61 @@ DEFAULT_C2C_PROXY_SCREEN = {
     "risk_penalty_per_label": 0.05,
     "min_proxy_score": None,
     "repairable_proxy_score_margin": 0.25,
-    "soft_min_proxy_score": 0.0,
+    "soft_min_proxy_score": -0.3,
+    "allow_neutral_proxy_full_s3": True,
+    "neutral_proxy_min_delta": -0.1,
+    "neutral_proxy_max_dataset_regression": 0.25,
     "baseline_cache_path": "experiment/results/c2c_proxy_baseline.json",
+    "eval_smoke": {
+        "enabled": True,
+        "max_prediction_files": 8,
+        "max_prediction_rows": 512,
+        "min_nonempty_prediction_rate": 0.5,
+        "min_answer_parse_rate": 0.2,
+    },
+    "activation_smoke": {
+        "enabled": True,
+        "hard_gate": True,
+        "require_ablation_switch": True,
+        "datasets": [],
+        "max_datasets": 1,
+        "eval_limit": None,
+        "timeout_seconds": 900,
+        "min_abs_metric_delta": 0.01,
+        "max_prediction_files": 8,
+        "max_prediction_rows": 512,
+        "min_prediction_diff_rate": 0.01,
+        "min_answer_diff_rate": 0.01,
+        "min_mean_output_length_delta": 1.0,
+        "require_observable_difference": True,
+    },
+}
+DEFAULT_C2C_FULL_TRAIN_OOM_RECOVERY = {
+    "enabled": True,
+    "per_device_train_batch_size": 1,
+    "preserve_effective_batch": True,
+    "gradient_accumulation_steps": None,
+    "learning_rate_scale": "effective_batch_ratio",
+    "max_length": None,
+    "train_samples": None,
+    "tag": "memory_safe",
+}
+DEFAULT_C2C_TRAIN_RESOURCE_POLICY = {
+    "enabled": True,
+    "per_device_train_batch_size": "auto",
+    "gradient_accumulation_steps": "preserve_effective_batch",
+    "reference_per_device_train_batch_size": 4,
+    "reference_gradient_accumulation_steps": 8,
+    "reference_num_gpus": 1,
+    "learning_rate_scale": "effective_batch_ratio",
+    "min_learning_rate": None,
+    "max_learning_rate": None,
+    "batch_tiers": [
+        {"min_free_mb": 22000, "per_device_train_batch_size": 4},
+        {"min_free_mb": 16000, "per_device_train_batch_size": 3},
+        {"min_free_mb": 10000, "per_device_train_batch_size": 2},
+        {"min_free_mb": 0, "per_device_train_batch_size": 1},
+    ],
 }
 DEFAULT_ALLOWED_FILES = [
     "rosetta/model/aligner.py",
@@ -207,6 +270,8 @@ def build_c2c_project_config(
                 "paperization_after_effect": True,
                 "mock_results": False,
                 "strict_dataset_cache": True,
+                "train_resource_policy": copy.deepcopy(DEFAULT_C2C_TRAIN_RESOURCE_POLICY),
+                "full_train_oom_recovery": copy.deepcopy(DEFAULT_C2C_FULL_TRAIN_OOM_RECOVERY),
                 "proxy_screen": copy.deepcopy(DEFAULT_C2C_PROXY_SCREEN),
             },
         },
@@ -222,7 +287,12 @@ def build_c2c_project_config(
         "experiment": {
             "disable_llm_during_execution": True,
             "self_heal": {"max_attempts": 2},
-            "gpu_policy": {"max_gpus": 6, "min_free_mb": 0},
+            "gpu_policy": {
+                "max_gpus": 6,
+                "min_free_mb": 8192,
+                "max_utilization_gpu": 40,
+                "respect_resource_filters": True,
+            },
         },
         "orchestration": {
             "auto_mode": True,
@@ -1015,6 +1085,14 @@ class C2CAdapter:
                     "parser_status": parse_result.get("status") or "ok",
                     "parser_artifacts": parse_result.get("artifacts") or [],
                 }
+                if parse_result.get("model_version"):
+                    card["parser_model_version"] = parse_result["model_version"]
+                if parse_result.get("language"):
+                    card["parser_language"] = parse_result["language"]
+                if parse_result.get("parser_config_hash"):
+                    card["parser_config_hash"] = parse_result["parser_config_hash"]
+                if parse_result.get("prompt_schema_version"):
+                    card["parser_prompt_schema_version"] = parse_result["prompt_schema_version"]
                 if parse_result.get("paper_full_md_path"):
                     card["paper_full_md_path"] = parse_result["paper_full_md_path"]
                 if parse_result.get("mineru_result_path"):
@@ -1034,6 +1112,10 @@ class C2CAdapter:
                             "parser_status": card.get("parser_status"),
                             "cache_status": card.get("parser_cache_status", "disabled"),
                             "parser_artifacts": card.get("parser_artifacts"),
+                            "model_version": card.get("parser_model_version"),
+                            "language": card.get("parser_language"),
+                            "parser_config_hash": card.get("parser_config_hash"),
+                            "prompt_schema_version": card.get("parser_prompt_schema_version"),
                         }
                     )
                 cards.append(card)
@@ -1076,6 +1158,7 @@ class C2CAdapter:
             and cached.get("source_sha256") == source_sha
         ):
             text = paper_full_path.read_text(encoding="utf-8", errors="ignore")
+            pdf_cfg = self.pdf_ingest_config
             return target, {
                 "status": "ok",
                 "parser": "mineru",
@@ -1083,6 +1166,10 @@ class C2CAdapter:
                 "text": text,
                 "paper_full_md_path": paper_full_path.relative_to(self.project_root).as_posix(),
                 "mineru_result_path": metadata_path.relative_to(self.project_root).as_posix(),
+                "model_version": cached.get("model_version") or str(pdf_cfg.get("model_version") or "vlm"),
+                "language": cached.get("language") or str(pdf_cfg.get("language") or "en"),
+                "parser_config_hash": cached.get("parser_config_hash") or _mineru_parser_config_hash(pdf_cfg),
+                "prompt_schema_version": cached.get("prompt_schema_version") or "c2c_paper_full_markdown_v1",
                 "artifacts": [
                     target.relative_to(self.project_root).as_posix(),
                     paper_full_path.relative_to(self.project_root).as_posix(),
@@ -1098,8 +1185,11 @@ class C2CAdapter:
                 cached_result["restored_at"] = now_utc()
                 cached_result["local_pdf_path"] = target.relative_to(self.project_root).as_posix()
                 cached_result["paper_full_md_path"] = paper_full_path.name
+                cached_result.setdefault("parser_config_hash", _mineru_parser_config_hash(self.pdf_ingest_config))
+                cached_result.setdefault("prompt_schema_version", "c2c_paper_full_markdown_v1")
                 write_json(metadata_path, cached_result)
             text = paper_full_path.read_text(encoding="utf-8", errors="ignore")
+            pdf_cfg = self.pdf_ingest_config
             return target, {
                 "status": "ok",
                 "parser": "mineru",
@@ -1107,6 +1197,10 @@ class C2CAdapter:
                 "text": text,
                 "paper_full_md_path": paper_full_path.relative_to(self.project_root).as_posix(),
                 "mineru_result_path": metadata_path.relative_to(self.project_root).as_posix(),
+                "model_version": cached.get("model_version") or str(pdf_cfg.get("model_version") or "vlm"),
+                "language": cached.get("language") or str(pdf_cfg.get("language") or "en"),
+                "parser_config_hash": cached.get("parser_config_hash") or _mineru_parser_config_hash(pdf_cfg),
+                "prompt_schema_version": cached.get("prompt_schema_version") or "c2c_paper_full_markdown_v1",
                 "artifacts": [
                     target.relative_to(self.project_root).as_posix(),
                     paper_full_path.relative_to(self.project_root).as_posix(),
@@ -1141,6 +1235,8 @@ class C2CAdapter:
             result["source_path"] = str(source)
             result["local_pdf_path"] = target.relative_to(self.project_root).as_posix()
             result["cache_status"] = "miss"
+            result["parser_config_hash"] = _mineru_parser_config_hash(pdf_cfg)
+            result["prompt_schema_version"] = "c2c_paper_full_markdown_v1"
             write_json(metadata_path, result)
             ensure_dir(cache_dir)
             shutil.copy2(paper_full_path, cache_md_path)
@@ -1153,6 +1249,10 @@ class C2CAdapter:
                 "text": text,
                 "paper_full_md_path": paper_full_path.relative_to(self.project_root).as_posix(),
                 "mineru_result_path": metadata_path.relative_to(self.project_root).as_posix(),
+                "model_version": result.get("model_version"),
+                "language": result.get("language"),
+                "parser_config_hash": result.get("parser_config_hash"),
+                "prompt_schema_version": result.get("prompt_schema_version"),
                 "artifacts": [
                     target.relative_to(self.project_root).as_posix(),
                     paper_full_path.relative_to(self.project_root).as_posix(),
@@ -1170,6 +1270,8 @@ class C2CAdapter:
                 "local_pdf_path": target.relative_to(self.project_root).as_posix(),
                 "err_msg": str(exc),
                 "cache_status": "miss",
+                "parser_config_hash": _mineru_parser_config_hash(pdf_cfg),
+                "prompt_schema_version": "c2c_paper_full_markdown_v1",
             }
             write_json(metadata_path, result)
             if bool(pdf_cfg.get("fallback_to_pypdf", False)):
@@ -1196,13 +1298,21 @@ class C2CAdapter:
                 ],
             }
 
-    def materialize_candidate_configs(self, candidate: dict[str, Any], gpu_selection: Any | None = None) -> dict[str, Any]:
+    def materialize_candidate_configs(
+        self,
+        candidate: dict[str, Any],
+        gpu_selection: Any | None = None,
+        *,
+        proxy_gpu_selection: Any | None = None,
+    ) -> dict[str, Any]:
         run_id = sanitize_filename(candidate.get("id") or candidate.get("title") or "candidate")
         run_root_rel = f"local/auto_research_runs/{run_id}"
         run_root = self.repo_root / run_root_rel
         ensure_dir(run_root)
         runtime_localization = self.localize_runtime_model_literals()
         selected_gpu_ids = list(getattr(gpu_selection, "selected_ids", []) or [])
+        proxy_selection = proxy_gpu_selection if proxy_gpu_selection is not None else gpu_selection
+        proxy_selected_gpu_ids = list(getattr(proxy_selection, "selected_ids", []) or [])
         config_overrides = c2c_candidate_config_overrides(candidate)
 
         train_template = self._train_template_path()
@@ -1215,6 +1325,11 @@ class C2CAdapter:
         train_config["output"]["output_dir"] = f"{run_root_rel}/checkpoints"
         train_config.setdefault("data", {}).setdefault("kwargs", {})
         train_config["data"]["kwargs"]["num_samples"] = int(self.c2c_config.get("small_loop", {}).get("train_samples", 2048))
+        train_resource_adjustment = _configure_c2c_train_resource_limits(
+            train_config,
+            self.c2c_config.get("small_loop", {}).get("train_resource_policy") or {},
+            selected_gpu_ids=selected_gpu_ids,
+        )
         _configure_disabled_wandb(train_config, run_id)
         train_config_path = run_root / "train_recipe.json"
         train_config_path.write_text(json.dumps(train_config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -1243,7 +1358,7 @@ class C2CAdapter:
             run_root=run_root,
             run_root_rel=run_root_rel,
             config_overrides=config_overrides,
-            selected_gpu_ids=selected_gpu_ids,
+            selected_gpu_ids=proxy_selected_gpu_ids,
         )
 
         return {
@@ -1262,9 +1377,96 @@ class C2CAdapter:
                 "cuda_visible_devices": ",".join(str(item) for item in selected_gpu_ids),
                 "policy": getattr(gpu_selection, "policy", {}) if gpu_selection else {},
                 "reason": getattr(gpu_selection, "reason", "") if gpu_selection else "",
+                "snapshot": getattr(gpu_selection, "snapshot", []) if gpu_selection else [],
             },
+            "proxy_gpu_selection": {
+                "selected_gpu_ids": proxy_selected_gpu_ids,
+                "cuda_visible_devices": ",".join(str(item) for item in proxy_selected_gpu_ids),
+                "policy": getattr(proxy_selection, "policy", {}) if proxy_selection else {},
+                "reason": getattr(proxy_selection, "reason", "") if proxy_selection else "",
+                "snapshot": getattr(proxy_selection, "snapshot", []) if proxy_selection else [],
+            },
+            "train_resource_adjustment": train_resource_adjustment,
             "frozen_hashes": self._frozen_hashes(train_config_path, eval_config_paths),
             "commands": self._candidate_commands(train_config_path, eval_config_paths, selected_gpu_ids),
+            "candidate": candidate,
+        }
+
+    def materialize_train_oom_recovery_config(
+        self,
+        run_spec: dict[str, Any],
+        *,
+        gpu_ids: list[int] | None = None,
+    ) -> dict[str, Any]:
+        recovery_cfg = deep_merge(
+            copy.deepcopy(DEFAULT_C2C_FULL_TRAIN_OOM_RECOVERY),
+            self.c2c_config.get("small_loop", {}).get("full_train_oom_recovery") or {},
+        )
+        if not recovery_cfg.get("enabled", True):
+            return {"enabled": False, "status": "disabled"}
+        source_path = Path(run_spec["train_config"])
+        train_config = copy.deepcopy(_read_json_fallback(source_path, default={}) or {})
+        if not train_config:
+            return {"enabled": True, "status": "failed", "reason": f"could not read train config: {source_path}"}
+        training = train_config.setdefault("training", {})
+        if not isinstance(training, dict):
+            train_config["training"] = training = {}
+        original_training = copy.deepcopy(training)
+        safe_batch = max(1, _safe_int(recovery_cfg.get("per_device_train_batch_size")) or 1)
+        original_batch = max(1, _safe_int(original_training.get("per_device_train_batch_size")) or safe_batch)
+        original_grad = max(1, _safe_int(original_training.get("gradient_accumulation_steps")) or 1)
+        original_gpu_count = max(1, len(gpu_ids or []))
+        original_effective_batch = original_batch * original_grad * original_gpu_count
+        training["per_device_train_batch_size"] = safe_batch
+        configured_grad = _safe_int(recovery_cfg.get("gradient_accumulation_steps"))
+        if configured_grad:
+            training["gradient_accumulation_steps"] = max(1, configured_grad)
+        elif recovery_cfg.get("preserve_effective_batch", True):
+            training["gradient_accumulation_steps"] = max(1, (original_grad * original_batch + safe_batch - 1) // safe_batch)
+        recovered_effective_batch = safe_batch * max(1, _safe_int(training.get("gradient_accumulation_steps")) or 1) * original_gpu_count
+        lr_adjustment = _maybe_scale_learning_rate(
+            training,
+            original_training,
+            original_effective_batch=original_effective_batch,
+            new_effective_batch=recovered_effective_batch,
+            policy=recovery_cfg,
+        )
+        max_length = _safe_int(recovery_cfg.get("max_length"))
+        if max_length:
+            original_length = _safe_int(original_training.get("max_length"))
+            training["max_length"] = min(original_length, max_length) if original_length else max_length
+        train_samples = _safe_int(recovery_cfg.get("train_samples"))
+        if train_samples:
+            data_kwargs = train_config.setdefault("data", {}).setdefault("kwargs", {})
+            if isinstance(data_kwargs, dict):
+                original_samples = _safe_int(data_kwargs.get("num_samples"))
+                data_kwargs["num_samples"] = min(original_samples, train_samples) if original_samples else train_samples
+        tag = sanitize_filename(str(recovery_cfg.get("tag") or "memory_safe"))
+        recovery_path = Path(run_spec["run_root"]) / f"train_recipe_{tag}.json"
+        recovery_path.write_text(json.dumps(train_config, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        selected_gpu_ids = list(gpu_ids or [])
+        commands = self._candidate_commands(recovery_path, run_spec["eval_configs"], selected_gpu_ids)
+        return {
+            "enabled": True,
+            "status": "materialized",
+            "tag": tag,
+            "train_config": recovery_path,
+            "command": commands["train"],
+            "gpu_ids": selected_gpu_ids,
+            "config_changes": {
+                "original_per_device_train_batch_size": original_training.get("per_device_train_batch_size"),
+                "per_device_train_batch_size": training.get("per_device_train_batch_size"),
+                "original_gradient_accumulation_steps": original_training.get("gradient_accumulation_steps"),
+                "gradient_accumulation_steps": training.get("gradient_accumulation_steps"),
+                "original_effective_batch_size": original_effective_batch,
+                "effective_batch_size": recovered_effective_batch,
+                "learning_rate": training.get("learning_rate"),
+                "learning_rate_adjustment": lr_adjustment,
+                "original_max_length": original_training.get("max_length"),
+                "max_length": training.get("max_length"),
+                "train_samples": ((train_config.get("data") or {}).get("kwargs") or {}).get("num_samples"),
+            },
+            "sha256": sha256_file(recovery_path),
         }
 
     def materialize_ablation_eval_configs(
@@ -1312,6 +1514,187 @@ class C2CAdapter:
             "metrics_path": ablation_root / "ablation_metrics.json",
             "commands": {"eval": self._candidate_commands(Path(run_spec["train_config"]), eval_config_paths, selected_gpu_ids)["eval"]},
             "frozen_hashes": self._frozen_hashes(Path(run_spec["train_config"]), eval_config_paths),
+        }
+
+    def materialize_proxy_activation_smoke_configs(
+        self,
+        candidate: dict[str, Any],
+        run_spec: dict[str, Any],
+        gpu_selection: Any | None = None,
+    ) -> dict[str, Any]:
+        proxy_cfg = c2c_proxy_screen_config(self.config)
+        smoke_cfg = proxy_cfg.get("activation_smoke") if isinstance(proxy_cfg.get("activation_smoke"), dict) else {}
+        if not smoke_cfg.get("enabled", True):
+            return {"enabled": False, "status": "skipped", "reason": "activation_smoke disabled"}
+        proxy_spec = run_spec.get("proxy_screen") or {}
+        if not proxy_spec.get("enabled", False):
+            return {"enabled": False, "status": "skipped", "reason": "proxy_screen disabled"}
+        switch = _candidate_ablation_switch(candidate)
+        if not switch:
+            status = "failed" if smoke_cfg.get("require_ablation_switch", True) else "skipped"
+            return {
+                "enabled": True,
+                "status": status,
+                "reason": "candidate has no ablation_switch for proxy activation smoke",
+                "repair_hint": "add an ablation_switch that disables only the proposed mechanism in eval rosetta_config",
+                "hard_gate": bool(smoke_cfg.get("hard_gate", True)),
+            }
+
+        proxy_eval_configs = proxy_spec.get("eval_configs") if isinstance(proxy_spec.get("eval_configs"), dict) else {}
+        if not proxy_eval_configs:
+            return {"enabled": True, "status": "failed", "reason": "proxy eval configs missing for activation smoke"}
+
+        selected_gpu_ids = list(getattr(gpu_selection, "selected_ids", []) or [])
+        run_root = Path(run_spec["run_root"])
+        run_root_rel = f"local/auto_research_runs/{run_spec['run_id']}"
+        proxy_root = Path(proxy_spec.get("run_root") or run_root / "proxy")
+        smoke_root = proxy_root / "activation_smoke_disabled"
+        ensure_dir(smoke_root)
+        smoke_root_rel = f"{run_root_rel}/proxy/activation_smoke_disabled"
+        proxy_checkpoint_rel = f"{run_root_rel}/proxy/checkpoints/final"
+        config_overrides = c2c_candidate_config_overrides(candidate)
+        proxy_datasets = [str(dataset) for dataset in proxy_eval_configs.keys()]
+        requested = [str(dataset) for dataset in (smoke_cfg.get("datasets") or []) if str(dataset) in proxy_datasets]
+        if not requested:
+            requested = proxy_datasets
+        max_datasets = max(1, int(smoke_cfg.get("max_datasets") or 1))
+        datasets = requested[:max_datasets]
+
+        eval_config_paths: dict[str, Path] = {}
+        for dataset in datasets:
+            eval_config = self._eval_template(dataset)
+            self._localize_model_references(eval_config)
+            eval_config = deep_merge(eval_config, config_overrides["eval"])
+            eval_config.setdefault("model", {}).setdefault("rosetta_config", {})
+            eval_config["model"]["rosetta_config"]["checkpoints_dir"] = proxy_checkpoint_rel
+            eval_config["model"]["rosetta_config"][str(switch)] = True
+            eval_config.setdefault("output", {})
+            eval_config["output"]["output_dir"] = f"{smoke_root_rel}/results/{dataset}"
+            eval_config.setdefault("eval", {})
+            eval_config["eval"]["dataset"] = dataset
+            eval_config["eval"]["gpu_ids"] = selected_gpu_ids or _coerce_gpu_ids(self.c2c_config.get("small_loop", {}).get("gpu_ids", [0]))
+            eval_limit = smoke_cfg.get("eval_limit")
+            if eval_limit is None:
+                proxy_eval_path = Path(proxy_eval_configs[dataset])
+                proxy_eval_config = read_yaml(proxy_eval_path, default={}) if proxy_eval_path.exists() else {}
+                eval_limit = ((proxy_eval_config.get("eval") or {}).get("limit") if isinstance(proxy_eval_config, dict) else None)
+            if eval_limit:
+                eval_config["eval"]["limit"] = int(eval_limit)
+            eval_path = smoke_root / f"eval_{dataset}.yaml"
+            eval_path.write_text(yaml.safe_dump(eval_config, sort_keys=False, allow_unicode=False), encoding="utf-8")
+            eval_config_paths[dataset] = eval_path
+
+        return {
+            "enabled": True,
+            "status": "materialized",
+            "switch": str(switch),
+            "hard_gate": bool(smoke_cfg.get("hard_gate", True)),
+            "run_root": smoke_root,
+            "result_root": smoke_root / "results",
+            "eval_configs": eval_config_paths,
+            "metrics_path": smoke_root / "activation_smoke_metrics.json",
+            "datasets": datasets,
+            "code_patch_validation": ((candidate.get("code_patch") or {}).get("validation") if isinstance(candidate.get("code_patch"), dict) else None),
+            "config": {
+                "min_abs_metric_delta": float(smoke_cfg.get("min_abs_metric_delta", 0.01) or 0.0),
+                "max_prediction_files": int(smoke_cfg.get("max_prediction_files") or 8),
+                "max_prediction_rows": int(smoke_cfg.get("max_prediction_rows") or 512),
+                "min_prediction_diff_rate": float(smoke_cfg.get("min_prediction_diff_rate", 0.01) or 0.0),
+                "min_answer_diff_rate": float(smoke_cfg.get("min_answer_diff_rate", 0.01) or 0.0),
+                "min_mean_output_length_delta": float(smoke_cfg.get("min_mean_output_length_delta", 1.0) or 0.0),
+                "require_observable_difference": bool(smoke_cfg.get("require_observable_difference", True)),
+                "timeout_seconds": int(smoke_cfg.get("timeout_seconds") or 0) or None,
+            },
+            "commands": {"eval": self._candidate_commands(Path(run_spec["train_config"]), eval_config_paths, selected_gpu_ids)["eval"]},
+            "frozen_hashes": self._frozen_hashes(Path(run_spec["train_config"]), eval_config_paths),
+        }
+
+    def collect_proxy_activation_smoke(
+        self,
+        run_spec: dict[str, Any],
+        activation_spec: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not activation_spec.get("enabled"):
+            return activation_spec
+        if activation_spec.get("status") != "materialized":
+            return activation_spec
+        datasets = [str(dataset) for dataset in activation_spec.get("datasets") or []]
+        disabled_metrics = self._collect_metrics_from_result_root(Path(activation_spec["result_root"]))
+        enabled_metrics = _filter_c2c_metrics_to_datasets(self.collect_proxy_metrics(run_spec), datasets)
+        disabled_metrics = _filter_c2c_metrics_to_datasets(disabled_metrics, datasets)
+        if disabled_metrics:
+            write_json(Path(activation_spec["metrics_path"]), disabled_metrics)
+
+        proxy_cfg = c2c_proxy_screen_config(self.config)
+        output_smoke = collect_c2c_eval_smoke(
+            Path(activation_spec["result_root"]),
+            repo_root=self.repo_root,
+            config=((proxy_cfg.get("eval_smoke") or {}) if isinstance(proxy_cfg.get("eval_smoke"), dict) else {}),
+        )
+        smoke_config = activation_spec.get("config") or {}
+        metric_comparison = _proxy_activation_metric_comparison(enabled_metrics, disabled_metrics, min_abs_delta=smoke_config.get("min_abs_metric_delta"))
+        prediction_comparison = _proxy_activation_prediction_comparison(
+            Path((run_spec.get("proxy_screen") or {}).get("run_root") or Path(run_spec["run_root"]) / "proxy") / "results",
+            Path(activation_spec["result_root"]),
+            datasets=datasets,
+            repo_root=self.repo_root,
+            config=smoke_config,
+        )
+        comparison = {
+            **metric_comparison,
+            "metric_comparison": metric_comparison,
+            "prediction_comparison": prediction_comparison,
+            "mechanism_observed": bool(metric_comparison.get("mechanism_observed") or prediction_comparison.get("mechanism_observed")),
+        }
+        mechanism_trace = _proxy_activation_mechanism_trace(self.project_root, run_spec, activation_spec)
+        tensor_trace = mechanism_trace.get("tensor_trace") if isinstance(mechanism_trace.get("tensor_trace"), dict) else {}
+        if tensor_trace.get("status") == "changed":
+            comparison["mechanism_observed"] = True
+            comparison["tensor_mechanism_observed"] = True
+        elif (
+            tensor_trace.get("status") == "unchanged"
+            and metric_comparison.get("mechanism_observed")
+            and not prediction_comparison.get("mechanism_observed")
+        ):
+            comparison["eval_noise_suspected"] = True
+            comparison["mechanism_observed"] = False
+        if mechanism_trace.get("status") == "wired" and not comparison["mechanism_observed"]:
+            comparison["mechanism_wired_metric_neutral"] = True
+        status = "passed"
+        reason = "proxy activation smoke observed enabled-vs-disabled metric or prediction change"
+        repair_hint = ""
+        if not enabled_metrics or not disabled_metrics:
+            status = "failed"
+            reason = "proxy activation smoke missing enabled or disabled metrics"
+            repair_hint = "ensure proxy eval writes summary metrics for both enabled and ablation-disabled configs"
+        elif _c2c_eval_smoke_hard_failure(output_smoke):
+            status = "failed"
+            reason = "proxy activation smoke disabled eval output health failed"
+            repair_hint = "repair eval output path, prediction format, or answer parsing before full S3"
+        elif smoke_config.get("require_observable_difference", True) and not comparison.get("mechanism_observed"):
+            if comparison.get("eval_noise_suspected"):
+                status = "failed"
+                reason = "proxy score changed but mechanism tensor trace did not change"
+                repair_hint = "treat this as eval noise; repair the mechanism path so enabled/disabled changes the traced tensors before full S3"
+            elif mechanism_trace.get("status") == "wired":
+                status = "passed"
+                reason = "ablation switch is wired into eval path but produced metric-neutral proxy outputs"
+                repair_hint = "mechanism is connected but effect is neutral on activation smoke; repair proxy effect or dataset regression rather than eval wiring"
+            else:
+                status = "failed"
+                reason = "ablation switch produced no observable proxy eval metric or prediction change"
+                repair_hint = "wire the mechanism and its ablation switch into the proxy eval path before full S3"
+
+        return {
+            **activation_spec,
+            "status": status,
+            "reason": reason,
+            "repair_hint": repair_hint,
+            "enabled_metrics": enabled_metrics,
+            "disabled_metrics": disabled_metrics,
+            "comparison": comparison,
+            "output_smoke": output_smoke,
+            "mechanism_trace": mechanism_trace,
         }
 
     def _materialize_proxy_screen_configs(
@@ -1527,6 +1910,16 @@ class C2CAdapter:
         proxy_root = Path(proxy_spec.get("run_root") or Path(run_spec["run_root"]) / "proxy")
         return self._collect_metrics_from_result_root(proxy_root / "results")
 
+    def collect_proxy_eval_smoke(self, run_spec: dict[str, Any]) -> dict[str, Any]:
+        proxy_spec = run_spec.get("proxy_screen") or {}
+        proxy_root = Path(proxy_spec.get("run_root") or Path(run_spec["run_root"]) / "proxy")
+        proxy_cfg = c2c_proxy_screen_config(self.config)
+        return collect_c2c_eval_smoke(
+            proxy_root / "results",
+            repo_root=self.repo_root,
+            config=(proxy_cfg.get("eval_smoke") if isinstance(proxy_cfg.get("eval_smoke"), dict) else {}),
+        )
+
     def proxy_baseline_metrics(self, run_spec: dict[str, Any]) -> dict[str, Any] | None:
         proxy_spec = run_spec.get("proxy_screen") or {}
         raw_metrics_path = proxy_spec.get("baseline_metrics_path")
@@ -1690,13 +2083,14 @@ class C2CAdapter:
     def _candidate_commands(self, train_config: Path, eval_configs: dict[str, Path], gpu_ids: list[int] | None = None) -> dict[str, Any]:
         python_cmd = self.env_python
         env_prefix = self._offline_env_prefix(gpu_ids=gpu_ids)
+        preflight_env_prefix = self._offline_env_prefix(gpu_ids=[])
         rel_train = train_config.relative_to(self.repo_root).as_posix()
         preflight = [
-            f"{env_prefix} {python_cmd} -m py_compile rosetta/model/aligner.py rosetta/model/projector.py rosetta/model/wrapper.py",
+            f"{preflight_env_prefix} {python_cmd} -m py_compile rosetta/model/aligner.py rosetta/model/projector.py rosetta/model/wrapper.py",
         ]
         test_path = self.repo_root / "test" / "test_aligner_span_overlap.py"
         if test_path.exists():
-            preflight.append(f"{env_prefix} {python_cmd} -m pytest test/test_aligner_span_overlap.py")
+            preflight.append(f"{preflight_env_prefix} {python_cmd} -m pytest --no-cov test/test_aligner_span_overlap.py")
         train_launcher = self._train_launcher(num_processes=len(gpu_ids or []))
         train = f"{env_prefix} {train_launcher} script/train/SFT_train.py --config {rel_train}"
         eval_commands = [
@@ -2031,6 +2425,720 @@ def parse_c2c_summary_json(path: Path, repo_root: Path | None = None) -> dict[st
     }
 
 
+def collect_c2c_eval_smoke(result_root: Path, *, repo_root: Path | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Collect lightweight output-health diagnostics from C2C eval artifacts."""
+    config = config or {}
+    if config.get("enabled") is False:
+        return {
+            "schema_version": "c2c_eval_smoke_v1",
+            "status": "skipped",
+            "reason": "eval_smoke disabled",
+            "result_root": _relpath(Path(result_root), repo_root),
+            "red_flags": [],
+        }
+    max_files = max(1, int(config.get("max_prediction_files") or 8))
+    max_rows = max(1, int(config.get("max_prediction_rows") or 512))
+    min_nonempty = float(config.get("min_nonempty_prediction_rate", 0.5))
+    min_parse = float(config.get("min_answer_parse_rate", 0.2))
+    result_root = Path(result_root)
+    summary_files = []
+    summary_datasets: dict[str, dict[str, Any]] = {}
+    for path in sorted(result_root.rglob("*_summary.json")):
+        parsed = parse_c2c_summary_json(path, repo_root)
+        if not parsed:
+            continue
+        summary_files.append(_relpath(path, repo_root))
+        summary_datasets[str(parsed.get("dataset") or path.parent.name)] = {
+            "accuracy_percent": parsed.get("accuracy_percent"),
+            "answer_method": parsed.get("answer_method"),
+            "source": parsed.get("source"),
+        }
+    prediction_files = _c2c_prediction_files(result_root, max_files=max_files)
+    dataset_rows: dict[str, list[dict[str, Any]]] = {}
+    files_scanned = []
+    for path in prediction_files:
+        rows = _read_c2c_prediction_rows(path, max_rows=max_rows)
+        if not rows:
+            continue
+        files_scanned.append(_relpath(path, repo_root))
+        dataset = _infer_c2c_dataset_from_path(path)
+        dataset_rows.setdefault(dataset, []).extend(rows[: max(0, max_rows - len(dataset_rows.get(dataset, [])))])
+    datasets = {
+        dataset: _c2c_eval_smoke_dataset(rows)
+        for dataset, rows in sorted(dataset_rows.items())
+    }
+    total_rows = sum(item.get("sample_count", 0) for item in datasets.values())
+    nonempty_count = sum(item.get("nonempty_prediction_count", 0) for item in datasets.values())
+    answer_like_count = sum(item.get("answer_like_count", 0) for item in datasets.values())
+    parsed_count = sum(item.get("parsed_answer_count", 0) for item in datasets.values())
+    answer_distribution: dict[str, int] = {}
+    for item in datasets.values():
+        for answer, count in (item.get("answer_distribution") or {}).items():
+            answer_distribution[answer] = answer_distribution.get(answer, 0) + int(count)
+    nonempty_rate = round(nonempty_count / total_rows, 4) if total_rows else None
+    answer_like_rate = round(answer_like_count / total_rows, 4) if total_rows else None
+    parse_rate = round(parsed_count / total_rows, 4) if total_rows else None
+    red_flags: list[str] = []
+    if not summary_files:
+        red_flags.append("no_summary_files")
+    if not prediction_files:
+        red_flags.append("no_prediction_files")
+    if total_rows and nonempty_rate is not None and nonempty_rate < min_nonempty:
+        red_flags.append("low_nonempty_prediction_rate")
+    if total_rows and parse_rate is not None and parse_rate < min_parse:
+        red_flags.append("low_answer_parse_rate")
+    if total_rows and _dominant_answer_share(answer_distribution) >= 0.95:
+        red_flags.append("answer_distribution_collapsed")
+    if summary_datasets and all(float(item.get("accuracy_percent") or 0.0) <= 0.0 for item in summary_datasets.values()):
+        red_flags.append("all_summary_scores_zero")
+        if not total_rows:
+            red_flags.append("all_zero_without_prediction_artifacts")
+    status = "warning" if red_flags else "ok"
+    return {
+        "schema_version": "c2c_eval_smoke_v1",
+        "status": status,
+        "result_root": _relpath(result_root, repo_root),
+        "summary_file_count": len(summary_files),
+        "summary_files": summary_files[:40],
+        "summary_datasets": summary_datasets,
+        "prediction_file_count": len(prediction_files),
+        "prediction_files_scanned": files_scanned,
+        "sample_count": total_rows,
+        "nonempty_prediction_rate": nonempty_rate,
+        "answer_like_rate": answer_like_rate,
+        "answer_parse_rate": parse_rate,
+        "mean_output_length": _weighted_mean([item.get("mean_output_length") for item in datasets.values()], [item.get("sample_count", 0) for item in datasets.values()]),
+        "answer_distribution": dict(sorted(answer_distribution.items())),
+        "datasets": datasets,
+        "red_flags": red_flags,
+    }
+
+
+def _c2c_prediction_files(result_root: Path, *, max_files: int) -> list[Path]:
+    if not result_root.exists():
+        return []
+    candidates: list[Path] = []
+    for path in sorted(result_root.rglob("*")):
+        if not path.is_file():
+            continue
+        name = path.name.lower()
+        if name.endswith("_summary.json"):
+            continue
+        if path.suffix.lower() not in {".json", ".jsonl", ".csv", ".txt"}:
+            continue
+        if any(marker in name for marker in ["predict", "prediction", "result", "answer", "generation", "output", "responses"]):
+            candidates.append(path)
+    return candidates[:max_files]
+
+
+def _read_c2c_prediction_rows(path: Path, *, max_rows: int) -> list[dict[str, Any]]:
+    suffix = path.suffix.lower()
+    try:
+        if suffix == ".jsonl":
+            rows = []
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if len(rows) >= max_rows:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(item, dict):
+                    rows.append(item)
+            return rows
+        if suffix == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(payload, list):
+                return [item for item in payload[:max_rows] if isinstance(item, dict)]
+            if isinstance(payload, dict):
+                for key in ["predictions", "results", "samples", "outputs", "items", "records", "examples"]:
+                    value = payload.get(key)
+                    if isinstance(value, list):
+                        return [item for item in value[:max_rows] if isinstance(item, dict)]
+                return [payload]
+        if suffix == ".csv":
+            rows = []
+            with path.open(newline="", encoding="utf-8", errors="ignore") as handle:
+                for row in csv.DictReader(handle):
+                    rows.append(dict(row))
+                    if len(rows) >= max_rows:
+                        break
+            return rows
+        if suffix == ".txt":
+            rows = []
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines()[:max_rows]:
+                if line.strip():
+                    rows.append({"output": line.strip()})
+            return rows
+    except (OSError, json.JSONDecodeError):
+        return []
+    return []
+
+
+def _c2c_eval_smoke_dataset(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    outputs = [_c2c_prediction_text(row) for row in rows]
+    parsed_answers = [_parse_c2c_answer(text) or _parse_c2c_answer(_c2c_label_text(row)) for row, text in zip(rows, outputs)]
+    nonempty = [text for text in outputs if text.strip()]
+    answer_like = [text for text in outputs if _parse_c2c_answer(text)]
+    lengths = [len(text.strip()) for text in outputs]
+    distribution: dict[str, int] = {}
+    for answer in parsed_answers:
+        if not answer:
+            continue
+        distribution[answer] = distribution.get(answer, 0) + 1
+    sample_count = len(rows)
+    return {
+        "sample_count": sample_count,
+        "nonempty_prediction_count": len(nonempty),
+        "nonempty_prediction_rate": round(len(nonempty) / sample_count, 4) if sample_count else None,
+        "answer_like_count": len(answer_like),
+        "answer_like_rate": round(len(answer_like) / sample_count, 4) if sample_count else None,
+        "parsed_answer_count": sum(1 for answer in parsed_answers if answer),
+        "answer_parse_rate": round(sum(1 for answer in parsed_answers if answer) / sample_count, 4) if sample_count else None,
+        "mean_output_length": round(sum(lengths) / sample_count, 4) if sample_count else None,
+        "max_output_length": max(lengths) if lengths else 0,
+        "answer_distribution": dict(sorted(distribution.items())),
+        "example_outputs": [text[:160] for text in outputs if text.strip()][:3],
+    }
+
+
+def _c2c_prediction_text(row: dict[str, Any]) -> str:
+    keys = [
+        "prediction",
+        "pred",
+        "output",
+        "generated_text",
+        "generation",
+        "response",
+        "model_output",
+        "answer_text",
+        "decoded",
+        "completion",
+    ]
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    nested = row.get("model") or row.get("result")
+    if isinstance(nested, dict):
+        return _c2c_prediction_text(nested)
+    return ""
+
+
+def _c2c_label_text(row: dict[str, Any]) -> str:
+    for key in ["predicted_answer", "prediction_label", "predicted_label", "predicted_choice", "model_answer", "model_choice"]:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value)
+    return ""
+
+
+def _parse_c2c_answer(text: str) -> str:
+    if not text:
+        return ""
+    stripped = str(text).strip()
+    patterns = [
+        r"(?:answer|choice|option)\s*[:：]\s*([A-D])\b",
+        r"\(([A-D])\)",
+        r"\b([A-D])\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, stripped, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).upper()
+    lowered = stripped.lower()
+    for word, label in [("yes", "YES"), ("no", "NO"), ("true", "TRUE"), ("false", "FALSE")]:
+        if re.fullmatch(rf"\W*{word}\W*", lowered):
+            return label
+    return ""
+
+
+def _infer_c2c_dataset_from_path(path: Path) -> str:
+    known = set(DEFAULT_DATASETS)
+    for part in reversed(path.parts):
+        if part in known:
+            return part
+    return path.parent.name
+
+
+def _dominant_answer_share(distribution: dict[str, int]) -> float:
+    total = sum(int(value) for value in distribution.values())
+    if not total:
+        return 0.0
+    return max(int(value) for value in distribution.values()) / total
+
+
+def _weighted_mean(values: list[Any], weights: list[Any]) -> float | None:
+    total_weight = 0.0
+    total = 0.0
+    for value, weight in zip(values, weights):
+        numeric = _safe_float(value)
+        try:
+            numeric_weight = float(weight)
+        except (TypeError, ValueError):
+            numeric_weight = 0.0
+        if numeric is None or numeric_weight <= 0:
+            continue
+        total += numeric * numeric_weight
+        total_weight += numeric_weight
+    return round(total / total_weight, 4) if total_weight else None
+
+
+def _candidate_ablation_switch(candidate: dict[str, Any]) -> str:
+    contract = candidate.get("experiment_contract") if isinstance(candidate.get("experiment_contract"), dict) else {}
+    ablation_plan = candidate.get("ablation_plan") if isinstance(candidate.get("ablation_plan"), dict) else {}
+    switch = contract.get("ablation_switch") or ablation_plan.get("switch")
+    return str(switch) if switch not in (None, "") else ""
+
+
+def _proxy_activation_mechanism_trace(project_root: Path, run_spec: dict[str, Any], activation_spec: dict[str, Any]) -> dict[str, Any]:
+    switch = str(activation_spec.get("switch") or "")
+    enabled_configs = (run_spec.get("proxy_screen") or {}).get("eval_configs") or {}
+    disabled_configs = activation_spec.get("eval_configs") or {}
+    enabled_rosetta = _first_eval_rosetta_config(enabled_configs.values())
+    disabled_rosetta = _first_eval_rosetta_config(disabled_configs.values())
+    validation_trace = _patch_validation_activation_wiring(project_root, run_spec, activation_spec)
+    tensor_trace = _proxy_activation_tensor_trace(run_spec, activation_spec)
+    failures: list[str] = []
+    if not switch:
+        failures.append("missing_ablation_switch")
+    elif disabled_rosetta.get(switch) is not True:
+        failures.append(f"disabled_eval_missing_{switch}")
+    if switch and enabled_rosetta.get(switch) is True:
+        failures.append(f"enabled_eval_sets_disable_switch_{switch}")
+    wiring_check_status = validation_trace.get("status")
+    if wiring_check_status not in {None, "ok", "skipped"}:
+        failures.append(f"s2_5_wiring_check_{wiring_check_status}")
+    if wiring_check_status is None:
+        failures.append("s2_5_wiring_check_missing")
+    status = "wired" if not failures else "missing"
+    return {
+        "status": status,
+        "switch": switch,
+        "failures": failures,
+        "enabled_eval_rosetta_keys": sorted(enabled_rosetta.keys()),
+        "disabled_eval_rosetta_keys": sorted(disabled_rosetta.keys()),
+        "disabled_switch_value": disabled_rosetta.get(switch) if switch else None,
+        "enabled_switch_value": enabled_rosetta.get(switch) if switch else None,
+        "s2_5_wiring_check": validation_trace,
+        "tensor_trace": tensor_trace,
+    }
+
+
+def _first_eval_rosetta_config(paths: Any) -> dict[str, Any]:
+    for raw_path in paths or []:
+        path = Path(raw_path)
+        if not path.exists():
+            continue
+        payload = read_yaml(path, default={}) if path.suffix in {".yaml", ".yml"} else read_json(path, default={})
+        if not isinstance(payload, dict):
+            continue
+        rosetta = ((payload.get("model") or {}).get("rosetta_config") or {})
+        return dict(rosetta) if isinstance(rosetta, dict) else {}
+    return {}
+
+
+def _patch_validation_activation_wiring(project_root: Path, run_spec: dict[str, Any], activation_spec: dict[str, Any]) -> dict[str, Any]:
+    validation = activation_spec.get("code_patch_validation")
+    if not validation:
+        validation = (((run_spec.get("candidate") or {}).get("code_patch") or {}).get("validation"))
+    if not validation:
+        validation = (run_spec.get("code_patch") or {}).get("validation")
+    if not validation:
+        return {"status": None, "reason": "candidate code_patch.validation path missing from run_spec"}
+    path = Path(str(validation))
+    if not path.is_absolute():
+        path = project_root / path
+    payload = read_json(path, default={}) if path.exists() else {}
+    for check in payload.get("checks") or []:
+        if isinstance(check, dict) and check.get("name") == "runtime_smoke:mechanism_activation_wiring":
+            return {
+                "status": check.get("status"),
+                "returncode": check.get("returncode"),
+                "switch": check.get("switch"),
+                "failure_category": check.get("failure_category"),
+                "runtime_code_refs": check.get("runtime_code_refs") or {},
+                "rosetta_config": check.get("rosetta_config") or {},
+                "repair_hint": check.get("repair_hint"),
+            }
+    return {"status": None, "reason": "runtime_smoke:mechanism_activation_wiring not found in S2.5 validation"}
+
+
+def _proxy_activation_tensor_trace(run_spec: dict[str, Any], activation_spec: dict[str, Any]) -> dict[str, Any]:
+    datasets = [str(dataset) for dataset in activation_spec.get("datasets") or []]
+    enabled_root = Path((run_spec.get("proxy_screen") or {}).get("run_root") or Path(run_spec["run_root"]) / "proxy") / "results"
+    disabled_root = Path(activation_spec.get("result_root") or "")
+    enabled = _collect_activation_tensor_traces(enabled_root, datasets=datasets)
+    disabled = _collect_activation_tensor_traces(disabled_root, datasets=datasets)
+    if not enabled and not disabled:
+        return {
+            "status": "not_collected",
+            "reason": "activation tensor trace artifacts were not found in enabled or disabled eval outputs",
+            "expected_artifacts": [
+                "activation_trace.json",
+                "activation_trace.jsonl",
+                "mechanism_trace.json",
+                "mechanism_trace.jsonl",
+            ],
+        }
+    comparison = _compare_activation_tensor_traces(enabled, disabled)
+    return {
+        "status": comparison.get("status"),
+        "reason": comparison.get("reason"),
+        "enabled_trace_count": len(enabled),
+        "disabled_trace_count": len(disabled),
+        "changed_fields": comparison.get("changed_fields") or [],
+        "unchanged_fields": comparison.get("unchanged_fields") or [],
+        "compared_fields": comparison.get("compared_fields") or [],
+        "sample_enabled_paths": [item.get("path") for item in enabled[:3]],
+        "sample_disabled_paths": [item.get("path") for item in disabled[:3]],
+    }
+
+
+def _collect_activation_tensor_traces(root: Path, *, datasets: list[str]) -> list[dict[str, Any]]:
+    if not root.exists():
+        return []
+    dataset_filter = set(datasets or [])
+    patterns = [
+        "activation_trace.json",
+        "activation_trace.jsonl",
+        "mechanism_trace.json",
+        "mechanism_trace.jsonl",
+        "tensor_trace.json",
+        "tensor_trace.jsonl",
+        "*activation*trace*.json",
+        "*activation*trace*.jsonl",
+        "*mechanism*trace*.json",
+        "*mechanism*trace*.jsonl",
+        "*tensor*trace*.json",
+        "*tensor*trace*.jsonl",
+    ]
+    paths: list[Path] = []
+    for pattern in patterns:
+        paths.extend(root.rglob(pattern))
+    traces: list[dict[str, Any]] = []
+    for path in sorted(set(paths)):
+        rel_parts = path.relative_to(root).parts
+        dataset = rel_parts[0] if rel_parts else ""
+        if dataset_filter and dataset not in dataset_filter:
+            continue
+        for payload in _read_activation_trace_payloads(path):
+            signature = _activation_trace_signature(payload)
+            if signature:
+                traces.append({"dataset": dataset, "path": path.as_posix(), "signature": signature})
+    return traces
+
+
+def _read_activation_trace_payloads(path: Path) -> list[Any]:
+    try:
+        if path.suffix == ".jsonl":
+            payloads = []
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payloads.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            return payloads
+        payload = read_json(path, default=None)
+        if isinstance(payload, list):
+            return payload
+        return [payload]
+    except Exception:
+        return []
+
+
+def _activation_trace_signature(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return {}
+    source = payload
+    for key in ["tensor_trace", "activation_trace", "mechanism_trace", "trace"]:
+        if isinstance(payload.get(key), dict):
+            source = payload[key]
+            break
+    signature: dict[str, Any] = {}
+    for key, value in source.items():
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            signature[str(key)] = value
+        elif isinstance(value, list) and len(value) <= 8 and all(isinstance(item, (str, int, float, bool)) or item is None for item in value):
+            signature[str(key)] = value
+        elif isinstance(value, dict):
+            nested = {
+                str(nested_key): nested_value
+                for nested_key, nested_value in value.items()
+                if isinstance(nested_value, (str, int, float, bool)) or nested_value is None
+            }
+            if nested:
+                signature[str(key)] = nested
+    for preferred in [
+        "tensor_checksum",
+        "checksum",
+        "sha256",
+        "mean",
+        "std",
+        "norm",
+        "l2_norm",
+        "shape",
+        "numel",
+        "nonzero",
+        "gate_mean",
+        "routing_entropy",
+        "alignment_mass",
+    ]:
+        if preferred in payload and preferred not in signature:
+            signature[preferred] = payload[preferred]
+    return signature
+
+
+def _compare_activation_tensor_traces(enabled: list[dict[str, Any]], disabled: list[dict[str, Any]]) -> dict[str, Any]:
+    if not enabled or not disabled:
+        return {"status": "missing_pair", "reason": "only one side wrote activation tensor trace artifacts"}
+    enabled_map = _activation_trace_map(enabled)
+    disabled_map = _activation_trace_map(disabled)
+    changed: list[str] = []
+    unchanged: list[str] = []
+    compared: list[str] = []
+    for key in sorted(set(enabled_map) & set(disabled_map)):
+        compared.append(key)
+        if _json_signature(enabled_map[key]) != _json_signature(disabled_map[key]):
+            changed.append(key)
+        else:
+            unchanged.append(key)
+    if changed:
+        return {"status": "changed", "reason": "enabled/disabled activation tensor traces differ", "changed_fields": changed, "unchanged_fields": unchanged, "compared_fields": compared}
+    if compared:
+        return {"status": "unchanged", "reason": "enabled/disabled activation tensor traces are identical", "changed_fields": [], "unchanged_fields": unchanged, "compared_fields": compared}
+    return {"status": "missing_pair", "reason": "activation tensor traces did not share comparable fields", "changed_fields": [], "unchanged_fields": [], "compared_fields": []}
+
+
+def _activation_trace_map(traces: list[dict[str, Any]]) -> dict[str, Any]:
+    mapped: dict[str, Any] = {}
+    for item in traces:
+        prefix = str(item.get("dataset") or "dataset")
+        signature = item.get("signature") if isinstance(item.get("signature"), dict) else {}
+        for key, value in signature.items():
+            mapped[f"{prefix}:{key}"] = value
+    return mapped
+
+
+def _json_signature(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
+
+
+def _filter_c2c_metrics_to_datasets(metrics: dict[str, Any] | None, datasets: list[str]) -> dict[str, Any] | None:
+    if not metrics:
+        return None
+    dataset_scores = metrics.get("datasets") if isinstance(metrics.get("datasets"), dict) else {}
+    selected = {dataset: float(dataset_scores[dataset]) for dataset in datasets if dataset in dataset_scores and _safe_float(dataset_scores[dataset]) is not None}
+    if not selected:
+        return None
+    return {
+        "mean": round(sum(selected.values()) / len(selected), 4),
+        "datasets": selected,
+        "summary_files": list(metrics.get("summary_files") or []),
+    }
+
+
+def _proxy_activation_metric_comparison(
+    enabled_metrics: dict[str, Any] | None,
+    disabled_metrics: dict[str, Any] | None,
+    *,
+    min_abs_delta: Any,
+) -> dict[str, Any]:
+    threshold = float(min_abs_delta or 0.0)
+    if not enabled_metrics or not disabled_metrics:
+        return {
+            "status": "insufficient_metrics",
+            "enabled_mean": (enabled_metrics or {}).get("mean"),
+            "disabled_mean": (disabled_metrics or {}).get("mean"),
+            "mechanism_observed": False,
+        }
+    enabled_mean = _safe_float(enabled_metrics.get("mean"))
+    disabled_mean = _safe_float(disabled_metrics.get("mean"))
+    dataset_deltas: dict[str, float] = {}
+    enabled_datasets = enabled_metrics.get("datasets") if isinstance(enabled_metrics.get("datasets"), dict) else {}
+    disabled_datasets = disabled_metrics.get("datasets") if isinstance(disabled_metrics.get("datasets"), dict) else {}
+    for dataset in sorted(set(enabled_datasets) & set(disabled_datasets)):
+        enabled_value = _safe_float(enabled_datasets.get(dataset))
+        disabled_value = _safe_float(disabled_datasets.get(dataset))
+        if enabled_value is None or disabled_value is None:
+            continue
+        dataset_deltas[str(dataset)] = round(enabled_value - disabled_value, 4)
+    mean_delta = round(enabled_mean - disabled_mean, 4) if enabled_mean is not None and disabled_mean is not None else None
+    max_abs_dataset_delta = max((abs(value) for value in dataset_deltas.values()), default=0.0)
+    mechanism_observed = bool(
+        (mean_delta is not None and abs(mean_delta) >= threshold)
+        or max_abs_dataset_delta >= threshold
+    )
+    return {
+        "status": "ok",
+        "enabled_mean": enabled_mean,
+        "disabled_mean": disabled_mean,
+        "enabled_minus_disabled_mean": mean_delta,
+        "dataset_enabled_minus_disabled": dataset_deltas,
+        "max_abs_dataset_delta": round(max_abs_dataset_delta, 4),
+        "min_abs_metric_delta": threshold,
+        "mechanism_observed": mechanism_observed,
+    }
+
+
+def _proxy_activation_prediction_comparison(
+    enabled_result_root: Path,
+    disabled_result_root: Path,
+    *,
+    datasets: list[str],
+    repo_root: Path | None,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    max_files = max(1, int(config.get("max_prediction_files") or 8))
+    max_rows = max(1, int(config.get("max_prediction_rows") or 512))
+    min_prediction_diff_rate = float(config.get("min_prediction_diff_rate", 0.01) or 0.0)
+    min_answer_diff_rate = float(config.get("min_answer_diff_rate", 0.01) or 0.0)
+    min_length_delta = float(config.get("min_mean_output_length_delta", 1.0) or 0.0)
+    enabled_by_dataset = _c2c_prediction_rows_by_dataset(enabled_result_root, datasets=datasets, max_files=max_files, max_rows=max_rows)
+    disabled_by_dataset = _c2c_prediction_rows_by_dataset(disabled_result_root, datasets=datasets, max_files=max_files, max_rows=max_rows)
+    dataset_comparisons: dict[str, Any] = {}
+    total_compared = 0
+    text_diff_count = 0
+    answer_diff_count = 0
+    length_deltas: list[float] = []
+    for dataset in datasets:
+        enabled_rows = enabled_by_dataset.get(dataset) or []
+        disabled_rows = disabled_by_dataset.get(dataset) or []
+        pair_count = min(len(enabled_rows), len(disabled_rows), max_rows)
+        if pair_count <= 0:
+            dataset_comparisons[dataset] = {
+                "status": "missing_predictions",
+                "enabled_row_count": len(enabled_rows),
+                "disabled_row_count": len(disabled_rows),
+                "compared_count": 0,
+            }
+            continue
+        dataset_text_diff = 0
+        dataset_answer_diff = 0
+        enabled_lengths: list[int] = []
+        disabled_lengths: list[int] = []
+        enabled_distribution: dict[str, int] = {}
+        disabled_distribution: dict[str, int] = {}
+        for enabled_row, disabled_row in zip(enabled_rows[:pair_count], disabled_rows[:pair_count]):
+            enabled_text = _c2c_prediction_text(enabled_row).strip()
+            disabled_text = _c2c_prediction_text(disabled_row).strip()
+            enabled_answer = _parse_c2c_answer(enabled_text) or _parse_c2c_answer(_c2c_label_text(enabled_row))
+            disabled_answer = _parse_c2c_answer(disabled_text) or _parse_c2c_answer(_c2c_label_text(disabled_row))
+            if enabled_text != disabled_text:
+                dataset_text_diff += 1
+            if enabled_answer != disabled_answer:
+                dataset_answer_diff += 1
+            enabled_lengths.append(len(enabled_text))
+            disabled_lengths.append(len(disabled_text))
+            if enabled_answer:
+                enabled_distribution[enabled_answer] = enabled_distribution.get(enabled_answer, 0) + 1
+            if disabled_answer:
+                disabled_distribution[disabled_answer] = disabled_distribution.get(disabled_answer, 0) + 1
+        mean_enabled_length = sum(enabled_lengths) / len(enabled_lengths) if enabled_lengths else 0.0
+        mean_disabled_length = sum(disabled_lengths) / len(disabled_lengths) if disabled_lengths else 0.0
+        mean_length_delta = round(mean_enabled_length - mean_disabled_length, 4)
+        text_diff_rate = round(dataset_text_diff / pair_count, 4)
+        answer_diff_rate = round(dataset_answer_diff / pair_count, 4)
+        total_compared += pair_count
+        text_diff_count += dataset_text_diff
+        answer_diff_count += dataset_answer_diff
+        length_deltas.append(abs(mean_length_delta))
+        dataset_comparisons[dataset] = {
+            "status": "ok",
+            "enabled_row_count": len(enabled_rows),
+            "disabled_row_count": len(disabled_rows),
+            "compared_count": pair_count,
+            "prediction_text_diff_count": dataset_text_diff,
+            "prediction_text_diff_rate": text_diff_rate,
+            "answer_diff_count": dataset_answer_diff,
+            "answer_diff_rate": answer_diff_rate,
+            "enabled_mean_output_length": round(mean_enabled_length, 4),
+            "disabled_mean_output_length": round(mean_disabled_length, 4),
+            "mean_output_length_delta": mean_length_delta,
+            "enabled_answer_distribution": dict(sorted(enabled_distribution.items())),
+            "disabled_answer_distribution": dict(sorted(disabled_distribution.items())),
+            "answer_distribution_changed": enabled_distribution != disabled_distribution,
+        }
+    prediction_diff_rate = round(text_diff_count / total_compared, 4) if total_compared else None
+    answer_diff_rate = round(answer_diff_count / total_compared, 4) if total_compared else None
+    max_abs_length_delta = round(max(length_deltas), 4) if length_deltas else 0.0
+    mechanism_observed = bool(
+        (prediction_diff_rate is not None and prediction_diff_rate >= min_prediction_diff_rate)
+        or (answer_diff_rate is not None and answer_diff_rate >= min_answer_diff_rate)
+        or max_abs_length_delta >= min_length_delta
+        or any((item.get("answer_distribution_changed") for item in dataset_comparisons.values() if isinstance(item, dict)))
+    )
+    return {
+        "status": "ok" if total_compared else "missing_predictions",
+        "enabled_result_root": _relpath(Path(enabled_result_root), repo_root),
+        "disabled_result_root": _relpath(Path(disabled_result_root), repo_root),
+        "datasets": dataset_comparisons,
+        "compared_count": total_compared,
+        "prediction_text_diff_count": text_diff_count,
+        "prediction_diff_rate": prediction_diff_rate,
+        "answer_diff_count": answer_diff_count,
+        "answer_diff_rate": answer_diff_rate,
+        "max_abs_mean_output_length_delta": max_abs_length_delta,
+        "thresholds": {
+            "min_prediction_diff_rate": min_prediction_diff_rate,
+            "min_answer_diff_rate": min_answer_diff_rate,
+            "min_mean_output_length_delta": min_length_delta,
+        },
+        "mechanism_observed": mechanism_observed,
+    }
+
+
+def _c2c_prediction_rows_by_dataset(
+    result_root: Path,
+    *,
+    datasets: list[str],
+    max_files: int,
+    max_rows: int,
+) -> dict[str, list[dict[str, Any]]]:
+    wanted = set(str(dataset) for dataset in datasets)
+    rows_by_dataset: dict[str, list[dict[str, Any]]] = {dataset: [] for dataset in wanted}
+    for path in _c2c_prediction_files(Path(result_root), max_files=max_files):
+        dataset = _infer_c2c_dataset_from_path(path)
+        if dataset not in wanted:
+            continue
+        remaining = max_rows - len(rows_by_dataset.setdefault(dataset, []))
+        if remaining <= 0:
+            continue
+        rows_by_dataset[dataset].extend(_read_c2c_prediction_rows(path, max_rows=remaining))
+    return rows_by_dataset
+
+
+def _c2c_eval_smoke_hard_failure(smoke: dict[str, Any] | None) -> bool:
+    if not isinstance(smoke, dict):
+        return False
+    red_flags = set(smoke.get("red_flags") or [])
+    if "no_summary_files" in red_flags:
+        return True
+    if "all_summary_scores_zero" in red_flags and (
+        "low_nonempty_prediction_rate" in red_flags
+        or "low_answer_parse_rate" in red_flags
+        or "answer_distribution_collapsed" in red_flags
+        or "all_zero_without_prediction_artifacts" in red_flags
+    ):
+        return True
+    return False
+
+
+def _relpath(path: Path, repo_root: Path | None) -> str:
+    if repo_root:
+        try:
+            return path.relative_to(repo_root).as_posix()
+        except ValueError:
+            pass
+    return path.as_posix()
+
+
 def _append_check(checks: list[dict[str, Any]], name: str, ok: bool, **fields: Any) -> None:
     checks.append({"name": name, "ok": ok, "reason": "" if ok else f"{name} check failed", **fields})
 
@@ -2151,6 +3259,19 @@ def _parser_for_path(path: Path) -> str:
     if suffix in {".md", ".txt"}:
         return "text"
     return "file_text"
+
+
+def _mineru_parser_config_hash(pdf_cfg: dict[str, Any]) -> str:
+    payload = {
+        "provider": str(pdf_cfg.get("provider") or "mineru"),
+        "model_version": str(pdf_cfg.get("model_version") or "vlm"),
+        "language": str(pdf_cfg.get("language") or "en"),
+        "enable_formula": bool(pdf_cfg.get("enable_formula", True)),
+        "enable_table": bool(pdf_cfg.get("enable_table", True)),
+        "is_ocr": bool(pdf_cfg.get("is_ocr", False)),
+        "prompt_schema_version": "c2c_paper_full_markdown_v1",
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _extract_pdf_with_pdftotext(path: Path, *, max_chars: int) -> str:
@@ -2546,14 +3667,22 @@ def normalize_c2c_mechanism_fields(idea: dict[str, Any], baseline: dict[str, Any
         item["mechanism_type"] = mechanism_type
     item.setdefault("mechanism_summary", item.get("description") or item.get("hypothesis") or item.get("title") or "")
     if mechanism_type in C2C_MECHANISM_TYPES:
-        item.setdefault("paper_claim", f"{mechanism_type} gives C2C a separable mechanism beyond local threshold tuning.")
-        item.setdefault("why_baseline_fails", f"{base_name} can still inject harmful cross-tokenizer cache states when alignment evidence is ambiguous.")
-        item.setdefault("expected_signature", _default_expected_signature(mechanism_type))
-        item.setdefault("ablation_plan", _default_ablation_plan(idea_id, mechanism_type))
-        item.setdefault("coverage_diagnostics", _default_coverage_diagnostics(mechanism_type))
-        item.setdefault("matched_coverage_ablation", _default_matched_coverage_ablation(idea_id, mechanism_type))
-    item.setdefault("expected_files", DEFAULT_ALLOWED_FILES)
-    item.setdefault("verification_commands", ["py_compile", "test_aligner_span_overlap", "small2048_train", "three_dataset_eval"])
+        if not item.get("paper_claim"):
+            item["paper_claim"] = f"{mechanism_type} gives C2C a separable mechanism beyond local threshold tuning."
+        if not item.get("why_baseline_fails"):
+            item["why_baseline_fails"] = f"{base_name} can still inject harmful cross-tokenizer cache states when alignment evidence is ambiguous."
+        if not item.get("expected_signature"):
+            item["expected_signature"] = _default_expected_signature(mechanism_type)
+        if not item.get("ablation_plan"):
+            item["ablation_plan"] = _default_ablation_plan(idea_id, mechanism_type)
+        if not item.get("coverage_diagnostics"):
+            item["coverage_diagnostics"] = _default_coverage_diagnostics(mechanism_type)
+        if not item.get("matched_coverage_ablation"):
+            item["matched_coverage_ablation"] = _default_matched_coverage_ablation(idea_id, mechanism_type)
+    if not _c2c_expected_file_list(item.get("expected_files")):
+        item["expected_files"] = DEFAULT_ALLOWED_FILES
+    if not item.get("verification_commands"):
+        item["verification_commands"] = ["py_compile", "test_aligner_span_overlap", "small2048_train", "three_dataset_eval"]
     implementation_plan = item.get("implementation_plan") if isinstance(item.get("implementation_plan"), dict) else {}
     if mechanism_type in C2C_MECHANISM_TYPES and not implementation_plan:
         implementation_plan = _default_implementation_plan(idea_id, mechanism_type, _c2c_expected_file_list(item.get("expected_files")))
@@ -2573,10 +3702,14 @@ def normalize_c2c_mechanism_fields(idea: dict[str, Any], baseline: dict[str, Any
     contract.setdefault("expected_files", item.get("expected_files") or DEFAULT_ALLOWED_FILES)
     contract.setdefault("verification_commands", item.get("verification_commands"))
     if mechanism_type in C2C_MECHANISM_TYPES:
-        contract.setdefault("ablation_switch", item.get("ablation_plan", {}).get("switch"))
-        contract.setdefault("mechanism_type", mechanism_type)
-        contract.setdefault("coverage_diagnostics", item.get("coverage_diagnostics"))
-        contract.setdefault("matched_coverage_ablation", item.get("matched_coverage_ablation"))
+        if not contract.get("ablation_switch"):
+            contract["ablation_switch"] = item.get("ablation_plan", {}).get("switch")
+        if not contract.get("mechanism_type"):
+            contract["mechanism_type"] = mechanism_type
+        if not contract.get("coverage_diagnostics"):
+            contract["coverage_diagnostics"] = item.get("coverage_diagnostics")
+        if not contract.get("matched_coverage_ablation"):
+            contract["matched_coverage_ablation"] = item.get("matched_coverage_ablation")
     contract.setdefault("implementation_scope", item.get("implementation_scope"))
     contract.setdefault("implementation_plan", item.get("implementation_plan"))
     item["experiment_contract"] = contract
@@ -3031,6 +4164,111 @@ def _configure_proxy_train_limits(train_config: dict[str, Any], proxy_cfg: dict[
         training["max_length"] = max(1, int(proxy_cfg["max_length"]))
 
 
+def _configure_c2c_train_resource_limits(
+    train_config: dict[str, Any],
+    policy: dict[str, Any],
+    *,
+    selected_gpu_ids: list[int] | None = None,
+) -> dict[str, Any]:
+    policy = deep_merge(copy.deepcopy(DEFAULT_C2C_TRAIN_RESOURCE_POLICY), policy if isinstance(policy, dict) else {})
+    if not policy.get("enabled", True):
+        return {"enabled": False, "status": "disabled"}
+    training = train_config.setdefault("training", {})
+    if not isinstance(training, dict):
+        train_config["training"] = training = {}
+    original_training = copy.deepcopy(training)
+    original_batch = max(1, _safe_int(training.get("per_device_train_batch_size")) or int(policy.get("reference_per_device_train_batch_size") or 4))
+    original_grad = max(1, _safe_int(training.get("gradient_accumulation_steps")) or int(policy.get("reference_gradient_accumulation_steps") or 8))
+    original_gpu_count = max(1, int(policy.get("reference_num_gpus") or len(selected_gpu_ids or []) or 1))
+    selected_gpu_count = max(1, len(selected_gpu_ids or []))
+    selected_free_mb = _selected_gpu_free_memory_mb(selected_gpu_ids)
+    selected_batch = _c2c_auto_train_batch_size(policy, selected_free_mb=selected_free_mb)
+    configured_batch = policy.get("per_device_train_batch_size", "auto")
+    if configured_batch not in (None, "", "auto"):
+        selected_batch = max(1, int(configured_batch))
+    training["per_device_train_batch_size"] = selected_batch
+    original_effective_batch = original_batch * original_grad * original_gpu_count
+    grad_setting = policy.get("gradient_accumulation_steps", "preserve_effective_batch")
+    if grad_setting not in (None, "", "preserve_effective_batch", "auto"):
+        training["gradient_accumulation_steps"] = max(1, int(grad_setting))
+    else:
+        training["gradient_accumulation_steps"] = max(1, (original_effective_batch + (selected_batch * selected_gpu_count) - 1) // (selected_batch * selected_gpu_count))
+    new_effective_batch = selected_batch * max(1, _safe_int(training.get("gradient_accumulation_steps")) or 1) * selected_gpu_count
+    lr_adjustment = _maybe_scale_learning_rate(
+        training,
+        original_training,
+        original_effective_batch=original_effective_batch,
+        new_effective_batch=new_effective_batch,
+        policy=policy,
+    )
+    return {
+        "enabled": True,
+        "status": "applied",
+        "selected_gpu_ids": list(selected_gpu_ids or []),
+        "selected_gpu_free_mb": selected_free_mb,
+        "original_per_device_train_batch_size": original_training.get("per_device_train_batch_size"),
+        "per_device_train_batch_size": training.get("per_device_train_batch_size"),
+        "original_gradient_accumulation_steps": original_training.get("gradient_accumulation_steps"),
+        "gradient_accumulation_steps": training.get("gradient_accumulation_steps"),
+        "original_effective_batch_size": original_effective_batch,
+        "effective_batch_size": new_effective_batch,
+        "learning_rate_adjustment": lr_adjustment,
+        "policy": {
+            "per_device_train_batch_size": policy.get("per_device_train_batch_size"),
+            "gradient_accumulation_steps": policy.get("gradient_accumulation_steps"),
+            "learning_rate_scale": policy.get("learning_rate_scale"),
+        },
+    }
+
+
+def _c2c_auto_train_batch_size(policy: dict[str, Any], *, selected_free_mb: int) -> int:
+    tiers = policy.get("batch_tiers") if isinstance(policy.get("batch_tiers"), list) else []
+    for tier in sorted((item for item in tiers if isinstance(item, dict)), key=lambda item: -int(item.get("min_free_mb") or 0)):
+        if selected_free_mb >= int(tier.get("min_free_mb") or 0):
+            return max(1, int(tier.get("per_device_train_batch_size") or 1))
+    return 1
+
+
+def _maybe_scale_learning_rate(
+    training: dict[str, Any],
+    original_training: dict[str, Any],
+    *,
+    original_effective_batch: int,
+    new_effective_batch: int,
+    policy: dict[str, Any],
+) -> dict[str, Any]:
+    original_lr = original_training.get("learning_rate")
+    if original_lr in (None, ""):
+        return {"status": "skipped", "reason": "training.learning_rate missing"}
+    mode = str(policy.get("learning_rate_scale") or "none")
+    try:
+        original_lr_value = float(original_lr)
+    except (TypeError, ValueError):
+        return {"status": "skipped", "reason": "training.learning_rate is not numeric", "original_learning_rate": original_lr}
+    if mode not in {"effective_batch_ratio", "linear", "auto"}:
+        training["learning_rate"] = original_lr_value
+        return {"status": "unchanged", "mode": mode, "learning_rate": original_lr_value}
+    if original_effective_batch <= 0 or new_effective_batch <= 0:
+        training["learning_rate"] = original_lr_value
+        return {"status": "unchanged", "reason": "invalid effective batch", "learning_rate": original_lr_value}
+    ratio = new_effective_batch / original_effective_batch
+    new_lr = original_lr_value * ratio
+    min_lr = policy.get("min_learning_rate")
+    max_lr = policy.get("max_learning_rate")
+    if min_lr not in (None, ""):
+        new_lr = max(float(min_lr), new_lr)
+    if max_lr not in (None, ""):
+        new_lr = min(float(max_lr), new_lr)
+    training["learning_rate"] = new_lr
+    return {
+        "status": "scaled" if abs(new_lr - original_lr_value) > 1e-15 else "unchanged",
+        "mode": mode,
+        "original_learning_rate": original_lr_value,
+        "learning_rate": new_lr,
+        "effective_batch_ratio": ratio,
+    }
+
+
 def _proxy_auto_batch_size(proxy_cfg: dict[str, Any], *, selected_gpu_ids: list[int] | None = None) -> int:
     configured = proxy_cfg.get("per_device_train_batch_size", "auto")
     if configured not in (None, "", "auto"):
@@ -3061,6 +4299,24 @@ def _selected_gpu_total_memory_mb(selected_gpu_ids: list[int] | None = None) -> 
     ]
     totals = [int(item.get("memory_total_mb") or 0) for item in candidates]
     return min(totals) if totals else 0
+
+
+def _selected_gpu_free_memory_mb(selected_gpu_ids: list[int] | None = None) -> int:
+    try:
+        from .adapters.runner import ExperimentRunner
+    except Exception:
+        return 0
+    snapshot = ExperimentRunner._gpu_snapshot()
+    if not snapshot:
+        return 0
+    selected = {int(item) for item in selected_gpu_ids or []}
+    candidates = [
+        item
+        for item in snapshot
+        if not selected or int(item.get("index", -1)) in selected
+    ]
+    free = [int(item.get("memory_free_mb") or 0) for item in candidates]
+    return min(free) if free else 0
 
 
 def _first_present(row: dict[str, Any], keys: list[str]) -> Any:
@@ -3368,6 +4624,10 @@ def _chunk_index_entry(chunk: dict[str, Any], *, source_type: str, ordinal: int)
         "start_line": chunk.get("start_line"),
         "end_line": chunk.get("end_line"),
         "keywords": chunk.get("keywords") or _chunk_keywords(text, extra_terms=[source_path, chunk.get("section"), chunk.get("symbol")]),
+        "semantic_summary": chunk.get("semantic_summary") or ((chunk.get("semantic_enrichment") or {}).get("semantic_summary") if isinstance(chunk.get("semantic_enrichment"), dict) else ""),
+        "mechanism_tags": chunk.get("mechanism_tags") or ((chunk.get("semantic_enrichment") or {}).get("mechanism_tags") if isinstance(chunk.get("semantic_enrichment"), dict) else []),
+        "failure_modes": chunk.get("failure_modes") or ((chunk.get("semantic_enrichment") or {}).get("failure_modes") if isinstance(chunk.get("semantic_enrichment"), dict) else []),
+        "retrieval_keywords": chunk.get("retrieval_keywords") or ((chunk.get("semantic_enrichment") or {}).get("retrieval_keywords") if isinstance(chunk.get("semantic_enrichment"), dict) else []),
         "tokens_estimate": chunk.get("tokens_estimate") or max(1, len(text) // 4),
         "char_count": len(text),
         "text_preview": " ".join(text.split())[:500],

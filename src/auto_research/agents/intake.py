@@ -6,6 +6,8 @@ import json
 from typing import Any
 
 from ..c2c import C2CAdapter, is_c2c_project
+from ..method_memory import load_shared_method_memory, shared_method_memory_query_context
+from ..s0_enrichment import DeepSeekS0SemanticEnricher, S0SemanticEnrichmentError, semantic_enrichment_enabled
 from ..utils import read_json
 from .base import AgentContext
 
@@ -37,10 +39,59 @@ class IntakeAgent:
         return {"artifacts": [record["path"]], "status": "ok"}
 
     def _run_c2c_intake(self, topic: str) -> dict[str, Any]:
-        cached = self._load_reusable_c2c_static_bundle()
+        force_refresh = bool(
+            (self.context.config.get("intake", {}) or {}).get("force_refresh")
+            or (self.context.config.get("c2c", {}) or {}).get("s0_force_refresh")
+        )
+        cached = None if force_refresh else self._load_reusable_c2c_static_bundle()
         if cached:
+            shared_memory = load_shared_method_memory(
+                self.context.config,
+                query_context=shared_method_memory_query_context(
+                    self.context.config,
+                    project_root=self.context.project_root,
+                    topic=topic,
+                    negative_memory=cached.get("negative_memory") or {},
+                ),
+            )
+            _merge_shared_method_memory_into_negative_memory(cached.setdefault("negative_memory", {}), shared_memory)
+            cached["shared_method_memory"] = shared_memory
+            cached["evidence_brief"] = _evidence_brief_with_shared_method_memory(cached.get("evidence_brief") or {}, shared_memory)
+            records = self._register_or_restore_cached_c2c_artifacts(cached)
+            records.append(
+                self.context.artifacts.write_json(
+                    self.stage_key,
+                    "c2c/negative_result_memory.json",
+                    cached["negative_memory"],
+                    artifact_type="c2c_negative_result_memory",
+                    summary="Static and shared method-level avoid-repeat memory",
+                    source_paths=["intake/c2c/static_bundle.json", shared_memory.get("path")] if shared_memory.get("path") else ["intake/c2c/static_bundle.json"],
+                    metadata={"cache_status": "reused_with_shared_method_memory_refresh"},
+                )
+            )
+            records.append(
+                self.context.artifacts.write_json(
+                    self.stage_key,
+                    "c2c/evidence_brief.json",
+                    cached["evidence_brief"],
+                    artifact_type="c2c_evidence_brief",
+                    summary="Compact static evidence brief with shared method memory",
+                    source_paths=["intake/c2c/static_bundle.json", shared_memory.get("path")] if shared_memory.get("path") else ["intake/c2c/static_bundle.json"],
+                    metadata={"cache_status": "reused_with_shared_method_memory_refresh"},
+                )
+            )
+            records.append(
+                self.context.artifacts.write_json(
+                    self.stage_key,
+                    "shared_method_failure_memory.json",
+                    shared_memory,
+                    artifact_type="shared_method_failure_memory",
+                    summary="Cross-project method-level failure memory reused by S0/S1",
+                    source_paths=[shared_memory.get("path")] if shared_memory.get("path") else [],
+                )
+            )
             return {
-                "artifacts": _c2c_static_artifact_paths(cached),
+                "artifacts": [record["path"] for record in records],
                 "status": "ok",
                 "static_bundle": cached,
                 "cache_status": "reused",
@@ -81,6 +132,27 @@ class IntakeAgent:
         code_cards = adapter.build_code_cards(repo_manifest)
         code_intake = adapter.build_code_intake()
         code_chunks = code_intake.chunks
+        semantic_enrichment_result: dict[str, Any] | None = None
+        if semantic_enrichment_enabled(self.context.config):
+            try:
+                semantic_enrichment_result = DeepSeekS0SemanticEnricher(self.context.project_root, self.context.config).enrich_c2c_chunks(
+                    paper_chunks=paper_chunks,
+                    rebuttal_chunks=rebuttal_chunks,
+                    code_chunks=code_chunks,
+                )
+                paper_chunks = semantic_enrichment_result["paper_chunks"]
+                rebuttal_chunks = semantic_enrichment_result["rebuttal_chunks"]
+                code_chunks = semantic_enrichment_result["code_chunks"]
+            except S0SemanticEnrichmentError as exc:
+                semantic_enrichment_result = {
+                    "report": {
+                        "enabled": True,
+                        "status": "failed_open",
+                        "reason": str(exc),
+                        "fallback": "raw_chunks_without_semantic_enrichment",
+                    },
+                    "artifacts": [],
+                }
         chunk_index = adapter.build_chunk_index(
             paper_chunks=paper_chunks,
             rebuttal_chunks=rebuttal_chunks,
@@ -88,6 +160,16 @@ class IntakeAgent:
         )
         result_ledger_csv = adapter.build_result_ledger_csv(historical_results, baseline)
         negative_memory = adapter.build_negative_result_memory(historical_results, baseline)
+        shared_method_memory = load_shared_method_memory(
+            self.context.config,
+            query_context=shared_method_memory_query_context(
+                self.context.config,
+                project_root=self.context.project_root,
+                topic=topic,
+                negative_memory=negative_memory,
+            ),
+        )
+        _merge_shared_method_memory_into_negative_memory(negative_memory, shared_method_memory)
         retrieval_plan = adapter.build_research_retrieval_plan(
             topic=topic,
             repo_card=repo_card,
@@ -129,7 +211,12 @@ class IntakeAgent:
             retrieval_plan=retrieval_plan,
             followup_bundle=followup_bundle,
         )
-        cache_summary = _c2c_cache_summary(reference_result.get("paper_full_manifest", []), code_intake.report)
+        evidence_brief = _evidence_brief_with_shared_method_memory(evidence_brief, shared_method_memory)
+        cache_summary = _c2c_cache_summary(
+            reference_result.get("paper_full_manifest", []),
+            code_intake.report,
+            pdf_ingest_config=adapter.pdf_ingest_config,
+        )
         static_bundle = {
             "schema_version": "c2c_static_intake_bundle_v1",
             "project_id": self.context.project_root.name,
@@ -156,9 +243,11 @@ class IntakeAgent:
             "implementation_surface_map": code_intake.surface_map,
             "code_retrieval_index": code_intake.retrieval_index,
             "cache_summary": cache_summary,
+            "semantic_enrichment": (semantic_enrichment_result or {}).get("report") or {"enabled": False},
             "chunk_index": chunk_index,
             "result_ledger_csv": result_ledger_csv,
             "negative_memory": negative_memory,
+            "shared_method_memory": shared_method_memory,
             "retrieval_plan": retrieval_plan,
             "followup_bundle": followup_bundle,
             "evidence_brief": evidence_brief,
@@ -189,11 +278,14 @@ class IntakeAgent:
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/implementation_surface_map.json", code_intake.surface_map, artifact_type="c2c_implementation_surface_map", summary="Editable mechanism surfaces for S2.5 patches"))
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/code_retrieval_index.json", code_intake.retrieval_index, artifact_type="c2c_code_retrieval_index", summary="Precomputed code retrieval entry points for S1/S2"))
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/cache_summary.json", cache_summary, artifact_type="c2c_static_cache_summary", summary="S0 cache hit/miss summary for MinerU and code intake"))
+        if semantic_enrichment_result:
+            records.extend({"path": path} for path in semantic_enrichment_result.get("artifacts", []))
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/chunk_index.json", chunk_index, artifact_type="c2c_chunk_index", summary="Full S0 chunk catalog for paper, rebuttal, and code retrieval"))
         records.append(self.context.artifacts.write_text(self.stage_key, "c2c/chunk_index.jsonl", _jsonl(chunk_index.get("entries", [])), artifact_type="c2c_chunk_index_jsonl", summary="Line-delimited S0 chunk catalog for retrieval"))
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/retrieval_plan.json", retrieval_plan, artifact_type="c2c_retrieval_plan", summary="Chunk retrieval plan for paper, rebuttal, and code evidence"))
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/retrieval_followup.json", followup_bundle, artifact_type="c2c_retrieval_followup", summary="Follow-up retrieval questions and targets"))
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/negative_result_memory.json", negative_memory, artifact_type="c2c_negative_result_memory", summary="Static below-baseline local variants and avoid-repeat rules"))
+        records.append(self.context.artifacts.write_json(self.stage_key, "shared_method_failure_memory.json", shared_method_memory, artifact_type="shared_method_failure_memory", summary="Cross-project method-level failure memory reused by S0/S1", source_paths=[shared_method_memory.get("path")] if shared_method_memory.get("path") else []))
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/evidence_brief.json", evidence_brief, artifact_type="c2c_evidence_brief", summary="Compact static evidence brief for S1 direction selection"))
         return {"artifacts": [record["path"] for record in records], "status": "ok", "static_bundle": static_bundle}
 
@@ -228,9 +320,109 @@ class IntakeAgent:
                 return None
         return bundle
 
+    def _register_or_restore_cached_c2c_artifacts(self, bundle: dict[str, Any]) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for spec in _c2c_static_artifact_specs():
+            path = self.context.project_root / spec["path"]
+            if not path.exists():
+                payload = _cached_c2c_artifact_payload(bundle, spec)
+                if payload is None:
+                    continue
+                if spec["format"] == "json":
+                    records.append(
+                        self.context.artifacts.write_json(
+                            self.stage_key,
+                            spec["relative_path"],
+                            payload,
+                            artifact_type=spec["artifact_type"],
+                            summary=spec["summary"],
+                            source_paths=["intake/c2c/static_bundle.json"],
+                            metadata={"cache_status": "restored_from_static_bundle"},
+                        )
+                    )
+                else:
+                    records.append(
+                        self.context.artifacts.write_text(
+                            self.stage_key,
+                            spec["relative_path"],
+                            str(payload),
+                            artifact_type=spec["artifact_type"],
+                            summary=spec["summary"],
+                            source_paths=["intake/c2c/static_bundle.json"],
+                            metadata={"cache_status": "restored_from_static_bundle"},
+                        )
+                    )
+                continue
+            records.append(
+                self.context.artifacts.register_artifact(
+                    self.stage_key,
+                    path,
+                    artifact_type=spec["artifact_type"],
+                    summary=spec["summary"],
+                    source_paths=["intake/c2c/static_bundle.json"] if spec["path"] != "intake/c2c/static_bundle.json" else [],
+                    metadata={"cache_status": "reused_existing_file"},
+                )
+            )
+        return records
+
 
 def _jsonl(items: list[dict[str, Any]]) -> str:
     return "\n".join(json.dumps(item, ensure_ascii=False) for item in items) + ("\n" if items else "")
+
+
+def _merge_shared_method_memory_into_negative_memory(negative_memory: dict[str, Any], shared_memory: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(negative_memory, dict) or not isinstance(shared_memory, dict):
+        return negative_memory
+    entries = [item for item in shared_memory.get("entries") or [] if isinstance(item, dict)]
+    catalog = [item for item in shared_memory.get("memory_catalog") or [] if isinstance(item, dict)]
+    if not entries and not catalog:
+        negative_memory.setdefault("shared_method_memory", {"enabled": bool(shared_memory.get("enabled")), "entry_count": 0})
+        return negative_memory
+    blocked = list(negative_memory.get("blocked_idea_patterns") or [])
+    for entry in entries[:12]:
+        summary = entry.get("summary") if isinstance(entry.get("summary"), dict) else {}
+        for rule in summary.get("avoid_repeat_rules") or []:
+            if rule and rule not in blocked:
+                blocked.append(str(rule))
+        for dataset in (summary.get("dragging_datasets") or [])[:4]:
+            if isinstance(dataset, dict) and dataset.get("dataset"):
+                rule = f"Shared method memory: avoid repeating mechanisms that regress {dataset.get('dataset')} without an explicit repair."
+                if rule not in blocked:
+                    blocked.append(rule)
+    negative_memory["blocked_idea_patterns"] = blocked
+    negative_memory["shared_method_memory"] = {
+        "enabled": bool(shared_memory.get("enabled")),
+        "path": shared_memory.get("path"),
+        "entry_count": shared_memory.get("entry_count", 0),
+        "ranking_policy": shared_memory.get("ranking_policy") or {},
+        "retrieval_policy": shared_memory.get("retrieval_policy") or {},
+        "retrieval_context": shared_memory.get("retrieval_context") or {},
+        "quality_summary": shared_memory.get("quality_summary") or {},
+        "high_quality_memory_ids": (shared_memory.get("quality_summary") or {}).get("high_quality_memory_ids") or [],
+        "full_memory_access": shared_memory.get("full_memory_access") or {},
+        "memory_catalog": shared_memory.get("memory_catalog") or [],
+        "recent_entries": shared_memory.get("memory_catalog") or [],
+    }
+    return negative_memory
+
+
+def _evidence_brief_with_shared_method_memory(evidence_brief: dict[str, Any], shared_memory: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(evidence_brief, dict):
+        evidence_brief = {}
+    updated = dict(evidence_brief)
+    updated["shared_method_memory"] = {
+        "enabled": bool(shared_memory.get("enabled")) if isinstance(shared_memory, dict) else False,
+        "path": shared_memory.get("path") if isinstance(shared_memory, dict) else None,
+        "entry_count": shared_memory.get("entry_count", 0) if isinstance(shared_memory, dict) else 0,
+        "ranking_policy": shared_memory.get("ranking_policy", {}) if isinstance(shared_memory, dict) else {},
+        "retrieval_policy": shared_memory.get("retrieval_policy", {}) if isinstance(shared_memory, dict) else {},
+        "retrieval_context": shared_memory.get("retrieval_context", {}) if isinstance(shared_memory, dict) else {},
+        "quality_summary": shared_memory.get("quality_summary", {}) if isinstance(shared_memory, dict) else {},
+        "high_quality_memory_ids": (shared_memory.get("quality_summary", {}) or {}).get("high_quality_memory_ids", []) if isinstance(shared_memory, dict) else [],
+        "full_memory_access": shared_memory.get("full_memory_access", {}) if isinstance(shared_memory, dict) else {},
+        "memory_catalog": shared_memory.get("memory_catalog", []) if isinstance(shared_memory, dict) else [],
+    }
+    return updated
 
 
 def _valid_chunk_index(value: Any) -> bool:
@@ -249,39 +441,127 @@ def _valid_chunk_index(value: Any) -> bool:
 
 def _c2c_static_artifact_paths(bundle: dict[str, Any]) -> list[str]:
     del bundle
+    return [spec["path"] for spec in _c2c_static_artifact_specs()]
+
+
+def _c2c_static_artifact_specs() -> list[dict[str, Any]]:
     return [
-        "intake/papers/metadata.json",
-        "intake/c2c/static_bundle.json",
-        "intake/c2c/paper_full_manifest.json",
-        "intake/c2c/repo_manifest.json",
-        "intake/c2c/repo_card.json",
-        "intake/c2c/historical_results.json",
-        "intake/c2c/result_ledger.csv",
-        "intake/c2c/baseline_evidence.json",
-        "intake/c2c/paper_cards.json",
-        "intake/c2c/paper_chunks.jsonl",
-        "intake/c2c/bibliography.json",
-        "intake/c2c/rebuttal_concern_matrix.json",
-        "intake/c2c/rebuttal_chunks.jsonl",
-        "intake/c2c/code_cards.json",
-        "intake/c2c/code_file_manifest.json",
-        "intake/c2c/code_symbols.jsonl",
-        "intake/c2c/code_chunks.jsonl",
-        "intake/c2c/code_edges.jsonl",
-        "intake/c2c/code_repo_map.json",
-        "intake/c2c/code_repo_map.md",
-        "intake/c2c/code_intake_report.json",
-        "intake/c2c/code_intake_report.md",
-        "intake/c2c/implementation_surface_map.json",
-        "intake/c2c/code_retrieval_index.json",
-        "intake/c2c/cache_summary.json",
-        "intake/c2c/chunk_index.json",
-        "intake/c2c/chunk_index.jsonl",
-        "intake/c2c/retrieval_plan.json",
-        "intake/c2c/retrieval_followup.json",
-        "intake/c2c/negative_result_memory.json",
-        "intake/c2c/evidence_brief.json",
+        _artifact_spec("intake/papers/metadata.json", "metadata", "C2C configured reference materials", bundle_key="metadata"),
+        _artifact_spec("intake/c2c/static_bundle.json", "c2c_static_bundle", "C2C static S0 evidence bundle", bundle_key=None),
+        _artifact_spec("intake/c2c/paper_full_manifest.json", "c2c_paper_full_manifest", "MinerU paper_full.md outputs for C2C PDF references", bundle_key="paper_full_manifest"),
+        _artifact_spec("intake/c2c/repo_manifest.json", "c2c_repo_manifest", "C2C repo intake manifest", bundle_key="repo_manifest"),
+        _artifact_spec("intake/c2c/repo_card.json", "c2c_repo_card", "C2C repo capabilities, constraints, and evidence inventory", bundle_key="repo_card"),
+        _artifact_spec("intake/c2c/historical_results.json", "c2c_historical_results", "Imported C2C historical experiment evidence", bundle_key="historical_results"),
+        _artifact_spec("intake/c2c/result_ledger.csv", "c2c_result_ledger", "Normalized C2C historical result ledger", bundle_key="result_ledger_csv", file_format="text"),
+        _artifact_spec("intake/c2c/baseline_evidence.json", "c2c_baseline_evidence", "C2C baseline target to beat", bundle_key="baseline"),
+        _artifact_spec("intake/c2c/paper_cards.json", "c2c_paper_cards", "Structured cards for configured C2C-area papers", bundle_key="paper_cards"),
+        _artifact_spec("intake/c2c/paper_chunks.jsonl", "c2c_paper_chunks", "Section-aware C2C paper chunks without bibliography text", bundle_key="paper_chunks", file_format="jsonl"),
+        _artifact_spec("intake/c2c/bibliography.json", "c2c_bibliography", "Reference sections preserved separately for related-work expansion", bundle_key="bibliography_cards"),
+        _artifact_spec("intake/c2c/rebuttal_concern_matrix.json", "c2c_rebuttal_concerns", "Reviewer concern matrix parsed from rebuttal materials", bundle_key="rebuttal_matrix"),
+        _artifact_spec("intake/c2c/rebuttal_chunks.jsonl", "c2c_rebuttal_chunks", "Review and rebuttal chunks with source anchors", bundle_key="rebuttal_chunks", file_format="jsonl"),
+        _artifact_spec("intake/c2c/code_cards.json", "c2c_code_cards", "Core C2C code symbols, config knobs, and imports", bundle_key="code_cards"),
+        _artifact_spec("intake/c2c/code_file_manifest.json", "c2c_code_file_manifest", "Tree-sitter code file manifest and edit surface", bundle_key="code_file_manifest"),
+        _artifact_spec("intake/c2c/code_symbols.jsonl", "c2c_code_symbols", "Tree-sitter code symbols for repository map", bundle_key="code_symbols", file_format="jsonl"),
+        _artifact_spec("intake/c2c/code_chunks.jsonl", "c2c_code_chunks", "Function-level source chunks for S1/S2 reasoning", bundle_key="code_chunks", file_format="jsonl"),
+        _artifact_spec("intake/c2c/code_edges.jsonl", "c2c_code_edges", "Static code relation graph edges", bundle_key="code_edges", file_format="jsonl"),
+        _artifact_spec("intake/c2c/code_repo_map.json", "c2c_code_repo_map", "Compact tree-sitter repository map", bundle_key="code_repo_map"),
+        _artifact_spec("intake/c2c/code_repo_map.md", "c2c_code_repo_map_markdown", "Readable tree-sitter repository map", bundle_key="code_repo_map", file_format="repo_map_md"),
+        _artifact_spec("intake/c2c/code_intake_report.json", "c2c_code_intake_report", "Code intake coverage and quality diagnostics", bundle_key="code_intake_report"),
+        _artifact_spec("intake/c2c/code_intake_report.md", "c2c_code_intake_report_markdown", "Readable code intake coverage report", bundle_key="code_intake_report", file_format="code_intake_report_md"),
+        _artifact_spec("intake/c2c/implementation_surface_map.json", "c2c_implementation_surface_map", "Editable mechanism surfaces for S2.5 patches", bundle_key="implementation_surface_map"),
+        _artifact_spec("intake/c2c/code_retrieval_index.json", "c2c_code_retrieval_index", "Precomputed code retrieval entry points for S1/S2", bundle_key="code_retrieval_index"),
+        _artifact_spec("intake/c2c/cache_summary.json", "c2c_static_cache_summary", "S0 cache hit/miss summary for MinerU and code intake", bundle_key="cache_summary"),
+        _artifact_spec("intake/c2c/chunk_index.json", "c2c_chunk_index", "Full S0 chunk catalog for paper, rebuttal, and code retrieval", bundle_key="chunk_index"),
+        _artifact_spec("intake/c2c/chunk_index.jsonl", "c2c_chunk_index_jsonl", "Line-delimited S0 chunk catalog for retrieval", bundle_key="chunk_index", file_format="chunk_index_jsonl"),
+        _artifact_spec("intake/c2c/retrieval_plan.json", "c2c_retrieval_plan", "Chunk retrieval plan for paper, rebuttal, and code evidence", bundle_key="retrieval_plan"),
+        _artifact_spec("intake/c2c/retrieval_followup.json", "c2c_retrieval_followup", "Follow-up retrieval questions and targets", bundle_key="followup_bundle"),
+        _artifact_spec("intake/c2c/negative_result_memory.json", "c2c_negative_result_memory", "Static below-baseline local variants and avoid-repeat rules", bundle_key="negative_memory"),
+        _artifact_spec("intake/c2c/evidence_brief.json", "c2c_evidence_brief", "Compact static evidence brief for S1 direction selection", bundle_key="evidence_brief"),
     ]
+
+
+def _artifact_spec(
+    path: str,
+    artifact_type: str,
+    summary: str,
+    *,
+    bundle_key: str | None,
+    file_format: str = "json",
+) -> dict[str, Any]:
+    return {
+        "path": path,
+        "relative_path": path.split("/", 1)[1],
+        "artifact_type": artifact_type,
+        "summary": summary,
+        "bundle_key": bundle_key,
+        "format": file_format,
+    }
+
+
+def _cached_c2c_artifact_payload(bundle: dict[str, Any], spec: dict[str, Any]) -> Any:
+    bundle_key = spec.get("bundle_key")
+    if bundle_key is None:
+        return bundle
+    if bundle_key not in bundle:
+        return None
+    value = bundle.get(bundle_key)
+    file_format = spec.get("format")
+    if file_format == "json":
+        return value
+    if file_format == "text":
+        return str(value or "")
+    if file_format == "jsonl":
+        return _jsonl(value if isinstance(value, list) else [])
+    if file_format == "chunk_index_jsonl":
+        entries = value.get("entries") if isinstance(value, dict) else []
+        return _jsonl(entries if isinstance(entries, list) else [])
+    if file_format == "repo_map_md":
+        return _repo_map_markdown_from_cached(value)
+    if file_format == "code_intake_report_md":
+        return _code_intake_report_markdown_from_cached(value)
+    return value
+
+
+def _repo_map_markdown_from_cached(repo_map: Any) -> str:
+    if not isinstance(repo_map, dict):
+        return "# Code Repo Map\n\nNo cached repo map available.\n"
+    counts = repo_map.get("counts") if isinstance(repo_map.get("counts"), dict) else {}
+    lines = ["# Code Repo Map", ""]
+    if counts:
+        lines.append(f"- Files: {counts.get('files', 0)}")
+        lines.append(f"- Symbols: {counts.get('symbols', 0)}")
+        lines.append(f"- Chunks: {counts.get('chunks', 0)}")
+        lines.append(f"- Edges: {counts.get('edges', 0)}")
+        lines.append("")
+    for item in (repo_map.get("top_editable_symbols") or [])[:40]:
+        if not isinstance(item, dict):
+            continue
+        symbol = item.get("symbol") or item.get("symbol_id") or ""
+        path = item.get("path") or ""
+        lines.append(f"- {path}: {symbol}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _code_intake_report_markdown_from_cached(report: Any) -> str:
+    if not isinstance(report, dict):
+        return "# Code Intake Report\n\nNo cached code intake report available.\n"
+    counts = report.get("counts") if isinstance(report.get("counts"), dict) else {}
+    cache = report.get("cache") if isinstance(report.get("cache"), dict) else {}
+    diagnostics = report.get("diagnostics") if isinstance(report.get("diagnostics"), list) else []
+    lines = ["# Code Intake Report", ""]
+    if counts:
+        lines.append("## Counts")
+        for key in ["files", "python_files", "symbols", "chunks", "edges", "editable_chunks"]:
+            if key in counts:
+                lines.append(f"- {key}: {counts.get(key)}")
+        lines.append("")
+    lines.append(f"- Cache: enabled={bool(cache.get('enabled'))} counts={cache.get('counts') or {}}")
+    if diagnostics:
+        lines.append("")
+        lines.append("## Diagnostics")
+        for item in diagnostics[:20]:
+            lines.append(f"- {item}")
+    return "\n".join(lines).rstrip() + "\n"
 
 
 def _c2c_evidence_brief(
@@ -330,7 +610,7 @@ def _c2c_evidence_brief(
     }
 
 
-def _c2c_cache_summary(paper_full_manifest: list[dict[str, Any]], code_intake_report: dict[str, Any]) -> dict[str, Any]:
+def _c2c_cache_summary(paper_full_manifest: list[dict[str, Any]], code_intake_report: dict[str, Any], *, pdf_ingest_config: dict[str, Any] | None = None) -> dict[str, Any]:
     mineru_counts: dict[str, int] = {}
     for item in paper_full_manifest:
         if not isinstance(item, dict):
@@ -338,8 +618,30 @@ def _c2c_cache_summary(paper_full_manifest: list[dict[str, Any]], code_intake_re
         status = str(item.get("cache_status") or "disabled")
         mineru_counts[status] = mineru_counts.get(status, 0) + 1
     code_cache = (code_intake_report.get("cache") or {}) if isinstance(code_intake_report, dict) else {}
+    code_fingerprint = code_intake_report.get("parser_fingerprint") if isinstance(code_intake_report, dict) else {}
+    mineru_provenance = _mineru_cache_provenance(pdf_ingest_config or {}, paper_full_manifest)
+    cache_fingerprint = _cache_summary_fingerprint(
+        {
+            "mineru": mineru_provenance,
+            "code_parser_config_hash": (code_fingerprint or {}).get("parser_config_hash"),
+            "code_chunking_config_hash": (code_fingerprint or {}).get("chunking_config_hash"),
+            "code_intake_schema_version": (code_fingerprint or {}).get("code_intake_schema_version"),
+        }
+    )
     return {
         "schema_version": "c2c_static_cache_summary_v1",
+        "cache_fingerprint": cache_fingerprint,
+        "provenance": {
+            "mineru_pdf": mineru_provenance,
+            "code_intake": {
+                "schema_version": (code_fingerprint or {}).get("code_intake_schema_version"),
+                "prompt_schema_version": (code_fingerprint or {}).get("prompt_schema_version"),
+                "tree_sitter_version": (code_fingerprint or {}).get("tree_sitter_version"),
+                "tree_sitter_python_version": (code_fingerprint or {}).get("tree_sitter_python_version"),
+                "parser_config_hash": (code_fingerprint or {}).get("parser_config_hash"),
+                "chunking_config_hash": (code_fingerprint or {}).get("chunking_config_hash"),
+            },
+        },
         "mineru_pdf": {
             "counts": dict(sorted(mineru_counts.items())),
             "items": [
@@ -348,6 +650,9 @@ def _c2c_cache_summary(paper_full_manifest: list[dict[str, Any]], code_intake_re
                     "sha256": item.get("sha256"),
                     "cache_status": item.get("cache_status", "disabled"),
                     "paper_full_md_path": item.get("paper_full_md_path"),
+                    "parser": item.get("parser"),
+                    "parser_status": item.get("parser_status"),
+                    "parser_artifacts": item.get("parser_artifacts"),
                 }
                 for item in paper_full_manifest
                 if isinstance(item, dict)
@@ -356,5 +661,39 @@ def _c2c_cache_summary(paper_full_manifest: list[dict[str, Any]], code_intake_re
         "code_intake": {
             "enabled": bool(code_cache.get("enabled")),
             "counts": code_cache.get("counts") or {},
+            "parser_config_hash": code_cache.get("parser_config_hash"),
+            "chunking_config_hash": code_cache.get("chunking_config_hash"),
         },
     }
+
+
+def _mineru_cache_provenance(pdf_ingest_config: dict[str, Any], paper_full_manifest: list[dict[str, Any]]) -> dict[str, Any]:
+    provider = str(pdf_ingest_config.get("provider") or "mineru")
+    model_versions = sorted({str(item.get("model_version")) for item in paper_full_manifest if isinstance(item, dict) and item.get("model_version")})
+    return {
+        "provider": provider,
+        "schema_version": "mineru_pdf_parse_result_v1",
+        "model_version": str(pdf_ingest_config.get("model_version") or (model_versions[0] if len(model_versions) == 1 else "vlm")),
+        "language": str(pdf_ingest_config.get("language") or "en"),
+        "enable_formula": bool(pdf_ingest_config.get("enable_formula", True)),
+        "enable_table": bool(pdf_ingest_config.get("enable_table", True)),
+        "is_ocr": bool(pdf_ingest_config.get("is_ocr", False)),
+        "prompt_schema_version": "c2c_paper_full_markdown_v1",
+        "parser_config_hash": _cache_summary_fingerprint(
+            {
+                "provider": provider,
+                "model_version": str(pdf_ingest_config.get("model_version") or "vlm"),
+                "language": str(pdf_ingest_config.get("language") or "en"),
+                "enable_formula": bool(pdf_ingest_config.get("enable_formula", True)),
+                "enable_table": bool(pdf_ingest_config.get("enable_table", True)),
+                "is_ocr": bool(pdf_ingest_config.get("is_ocr", False)),
+            }
+        ),
+    }
+
+
+def _cache_summary_fingerprint(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()

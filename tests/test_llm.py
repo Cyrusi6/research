@@ -2,7 +2,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
-from auto_research.llm import ModelClient
+from auto_research.llm import ModelClient, codex_subprocess_env
 
 
 def test_openai_api_key_rotation_prefers_base_key_then_numbered(monkeypatch) -> None:
@@ -23,6 +23,53 @@ def test_openai_api_key_rotation_prefers_base_key_then_numbered(monkeypatch) -> 
     )
 
     assert client._openai_api_keys[:3] == ["base-key", "first-key", "second-key"]
+
+
+def test_openai_api_key_env_strict_uses_only_configured_key(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "base-key")
+    monkeypatch.setenv("OPENAI_API_KEY_1", "first-key")
+    monkeypatch.setenv("OPENAI_API_KEY_2", "second-key")
+    monkeypatch.setenv("OPENAI_API_TOKEN", "token-key")
+    client = ModelClient(
+        {
+            "llm": {
+                "provider": "openai",
+                "reasoning_provider": "openai",
+                "api_key_env": "OPENAI_API_KEY_2",
+                "disable_api_key_fallback": True,
+                "model": "gpt-5.4",
+                "timeout_seconds": 10,
+                "use_real_api": False,
+            }
+        }
+    )
+
+    assert client._openai_api_keys == ["second-key"]
+
+
+def test_codex_subprocess_env_scopes_only_openai_keys(monkeypatch) -> None:
+    monkeypatch.setenv("OPENAI_API_KEY", "base-key")
+    monkeypatch.setenv("OPENAI_API_KEY_1", "first-key")
+    monkeypatch.setenv("OPENAI_API_KEY_2", "second-key")
+    monkeypatch.setenv("OPENAI_API_TOKEN", "token-key")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+    monkeypatch.setenv("MINERU_API_KEY", "mineru-key")
+
+    env = codex_subprocess_env(
+        {
+            "llm": {
+                "api_key_env": "OPENAI_API_KEY_2",
+                "disable_api_key_fallback": True,
+            }
+        }
+    )
+
+    assert env["OPENAI_API_KEY"] == "second-key"
+    assert env["OPENAI_API_KEY_2"] == "second-key"
+    assert "OPENAI_API_KEY_1" not in env
+    assert "OPENAI_API_TOKEN" not in env
+    assert env["DEEPSEEK_API_KEY"] == "deepseek-key"
+    assert env["MINERU_API_KEY"] == "mineru-key"
 
 
 def test_openai_api_key_rotation_falls_back_on_quota(monkeypatch) -> None:
@@ -170,7 +217,7 @@ def test_codex_cli_provider_persists_session(monkeypatch, tmp_path: Path) -> Non
     meta_dir.mkdir(parents=True)
     (meta_dir / "codex_sessions.yaml").write_text("sessions: {}\n", encoding="utf-8")
 
-    def fake_run(command, capture_output, text, cwd, timeout):
+    def fake_run(command, capture_output, text, cwd, timeout, env=None):
         output_path = Path(command[command.index("--output-last-message") + 1])
         output_path.write_text('{"value": 1}\n', encoding="utf-8")
         return SimpleNamespace(returncode=0, stdout="", stderr="session id: 123e4567-e89b-12d3-a456-426614174000\n")

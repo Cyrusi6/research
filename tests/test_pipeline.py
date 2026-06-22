@@ -3,6 +3,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import yaml
+import pytest
 
 import auto_research.config as config_module
 import auto_research.agents.literature as literature_module
@@ -10,7 +11,7 @@ import auto_research.orchestrator as orchestrator_module
 from auto_research.adapters.literature import LiteratureProvider
 from auto_research.orchestrator import Orchestrator
 from auto_research.registry import block_stage
-from auto_research.utils import write_json
+from auto_research.utils import write_json, write_yaml
 
 
 def _test_config(tmp_path: Path, simulate: bool) -> dict:
@@ -267,6 +268,94 @@ def test_s3_failure_feedback_can_early_stop_from_iteration_history(tmp_path: Pat
     assert registry["status"] == "blocked"
 
 
+def test_s3_full_failure_records_proxy_calibration_shared_memory(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_full_proxy_memory"
+    write_json(
+        project_root / "experiment" / "results" / "main_results.json",
+        {
+            "baseline": {"mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+            "acceptance": {"passed": False, "reason": "below baseline"},
+            "candidate_results": [
+                {
+                    "id": "proxy_pass_full_fail",
+                    "title": "Proxy pass full fail",
+                    "mechanism_type": "utility_predicted_cache_routing",
+                    "decision": "not_viable",
+                    "metrics": {"mean": 49.8, "datasets": {"mmlu-redux": 48.5}},
+                    "delta_vs_baseline": -0.2,
+                    "proxy_screen": {
+                        "status": "passed",
+                        "proxy_delta_vs_baseline": 0.8,
+                        "proxy_dataset_deltas": {"mmlu-redux": 0.9},
+                    },
+                }
+            ],
+        },
+    )
+    write_json(
+        project_root / "experiment" / "results" / "proxy_calibration.json",
+        {
+            "summary": {
+                "candidate_count": 1,
+                "proxy_false_positive_count": 1,
+                "proxy_false_positive_rate": 1.0,
+                "dataset_error_summary": {"mmlu-redux": {"misprediction_count": 1, "count": 1}},
+                "mechanism_false_positive_summary": {
+                    "utility_predicted_cache_routing": {"count": 1, "false_positive_count": 1, "false_positive_rate": 1.0}
+                },
+            },
+            "current_iteration": {
+                "iteration": 1,
+                "acceptance_passed": False,
+                "candidate_count": 1,
+                "proxy_false_positive_count": 1,
+                "proxy_false_positive_rate": 1.0,
+                "candidates": [
+                    {
+                        "id": "proxy_pass_full_fail",
+                        "mechanism_type": "utility_predicted_cache_routing",
+                        "proxy_false_positive": True,
+                        "mispredicted_datasets": ["mmlu-redux"],
+                    }
+                ],
+            },
+        },
+    )
+    config = {
+        "orchestration": {
+            "failure_feedback": {"enabled": True, "route_s3_failure_to_s1": True},
+            "shared_method_memory": {
+                "enabled": True,
+                "path": str(tmp_path / "method_memory.jsonl"),
+                "summary_path": str(tmp_path / "method_memory.md"),
+            },
+        }
+    }
+    registry = {
+        "iteration": 1,
+        "max_iterations": 3,
+        "status": "running",
+        "blocked_reason": None,
+        "current_stage": "S3_experiment",
+        "stages": {
+            "S1_literature": {"status": "completed", "judge_retries": 0},
+            "S2_plan": {"status": "completed", "judge_retries": 0},
+            "S3_experiment": {"status": "running", "judge_retries": 0},
+            "S4_writing": {"status": "pending", "judge_retries": 0},
+            "S5_review": {"status": "pending", "judge_retries": 0},
+        },
+    }
+
+    routed = Orchestrator._route_s3_failure_to_s1(project_root, registry, {"status": "not_viable"}, "below baseline", config=config)
+    memory = json.loads((tmp_path / "method_memory.jsonl").read_text(encoding="utf-8").splitlines()[0])
+
+    assert routed["status"] == "routed"
+    assert routed["shared_method_memory"]["status"] == "appended"
+    assert memory["proxy_calibration"]["summary"]["proxy_false_positive_count"] == 1
+    assert "proxy_full_false_positive" in memory["memory_quality"]["signals"]
+    assert memory["memory_quality"]["priority"] > 5
+
+
 def test_s3_repairable_proxy_routes_back_to_s2_same_iteration(tmp_path: Path) -> None:
     project_root = tmp_path / "proj"
     write_json(
@@ -309,7 +398,779 @@ def test_s3_repairable_proxy_routes_back_to_s2_same_iteration(tmp_path: Path) ->
     assert registry["repair_routes"]["2"] == 1
 
 
-def test_s3_repairable_proxy_allows_three_routes_per_iteration(tmp_path: Path) -> None:
+def test_s2_retryable_codex_limit_pauses_without_consuming_judge_retry(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_retryable_pause"
+    config = _test_config(tmp_path, simulate=False)
+    config["orchestration"]["judge_max_retries"] = 0
+    project_root.mkdir(parents=True)
+    (project_root / "meta").mkdir()
+    (project_root / "plan" / "code_patches").mkdir(parents=True)
+    write_json(project_root / "meta" / "project_config.yaml", config)
+    registry = {
+        "project_id": "proj_retryable_pause",
+        "research_topic": "topic",
+        "current_stage": "S2_plan",
+        "iteration": 1,
+        "max_iterations": 2,
+        "status": "running",
+        "blocked_reason": None,
+        "stages": {
+            "S0_intake": {"status": "completed", "started_at": None, "completed_at": None, "judge_passed": True, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S1_literature": {"status": "completed", "started_at": None, "completed_at": None, "judge_passed": True, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S2_plan": {"status": "pending", "started_at": None, "completed_at": None, "judge_passed": False, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S3_experiment": {"status": "pending", "started_at": None, "completed_at": None, "judge_passed": False, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S4_writing": {"status": "pending", "started_at": None, "completed_at": None, "judge_passed": False, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S5_review": {"status": "pending", "started_at": None, "completed_at": None, "judge_passed": False, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+        },
+    }
+    write_json(project_root / "meta" / "registry.yaml", registry)
+    write_json(
+        project_root / "plan" / "code_patches" / "patch_manifest.json",
+        {
+            "status": "retryable_no_valid_patch",
+            "retryable": True,
+            "retryable_patch_count": 1,
+            "valid_patch_count": 0,
+            "candidates": [
+                {
+                    "candidate_id": "rate_limited",
+                    "status": "retryable_codex_failed",
+                    "retryable": True,
+                    "failure_category": "llm_rate_limit_or_quota",
+                    "reason": "429 Too Many Requests",
+                }
+            ],
+        },
+    )
+
+    def fake_plan_run(self):
+        plan_dir = self.context.project_root / "plan"
+        write_yaml(
+            plan_dir / "plan.yaml",
+            {
+                "hypotheses": [{"id": "h1"}],
+                "baselines": [{"name": "base"}, {"name": "candidate"}],
+                "datasets": [{"name": "mmlu-redux"}],
+                "task_graph": {},
+                "resource_budget": {},
+                "execution": {
+                    "collector": "c2c_small_loop",
+                    "min_delta_to_pass": 0.1,
+                    "max_dataset_regression": 2.0,
+                },
+                "acceptance_criteria": {
+                    "minimum_mean_delta": 0.1,
+                    "coverage_diagnostics_required": True,
+                    "matched_coverage_ablation_required": True,
+                },
+                "ablation_matrix": [{"experiment": "matched transfer coverage control", "matched_coverage_ablation": {"required": True}}],
+                "reviewer_risk_controls": {"top_concerns": []},
+            },
+        )
+        write_yaml(plan_dir / "short_loop_plan.yaml", {"run": True})
+        write_json(
+            plan_dir / "candidate_ideas.json",
+            [
+                {
+                    "id": "utility_predicted_cache_routing",
+                    "title": "Utility-predicted cache routing",
+                    "selected": True,
+                    "hypothesis": "Predict transferred-cache utility before routing.",
+                    "description": "Mechanism-level utility prediction for cache routing.",
+                    "mechanism_type": "utility_predicted_cache_routing",
+                    "mechanism_contract": {"components": ["utility predictor"], "ablation_switch": "disable_utility_router"},
+                    "experiment_contract": {"ablation_switch": "disable_utility_router"},
+                    "implementation_scope": {"files": ["rosetta/model/projector.py"]},
+                    "decomposition_plan": [{"step": "wire utility router"}],
+                    "expected_signature": {"stats": ["accepted_span_rate"]},
+                }
+            ],
+        )
+        return {"artifacts": ["plan/plan.yaml", "plan/short_loop_plan.yaml", "plan/candidate_ideas.json", "plan/code_patches/patch_manifest.json"]}
+
+    monkeypatch.setattr(config_module, "load_root_config", lambda: config)
+    monkeypatch.setattr(orchestrator_module, "load_root_config", lambda: config)
+    monkeypatch.setattr(orchestrator_module.PlanAgent, "run", fake_plan_run)
+
+    result = Orchestrator().start(project_root.name)
+
+    saved = yaml.safe_load((project_root / "meta" / "registry.yaml").read_text(encoding="utf-8"))
+    assert result["status"] == "retryable_paused"
+    assert result["stage"] == "S2_plan"
+    assert result["pause_type"] == "codex_quota_or_rate_limit"
+    assert "resume --project-id proj_retryable_pause" in result["resume_instruction"]
+    assert saved["status"] == "retryable_paused"
+    assert saved["current_stage"] == "S2_plan"
+    assert saved["stages"]["S2_plan"]["status"] == "retryable_paused"
+    assert saved["stages"]["S2_plan"]["judge_retries"] == 0
+    state = json.loads((project_root / "orchestration" / "state.json").read_text(encoding="utf-8"))
+    assert state["status"] == "retryable_paused"
+    assert state["current_stage"] == "S2_plan"
+    assert state["resume_instruction"] == saved["resume_instruction"]
+    contract = json.loads((project_root / "orchestration" / "stage_contracts" / "S2_plan.json").read_text(encoding="utf-8"))
+    assert contract["status"] == "retryable_paused"
+    assert contract["gate"]["status"] == "NEEDS_RETRY"
+    session_log = (project_root / "meta" / "session_log.jsonl").read_text(encoding="utf-8")
+    assert "retryable_paused" in session_log
+
+
+def test_s2_runtime_smoke_resource_retry_pauses_without_codex_repair(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_resource_retry_pause"
+    config = _test_config(tmp_path, simulate=False)
+    config["orchestration"]["judge_max_retries"] = 0
+    project_root.mkdir(parents=True)
+    (project_root / "meta").mkdir()
+    (project_root / "plan" / "code_patches").mkdir(parents=True)
+    write_json(project_root / "meta" / "project_config.yaml", config)
+    registry = {
+        "project_id": "proj_resource_retry_pause",
+        "research_topic": "topic",
+        "current_stage": "S2_plan",
+        "iteration": 1,
+        "max_iterations": 2,
+        "status": "running",
+        "blocked_reason": None,
+        "stages": {
+            "S0_intake": {"status": "completed", "started_at": None, "completed_at": None, "judge_passed": True, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S1_literature": {"status": "completed", "started_at": None, "completed_at": None, "judge_passed": True, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S2_plan": {"status": "pending", "started_at": None, "completed_at": None, "judge_passed": False, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S3_experiment": {"status": "pending", "started_at": None, "completed_at": None, "judge_passed": False, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S4_writing": {"status": "pending", "started_at": None, "completed_at": None, "judge_passed": False, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+            "S5_review": {"status": "pending", "started_at": None, "completed_at": None, "judge_passed": False, "judge_retries": 0, "artifacts": [], "blocked_reason": None},
+        },
+    }
+    write_json(project_root / "meta" / "registry.yaml", registry)
+    write_json(
+        project_root / "plan" / "code_patches" / "patch_manifest.json",
+        {
+            "status": "retryable_no_valid_patch",
+            "retryable": True,
+            "retryable_patch_count": 1,
+            "valid_patch_count": 0,
+            "candidates": [
+                {
+                    "candidate_id": "resource_wait",
+                    "status": "validation_failed",
+                    "retryable": True,
+                    "resource_retry": True,
+                    "failure_category": "runtime_smoke_resource_retry",
+                    "reason": "runtime smoke could not obtain a GPU with enough free memory",
+                }
+            ],
+        },
+    )
+
+    def fake_plan_run(self):
+        plan_dir = self.context.project_root / "plan"
+        write_yaml(
+            plan_dir / "plan.yaml",
+            {
+                "hypotheses": [{"id": "h1"}],
+                "baselines": [{"name": "base"}, {"name": "candidate"}],
+                "datasets": [{"name": "mmlu-redux"}],
+                "task_graph": {},
+                "resource_budget": {},
+                "execution": {
+                    "collector": "c2c_small_loop",
+                    "min_delta_to_pass": 0.1,
+                    "max_dataset_regression": 2.0,
+                },
+                "acceptance_criteria": {
+                    "minimum_mean_delta": 0.1,
+                    "coverage_diagnostics_required": True,
+                    "matched_coverage_ablation_required": True,
+                },
+                "ablation_matrix": [{"experiment": "matched transfer coverage control", "matched_coverage_ablation": {"required": True}}],
+                "reviewer_risk_controls": {"top_concerns": []},
+            },
+        )
+        write_yaml(plan_dir / "short_loop_plan.yaml", {"run": True})
+        write_json(
+            plan_dir / "candidate_ideas.json",
+            [
+                {
+                    "id": "utility_predicted_cache_routing",
+                    "title": "Utility-predicted cache routing",
+                    "selected": True,
+                    "hypothesis": "Predict transferred-cache utility before routing.",
+                    "description": "Mechanism-level utility prediction for cache routing.",
+                    "mechanism_type": "utility_predicted_cache_routing",
+                    "mechanism_contract": {"components": ["utility predictor"], "ablation_switch": "disable_utility_router"},
+                    "experiment_contract": {"ablation_switch": "disable_utility_router"},
+                    "implementation_scope": {"files": ["rosetta/model/projector.py"]},
+                    "decomposition_plan": [{"step": "wire utility router"}],
+                    "expected_signature": {"stats": ["accepted_span_rate"]},
+                }
+            ],
+        )
+        return {"artifacts": ["plan/plan.yaml", "plan/short_loop_plan.yaml", "plan/candidate_ideas.json", "plan/code_patches/patch_manifest.json"]}
+
+    monkeypatch.setattr(config_module, "load_root_config", lambda: config)
+    monkeypatch.setattr(orchestrator_module, "load_root_config", lambda: config)
+    monkeypatch.setattr(orchestrator_module.PlanAgent, "run", fake_plan_run)
+
+    result = Orchestrator().start(project_root.name)
+
+    saved = yaml.safe_load((project_root / "meta" / "registry.yaml").read_text(encoding="utf-8"))
+    assert result["status"] == "retryable_paused"
+    assert result["pause_type"] == "runtime_smoke_resource_retry"
+    assert "GPU memory" in result["reason"]
+    assert saved["status"] == "retryable_paused"
+    assert saved["pause_type"] == "runtime_smoke_resource_retry"
+    assert saved["stages"]["S2_plan"]["judge_retries"] == 0
+
+
+def test_s3_implementation_failure_routes_to_s2_without_consuming_direction_budget(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_implementation_failure_route"
+    write_json(
+        project_root / "experiment" / "results" / "main_results.json",
+        {
+            "candidate_results": [
+                {
+                    "id": "idea_impl",
+                    "decision": "proxy_repairable",
+                    "command_status": "proxy_repairable",
+                    "patch_result": {
+                        "status": "applied",
+                        "changed_files": ["rosetta/model/projector.py"],
+                        "validation": {
+                            "checks": [
+                                {
+                                    "name": "runtime_smoke:mechanism_activation_wiring",
+                                    "returncode": 1,
+                                    "failure_category": "mechanism_activation_wiring_failed",
+                                }
+                            ]
+                        },
+                    },
+                    "proxy_screen": {
+                        "status": "repairable_proxy_risk",
+                        "reason": "ablation switch produced no observable proxy eval metric or prediction change",
+                        "activation_smoke": {
+                            "status": "failed",
+                            "mechanism_trace": {"status": "missing"},
+                        },
+                    },
+                    "failure_attribution": {"primary_failure": "proxy_activation_smoke_no_effect"},
+                }
+            ]
+        },
+    )
+    registry = {
+        "iteration": 2,
+        "max_iterations": 5,
+        "status": "running",
+        "blocked_reason": None,
+        "current_stage": "S3_experiment",
+        "repair_routes": {"2": 4},
+        "implementation_repair_routes": {},
+        "stages": {
+            "S1_literature": {"status": "completed", "judge_retries": 0},
+            "S2_plan": {"status": "completed", "judge_retries": 1},
+            "S3_experiment": {"status": "running", "judge_retries": 1},
+            "S4_writing": {"status": "pending", "judge_retries": 0},
+            "S5_review": {"status": "pending", "judge_retries": 0},
+        },
+    }
+    config = {
+        "orchestration": {
+            "failure_feedback": {
+                "enabled": True,
+                "route_repairable_proxy_to_s2": True,
+                "route_s3_failure_to_s1": True,
+                "max_same_direction_proxy_failures": 5,
+            }
+        }
+    }
+
+    assert orchestrator_module._s3_feedback_failure_class(project_root) == "implementation_failure"
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s2(config, project_root, registry) is True
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s1(config, project_root, registry) is False
+    routed = Orchestrator._route_s3_repairable_proxy_to_s2(project_root, registry, {"status": "blocked"}, "activation wiring failed", config=config)
+
+    assert routed["status"] == "routed"
+    assert routed["next_stage"] == "S2_plan"
+    assert routed["failure_class"] == "implementation_failure"
+    assert routed["repair_lane"] == "s2_5_only_implementation_repair"
+    assert routed["skips_s2_planner"] is True
+    assert routed["same_direction_failure_count"] == 0
+    assert registry["repair_routes"]["2"] == 4
+    assert registry["implementation_repair_routes"]["2"] == 1
+    assert registry["s2_5_repair_dispatch"]["active"] is True
+    assert registry["s2_5_repair_dispatch"]["selected_candidate_id"] == "idea_impl"
+    assert registry["iteration"] == 2
+    assert registry["current_stage"] == "S2_plan"
+    assert not (project_root / "plan" / "direction_scorecard.json").exists()
+    feedback = json.loads((project_root / "plan" / "performance_feedback.json").read_text(encoding="utf-8"))
+    assert feedback["summary"]["failure_class"] == "implementation_failure"
+    assert feedback["summary"]["does_not_consume_same_direction_attempt"] is True
+    assert feedback["summary"]["recommended_s2_action"] == "patch_repair"
+    assert feedback["summary"]["s2_action_policy"]["matched_rule"] == "implementation_failure"
+    dispatch = json.loads((project_root / "plan" / "s2_5_repair_dispatch.json").read_text(encoding="utf-8"))
+    assert dispatch["mode"] == "s2_5_only_implementation_repair"
+    assert dispatch["selected_candidate_id"] == "idea_impl"
+    assert dispatch["same_candidate_required"] is True
+    assert dispatch["reuse_persistent_codex_session"] is True
+    assert dispatch["do_not_replan_method"] is True
+    assert dispatch["changed_files"] == ["rosetta/model/projector.py"]
+    assert "mechanism_activation_wiring_failed" in dispatch["implementation_failure_signals"]
+
+
+def test_s3_proxy_oom_pauses_as_resource_retry_not_s2_5_repair(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_s3_proxy_oom_resource_retry"
+    write_json(
+        project_root / "experiment" / "results" / "main_results.json",
+        {
+            "candidate_results": [
+                {
+                    "id": "proxy_oom",
+                    "decision": "proxy_repairable",
+                    "command_status": "proxy_repairable",
+                    "proxy_screen": {
+                        "status": "repairable_proxy_risk",
+                        "reason": "proxy command 0 failed: resource_oom",
+                        "command_failure": {
+                            "category": "resource_oom",
+                            "summary": "resource_oom: CUDA out of memory",
+                        },
+                    },
+                    "failure_attribution": {"primary_failure": "repairable_proxy_risk_before_full_training"},
+                }
+            ]
+        },
+    )
+    config = {
+        "orchestration": {
+            "failure_feedback": {
+                "enabled": True,
+                "route_repairable_proxy_to_s2": True,
+                "route_s3_failure_to_s1": True,
+            }
+        }
+    }
+    registry = {
+        "iteration": 1,
+        "max_iterations": 5,
+        "status": "running",
+        "blocked_reason": None,
+        "current_stage": "S3_experiment",
+        "repair_routes": {"1": 0},
+        "implementation_repair_routes": {"1": 8},
+        "implementation_repair_routes_by_candidate": {"1:proxy_oom:unknown_variant": 8},
+        "stages": {
+            "S1_literature": {"status": "completed", "judge_retries": 0},
+            "S2_plan": {"status": "completed", "judge_retries": 0},
+            "S3_experiment": {"status": "running", "judge_retries": 0},
+            "S4_writing": {"status": "pending", "judge_retries": 0},
+            "S5_review": {"status": "pending", "judge_retries": 0},
+        },
+    }
+
+    assert orchestrator_module._s3_result_has_resource_retry(project_root) is True
+    assert orchestrator_module._s3_feedback_failure_class(project_root) == "resource_retry"
+    assert Orchestrator._should_route_s3_implementation_failure_to_s2(config, project_root, registry) is False
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s2(config, project_root, registry) is False
+    pause = Orchestrator._s3_resource_retry_pause_details(
+        project_root,
+        {"status": "blocked"},
+        "C2C cheap proxy found repairable S2.5 patch risk for all candidates",
+    )
+
+    assert pause is not None
+    assert pause["pause_type"] == "s3_proxy_resource_retry"
+    assert "not an S2.5 implementation repair" in pause["reason"]
+    assert registry["implementation_repair_routes"]["1"] == 8
+    assert registry["implementation_repair_routes_by_candidate"]["1:proxy_oom:unknown_variant"] == 8
+
+
+@pytest.mark.parametrize(
+    ("probe_payload", "expected_signal"),
+    [
+        (
+            {
+                "probe_type": "repo_small_batch_forward_failed_static_trace",
+                "fallback_reason": "torch_import_failed",
+                "failures": ["torch_import_failed"],
+            },
+            "torch_import_failed",
+        ),
+        (
+            {
+                "probe_type": "repo_small_batch_forward_failed_static_trace",
+                "fallback_reason": "projector_import_failed",
+                "failures": ["projector_import_failed"],
+            },
+            "projector_import_failed",
+        ),
+        (
+            {
+                "probe_type": "repo_small_batch_forward",
+                "failures": ["enabled_disabled_forward_tensors_identical"],
+                "mechanism_observed": False,
+            },
+            "enabled_disabled_forward_tensors_identical",
+        ),
+    ],
+)
+def test_s3_activation_forward_probe_failures_are_implementation_only(tmp_path: Path, probe_payload: dict, expected_signal: str) -> None:
+    project_root = tmp_path / "proj_forward_probe_impl_route"
+    write_json(
+        project_root / "experiment" / "results" / "main_results.json",
+        {
+            "candidate_results": [
+                {
+                    "id": "forward_probe_impl",
+                    "decision": "proxy_repairable",
+                    "command_status": "proxy_repairable",
+                    "patch_result": {
+                        "status": "applied",
+                        "changed_files": ["rosetta/model/projector.py"],
+                        "validation": {
+                            "checks": [
+                                {
+                                    "name": "runtime_smoke:mechanism_activation_forward_probe",
+                                    "returncode": 1,
+                                    "failure_category": "mechanism_activation_forward_probe_failed",
+                                    "forward_probe_diagnostics": {
+                                        "switch_seen_by_forward": False,
+                                        "projector_output_identical": True,
+                                        "changed_tensors": [],
+                                        "identical_tensors": ["projector_output"],
+                                    },
+                                    "probe": probe_payload,
+                                }
+                            ]
+                        },
+                    },
+                    "proxy_screen": {
+                        "status": "repairable_proxy_risk",
+                        "reason": "forward probe did not observe mechanism activation",
+                    },
+                    "failure_attribution": {"primary_failure": "repairable_proxy_risk_before_full_training"},
+                }
+            ]
+        },
+    )
+    registry = {
+        "iteration": 1,
+        "max_iterations": 5,
+        "status": "running",
+        "blocked_reason": None,
+        "current_stage": "S3_experiment",
+        "repair_routes": {"1": 4},
+        "implementation_repair_routes": {},
+        "stages": {
+            "S1_literature": {"status": "completed", "judge_retries": 0},
+            "S2_plan": {"status": "completed", "judge_retries": 0},
+            "S3_experiment": {"status": "running", "judge_retries": 0},
+            "S4_writing": {"status": "pending", "judge_retries": 0},
+            "S5_review": {"status": "pending", "judge_retries": 0},
+        },
+    }
+    config = {
+        "orchestration": {
+            "failure_feedback": {
+                "enabled": True,
+                "route_repairable_proxy_to_s2": True,
+                "route_s3_failure_to_s1": True,
+                "max_same_direction_proxy_failures": 5,
+            }
+        }
+    }
+
+    assert orchestrator_module._s3_feedback_failure_class(project_root) == "implementation_failure"
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s2(config, project_root, registry) is True
+    routed = Orchestrator._route_s3_repairable_proxy_to_s2(project_root, registry, {"status": "blocked"}, "forward probe failed", config=config)
+
+    assert routed["failure_class"] == "implementation_failure"
+    assert routed["same_direction_failure_count"] == 0
+    assert registry["repair_routes"]["1"] == 4
+    assert registry["implementation_repair_routes"]["1"] == 1
+    assert not (project_root / "plan" / "direction_scorecard.json").exists()
+    feedback = json.loads((project_root / "plan" / "performance_feedback.json").read_text(encoding="utf-8"))
+    assert feedback["summary"]["does_not_consume_same_direction_attempt"] is True
+    assert feedback["summary"]["recommended_s2_action"] == "patch_repair"
+    assert expected_signal in feedback["summary"]["repair_vs_variant_signals"]
+    assert expected_signal in feedback["candidate_results"][0]["implementation_failure_signals"]
+    dispatch = json.loads((project_root / "plan" / "s2_5_repair_dispatch.json").read_text(encoding="utf-8"))
+    assert dispatch["repair_lane"] == "s2_5_only_implementation_repair"
+    assert dispatch["selected_candidate_id"] == "forward_probe_impl"
+    assert dispatch["same_candidate_required"] is True
+    assert dispatch["reuse_persistent_codex_session"] is True
+    assert dispatch["activation_forward_probe_diagnostics"]["projector_output_identical"] is True
+    assert dispatch["tensor_checks"]["identical_tensors"] == ["projector_output"]
+
+
+def test_s3_full_metrics_failure_is_method_failure_even_with_implementation_signals(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_full_metrics_method_failure"
+    write_json(
+        project_root / "experiment" / "results" / "main_results.json",
+        {
+            "baseline": {"mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+            "acceptance": {"passed": False, "reason": "full metric below baseline"},
+            "candidate_results": [
+                {
+                    "id": "proxy_pass_full_collapse",
+                    "title": "Proxy pass full collapse",
+                    "decision": "not_viable",
+                    "command_status": "ok",
+                    "mechanism_type": "utility_predicted_cache_routing",
+                    "metrics": {"mean": 43.0, "datasets": {"mmlu-redux": 42.0}},
+                    "delta_vs_baseline": -7.0,
+                    "proxy_screen": {
+                        "status": "passed",
+                        "proxy_delta_vs_baseline": 0.6,
+                        "proxy_dataset_deltas": {"mmlu-redux": 0.7},
+                        "activation_smoke": {
+                            "status": "failed",
+                            "mechanism_trace": {"status": "missing"},
+                        },
+                        "proxy_effect_repair_contract": {"source": "proxy_activation_smoke"},
+                    },
+                    "activation_smoke": {
+                        "status": "failed",
+                        "mechanism_trace": {"status": "missing"},
+                    },
+                    "patch_result": {
+                        "status": "applied",
+                        "validation": {
+                            "checks": [
+                                {
+                                    "name": "runtime_smoke:mechanism_activation_forward_probe",
+                                    "returncode": 1,
+                                    "failure_category": "mechanism_activation_forward_probe_failed",
+                                    "probe": {
+                                        "probe_type": "repo_small_batch_forward",
+                                        "failures": ["enabled_disabled_forward_tensors_identical"],
+                                    },
+                                }
+                            ]
+                        },
+                    },
+                    "failure_attribution": {"primary_failure": "proxy_activation_smoke_no_effect"},
+                }
+            ],
+        },
+    )
+    write_json(
+        project_root / "experiment" / "results" / "proxy_calibration.json",
+        {
+            "current_iteration": {
+                "proxy_false_positive_count": 1,
+                "proxy_false_positive_rate": 1.0,
+            }
+        },
+    )
+    registry = {"iteration": 1}
+
+    assert orchestrator_module._s3_feedback_failure_class(project_root) == "method_failure"
+    feedback = orchestrator_module._s3_full_performance_feedback(
+        project_root,
+        registry,
+        {"status": "not_viable"},
+        "full metric below baseline",
+    )
+
+    assert feedback["summary"]["failure_class"] == "method_failure"
+    assert feedback["summary"]["does_not_consume_same_direction_attempt"] is False
+    assert feedback["summary"]["full_s3_completed_candidates"] == 1
+    assert feedback["summary"]["proxy_false_positive_count"] == 1
+
+
+def test_s3_full_metrics_repairable_does_not_use_implementation_repair_route(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_full_metrics_repairable_method_route"
+    write_json(
+        project_root / "experiment" / "results" / "main_results.json",
+        {
+            "acceptance": {"passed": False, "reason": "full metric below baseline"},
+            "candidate_results": [
+                {
+                    "id": "proxy_pass_full_collapse",
+                    "decision": "proxy_repairable",
+                    "command_status": "ok",
+                    "metrics": {"mean": 43.0, "datasets": {"mmlu-redux": 42.0}},
+                    "delta_vs_baseline": -7.0,
+                    "proxy_screen": {
+                        "status": "repairable_proxy_risk",
+                        "proxy_delta_vs_baseline": 0.6,
+                        "proxy_effect_repair_contract": {"source": "proxy_activation_smoke"},
+                    },
+                    "activation_smoke": {
+                        "status": "failed",
+                        "mechanism_trace": {"status": "missing"},
+                    },
+                    "failure_attribution": {"primary_failure": "proxy_activation_smoke_no_effect"},
+                }
+            ],
+        },
+    )
+    config = {
+        "orchestration": {
+            "failure_feedback": {
+                "enabled": True,
+                "route_repairable_proxy_to_s2": True,
+                "route_s3_failure_to_s1": True,
+                "max_same_direction_proxy_failures": 5,
+            }
+        }
+    }
+    registry = {
+        "iteration": 1,
+        "max_iterations": 5,
+        "status": "running",
+        "blocked_reason": None,
+        "current_stage": "S3_experiment",
+        "repair_routes": {"1": 0},
+        "implementation_repair_routes": {},
+        "stages": {
+            "S1_literature": {"status": "completed", "judge_retries": 0},
+            "S2_plan": {"status": "completed", "judge_retries": 0},
+            "S3_experiment": {"status": "running", "judge_retries": 0},
+            "S4_writing": {"status": "pending", "judge_retries": 0},
+            "S5_review": {"status": "pending", "judge_retries": 0},
+        },
+    }
+
+    assert orchestrator_module._s3_feedback_failure_class(project_root) == "method_failure"
+    assert Orchestrator._should_route_s3_implementation_failure_to_s2(config, project_root, registry) is False
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s2(config, project_root, registry) is True
+    routed = Orchestrator._route_s3_repairable_proxy_to_s2(project_root, registry, {"status": "blocked"}, "full metric below baseline", config=config)
+
+    assert routed["failure_class"] == "method_failure"
+    assert routed["same_direction_failure_count"] == 1
+    assert registry["implementation_repair_routes"] == {}
+    assert registry["repair_routes"]["1"] == 1
+    feedback = json.loads((project_root / "plan" / "performance_feedback.json").read_text(encoding="utf-8"))
+    assert feedback["summary"]["failure_class"] == "method_failure"
+    assert feedback["summary"]["does_not_consume_same_direction_attempt"] is False
+
+
+def test_s3_proxy_baseline_blocked_is_not_implementation_failure(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_proxy_baseline_blocked"
+    write_json(
+        project_root / "experiment" / "results" / "main_results.json",
+        {
+            "acceptance": {"passed": False, "reason": "no candidate metrics"},
+            "candidate_results": [
+                {
+                    "id": "idea_proxy_timeout",
+                    "decision": "blocked",
+                    "command_status": "blocked",
+                    "metrics": None,
+                    "proxy_screen": {
+                        "status": "baseline_blocked",
+                        "reason": "proxy baseline eval mmlu-redux failed",
+                        "baseline_status": "blocked",
+                        "baseline_failure": {
+                            "category": "proxy_timeout",
+                            "step": "proxy_baseline_eval_mmlu-redux",
+                            "returncode": 124,
+                        },
+                    },
+                    "failure_attribution": {"primary_failure": "none"},
+                }
+            ],
+        },
+    )
+    config = {
+        "orchestration": {
+            "failure_feedback": {
+                "enabled": True,
+                "route_repairable_proxy_to_s2": True,
+                "route_implementation_failure_to_s2": True,
+            }
+        }
+    }
+    registry = {"iteration": 1, "implementation_repair_routes": {}}
+
+    assert orchestrator_module._s3_feedback_failure_class(project_root) == "method_failure"
+    assert Orchestrator._should_route_s3_implementation_failure_to_s2(config, project_root, registry) is False
+
+
+def test_s3_proxy_rejected_with_metrics_routes_as_method_feedback(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_proxy_rejected_metrics_method"
+    write_json(
+        project_root / "experiment" / "results" / "main_results.json",
+        {
+            "acceptance": {
+                "passed": False,
+                "reason": "proxy mean delta -2.703 below hard threshold -0.3",
+            },
+            "candidate_results": [
+                {
+                    "id": "inline_validmask_coverage_ablation_repair",
+                    "decision": "proxy_rejected",
+                    "command_status": "proxy_rejected",
+                    "metrics": None,
+                    "proxy_screen": {
+                        "status": "rejected",
+                        "reason": "proxy mean delta -2.703 below hard threshold -0.3",
+                        "metrics": {
+                            "mean": 36.6112,
+                            "datasets": {
+                                "ai2-arc": 39.6825,
+                                "mmlu-redux": 34.2135,
+                                "openbookqa": 35.9375,
+                            },
+                        },
+                        "proxy_baseline": {
+                            "mean": 39.3142,
+                            "datasets": {
+                                "ai2-arc": 38.0952,
+                                "mmlu-redux": 37.6598,
+                                "openbookqa": 42.1875,
+                            },
+                        },
+                        "proxy_delta_vs_proxy_baseline": -2.703,
+                        "proxy_dataset_deltas": {
+                            "ai2-arc": 1.5873,
+                            "mmlu-redux": -3.4463,
+                            "openbookqa": -6.25,
+                        },
+                    },
+                    "failure_attribution": {
+                        "primary_failure": "cheap_proxy_rejected_before_full_training",
+                        "patch_risk": {
+                            "risk_labels": [
+                                "alignment_mechanism_changed",
+                                "config_override_changed",
+                                "projector_mechanism_changed",
+                                "test_change",
+                                "training_loop_changed",
+                            ]
+                        },
+                    },
+                    "patch_result": {
+                        "status": "snapshot_applied",
+                        "changed_files": [
+                            "rosetta/model/aligner.py",
+                            "rosetta/model/projector.py",
+                            "script/train/SFT_train.py",
+                            "test/test_activation_forward_probe.py",
+                        ],
+                    },
+                }
+            ],
+        },
+    )
+    config = {
+        "orchestration": {
+            "failure_feedback": {
+                "enabled": True,
+                "route_proxy_rejected_to_s2": True,
+                "route_repairable_proxy_to_s2": True,
+                "max_same_direction_proxy_failures": 5,
+            }
+        }
+    }
+    registry = {"iteration": 1, "proxy_rejected_routes": {}, "implementation_repair_routes": {}}
+
+    assert orchestrator_module._s3_feedback_failure_class(project_root) == "method_failure"
+    assert Orchestrator._should_route_s3_implementation_failure_to_s2(config, project_root, registry) is False
+    assert Orchestrator._should_route_s3_proxy_rejected_to_s2(config, project_root, registry) is True
+
+
+def test_s3_repairable_proxy_budget_returns_to_s1_on_final_failure(tmp_path: Path) -> None:
     project_root = tmp_path / "proj_proxy_route_budget"
     write_json(
         project_root / "experiment" / "results" / "main_results.json",
@@ -328,15 +1189,56 @@ def test_s3_repairable_proxy_allows_three_routes_per_iteration(tmp_path: Path) -
             "failure_feedback": {
                 "enabled": True,
                 "route_repairable_proxy_to_s2": True,
+                "route_s3_failure_to_s1": True,
                 "max_proxy_repair_routes_per_iteration": 3,
+                "max_same_direction_proxy_failures": 5,
             }
         }
     }
-    registry = {"iteration": 1, "repair_routes": {"1": 2}}
+    registry = {
+        "iteration": 1,
+        "max_iterations": 5,
+        "status": "running",
+        "blocked_reason": None,
+        "current_stage": "S3_experiment",
+        "repair_routes": {"1": 1},
+        "stages": {
+            "S1_literature": {"status": "completed", "judge_retries": 0},
+            "S2_plan": {"status": "completed", "judge_retries": 0},
+            "S3_experiment": {"status": "running", "judge_retries": 0},
+            "S4_writing": {"status": "pending", "judge_retries": 0},
+            "S5_review": {"status": "pending", "judge_retries": 0},
+        },
+    }
 
     assert Orchestrator._should_route_s3_repairable_proxy_to_s2(config, project_root, registry) is True
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s1(config, project_root, registry) is False
+    registry["repair_routes"]["1"] = 2
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s2(config, project_root, registry) is True
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s1(config, project_root, registry) is False
     registry["repair_routes"]["1"] = 3
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s2(config, project_root, registry) is True
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s1(config, project_root, registry) is False
+    registry["repair_routes"]["1"] = 4
     assert Orchestrator._should_route_s3_repairable_proxy_to_s2(config, project_root, registry) is False
+    assert Orchestrator._should_route_s3_repairable_proxy_to_s1(config, project_root, registry) is True
+    routed = Orchestrator._route_s3_repairable_proxy_to_s1(
+        project_root,
+        registry,
+        {"status": "blocked"},
+        "repairable proxy budget exhausted",
+        config=config,
+    )
+
+    assert routed["status"] == "routed"
+    assert routed["next_stage"] == "S1_literature"
+    assert routed["same_direction_failure_count"] == 5
+    assert routed["same_direction_failure_budget"] == 5
+    assert registry["iteration"] == 2
+    assert registry["current_stage"] == "S1_literature"
+    feedback = json.loads((project_root / "plan" / "performance_feedback.json").read_text(encoding="utf-8"))
+    assert feedback["summary"]["recommended_s2_action"] == "return_to_s1_new_direction"
+    assert feedback["summary"]["s2_action_policy"]["matched_rule"] == "failure_budget_exhausted"
 
 
 def test_s3_blocked_repairable_proxy_routes_before_final_block(monkeypatch, tmp_path: Path) -> None:
@@ -516,7 +1418,8 @@ def test_s3_blocked_proxy_rejected_routes_to_s2_same_direction(monkeypatch, tmp_
     feedback = json.loads((project_root / "plan" / "performance_feedback.json").read_text(encoding="utf-8"))
     assert feedback["summary"]["next_action"] == "repair_or_variant_same_direction"
     assert feedback["summary"]["recommended_s2_action"] == "mechanism_repair"
-    assert "mixed_dataset_signal" in feedback["summary"]["repair_vs_variant_signals"]
+    assert feedback["summary"]["s2_action_policy"]["matched_rule"] == "single_dataset_small_drop"
+    assert "single_dataset_small_drop" in feedback["summary"]["repair_vs_variant_signals"]
     assert feedback["candidate_results"][0]["dragging_datasets"][0]["dataset"] == "mmlu-redux"
     assert feedback["candidate_results"][0]["runtime_validation"]["runtime_smoke"] == "passed"
     session_log = (project_root / "meta" / "session_log.jsonl").read_text(encoding="utf-8")
@@ -565,8 +1468,275 @@ def test_s3_proxy_feedback_recommends_patch_repair_for_runtime_failure(tmp_path:
         max_failures=5,
     )
 
+    assert feedback["summary"]["failure_class"] == "implementation_failure"
+    assert feedback["summary"]["does_not_consume_same_direction_attempt"] is True
     assert feedback["summary"]["recommended_s2_action"] == "patch_repair"
-    assert "runtime_or_validation_failed" in feedback["summary"]["repair_vs_variant_signals"]
+    assert feedback["summary"]["s2_action_policy"]["matched_rule"] == "implementation_failure"
+    assert "implementation_failure" in feedback["summary"]["repair_vs_variant_signals"]
+
+
+def test_s2_5_validation_failure_routes_to_patch_only_repair(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_s2_5_validation_repair"
+    validation_path = project_root / "plan" / "code_patches" / "idea_impl" / "validation.json"
+    write_json(
+        validation_path,
+        {
+            "status": "validation_failed",
+            "checks": [
+                {"name": "py_compile:rosetta/model/projector.py", "returncode": 0},
+                {
+                    "name": "runtime_smoke:first_batch_train",
+                    "returncode": 1,
+                    "failure_category": "first_batch_runtime_error",
+                    "repair_hint": "Fix the patched forward/train path so a one-sample first batch can complete before proxy train.",
+                },
+            ],
+            "changed_files": ["rosetta/model/projector.py"],
+        },
+    )
+    write_json(
+        project_root / "plan" / "code_patches" / "patch_manifest.json",
+        {
+            "status": "no_valid_patch",
+            "valid_patch_count": 0,
+            "retryable_patch_count": 0,
+            "selected_candidate_id": None,
+            "candidates": [
+                {
+                    "candidate_id": "idea_impl",
+                    "title": "Implementation Repair",
+                    "status": "validation_failed",
+                    "validation": "plan/code_patches/idea_impl/validation.json",
+                    "changed_files": ["rosetta/model/projector.py"],
+                    "variant_fingerprint": "abc123",
+                    "reason": "validation_failed",
+                }
+            ],
+        },
+    )
+    registry = {
+        "iteration": 1,
+        "status": "running",
+        "current_stage": "S2_plan",
+        "implementation_repair_routes": {},
+        "stages": {
+            "S1_literature": {"status": "completed", "judge_retries": 0},
+            "S2_plan": {"status": "running", "judge_retries": 2},
+            "S3_experiment": {"status": "pending", "judge_retries": 1},
+            "S4_writing": {"status": "pending", "judge_retries": 0},
+            "S5_review": {"status": "pending", "judge_retries": 0},
+        },
+    }
+    config = {
+        "orchestration": {
+            "failure_feedback": {
+                "enabled": True,
+                "max_implementation_repair_routes_per_iteration": 4,
+            }
+        }
+    }
+    gate_report = SimpleNamespace(
+        to_dict=lambda: {
+            "checks": [
+                {
+                    "name": "s2_5_patch_manifest_status",
+                    "status": "FAIL",
+                    "message": "S2.5 patch manifest status is no_valid_patch",
+                }
+            ]
+        }
+    )
+
+    routed = Orchestrator._route_s2_5_validation_failure_to_repair(
+        project_root,
+        registry,
+        {"status": "running"},
+        gate_report,
+        "S2.5 patch manifest status is no_valid_patch",
+        config=config,
+    )
+
+    assert routed is not None
+    assert routed["status"] == "routed"
+    assert routed["repair_lane"] == "s2_5_only_implementation_repair"
+    assert routed["skips_s2_planner"] is True
+    assert routed["does_not_consume_same_direction_attempt"] is True
+    assert registry["implementation_repair_routes"]["1"] == 1
+    assert registry["stages"]["S2_plan"]["judge_retries"] == 0
+    assert registry["stages"]["S3_experiment"]["judge_retries"] == 0
+    feedback = json.loads((project_root / "plan" / "performance_feedback.json").read_text(encoding="utf-8"))
+    assert feedback["summary"]["failure_class"] == "implementation_failure"
+    assert feedback["summary"]["s2_action_policy"]["skips_s2_planner"] is True
+    assert feedback["candidate_results"][0]["runtime_validation"]["runtime_smoke"] == "failed"
+    dispatch = json.loads((project_root / "plan" / "s2_5_repair_dispatch.json").read_text(encoding="utf-8"))
+    assert dispatch["selected_candidate_id"] == "idea_impl"
+    assert dispatch["variant_fingerprint"] == "abc123"
+    assert dispatch["runtime_validation"]["runtime_smoke"] == "failed"
+    assert dispatch["same_candidate_required"] is True
+    assert dispatch["do_not_replan_method"] is True
+
+
+def test_s2_5_validation_repair_budget_is_per_candidate_variant(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_s2_5_per_candidate_budget"
+    validation_path = project_root / "plan" / "code_patches" / "new_impl" / "validation.json"
+    write_json(
+        validation_path,
+        {
+            "status": "validation_failed",
+            "checks": [
+                {"name": "py_compile:rosetta/model/projector.py", "returncode": 0},
+                {
+                    "name": "runtime_smoke:mechanism_activation_wiring",
+                    "returncode": 1,
+                    "failure_category": "mechanism_activation_wiring_failed",
+                    "stderr": "runtime model files mention ablation_disable_new_impl but no forward function reads it",
+                },
+            ],
+            "changed_files": ["rosetta/model/projector.py"],
+        },
+    )
+    write_json(
+        project_root / "plan" / "code_patches" / "patch_manifest.json",
+        {
+            "status": "no_valid_patch",
+            "valid_patch_count": 0,
+            "retryable_patch_count": 0,
+            "selected_candidate_id": None,
+            "candidates": [
+                {
+                    "candidate_id": "new_impl",
+                    "title": "New Implementation Repair",
+                    "status": "validation_failed",
+                    "validation": "plan/code_patches/new_impl/validation.json",
+                    "changed_files": ["rosetta/model/projector.py"],
+                    "variant_fingerprint": "new_fingerprint",
+                    "reason": "validation_failed",
+                }
+            ],
+        },
+    )
+    registry = {
+        "iteration": 1,
+        "status": "running",
+        "current_stage": "S2_plan",
+        "implementation_repair_routes": {"1": 8},
+        "implementation_repair_routes_by_candidate": {"1:old_impl:old_fingerprint": 8},
+        "stages": {
+            "S1_literature": {"status": "completed", "judge_retries": 0},
+            "S2_plan": {"status": "running", "judge_retries": 2},
+            "S3_experiment": {"status": "pending", "judge_retries": 1},
+            "S4_writing": {"status": "pending", "judge_retries": 0},
+            "S5_review": {"status": "pending", "judge_retries": 0},
+        },
+    }
+    config = {
+        "orchestration": {
+            "failure_feedback": {
+                "enabled": True,
+                "max_implementation_repair_routes_per_iteration": 8,
+            }
+        }
+    }
+
+    routed = Orchestrator._route_s2_5_validation_failure_to_repair(
+        project_root,
+        registry,
+        {"status": "running"},
+        SimpleNamespace(to_dict=lambda: {"checks": []}),
+        "S2.5 patch manifest status is no_valid_patch",
+        config=config,
+    )
+
+    assert routed is not None
+    assert routed["repair_lane"] == "s2_5_only_implementation_repair"
+    assert routed["repair_route_key"] == "1:new_impl:new_fingerprint"
+    assert registry["implementation_repair_routes"]["1"] == 9
+    assert registry["implementation_repair_routes_by_candidate"]["1:old_impl:old_fingerprint"] == 8
+    assert registry["implementation_repair_routes_by_candidate"]["1:new_impl:new_fingerprint"] == 1
+    dispatch = json.loads((project_root / "plan" / "s2_5_repair_dispatch.json").read_text(encoding="utf-8"))
+    assert dispatch["selected_candidate_id"] == "new_impl"
+
+
+def test_s2_5_preflight_refreshes_stale_repair_dispatch_before_s2_agent(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_s2_5_preflight_refresh"
+    validation_path = project_root / "plan" / "code_patches" / "new_impl" / "validation.json"
+    write_json(
+        validation_path,
+        {
+            "status": "validation_failed",
+            "checks": [
+                {
+                    "name": "runtime_smoke:mechanism_activation_wiring",
+                    "returncode": 1,
+                    "failure_category": "mechanism_activation_wiring_failed",
+                    "stderr": "no forward function reads ablation_disable_new_impl",
+                }
+            ],
+            "changed_files": ["rosetta/model/projector.py"],
+        },
+    )
+    write_json(
+        project_root / "plan" / "code_patches" / "patch_manifest.json",
+        {
+            "status": "no_valid_patch",
+            "valid_patch_count": 0,
+            "retryable_patch_count": 0,
+            "selected_candidate_id": None,
+            "candidates": [
+                {
+                    "candidate_id": "new_impl",
+                    "status": "validation_failed",
+                    "validation": "plan/code_patches/new_impl/validation.json",
+                    "changed_files": ["rosetta/model/projector.py"],
+                    "variant_fingerprint": "new_fingerprint",
+                }
+            ],
+        },
+    )
+    write_json(
+        project_root / "plan" / "s2_5_repair_dispatch.json",
+        {
+            "mode": "s2_5_only_implementation_repair",
+            "status": "active",
+            "selected_candidate_id": "old_impl",
+            "variant_fingerprint": "old_fingerprint",
+        },
+    )
+    registry = {
+        "iteration": 1,
+        "status": "running",
+        "current_stage": "S2_plan",
+        "implementation_repair_routes": {"1": 8},
+        "implementation_repair_routes_by_candidate": {"1:old_impl:old_fingerprint": 8},
+        "stages": {
+            "S1_literature": {"status": "completed", "judge_retries": 0},
+            "S2_plan": {"status": "running", "judge_retries": 0},
+            "S3_experiment": {"status": "pending", "judge_retries": 0},
+            "S4_writing": {"status": "pending", "judge_retries": 0},
+            "S5_review": {"status": "pending", "judge_retries": 0},
+        },
+    }
+    config = {
+        "orchestration": {
+            "failure_feedback": {
+                "enabled": True,
+                "max_implementation_repair_routes_per_iteration": 8,
+            }
+        }
+    }
+
+    routed = Orchestrator._route_existing_s2_5_validation_failure_before_s2_agent(
+        project_root,
+        registry,
+        config=config,
+    )
+
+    assert routed is not None
+    assert routed["repair_route_key"] == "1:new_impl:new_fingerprint"
+    dispatch = json.loads((project_root / "plan" / "s2_5_repair_dispatch.json").read_text(encoding="utf-8"))
+    assert dispatch["selected_candidate_id"] == "new_impl"
+    assert dispatch["variant_fingerprint"] == "new_fingerprint"
+    assert registry["implementation_repair_routes_by_candidate"]["1:new_impl:new_fingerprint"] == 1
 
 
 def test_s3_proxy_feedback_recommends_variant_for_all_dataset_collapse(tmp_path: Path) -> None:

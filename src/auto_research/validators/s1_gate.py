@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from auto_research.evidence_refs import resolve_s1_evidence_refs
+
 from .base import StageGateValidator, load_schema, validate_min_schema
 
 
@@ -50,7 +52,32 @@ class S1GateValidator(StageGateValidator):
             self._validate_c2c_s1_contract(ideas if isinstance(ideas, list) else [])
         elif (self.project_root / "literature" / "evidence_session.json").exists():
             self._validate_generic_codex_evidence_agent_contract(ideas if isinstance(ideas, list) else [])
+        self._validate_s1_novelty_audit()
         return self.finalize()
+
+    def _validate_s1_novelty_audit(self) -> None:
+        path = self.project_root / "literature" / "c2c" / "novelty_audit.json"
+        if not path.exists():
+            path = self.project_root / "literature" / "novelty_audit.json"
+        if not path.exists():
+            self.pass_check("s1_novelty_audit", details={"status": "not_configured"})
+            return
+        try:
+            audits = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            self.retry_check("s1_novelty_audit", "novelty audit artifact is not valid JSON", artifact=str(path.relative_to(self.project_root)))
+            return
+        if not isinstance(audits, list) or not audits:
+            self.retry_check("s1_novelty_audit", "novelty audit artifact must be a non-empty list", artifact=str(path.relative_to(self.project_root)))
+            return
+        latest = next((item for item in reversed(audits) if isinstance(item, dict)), {})
+        if latest.get("status") == "skipped" or latest.get("enabled") is False:
+            self.pass_check("s1_novelty_audit", artifact=str(path.relative_to(self.project_root)), details={"status": latest.get("status"), "reason": latest.get("reason")})
+        elif latest.get("passed") is True:
+            audit = latest.get("audit") if isinstance(latest.get("audit"), dict) else {}
+            self.pass_check("s1_novelty_audit", artifact=str(path.relative_to(self.project_root)), details={"novelty_score": audit.get("novelty_score"), "threshold": latest.get("threshold")})
+        else:
+            self.retry_check("s1_novelty_audit", "S1 novelty audit did not pass", artifact=str(path.relative_to(self.project_root)), details={"latest": latest})
 
     def _validate_generic_codex_evidence_agent_contract(self, ideas: list[dict]) -> None:
         required = [
@@ -58,6 +85,7 @@ class S1GateValidator(StageGateValidator):
             "literature/evidence_bundle.json",
             "literature/direction_decision.json",
             "literature/evidence_session.json",
+            "literature/evidence_ref_report.json",
         ]
         missing = [rel for rel in required if not (self.project_root / rel).exists()]
         if missing:
@@ -71,6 +99,7 @@ class S1GateValidator(StageGateValidator):
         direction = self._safe_json("literature/direction_decision.json")
         bundle = self._safe_json("literature/evidence_bundle.json")
         session = self._safe_json("literature/evidence_session.json")
+        ref_report = self._safe_json("literature/evidence_ref_report.json")
         errors = []
         if not isinstance(direction, dict) or not direction.get("direction_id") or not direction.get("core_hypothesis"):
             errors.append("direction_decision must include direction_id and core_hypothesis")
@@ -78,8 +107,17 @@ class S1GateValidator(StageGateValidator):
             errors.append("evidence_bundle.items must be non-empty")
         if not isinstance(session, dict) or session.get("status") != "ok":
             errors.append("evidence_session.status must be ok")
+        if not isinstance(ref_report, dict):
+            errors.append("evidence_ref_report must exist")
+        elif ref_report.get("status") != "pass":
+            errors.append("evidence_ref_report.status must be pass")
         if len(ideas) != 1:
             errors.append("S1 Codex evidence agent must pass exactly one high-level idea/direction to S2")
+        if not errors:
+            payload = {"evidence_bundle": bundle, "selected_ideas": ideas}
+            live_report = resolve_s1_evidence_refs(self.project_root, payload, mode="generic")
+            if live_report.get("status") != "pass":
+                errors.append("live evidence ref resolution failed")
         if errors:
             self.retry_check(
                 "s1_codex_evidence_agent_contract",
@@ -149,6 +187,7 @@ class S1GateValidator(StageGateValidator):
             "literature/c2c/evidence_bundle.json",
             "literature/c2c/direction_decision.json",
             "literature/c2c/evidence_session.json",
+            "literature/c2c/evidence_ref_report.json",
         ]
         missing = [rel for rel in required if not (self.project_root / rel).exists()]
         if missing:
@@ -162,6 +201,7 @@ class S1GateValidator(StageGateValidator):
         direction = self._safe_json("literature/c2c/direction_decision.json")
         bundle = self._safe_json("literature/c2c/evidence_bundle.json")
         session = self._safe_json("literature/c2c/evidence_session.json")
+        ref_report = self._safe_json("literature/c2c/evidence_ref_report.json")
         errors = []
         if not isinstance(direction, dict) or not direction.get("direction_id") or not direction.get("core_hypothesis"):
             errors.append("direction_decision must include direction_id and core_hypothesis")
@@ -169,8 +209,17 @@ class S1GateValidator(StageGateValidator):
             errors.append("evidence_bundle.items must be non-empty")
         if not isinstance(session, dict) or session.get("status") != "ok":
             errors.append("evidence_session.status must be ok")
+        if not isinstance(ref_report, dict):
+            errors.append("evidence_ref_report must exist")
+        elif ref_report.get("status") != "pass":
+            errors.append("evidence_ref_report.status must be pass")
         if not debate.get("selected_ideas") or len(debate.get("selected_ideas") or []) != 1:
             errors.append("Codex S1 must pass exactly one high-level direction card to S2")
+        if not errors:
+            payload = {"evidence_bundle": bundle, "selected_ideas": debate.get("selected_ideas") or []}
+            live_report = resolve_s1_evidence_refs(self.project_root, payload, mode="c2c")
+            if live_report.get("status") != "pass":
+                errors.append("live evidence ref resolution failed")
         if errors:
             self.retry_check(
                 "c2c_s1_codex_evidence_agent_contract",
