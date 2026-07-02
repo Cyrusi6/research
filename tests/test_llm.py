@@ -52,6 +52,8 @@ def test_codex_subprocess_env_scopes_only_openai_keys(monkeypatch) -> None:
     monkeypatch.setenv("OPENAI_API_KEY_1", "first-key")
     monkeypatch.setenv("OPENAI_API_KEY_2", "second-key")
     monkeypatch.setenv("OPENAI_API_TOKEN", "token-key")
+    monkeypatch.setenv("CODEX_API_KEY", "stale-codex-key")
+    monkeypatch.setenv("CODEX_API_TOKEN", "stale-codex-token")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
     monkeypatch.setenv("MINERU_API_KEY", "mineru-key")
 
@@ -68,6 +70,8 @@ def test_codex_subprocess_env_scopes_only_openai_keys(monkeypatch) -> None:
     assert env["OPENAI_API_KEY_2"] == "second-key"
     assert "OPENAI_API_KEY_1" not in env
     assert "OPENAI_API_TOKEN" not in env
+    assert "CODEX_API_KEY" not in env
+    assert "CODEX_API_TOKEN" not in env
     assert env["DEEPSEEK_API_KEY"] == "deepseek-key"
     assert env["MINERU_API_KEY"] == "mineru-key"
 

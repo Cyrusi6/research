@@ -351,7 +351,7 @@ def test_s3_full_failure_records_proxy_calibration_shared_memory(tmp_path: Path)
 
     assert routed["status"] == "routed"
     assert routed["shared_method_memory"]["status"] == "appended"
-    assert memory["proxy_calibration"]["summary"]["proxy_false_positive_count"] == 1
+    assert memory["proxy_calibration"]["overall_false_positive_count"] == 1
     assert "proxy_full_false_positive" in memory["memory_quality"]["signals"]
     assert memory["memory_quality"]["priority"] > 5
 

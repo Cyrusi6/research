@@ -249,8 +249,8 @@ class Orchestrator:
                     save_registry(registry_path, registry)
                     state.stage_blocked(registry, stage_key, registry["blocked_reason"])
                     contracts.stage_stopped(stage_key, status="blocked", reason=registry["blocked_reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
-                self._log_session(project_root, action="blocked", details={"stage": stage_key, "reason": registry["blocked_reason"]})
-                return {"status": "blocked", "stage": stage_key, "reason": registry["blocked_reason"]}
+                    self._log_session(project_root, action="blocked", details={"stage": stage_key, "reason": registry["blocked_reason"]})
+                    return {"status": "blocked", "stage": stage_key, "reason": registry["blocked_reason"]}
                 gate_report = gate_s1(project_root, config)
             elif stage_key == "S2_plan":
                 preflight_route = self._route_existing_s2_5_validation_failure_before_s2_agent(

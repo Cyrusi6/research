@@ -463,6 +463,8 @@ def codex_subprocess_env(config: dict[str, Any]) -> dict[str, str]:
             if re.fullmatch(r"OPENAI_API_KEY(_\d+)?", key) and key != api_key_env:
                 env.pop(key, None)
         env.pop("OPENAI_API_TOKEN", None)
+        env.pop("CODEX_API_KEY", None)
+        env.pop("CODEX_API_TOKEN", None)
 
     if selected_key:
         env["OPENAI_API_KEY"] = selected_key

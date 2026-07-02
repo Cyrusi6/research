@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import requests
 import yaml
 
 import auto_research.config as config_module
@@ -795,6 +796,19 @@ def test_mineru_pdf_client_requires_api_key(tmp_path: Path, monkeypatch) -> None
         raise AssertionError("MinerUPdfClient should fail without an API key")
 
 
+def test_mineru_pdf_client_wraps_connection_errors(tmp_path: Path) -> None:
+    class BrokenMinerUSession:
+        def post(self, *args, **kwargs):
+            raise requests.ConnectionError("dns unavailable")
+
+    pdf_path = tmp_path / "paper.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4 fake")
+    client = MinerUPdfClient(api_key="secret-token", session=BrokenMinerUSession())
+
+    with pytest.raises(MinerUError, match="request upload URL"):
+        client.parse_pdf(pdf_path, tmp_path / "out", data_id="paper-id")
+
+
 def test_c2c_pdf_ref_uses_mineru_paper_full(monkeypatch, tmp_path: Path) -> None:
     source_repo = _fake_c2c_repo(tmp_path)
     ref_paper = tmp_path / "paper.pdf"
@@ -879,6 +893,102 @@ def test_c2c_pdf_ref_reuses_mineru_sha_cache(monkeypatch, tmp_path: Path) -> Non
     assert second["paper_full_manifest"][0]["cache_status"] in {"local_hit", "sha_hit"}
     assert second["paper_full_manifest"][0]["parser_config_hash"]
     assert "Cached Paper" in second["cards"][0]["text"]
+
+
+def test_c2c_pdf_ref_reuses_shared_mineru_cache_across_projects(monkeypatch, tmp_path: Path) -> None:
+    source_repo = _fake_c2c_repo(tmp_path)
+    ref_paper = tmp_path / "paper.pdf"
+    ref_rebuttal = tmp_path / "rebuttal.md"
+    ref_paper.write_bytes(b"%PDF-1.4 shared cache")
+    ref_rebuttal.write_text("review text", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    first_paths = init_workspace(_base_config(workspace), "topic", project_id="proj_pdf_shared_a", simulate=True)
+    second_paths = init_workspace(_base_config(workspace), "topic", project_id="proj_pdf_shared_b", simulate=True)
+    config_patch = {
+        "c2c": {
+            "enabled": True,
+            "snapshot_path": str(source_repo),
+            "ref_paper": str(ref_paper),
+            "ref_rebuttal": str(ref_rebuttal),
+            "env_python": "/usr/bin/python3",
+            "pdf_ingest": {"provider": "mineru"},
+        }
+    }
+    calls = {"count": 0}
+
+    def fake_parse(self, pdf_path: Path, output_dir: Path, *, data_id: str, title: str = ""):
+        del self, pdf_path, data_id, title
+        calls["count"] += 1
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "paper_full.md").write_text("# Shared Paper\n\n## Method\n\nshared cache text\n", encoding="utf-8")
+        result = {"provider": "mineru", "state": "done", "paper_full_md_path": "paper_full.md"}
+        (output_dir / "mineru_result.json").write_text(json.dumps(result), encoding="utf-8")
+        return result
+
+    monkeypatch.setattr("auto_research.c2c.MinerUPdfClient.parse_pdf", fake_parse)
+    first = C2CAdapter(first_paths.root, config_patch).import_reference_materials()
+
+    def fail_parse(self, pdf_path: Path, output_dir: Path, *, data_id: str, title: str = ""):
+        del self, pdf_path, output_dir, data_id, title
+        raise AssertionError("MinerU API should not be called when shared cache is available")
+
+    monkeypatch.setattr("auto_research.c2c.MinerUPdfClient.parse_pdf", fail_parse)
+    second = C2CAdapter(second_paths.root, config_patch).import_reference_materials()
+
+    assert calls["count"] == 1
+    assert first["paper_full_manifest"][0]["cache_status"] == "miss"
+    assert second["paper_full_manifest"][0]["cache_status"] == "shared_hit"
+    assert "Shared Paper" in second["cards"][0]["text"]
+
+
+def test_c2c_pdf_ref_promotes_legacy_mineru_artifact_to_shared_cache(monkeypatch, tmp_path: Path) -> None:
+    source_repo = _fake_c2c_repo(tmp_path)
+    ref_paper = tmp_path / "paper.pdf"
+    ref_rebuttal = tmp_path / "rebuttal.md"
+    ref_paper.write_bytes(b"%PDF-1.4 legacy cache")
+    ref_rebuttal.write_text("review text", encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    legacy_root = workspace / "legacy_project"
+    legacy_md = legacy_root / "references/c2c/ref_paper/demo/paper_full.md"
+    legacy_md.parent.mkdir(parents=True)
+    legacy_md.write_text("# Legacy Paper\n\n## Method\n\nlegacy cache text\n", encoding="utf-8")
+    write_json(
+        legacy_root / "intake/c2c/static_bundle.json",
+        {
+            "schema_version": "c2c_static_intake_bundle_v1",
+            "paper_full_manifest": [
+                {
+                    "paper_id": "demo",
+                    "sha256": sha256_file(ref_paper),
+                    "paper_full_md_path": "references/c2c/ref_paper/demo/paper_full.md",
+                    "prompt_schema_version": "c2c_paper_full_markdown_v1",
+                }
+            ],
+        },
+    )
+    paths = init_workspace(_base_config(workspace), "topic", project_id="proj_pdf_legacy", simulate=True)
+    config_patch = {
+        "c2c": {
+            "enabled": True,
+            "snapshot_path": str(source_repo),
+            "ref_paper": str(ref_paper),
+            "ref_rebuttal": str(ref_rebuttal),
+            "env_python": "/usr/bin/python3",
+            "pdf_ingest": {"provider": "mineru"},
+        }
+    }
+
+    def fail_parse(self, pdf_path: Path, output_dir: Path, *, data_id: str, title: str = ""):
+        del self, pdf_path, output_dir, data_id, title
+        raise AssertionError("MinerU API should not be called when legacy artifact is available")
+
+    monkeypatch.setattr("auto_research.c2c.MinerUPdfClient.parse_pdf", fail_parse)
+    refs = C2CAdapter(paths.root, config_patch).import_reference_materials()
+
+    assert refs["status"] == "ok"
+    assert refs["paper_full_manifest"][0]["cache_status"] == "legacy_project_hit"
+    assert "Legacy Paper" in refs["cards"][0]["text"]
+    assert list((workspace / "_shared_cache" / "auto_research" / "mineru_pdf").glob("*/**/paper_full.md"))
 
 
 def test_c2c_strong_reference_comparison_is_s3_only(tmp_path: Path) -> None:
@@ -1058,6 +1168,7 @@ def _code_patch_test_config(workspace_root: Path, repo: Path, *, require_targete
     config["code_patch"] = {
         "enabled": True,
         "backend": "mock_codex",
+        "worktree_storage_root": str(workspace_root.parent / "code_worktrees_cache"),
         "timeout_seconds": 1800,
         "max_candidates": 3,
         "variants_per_candidate": 1,
@@ -1219,7 +1330,11 @@ def test_code_patch_persistent_backend_uses_git_worktree_and_codex_resume(monkey
 
     assert manifest["status"] == "ok"
     session_dir = paths.root / "plan/code_worktrees/idea-session_path/v1"
-    assert (session_dir / "repo").exists()
+    metadata = json.loads((session_dir / "worktree_metadata.json").read_text(encoding="utf-8"))
+    repo_path = Path(metadata["repo"])
+    assert repo_path.exists()
+    assert repo_path.is_relative_to(Path(config["code_patch"]["worktree_storage_root"]))
+    assert not (session_dir / "repo").exists()
     assert (session_dir / "codex_session.json").exists()
     assert (session_dir / "codex_events.jsonl").exists()
     assert (session_dir / "patch_blueprint.json").exists()
@@ -1710,6 +1825,12 @@ def test_code_patch_prunes_persistent_worktree_before_codex(monkeypatch, tmp_pat
             if "Persistent S2.5 Codex session bootstrap" in prompt:
                 output_path.write_text("preload\n", encoding="utf-8")
                 return SimpleNamespace(returncode=0, stdout="", stderr="session id: preload-session\n")
+            if "Persistent S2.5 Codex root-cause diagnosis" in prompt:
+                output_path.write_text(
+                    json.dumps({"root_cause": "stale-worktree", "evidence": "test", "repair_target": "aligner.py"}),
+                    encoding="utf-8",
+                )
+                return SimpleNamespace(returncode=0, stdout="", stderr="session id: stale-session\n")
             codex_calls += 1
             assert (worktree_repo / "script/evaluation/unified_evaluator.py").read_text(encoding="utf-8") == baseline_eval
             assert (worktree_repo / "script/train/SFT_train.py").read_text(encoding="utf-8") == baseline_train
@@ -5117,6 +5238,44 @@ def test_c2c_s1_codex_evidence_agent_blocks_without_fallback(monkeypatch, tmp_pa
     assert (project_root / "literature/c2c/s1_codex_events.jsonl").exists()
 
 
+def test_c2c_s1_codex_evidence_agent_stops_on_backend_auth_failure(monkeypatch, tmp_path: Path) -> None:
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {"enabled": True}
+    config["agents"] = {"s1_evidence_agent": {"max_json_repairs": 2, "timeout_seconds": 5}}
+    project_root = tmp_path / "workspace" / "p_auth"
+    project_root.mkdir(parents=True)
+    monkeypatch.setattr(literature_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    calls = []
+
+    def fake_auth_failed_codex(command, **kwargs):
+        calls.append(command)
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        output_path.write_text("", encoding="utf-8")
+        stderr = (
+            '{"type":"error","message":"unexpected status 401 Unauthorized: Invalid token, '
+            'url: https://api.example.test/v1/responses"}\n'
+        )
+        return SimpleNamespace(returncode=1, stdout="", stderr=stderr)
+
+    monkeypatch.setattr(literature_module.subprocess, "run", fake_auth_failed_codex)
+
+    result = literature_module._run_s1_codex_evidence_agent(
+        project_root=project_root,
+        config=config,
+        prompt="return valid json",
+        max_repairs=2,
+        timeout_seconds=5,
+    )
+
+    assert result["status"] == "blocked"
+    assert result["failure_category"] == "llm_authentication"
+    assert result["repair_count"] == 0
+    assert len(calls) == 1
+    assert "invalid token" in result["reason"].lower()
+    event_log = (project_root / "literature/c2c/s1_codex_events.jsonl").read_text(encoding="utf-8")
+    assert "llm_authentication" in event_log
+
+
 def test_c2c_s1_codex_evidence_agent_repairs_unresolved_refs(monkeypatch, tmp_path: Path) -> None:
     config = _base_config(tmp_path / "workspace", simulate=False)
     config["c2c"] = {"enabled": True}
@@ -7033,6 +7192,7 @@ def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: 
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0, 1], "max_gpus": 2}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     memory_safe_config = Path(result["execution_repo"]["repo_root"]) / "local" / "auto_research_runs" / "idea" / "train_recipe_memory_safe.json"
@@ -7251,6 +7411,7 @@ def test_s3_prefers_patched_repo_snapshot_over_patch_json(tmp_path: Path) -> Non
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     execution_repo = Path(result["execution_repo"]["repo_root"])
@@ -7308,6 +7469,7 @@ def test_s3_blocks_outputs_written_to_original_snapshot(monkeypatch, tmp_path: P
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     audit = result["execution_repo_audit"]
@@ -7571,6 +7733,7 @@ def test_s3_runs_ablation_switch_disabled_eval(monkeypatch, tmp_path: Path) -> N
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     ablation = result["ablation"]
@@ -7724,6 +7887,7 @@ def test_s3_rejects_validation_failed_code_patch_before_training(monkeypatch, tm
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     assert result["decision"] == "patch_rejected"
@@ -7806,6 +7970,7 @@ def test_c2c_static_proxy_rejects_evaluator_patch_before_training(monkeypatch, t
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
@@ -7910,6 +8075,7 @@ def test_c2c_proxy_carries_instrumentation_quality_repair_request(monkeypatch, t
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     assert result["proxy_screen"]["status"] == "repairable_proxy_risk"
@@ -8013,6 +8179,7 @@ def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch,
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=gpu_selection,
+        proxy_gpu_selection=gpu_selection,
     )
 
     assert result["decision"] == "proxy_rejected"
@@ -8545,6 +8712,7 @@ def test_c2c_result_payload_compacts_patch_state_and_proxy_logs(tmp_path: Path, 
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     rendered = json.dumps(result, ensure_ascii=False)
@@ -8915,6 +9083,7 @@ def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkey
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
@@ -9028,6 +9197,7 @@ def test_c2c_full_s3_readiness_blocks_train_when_not_ready(monkeypatch, tmp_path
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
@@ -9388,6 +9558,7 @@ def test_c2c_proxy_all_zero_records_eval_smoke_failure(monkeypatch, tmp_path: Pa
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
     proxy = result["proxy_screen"]

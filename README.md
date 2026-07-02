@@ -63,4 +63,5 @@ workspace/<project_id>/
 ## Notes
 
 - The system keeps output management strict: stage files are committed atomically and recorded in manifests.
+- S2.5 persistent Codex sessions keep metadata/events in `workspace/<project_id>/plan/code_worktrees/`, but new Git worktree repos are stored outside the repo by default via `code_patch.worktree_storage_root` or `AUTO_RESEARCH_WORKTREE_ROOT`.
 - It is designed to be honest. If a stage lacks the data or execution hooks needed to proceed, the registry is marked blocked or failed instead of fabricating artifacts.

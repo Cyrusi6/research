@@ -20,6 +20,7 @@ import yaml
 
 from .code_intake import CodeIntakeResult, build_code_intake
 from .mineru import MinerUError, MinerUPdfClient
+from .shared_cache import shared_cache_root
 from .utils import deep_merge, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, sha256_file, write_json, write_yaml
 
 
@@ -1147,9 +1148,14 @@ class C2CAdapter:
         source_sha = sha256_file(target)
         metadata_path = output_dir / "mineru_result.json"
         paper_full_path = output_dir / "paper_full.md"
+        pdf_cfg = self.pdf_ingest_config
+        parser_config_hash = _mineru_parser_config_hash(pdf_cfg)
         cache_dir = self.project_root / ".cache" / "auto_research" / "mineru_pdf" / source_sha
         cache_md_path = cache_dir / "paper_full.md"
         cache_result_path = cache_dir / "mineru_result.json"
+        shared_dir = shared_cache_root(self.project_root, self.config) / "mineru_pdf" / source_sha / parser_config_hash
+        shared_md_path = shared_dir / "paper_full.md"
+        shared_result_path = shared_dir / "mineru_result.json"
         cached = read_json(metadata_path, default={}) if metadata_path.exists() else {}
         if (
             paper_full_path.exists()
@@ -1157,58 +1163,54 @@ class C2CAdapter:
             and isinstance(cached, dict)
             and cached.get("source_sha256") == source_sha
         ):
+            _write_mineru_cache_copy(shared_md_path, shared_result_path, paper_full_path, metadata_path)
             text = paper_full_path.read_text(encoding="utf-8", errors="ignore")
-            pdf_cfg = self.pdf_ingest_config
-            return target, {
-                "status": "ok",
-                "parser": "mineru",
-                "cache_status": "local_hit",
-                "text": text,
-                "paper_full_md_path": paper_full_path.relative_to(self.project_root).as_posix(),
-                "mineru_result_path": metadata_path.relative_to(self.project_root).as_posix(),
-                "model_version": cached.get("model_version") or str(pdf_cfg.get("model_version") or "vlm"),
-                "language": cached.get("language") or str(pdf_cfg.get("language") or "en"),
-                "parser_config_hash": cached.get("parser_config_hash") or _mineru_parser_config_hash(pdf_cfg),
-                "prompt_schema_version": cached.get("prompt_schema_version") or "c2c_paper_full_markdown_v1",
-                "artifacts": [
-                    target.relative_to(self.project_root).as_posix(),
-                    paper_full_path.relative_to(self.project_root).as_posix(),
-                    metadata_path.relative_to(self.project_root).as_posix(),
-                ],
-            }
-        if cache_md_path.exists() and cache_md_path.stat().st_size > 0 and cache_result_path.exists():
-            ensure_dir(output_dir)
-            shutil.copy2(cache_md_path, paper_full_path)
-            cached_result = read_json(cache_result_path, default={})
-            if isinstance(cached_result, dict):
-                cached_result["cache_status"] = "sha_hit"
-                cached_result["restored_at"] = now_utc()
-                cached_result["local_pdf_path"] = target.relative_to(self.project_root).as_posix()
-                cached_result["paper_full_md_path"] = paper_full_path.name
-                cached_result.setdefault("parser_config_hash", _mineru_parser_config_hash(self.pdf_ingest_config))
-                cached_result.setdefault("prompt_schema_version", "c2c_paper_full_markdown_v1")
-                write_json(metadata_path, cached_result)
-            text = paper_full_path.read_text(encoding="utf-8", errors="ignore")
-            pdf_cfg = self.pdf_ingest_config
-            return target, {
-                "status": "ok",
-                "parser": "mineru",
-                "cache_status": "sha_hit",
-                "text": text,
-                "paper_full_md_path": paper_full_path.relative_to(self.project_root).as_posix(),
-                "mineru_result_path": metadata_path.relative_to(self.project_root).as_posix(),
-                "model_version": cached.get("model_version") or str(pdf_cfg.get("model_version") or "vlm"),
-                "language": cached.get("language") or str(pdf_cfg.get("language") or "en"),
-                "parser_config_hash": cached.get("parser_config_hash") or _mineru_parser_config_hash(pdf_cfg),
-                "prompt_schema_version": cached.get("prompt_schema_version") or "c2c_paper_full_markdown_v1",
-                "artifacts": [
-                    target.relative_to(self.project_root).as_posix(),
-                    paper_full_path.relative_to(self.project_root).as_posix(),
-                    metadata_path.relative_to(self.project_root).as_posix(),
-                ],
-            }
+            return target, _mineru_parse_payload(
+                target=target,
+                project_root=self.project_root,
+                paper_full_path=paper_full_path,
+                metadata_path=metadata_path,
+                metadata=cached,
+                pdf_cfg=pdf_cfg,
+                cache_status="local_hit",
+                text=text,
+            )
+        for candidate_md, candidate_result, cache_status in [
+            (cache_md_path, cache_result_path, "sha_hit"),
+            (shared_md_path, shared_result_path, "shared_hit"),
+        ]:
+            restored = _restore_mineru_cache_candidate(
+                candidate_md,
+                candidate_result,
+                target=target,
+                paper_full_path=paper_full_path,
+                metadata_path=metadata_path,
+                project_root=self.project_root,
+                source=source,
+                source_sha=source_sha,
+                pdf_cfg=pdf_cfg,
+                parser_config_hash=parser_config_hash,
+                cache_status=cache_status,
+            )
+            if restored is not None:
+                _write_mineru_cache_copy(cache_md_path, cache_result_path, paper_full_path, metadata_path)
+                _write_mineru_cache_copy(shared_md_path, shared_result_path, paper_full_path, metadata_path)
+                return target, restored
+        legacy = _restore_legacy_mineru_cache(
+            self.project_root,
+            target=target,
+            paper_full_path=paper_full_path,
+            metadata_path=metadata_path,
+            source=source,
+            source_sha=source_sha,
+            pdf_cfg=pdf_cfg,
+            parser_config_hash=parser_config_hash,
+        )
+        if legacy is not None:
+            _write_mineru_cache_copy(cache_md_path, cache_result_path, paper_full_path, metadata_path)
+            _write_mineru_cache_copy(shared_md_path, shared_result_path, paper_full_path, metadata_path)
+            return target, legacy
 
-        pdf_cfg = self.pdf_ingest_config
         provider = str(pdf_cfg.get("provider") or "mineru")
         if provider != "mineru":
             text = extract_reference_text(target)
@@ -1235,12 +1237,11 @@ class C2CAdapter:
             result["source_path"] = str(source)
             result["local_pdf_path"] = target.relative_to(self.project_root).as_posix()
             result["cache_status"] = "miss"
-            result["parser_config_hash"] = _mineru_parser_config_hash(pdf_cfg)
+            result["parser_config_hash"] = parser_config_hash
             result["prompt_schema_version"] = "c2c_paper_full_markdown_v1"
             write_json(metadata_path, result)
-            ensure_dir(cache_dir)
-            shutil.copy2(paper_full_path, cache_md_path)
-            write_json(cache_result_path, result)
+            _write_mineru_cache_copy(cache_md_path, cache_result_path, paper_full_path, metadata_path)
+            _write_mineru_cache_copy(shared_md_path, shared_result_path, paper_full_path, metadata_path)
             text = paper_full_path.read_text(encoding="utf-8", errors="ignore")
             return target, {
                 "status": "ok",
@@ -1270,7 +1271,7 @@ class C2CAdapter:
                 "local_pdf_path": target.relative_to(self.project_root).as_posix(),
                 "err_msg": str(exc),
                 "cache_status": "miss",
-                "parser_config_hash": _mineru_parser_config_hash(pdf_cfg),
+                "parser_config_hash": parser_config_hash,
                 "prompt_schema_version": "c2c_paper_full_markdown_v1",
             }
             write_json(metadata_path, result)
@@ -3248,6 +3249,166 @@ def _iter_reference_files(source: Path, kind: str) -> list[Path]:
 def _reference_title(path: Path, kind: str) -> str:
     label = "paper" if kind == "ref_paper" else "review/rebuttal"
     return f"C2C reference {label}: {path.stem}"
+
+
+def _mineru_parse_payload(
+    *,
+    target: Path,
+    project_root: Path,
+    paper_full_path: Path,
+    metadata_path: Path,
+    metadata: dict[str, Any],
+    pdf_cfg: dict[str, Any],
+    cache_status: str,
+    text: str,
+) -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "parser": "mineru",
+        "cache_status": cache_status,
+        "text": text,
+        "paper_full_md_path": paper_full_path.relative_to(project_root).as_posix(),
+        "mineru_result_path": metadata_path.relative_to(project_root).as_posix(),
+        "model_version": metadata.get("model_version") or str(pdf_cfg.get("model_version") or "vlm"),
+        "language": metadata.get("language") or str(pdf_cfg.get("language") or "en"),
+        "parser_config_hash": metadata.get("parser_config_hash") or _mineru_parser_config_hash(pdf_cfg),
+        "prompt_schema_version": metadata.get("prompt_schema_version") or "c2c_paper_full_markdown_v1",
+        "artifacts": [
+            target.relative_to(project_root).as_posix(),
+            paper_full_path.relative_to(project_root).as_posix(),
+            metadata_path.relative_to(project_root).as_posix(),
+        ],
+    }
+
+
+def _restore_mineru_cache_candidate(
+    cache_md_path: Path,
+    cache_result_path: Path,
+    *,
+    target: Path,
+    paper_full_path: Path,
+    metadata_path: Path,
+    project_root: Path,
+    source: Path,
+    source_sha: str,
+    pdf_cfg: dict[str, Any],
+    parser_config_hash: str,
+    cache_status: str,
+) -> dict[str, Any] | None:
+    if not cache_md_path.exists() or cache_md_path.stat().st_size <= 0 or not cache_result_path.exists():
+        return None
+    cached_result = read_json(cache_result_path, default={})
+    if not isinstance(cached_result, dict):
+        return None
+    if cached_result.get("source_sha256") and cached_result.get("source_sha256") != source_sha:
+        return None
+    if cached_result.get("parser_config_hash") and cached_result.get("parser_config_hash") != parser_config_hash:
+        return None
+    shutil.copy2(cache_md_path, paper_full_path)
+    metadata = dict(cached_result)
+    metadata.update(
+        {
+            "cache_status": cache_status,
+            "restored_at": now_utc(),
+            "source_sha256": source_sha,
+            "source_path": str(source),
+            "local_pdf_path": target.relative_to(project_root).as_posix(),
+            "paper_full_md_path": paper_full_path.name,
+            "parser_config_hash": parser_config_hash,
+            "prompt_schema_version": metadata.get("prompt_schema_version") or "c2c_paper_full_markdown_v1",
+        }
+    )
+    metadata.setdefault("provider", "mineru")
+    metadata.setdefault("schema_version", "mineru_pdf_parse_result_v1")
+    write_json(metadata_path, metadata)
+    text = paper_full_path.read_text(encoding="utf-8", errors="ignore")
+    return _mineru_parse_payload(
+        target=target,
+        project_root=project_root,
+        paper_full_path=paper_full_path,
+        metadata_path=metadata_path,
+        metadata=metadata,
+        pdf_cfg=pdf_cfg,
+        cache_status=cache_status,
+        text=text,
+    )
+
+
+def _restore_legacy_mineru_cache(
+    project_root: Path,
+    *,
+    target: Path,
+    paper_full_path: Path,
+    metadata_path: Path,
+    source: Path,
+    source_sha: str,
+    pdf_cfg: dict[str, Any],
+    parser_config_hash: str,
+) -> dict[str, Any] | None:
+    for bundle_path in sorted(project_root.parent.glob("*/intake/c2c/static_bundle.json"), key=lambda path: path.stat().st_mtime if path.exists() else 0.0, reverse=True):
+        source_project_root = bundle_path.parents[2]
+        if source_project_root == project_root:
+            continue
+        bundle = read_json(bundle_path, default={})
+        if not isinstance(bundle, dict):
+            continue
+        for item in bundle.get("paper_full_manifest") or []:
+            if not isinstance(item, dict) or item.get("sha256") != source_sha:
+                continue
+            if item.get("parser_config_hash") and item.get("parser_config_hash") != parser_config_hash:
+                continue
+            md_rel = item.get("paper_full_md_path")
+            if not isinstance(md_rel, str) or not md_rel:
+                continue
+            candidate_md = source_project_root / md_rel
+            if not candidate_md.exists() or candidate_md.stat().st_size <= 0:
+                continue
+            result_rel = item.get("mineru_result_path")
+            if not isinstance(result_rel, str) or not result_rel:
+                result_rel = str(Path(md_rel).parent / "mineru_result.json")
+            candidate_result = source_project_root / result_rel
+            metadata = read_json(candidate_result, default={}) if candidate_result.exists() else {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            shutil.copy2(candidate_md, paper_full_path)
+            metadata.update(
+                {
+                    "provider": "mineru",
+                    "schema_version": "mineru_pdf_parse_result_v1",
+                    "cache_status": "legacy_project_hit",
+                    "restored_at": now_utc(),
+                    "legacy_cache_source_project": source_project_root.name,
+                    "source_sha256": source_sha,
+                    "source_path": str(source),
+                    "local_pdf_path": target.relative_to(project_root).as_posix(),
+                    "paper_full_md_path": paper_full_path.name,
+                    "model_version": item.get("model_version") or metadata.get("model_version") or str(pdf_cfg.get("model_version") or "vlm"),
+                    "language": item.get("language") or metadata.get("language") or str(pdf_cfg.get("language") or "en"),
+                    "parser_config_hash": parser_config_hash,
+                    "prompt_schema_version": item.get("prompt_schema_version") or metadata.get("prompt_schema_version") or "c2c_paper_full_markdown_v1",
+                }
+            )
+            write_json(metadata_path, metadata)
+            text = paper_full_path.read_text(encoding="utf-8", errors="ignore")
+            return _mineru_parse_payload(
+                target=target,
+                project_root=project_root,
+                paper_full_path=paper_full_path,
+                metadata_path=metadata_path,
+                metadata=metadata,
+                pdf_cfg=pdf_cfg,
+                cache_status="legacy_project_hit",
+                text=text,
+            )
+    return None
+
+
+def _write_mineru_cache_copy(cache_md_path: Path, cache_result_path: Path, paper_full_path: Path, metadata_path: Path) -> None:
+    if not paper_full_path.exists() or not metadata_path.exists():
+        return
+    ensure_dir(cache_md_path.parent)
+    shutil.copy2(paper_full_path, cache_md_path)
+    shutil.copy2(metadata_path, cache_result_path)
 
 
 def _parser_for_path(path: Path) -> str:

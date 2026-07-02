@@ -8,14 +8,14 @@ from auto_research.s0_enrichment import DeepSeekS0SemanticEnricher, S0SemanticEn
 from auto_research.utils import write_json, write_yaml
 
 
-def _write_project(tmp_path):
-    project = tmp_path / "proj_enrich"
+def _write_project(tmp_path, project_id="proj_enrich"):
+    project = tmp_path / project_id
     (project / "meta").mkdir(parents=True)
     (project / "intake" / "c2c").mkdir(parents=True)
     write_yaml(
         project / "meta" / "registry.yaml",
         {
-            "project_id": "proj_enrich",
+            "project_id": project_id,
             "research_topic": "cross tokenizer cache",
             "status": "running",
             "current_stage": "S1_literature",
@@ -118,6 +118,57 @@ def test_s0_enrichment_api_mode_caches_records(tmp_path, monkeypatch) -> None:
     assert first["report"]["records"][0]["cache_status"] == "miss"
     assert second["report"]["records"][0]["cache_status"] == "hit"
     assert first["report"]["records"][0]["enrichment"]["mechanism_tags"] == ["cache routing"]
+
+
+def test_s0_enrichment_reuses_shared_cache_without_api_key(tmp_path, monkeypatch) -> None:
+    first_project = _write_project(tmp_path, project_id="proj_enrich_a")
+    second_project = _write_project(tmp_path, project_id="proj_enrich_b")
+    second_bundle_path = second_project / "intake" / "c2c" / "static_bundle.json"
+    second_bundle = json.loads(second_bundle_path.read_text(encoding="utf-8"))
+    second_bundle["paper_chunks"][0]["chunk_id"] = "paper:renamed_same_text"
+    write_json(second_bundle_path, second_bundle)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "secret")
+    calls = []
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
+
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            content = json.dumps(
+                {
+                    "semantic_summary": "Shared cached cache-routing evidence.",
+                    "mechanism_tags": ["cache routing"],
+                    "method_claims": ["claim"],
+                    "failure_modes": [],
+                    "implementation_relevance": "medium",
+                    "dataset_relevance": [],
+                    "reviewer_risk_notes": [],
+                    "retrieval_keywords": ["cache"],
+                    "s1_direction_utility": "medium",
+                    "s2_patch_utility": "medium",
+                    "evidence_quality": "high",
+                    "code_patch_surface_notes": "",
+                }
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+                usage=SimpleNamespace(prompt_tokens=20, completion_tokens=10, total_tokens=30, prompt_cache_hit_tokens=0, prompt_cache_miss_tokens=20),
+            )
+
+    import auto_research.s0_enrichment as module
+
+    monkeypatch.setattr(module, "OpenAI", FakeClient)
+    first = DeepSeekS0SemanticEnricher(first_project, {}).run(limit=1)
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    second = DeepSeekS0SemanticEnricher(second_project, {}).run(limit=1)
+
+    assert len(calls) == 1
+    assert first["report"]["records"][0]["cache_status"] == "miss"
+    assert second["report"]["records"][0]["cache_status"] == "hit"
+    assert second["report"]["records"][0]["chunk"]["chunk_id"] == "paper:renamed_same_text"
+    assert "_shared_cache" in second["report"]["records"][0]["cache_source"]
 
 
 def test_s0_enrichment_filters_infra_code_and_prioritizes_mechanism_chunks(tmp_path) -> None:

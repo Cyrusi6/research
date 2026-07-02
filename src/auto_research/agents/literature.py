@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import re
 import shutil
 import subprocess
@@ -23,6 +24,7 @@ from ..failure_log import load_c2c_feedback_bundle
 from ..method_memory import collect_used_shared_memory_refs, shared_method_memory_for_prompt, shared_method_memory_query_context
 from ..llm import codex_subprocess_env
 from ..resources import discover_local_mm_resources
+from ..shared_cache import shared_cache_root
 from ..s0_enrichment import (
     DEFAULT_DEEPSEEK_MODEL,
     S0_CODE_SEMANTIC_ENRICHMENT_PROMPT_VERSION,
@@ -1287,6 +1289,11 @@ def _merge_s0_semantic_enrichment_for_s1(
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     records_by_id, record_source_paths = _load_s0_semantic_records(project_root, config=config or {})
+    _alias_s0_semantic_records_by_text(
+        records_by_id,
+        [*paper_chunks, *rebuttal_chunks, *code_chunks],
+        config=config or {},
+    )
     paper_chunks = _apply_s1_semantic_records_to_chunks(paper_chunks, records_by_id, source_type="paper")
     rebuttal_chunks = _apply_s1_semantic_records_to_chunks(rebuttal_chunks, records_by_id, source_type="rebuttal")
     code_chunks = _apply_s1_semantic_records_to_chunks(code_chunks, records_by_id, source_type="code")
@@ -1355,6 +1362,9 @@ def _iter_s0_semantic_cache_records(project_root: Path, *, config: dict[str, Any
     cache_roots = [
         project_root / ".cache" / "auto_research" / "s0_semantic_enrichment" / _s1_cache_safe(model),
         project_root / ".cache" / "auto_research" / "s0_semantic_enrichment" / _s1_cache_safe(DEFAULT_DEEPSEEK_MODEL),
+        shared_cache_root(project_root, config) / "s0_semantic_enrichment" / _s1_cache_safe(model),
+        shared_cache_root(project_root, config) / "s0_semantic_enrichment" / _s1_cache_safe(DEFAULT_DEEPSEEK_MODEL),
+        *_s1_legacy_semantic_cache_roots(project_root, model),
     ]
     for cache_root in cache_roots:
         if not cache_root.exists():
@@ -1362,7 +1372,11 @@ def _iter_s0_semantic_cache_records(project_root: Path, *, config: dict[str, Any
         for path in sorted(cache_root.glob("*.json")):
             payload = read_json(path, default={})
             if isinstance(payload, dict):
-                yield payload, str(path.relative_to(project_root))
+                try:
+                    source_path = str(path.relative_to(project_root))
+                except ValueError:
+                    source_path = str(path)
+                yield payload, source_path
 
 
 def _s0_semantic_model_from_config(config: dict[str, Any]) -> str:
@@ -1377,6 +1391,18 @@ def _s1_cache_safe(value: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "_", value).strip("_") or "model"
 
 
+def _s1_legacy_semantic_cache_roots(project_root: Path, model: str) -> list[Path]:
+    model_dirs = {_s1_cache_safe(model), _s1_cache_safe(DEFAULT_DEEPSEEK_MODEL)}
+    roots: list[Path] = []
+    for candidate in sorted(project_root.parent.glob("*/.cache/auto_research/s0_semantic_enrichment/*")):
+        if not candidate.is_dir() or candidate.name not in model_dirs:
+            continue
+        if candidate.parent.parent.parent.parent == project_root:
+            continue
+        roots.append(candidate)
+    return roots
+
+
 def _select_best_s0_semantic_record(records: dict[str, dict[str, Any]], candidate: dict[str, Any]) -> None:
     chunk = candidate.get("chunk") if isinstance(candidate.get("chunk"), dict) else {}
     chunk_id = str(chunk.get("chunk_id") or candidate.get("chunk_id") or "")
@@ -1385,6 +1411,55 @@ def _select_best_s0_semantic_record(records: dict[str, dict[str, Any]], candidat
     current = records.get(chunk_id)
     if current is None or _s0_semantic_record_score(candidate) >= _s0_semantic_record_score(current):
         records[chunk_id] = candidate
+
+
+def _alias_s0_semantic_records_by_text(records: dict[str, dict[str, Any]], chunks: list[dict[str, Any]], *, config: dict[str, Any]) -> None:
+    by_signature: dict[tuple[str, str, str, str], dict[str, Any]] = {}
+    for record in records.values():
+        chunk = record.get("chunk") if isinstance(record.get("chunk"), dict) else {}
+        signature = (
+            str(chunk.get("source_type") or ""),
+            str(chunk.get("text_sha256") or ""),
+            str(record.get("prompt_version") or ""),
+            str(record.get("model") or ""),
+        )
+        if not all(signature):
+            continue
+        current = by_signature.get(signature)
+        if current is None or _s0_semantic_record_score(record) >= _s0_semantic_record_score(current):
+            by_signature[signature] = record
+    model = _s0_semantic_model_from_config(config)
+    for chunk in chunks:
+        if not isinstance(chunk, dict):
+            continue
+        chunk_id = str(chunk.get("chunk_id") or "")
+        if not chunk_id or chunk_id in records:
+            continue
+        source_type = str(chunk.get("source_type") or "")
+        signature = (
+            source_type,
+            _s1_semantic_text_sha(chunk, config=config),
+            S0_CODE_SEMANTIC_ENRICHMENT_PROMPT_VERSION if source_type == "code" else S0_SEMANTIC_ENRICHMENT_PROMPT_VERSION,
+            model,
+        )
+        record = by_signature.get(signature)
+        if record is not None:
+            aliased = dict(record)
+            aliased["chunk"] = {**(record.get("chunk") if isinstance(record.get("chunk"), dict) else {}), **chunk, "source_type": source_type, "text_sha256": signature[1]}
+            records[chunk_id] = aliased
+
+
+def _s1_semantic_text_sha(chunk: dict[str, Any], *, config: dict[str, Any]) -> str:
+    intake = config.get("intake") if isinstance(config, dict) else {}
+    semantic = (intake or {}).get("semantic_enrichment") if isinstance(intake, dict) else {}
+    semantic = semantic if isinstance(semantic, dict) else {}
+    source_type = str(chunk.get("source_type") or "")
+    max_chars = int((semantic.get("code_max_input_chars") if source_type == "code" else semantic.get("max_input_chars")) or (3000 if source_type == "code" else 6000))
+    text = str(chunk.get("text") or chunk.get("content") or chunk.get("text_preview") or "")
+    text = re.sub(r"\s+", " ", text).strip()
+    if len(text) > max_chars:
+        text = text[:max_chars]
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 def _s0_semantic_record_score(record: dict[str, Any]) -> tuple[int, int, int, str]:
@@ -1964,6 +2039,18 @@ def _run_s1_codex_evidence_agent(
         else:
             validation_errors = [str(call.get("reason") or f"codex output status={status}")]
             previous_status = status or "invalid"
+            if call.get("failure_category"):
+                return _s1_codex_backend_blocked_result(
+                    session_key=session_key,
+                    session_id=session_id,
+                    used_existing_session=used_existing_session,
+                    repair_count=attempt_idx,
+                    attempts=attempts,
+                    novelty_audits=novelty_audits,
+                    reset_info=reset_info,
+                    call=call,
+                    validation_errors=validation_errors,
+                )
         previous_output = str(call.get("raw_text") or call.get("reason") or "")[-4000:]
 
     return {
@@ -2064,6 +2151,11 @@ def _run_s1_codex_cli_once(
         "duration_seconds": round(time.monotonic() - start_monotonic, 3),
         "raw_text": raw_text,
     }
+    if result.returncode != 0:
+        category = _s1_codex_backend_failure_category(call.get("reason"), result.stderr, result.stdout)
+        if category:
+            call["failure_category"] = category
+            call["retryable"] = category in {"llm_rate_limit_or_quota", "llm_transient_backend"}
     if parsed_session_id:
         _save_s1_codex_session(project_root, session_key, parsed_session_id, config, call)
     if result.returncode == 0:
@@ -2092,6 +2184,74 @@ def _s1_codex_json_repair_prompt(validation_errors: list[str], previous_output: 
         ],
     }
     return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def _s1_codex_backend_failure_category(*parts: Any) -> str | None:
+    text = "\n".join(str(part or "") for part in parts).lower()
+    if any(marker in text for marker in ["401 unauthorized", "invalid token", "invalid api key", "incorrect api key", "authentication_error"]):
+        return "llm_authentication"
+    if any(marker in text for marker in ["403 forbidden", "permission denied", "access denied"]):
+        return "llm_permission"
+    if any(marker in text for marker in ["429", "too many requests", "rate limit", "rate_limit", "insufficient_quota", "quota exceeded", "billing limit", "payment required"]):
+        return "llm_rate_limit_or_quota"
+    if any(marker in text for marker in ["temporarily unavailable", "service unavailable", "retry-after", "connection reset", "connection aborted"]):
+        return "llm_transient_backend"
+    return None
+
+
+def _s1_codex_backend_blocked_result(
+    *,
+    session_key: str,
+    session_id: str | None,
+    used_existing_session: bool,
+    repair_count: int,
+    attempts: list[dict[str, Any]],
+    novelty_audits: list[dict[str, Any]],
+    reset_info: dict[str, Any] | None,
+    call: dict[str, Any],
+    validation_errors: list[str],
+) -> dict[str, Any]:
+    category = str(call.get("failure_category") or "codex_cli_failure")
+    retryable = bool(call.get("retryable"))
+    reason = _s1_codex_backend_blocked_reason(category, retryable=retryable)
+    return {
+        "status": "blocked",
+        "reason": reason,
+        "failure_category": category,
+        "retryable": retryable,
+        "session_key": session_key,
+        "session_id": session_id,
+        "used_existing_session": used_existing_session,
+        "repair_count": max(0, repair_count),
+        "attempts": attempts,
+        "novelty_audits": novelty_audits,
+        "session_reset": bool(reset_info),
+        "session_reset_reason": (reset_info or {}).get("reason"),
+        "validation_errors": validation_errors,
+        "last_output_tail": str(call.get("raw_text") or call.get("reason") or "")[-2000:],
+    }
+
+
+def _s1_codex_backend_blocked_reason(category: str, *, retryable: bool) -> str:
+    if category == "llm_authentication":
+        return (
+            "S1 Codex evidence agent failed before JSON generation because the Codex backend rejected authentication "
+            "(401 Unauthorized / invalid token). Refresh OPENAI_API_KEY/OPENAI_BASE_URL credentials, then resume."
+        )
+    if category == "llm_permission":
+        return (
+            "S1 Codex evidence agent failed before JSON generation because the Codex backend denied access "
+            "(403/permission error). Check model, endpoint, and account permissions, then resume."
+        )
+    if category == "llm_rate_limit_or_quota":
+        return (
+            "S1 Codex evidence agent failed before JSON generation because the Codex backend hit a quota/rate-limit/billing error. "
+            "Wait for quota recovery or update billing credentials, then resume."
+        )
+    if category == "llm_transient_backend":
+        return "S1 Codex evidence agent failed before JSON generation because the Codex backend was transiently unavailable. Retry resume later."
+    retry_hint = " Retry resume later." if retryable else ""
+    return f"S1 Codex evidence agent failed before JSON generation due to a Codex CLI/backend failure.{retry_hint}"
 
 
 def _s1_revision_feedback_prompt(audit: dict[str, Any], previous_payload: dict[str, Any], *, mode: str = "c2c") -> str:
@@ -2610,6 +2770,8 @@ def _s1_codex_attempt_summary(call: dict[str, Any]) -> dict[str, Any]:
         "status": call.get("status"),
         "returncode": call.get("returncode"),
         "reason": call.get("reason"),
+        "failure_category": call.get("failure_category"),
+        "retryable": call.get("retryable"),
         "session_id": call.get("session_id"),
         "previous_session_id": call.get("previous_session_id"),
         "attempt": call.get("attempt"),

@@ -124,17 +124,23 @@ class MinerUPdfClient:
             "enable_formula": self.enable_formula,
             "enable_table": self.enable_table,
         }
-        response = self.session.post(
-            f"{self.base_url}/file-urls/batch",
-            headers=self._headers,
-            json=payload,
-            timeout=self.request_timeout_seconds,
-        )
+        try:
+            response = self.session.post(
+                f"{self.base_url}/file-urls/batch",
+                headers=self._headers,
+                json=payload,
+                timeout=self.request_timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            raise MinerUError(f"MinerU request upload URL failed: {exc}") from exc
         return self._data_or_raise(response, "request upload URL")
 
     def _upload_pdf(self, pdf_path: Path, file_url: str) -> None:
-        with pdf_path.open("rb") as handle:
-            response = self.session.put(file_url, data=handle, timeout=self.request_timeout_seconds)
+        try:
+            with pdf_path.open("rb") as handle:
+                response = self.session.put(file_url, data=handle, timeout=self.request_timeout_seconds)
+        except requests.RequestException as exc:
+            raise MinerUError(f"MinerU upload failed: {exc}") from exc
         if response.status_code not in {200, 201}:
             raise MinerUError(f"MinerU upload failed with HTTP {response.status_code}.")
 
@@ -142,11 +148,14 @@ class MinerUPdfClient:
         deadline = time.monotonic() + max(1, int(self.timeout_seconds))
         last_result: dict[str, Any] = {}
         while time.monotonic() < deadline:
-            response = self.session.get(
-                f"{self.base_url}/extract-results/batch/{batch_id}",
-                headers=self._headers,
-                timeout=self.request_timeout_seconds,
-            )
+            try:
+                response = self.session.get(
+                    f"{self.base_url}/extract-results/batch/{batch_id}",
+                    headers=self._headers,
+                    timeout=self.request_timeout_seconds,
+                )
+            except requests.RequestException as exc:
+                raise MinerUError(f"MinerU poll batch failed: {exc}") from exc
             data = self._data_or_raise(response, "poll batch")
             results = data.get("extract_result") or []
             result = _select_extract_result(results, data_id=data_id, file_name=file_name)
@@ -161,7 +170,10 @@ class MinerUPdfClient:
         raise MinerUError(f"MinerU batch polling timed out after {self.timeout_seconds}s. Last result: {last_result}")
 
     def _download_full_markdown(self, full_zip_url: str) -> str:
-        response = self.session.get(full_zip_url, timeout=self.request_timeout_seconds)
+        try:
+            response = self.session.get(full_zip_url, timeout=self.request_timeout_seconds)
+        except requests.RequestException as exc:
+            raise MinerUError(f"MinerU result zip download failed: {exc}") from exc
         if response.status_code != 200:
             raise MinerUError(f"MinerU result zip download failed with HTTP {response.status_code}.")
         try:

@@ -25,6 +25,15 @@
 - 普通项目写出 `literature/evidence_requests.json`、`literature/evidence_bundle.json`、`literature/direction_decision.json`、`literature/evidence_session.json`。
 - C2C 项目写出对应的 `literature/c2c/...` 证据和方向产物，并保留 C2C 专属 contract/gate。
 
+## 2026-06-26 External S2.5 Worktree Storage
+
+真实 C2C 迭代积累后发现 `workspace/<project_id>/plan/code_worktrees/<idea>/vN/repo` 会把完整 Git worktree 放进当前 VS Code workspace。打开项目根目录时 VS Code 会递归 watch 历史 artifact 和 worktree repo，当前本地 `workspace/` 已达到 109G、15 万以上文件，触发 20 万量级 watcher。
+
+- 新增 `code_patch.worktree_storage_root`，也可用 `AUTO_RESEARCH_WORKTREE_ROOT` 覆盖；未配置时默认使用用户缓存目录 `~/.cache/auto-research/code-worktrees`。
+- S2.5 session、events、metadata 仍写在 `workspace/<project_id>/plan/code_worktrees/...`，保持 artifact 审计和 resume 入口稳定。
+- repo 路径选择顺序为 metadata 中已有 repo、legacy `workspace/.../repo`、外置缓存新 repo，避免打断已经跑到一半的 persistent Codex session。
+- `.vscode/settings.json` 排除 `workspace/**` watcher/search/Pylance 扫描，立即降低打开项目根目录时的文件监听压力。
+
 ## 2026-06-21 Shared Method Memory Purity
 
 本次收紧长期共享记忆池，目标是保证 `.auto-research/method_failure_memory.jsonl` 只保存可跨项目复用的方法级失败经验，不保存实现错误、资源错误、测试残留或短期反馈噪声。

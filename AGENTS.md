@@ -41,3 +41,13 @@ uv run auto-research init-c2c \
 - Keep design history in `FRAMEWORK_STAGE_UPDATES.md`.
 - `/docs/agent_context/project_brief.md` contains the project context and user-provided requirements summarized from previous conversations.
 
+## Commit 
+
+不使用Pull Request, 通过 Git commit 管理变更, 使用 git commit -m "提交信息"; git push origin main去提交 
+每次改进后按照之前的结构更新到`FRAMEWORK_UPDATE.md`
+
+完成后需要commit / push，并回复以下内容，除非明确要求：
+1. Commit hash 和 Push range
+2. 修改文件列表与摘要，按文件或目录列出变化
+3. 测试命令和结果
+4. 端到端命令结果摘要，如果本任务不涉及端到端命令，写“不涉及”

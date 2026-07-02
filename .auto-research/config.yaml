@@ -158,6 +158,7 @@ code_patch:
   backend: codex_persistent_cli
   persistent_session: true
   use_git_worktree: true
+  worktree_storage_root: "~/.cache/auto-research/code-worktrees"
   worktree_base_ref: 113c3a9b2538cbf096a0477e1ec99ae2a2e0d12a
   codex_json_events: true
   no_progress_timeout_seconds:

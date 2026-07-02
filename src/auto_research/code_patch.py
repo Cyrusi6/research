@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import ast
-import difflib
 import copy
+import difflib
+import hashlib
 import json
 import os
 import re
@@ -21,7 +22,7 @@ from .adapters.runner import ExperimentRunner, GpuSelection
 from .artifacts import ArtifactManager
 from .c2c import C2CAdapter, c2c_candidate_config_overrides, c2c_idea_novelty_report, repo_snapshot_manifest
 from .llm import codex_subprocess_env
-from .utils import ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, sha256_file, write_json, write_yaml
+from .utils import ensure_dir, now_utc, read_json, read_yaml, repo_root, sanitize_filename, sha256_file, write_json, write_yaml
 
 
 DEFAULT_CODE_PATCH_CONFIG = {
@@ -35,6 +36,7 @@ DEFAULT_CODE_PATCH_CONFIG = {
     "codex_json_events": True,
     "no_progress_timeout_seconds": None,
     "worktree_base_ref": "HEAD",
+    "worktree_storage_root": None,
     "codex_sandbox": "workspace-write",
     "codex_sandbox_fallback": "danger-full-access",
     "codex_approval_policy": "never",
@@ -1613,14 +1615,17 @@ def _prepare_code_worktree_workspace(
             "failure_category": "git_worktree_setup_failed",
             "recovery_actions": [],
         }
-    worktree_root = project_root / "plan" / "code_worktrees" / idea_id / f"v{variant_index}"
-    repo = worktree_root / "repo"
-    session_path = worktree_root / "codex_session.json"
-    events_path = worktree_root / "codex_events.jsonl"
-    metadata_path = worktree_root / "worktree_metadata.json"
+    worktree_paths = _code_worktree_paths(project_root, code_patch_config, idea_id, variant_index)
+    session_root = worktree_paths["session_root"]
+    worktree_root = worktree_paths["worktree_root"]
+    repo = worktree_paths["repo"]
+    session_path = session_root / "codex_session.json"
+    events_path = session_root / "codex_events.jsonl"
+    metadata_path = session_root / "worktree_metadata.json"
     branch = _persistent_worktree_branch(project_root.name, idea_id, variant_index)
     session_key = f"s2_5:{idea_id}:v{variant_index}"
     recovery_actions: list[dict[str, Any]] = []
+    ensure_dir(session_root)
     ensure_dir(worktree_root)
     created_worktree = False
     if not repo.exists():
@@ -1675,7 +1680,9 @@ def _prepare_code_worktree_workspace(
         "session_key": session_key,
         "target_repo": str(target_repo.resolve()),
         "repo": str(repo.resolve()),
+        "session_root": str(session_root.resolve()),
         "worktree_root": str(worktree_root.resolve()),
+        "worktree_storage": worktree_paths["storage"],
         "branch": branch,
         "base_ref": base_ref,
         "base_commit": commit.stdout.strip(),
@@ -1695,6 +1702,83 @@ def _prepare_code_worktree_workspace(
     }
     write_json(metadata_path, metadata)
     return metadata
+
+
+def _code_worktree_paths(
+    project_root: Path,
+    code_patch_config: dict[str, Any],
+    idea_id: str,
+    variant_index: int,
+) -> dict[str, Any]:
+    session_root = project_root / "plan" / "code_worktrees" / idea_id / f"v{variant_index}"
+    metadata_repo = _code_worktree_repo_from_metadata(session_root / "worktree_metadata.json")
+    if metadata_repo is not None:
+        return {
+            "session_root": session_root,
+            "worktree_root": metadata_repo.parent,
+            "repo": metadata_repo,
+            "storage": {"mode": "metadata_repo", "source": "worktree_metadata.json"},
+        }
+
+    legacy_repo = session_root / "repo"
+    if legacy_repo.is_dir():
+        return {
+            "session_root": session_root,
+            "worktree_root": session_root,
+            "repo": legacy_repo,
+            "storage": {"mode": "legacy_project_workspace"},
+        }
+
+    storage_root = _code_worktree_storage_root(code_patch_config)
+    project_key = _code_worktree_project_key(project_root)
+    worktree_root = storage_root / project_key / idea_id / f"v{variant_index}"
+    return {
+        "session_root": session_root,
+        "worktree_root": worktree_root,
+        "repo": worktree_root / "repo",
+        "storage": {
+            "mode": "external_cache",
+            "storage_root": str(storage_root),
+            "project_key": project_key,
+        },
+    }
+
+
+def _code_worktree_repo_from_metadata(metadata_path: Path) -> Path | None:
+    if not metadata_path.exists():
+        return None
+    try:
+        metadata = read_json(metadata_path, default={}) or {}
+    except (OSError, json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(metadata, dict):
+        return None
+    repo_value = metadata.get("repo")
+    if not repo_value:
+        return None
+    repo = Path(str(repo_value)).expanduser()
+    if repo.is_dir():
+        return repo.resolve()
+    return None
+
+
+def _code_worktree_storage_root(code_patch_config: dict[str, Any]) -> Path:
+    configured = os.environ.get("AUTO_RESEARCH_WORKTREE_ROOT")
+    if not configured:
+        configured = code_patch_config.get("worktree_storage_root")
+    if configured:
+        root = Path(str(configured)).expanduser()
+        if not root.is_absolute():
+            root = repo_root() / root
+        return root.resolve()
+    xdg_cache = os.environ.get("XDG_CACHE_HOME")
+    base = Path(xdg_cache).expanduser() if xdg_cache else Path.home() / ".cache"
+    return (base / "auto-research" / "code-worktrees").resolve()
+
+
+def _code_worktree_project_key(project_root: Path) -> str:
+    digest = hashlib.sha256(str(project_root.resolve()).encode("utf-8")).hexdigest()[:12]
+    return f"{sanitize_filename(project_root.name, max_length=60)}-{digest}"
 
 
 def _persistent_worktree_branch(project_id: str, idea_id: str, variant_index: int) -> str:

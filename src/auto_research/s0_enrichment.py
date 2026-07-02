@@ -13,6 +13,7 @@ from typing import Any
 from openai import OpenAI
 
 from .artifacts import ArtifactManager
+from .shared_cache import shared_cache_root
 from .utils import ensure_dir, now_utc, read_json, write_json
 
 
@@ -134,14 +135,14 @@ class DeepSeekS0SemanticEnricher:
         selected_workers = max(1, int(workers or cfg.get("workers") or 1))
         if selected_limit <= 0:
             raise S0SemanticEnrichmentError("limit must be positive")
-        if not selected_dry_run and not os.environ.get("DEEPSEEK_API_KEY"):
-            raise S0SemanticEnrichmentError("DEEPSEEK_API_KEY is missing. Put it in .env.local or the environment.")
 
         chunks = [_annotate_enrichment_priority(chunk) for chunk in chunks if str(chunk.get("source_type") or "") in set(selected_source_types)]
         eligible_chunks = [chunk for chunk in chunks if not chunk.get("semantic_enrichment_skip")]
         selected = _select_balanced_chunks(eligible_chunks, limit=selected_limit, source_types=selected_source_types)
-        cache_root = self.project_root / ".cache" / "auto_research" / "s0_semantic_enrichment" / _cache_safe(model)
-        client = None if selected_dry_run else OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url=base_url)
+        local_cache_root = self.project_root / ".cache" / "auto_research" / "s0_semantic_enrichment" / _cache_safe(model)
+        shared_root = shared_cache_root(self.project_root, self.config) / "s0_semantic_enrichment" / _cache_safe(model)
+        cache_roots = _dedupe_paths([local_cache_root, shared_root, *_legacy_semantic_cache_roots(self.project_root, model)])
+        write_cache_roots = _dedupe_paths([local_cache_root, shared_root])
 
         records: list[dict[str, Any]] = []
         failures: list[dict[str, Any]] = []
@@ -154,11 +155,16 @@ class DeepSeekS0SemanticEnricher:
             }
             for ordinal, chunk in enumerate(selected)
         ]
+        api_key = os.environ.get("DEEPSEEK_API_KEY")
+        if not selected_dry_run and not api_key and not _all_enrichment_tasks_cached(tasks, cache_roots=cache_roots, model=model, refresh=refresh):
+            raise S0SemanticEnrichmentError("DEEPSEEK_API_KEY is missing and selected chunks are not fully available in the shared S0 semantic cache.")
+        client = None if selected_dry_run or not api_key else OpenAI(api_key=api_key, base_url=base_url)
         if selected_dry_run or selected_workers == 1:
             results = [
                 _process_enrichment_task(
                     task,
-                    cache_root=cache_root,
+                    cache_roots=cache_roots,
+                    write_cache_roots=write_cache_roots,
                     model=model,
                     base_url=base_url,
                     temperature=temperature,
@@ -176,7 +182,8 @@ class DeepSeekS0SemanticEnricher:
                     pool.submit(
                         _process_enrichment_task,
                         task,
-                        cache_root=cache_root,
+                        cache_roots=cache_roots,
+                        write_cache_roots=write_cache_roots,
                         model=model,
                         base_url=base_url,
                         temperature=temperature,
@@ -375,7 +382,8 @@ def _select_balanced_chunks(chunks: list[dict[str, Any]], *, limit: int, source_
 def _process_enrichment_task(
     task: dict[str, Any],
     *,
-    cache_root: Path,
+    cache_roots: list[Path],
+    write_cache_roots: list[Path],
     model: str,
     base_url: str,
     temperature: float,
@@ -386,15 +394,17 @@ def _process_enrichment_task(
 ) -> dict[str, Any]:
     prepared = _prepare_chunk(task["chunk"], max_input_chars=int(task["max_input_chars"]))
     cache_key = _chunk_cache_key(prepared, model=model)
-    cache_path = cache_root / f"{cache_key}.json"
-    if cache_path.exists() and not refresh:
-        cached = read_json(cache_path, default={}) or {}
-        if isinstance(cached, dict) and cached.get("schema_version") == S0_SEMANTIC_ENRICHMENT_SCHEMA_VERSION:
-            record = dict(cached)
-            record["cache_status"] = "hit"
-            return {"ordinal": task["ordinal"], "record": record}
+    cached, cache_source = _read_cached_enrichment_record(cache_roots, cache_key, prepared=prepared, model=model, refresh=refresh)
+    if cached is not None:
+        record = _cached_record_for_prepared(cached, prepared)
+        record["cache_status"] = "hit"
+        record["cache_source"] = cache_source
+        _write_enrichment_record_to_roots(write_cache_roots, cache_key, record)
+        return {"ordinal": task["ordinal"], "record": record}
     if dry_run:
         return {"ordinal": task["ordinal"], "record": _dry_run_record(prepared, model=model, base_url=base_url)}
+    if client is None:
+        raise S0SemanticEnrichmentError("DEEPSEEK_API_KEY is missing and selected chunks are not fully available in the shared S0 semantic cache.")
     try:
         record = _call_deepseek(
             client,
@@ -413,9 +423,99 @@ def _process_enrichment_task(
             "failure": {"chunk_id": prepared["chunk_id"], "source_type": prepared["source_type"], "error": str(exc), "fallback_used": True},
         }
     record["cache_status"] = "miss"
-    ensure_dir(cache_path.parent)
-    write_json(cache_path, record)
+    _write_enrichment_record_to_roots(write_cache_roots, cache_key, record)
     return {"ordinal": task["ordinal"], "record": record}
+
+
+def _all_enrichment_tasks_cached(tasks: list[dict[str, Any]], *, cache_roots: list[Path], model: str, refresh: bool) -> bool:
+    if refresh:
+        return False
+    for task in tasks:
+        prepared = _prepare_chunk(task["chunk"], max_input_chars=int(task["max_input_chars"]))
+        cache_key = _chunk_cache_key(prepared, model=model)
+        cached, _ = _read_cached_enrichment_record(cache_roots, cache_key, prepared=prepared, model=model, refresh=False)
+        if cached is None:
+            return False
+    return True
+
+
+def _read_cached_enrichment_record(
+    cache_roots: list[Path],
+    cache_key: str,
+    *,
+    prepared: dict[str, Any],
+    model: str,
+    refresh: bool,
+) -> tuple[dict[str, Any] | None, str]:
+    if refresh:
+        return None, ""
+    for cache_root in cache_roots:
+        cache_path = cache_root / f"{cache_key}.json"
+        if not cache_path.exists():
+            continue
+        cached = read_json(cache_path, default={}) or {}
+        if isinstance(cached, dict) and cached.get("schema_version") == S0_SEMANTIC_ENRICHMENT_SCHEMA_VERSION:
+            return dict(cached), str(cache_path)
+    for cache_root in cache_roots:
+        if not cache_root.exists():
+            continue
+        for cache_path in sorted(cache_root.glob("*.json")):
+            cached = read_json(cache_path, default={}) or {}
+            if _cached_record_matches_prepared(cached, prepared, model=model):
+                return dict(cached), str(cache_path)
+    return None, ""
+
+
+def _cached_record_matches_prepared(record: Any, prepared: dict[str, Any], *, model: str) -> bool:
+    if not isinstance(record, dict) or record.get("schema_version") != S0_SEMANTIC_ENRICHMENT_SCHEMA_VERSION:
+        return False
+    chunk = record.get("chunk") if isinstance(record.get("chunk"), dict) else {}
+    return (
+        str(record.get("model") or "") == model
+        and str(record.get("prompt_version") or "") == _prompt_version_for_chunk(prepared)
+        and str(chunk.get("source_type") or "") == str(prepared.get("source_type") or "")
+        and str(chunk.get("text_sha256") or "") == str(prepared.get("text_sha256") or "")
+    )
+
+
+def _cached_record_for_prepared(record: dict[str, Any], prepared: dict[str, Any]) -> dict[str, Any]:
+    updated = dict(record)
+    updated["chunk"] = dict(prepared)
+    return updated
+
+
+def _write_enrichment_record_to_roots(cache_roots: list[Path], cache_key: str, record: dict[str, Any]) -> None:
+    for cache_root in cache_roots:
+        ensure_dir(cache_root)
+        write_json(cache_root / f"{cache_key}.json", record)
+
+
+def _legacy_semantic_cache_roots(project_root: Path, model: str) -> list[Path]:
+    model_dir = _cache_safe(model)
+    roots: list[Path] = []
+    for candidate in sorted(project_root.parent.glob("*/.cache/auto_research/s0_semantic_enrichment/*")):
+        if candidate.parent.parent.parent.parent == project_root:
+            continue
+        if candidate.name == model_dir and candidate.is_dir():
+            roots.append(candidate)
+    default_dir = _cache_safe(DEFAULT_DEEPSEEK_MODEL)
+    if default_dir != model_dir:
+        for candidate in sorted(project_root.parent.glob(f"*/.cache/auto_research/s0_semantic_enrichment/{default_dir}")):
+            if candidate.parent.parent.parent.parent != project_root and candidate.is_dir():
+                roots.append(candidate)
+    return roots
+
+
+def _dedupe_paths(paths: list[Path]) -> list[Path]:
+    seen: set[str] = set()
+    result: list[Path] = []
+    for path in paths:
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(path)
+    return result
 
 
 def _annotate_enrichment_priority(chunk: dict[str, Any]) -> dict[str, Any]:
