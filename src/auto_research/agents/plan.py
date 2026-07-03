@@ -35,6 +35,11 @@ from ..s2_planner_contracts import (
     build_s2_planner_gate_report,
     build_s2_variant_scorecard,
 )
+from ..s2_feedback_policy import (
+    build_s2_adaptive_policy,
+    build_s2_feedback_context,
+    build_s2_score_adjustment_report,
+)
 from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, write_yaml
 from .base import AgentContext
 
@@ -381,13 +386,86 @@ class PlanAgent:
         history_fingerprints = []
         if isinstance(variant_selection.get("history_summary"), dict):
             history_fingerprints = [str(item) for item in variant_selection["history_summary"].get("fingerprints") or [] if item]
+        pool_candidates = variant_selection.get("candidate_pool") if isinstance(variant_selection.get("candidate_pool"), list) else ideas
+        candidate_pool = build_s2_candidate_pool(
+            direction=s1_direction,
+            candidates=[item for item in pool_candidates if isinstance(item, dict)],
+            source=str(planning_result["metadata"].get("source") or "s2_directional_planner"),
+            used_shared_memory_refs=planning_result["metadata"].get("used_shared_memory_refs") if isinstance(planning_result.get("metadata"), dict) else [],
+        )
+        evidence_quality = read_json(self.context.project_root / "literature" / "c2c" / "evidence_quality_score.json", default={}) or {}
+        shared_memory = shared_method_memory_for_prompt(
+            self.context.config,
+            query_context=shared_method_memory_query_context(
+                self.context.config,
+                project_root=self.context.project_root,
+                selected_direction=s1_direction,
+                feedback=feedback,
+            ),
+        )
+        feedback_context = build_s2_feedback_context(
+            project_root=self.context.project_root,
+            direction=s1_direction,
+            config=self.context.config,
+            shared_memory=shared_memory,
+        )
+        adaptive_policy = build_s2_adaptive_policy(feedback_context, self.context.config)
+        scorecard = build_s2_variant_scorecard(
+            direction=s1_direction,
+            candidate_pool=candidate_pool,
+            selected_variant=next_variant or selected,
+            evidence_quality=evidence_quality if isinstance(evidence_quality, dict) else {},
+            variant_fingerprint={},
+            planner_memory=planner_memory,
+            feedback=feedback,
+            feedback_context=feedback_context,
+            adaptive_policy=adaptive_policy,
+            config=self.context.config,
+        )
+        selected = _select_candidate_for_scorecard(
+            ideas=[item for item in ideas if isinstance(item, dict)],
+            pool_candidates=[item for item in pool_candidates if isinstance(item, dict)],
+            selected_variant_id=str(scorecard.get("selected_variant_id") or ""),
+            fallback=selected,
+        )
+        _mark_selected_variant(ideas, selected)
+        selected.setdefault("s1_direction_id", s1_direction.get("direction_id"))
+        selected.setdefault("direction_id", s1_direction.get("direction_id"))
+        selected.setdefault("mechanism_axis", s1_direction.get("mechanism_axis"))
+        selected.setdefault("integration_point", s1_direction.get("integration_point"))
+        selected.setdefault("control_signal", s1_direction.get("control_signal"))
+        selected.setdefault("expected_signature", s1_direction.get("expected_metric_signature"))
+        if not _variant_expected_files(selected) and s1_direction.get("expected_files"):
+            selected["expected_files"] = list(s1_direction.get("expected_files") or [])
+        _ensure_c2c_s2_config_overrides(selected)
+        if isinstance(selected.get("experiment_contract"), dict) and not selected["experiment_contract"].get("expected_files") and selected.get("expected_files"):
+            selected["experiment_contract"]["expected_files"] = list(selected.get("expected_files") or [])
         if not selected.get("variant_fingerprint"):
             selected["variant_fingerprint"] = _s2_variant_fingerprint(selected)
+        next_variant = selected
+        if variant_selection:
+            variant_selection["next_variant"] = next_variant
+            variant_selection["selected_variant_id"] = selected.get("id")
+            variant_selection["adaptive_policy_hash"] = adaptive_policy.get("policy_hash")
+        plan["selected_idea"] = selected
+        plan["next_variant"] = next_variant
+        plan["implementation_scope"] = {
+            "selected_scope": selected.get("implementation_scope"),
+            "implementation_plan": selected.get("implementation_plan"),
+            "scope_gate": selected.get("implementation_scope_gate"),
+        }
+        if plan.get("ablation_matrix"):
+            plan["ablation_matrix"][0]["switch"] = (selected.get("experiment_contract") or {}).get("ablation_switch") or (selected.get("ablation_plan") or {}).get("switch")
+            plan["ablation_matrix"][0]["expected_signature"] = selected.get("expected_signature")
+            plan["ablation_matrix"][0]["coverage_diagnostics"] = selected.get("coverage_diagnostics")
+            if len(plan["ablation_matrix"]) > 1:
+                plan["ablation_matrix"][1]["matched_coverage_ablation"] = selected.get("matched_coverage_ablation")
+                plan["ablation_matrix"][1]["required_stats"] = (selected.get("coverage_diagnostics") or {}).get("stats")
         planner_decision = build_planner_decision_artifact(
             direction=s1_direction,
             planner_summary=planning_result["metadata"].get("planner_summary"),
             planning_mode=planning_result["metadata"].get("planning_mode"),
-            next_variant=next_variant or selected,
+            next_variant=next_variant,
             used_shared_memory_refs=planning_result["metadata"].get("used_shared_memory_refs") if isinstance(planning_result.get("metadata"), dict) else [],
             source=str(planning_result["metadata"].get("source") or "c2c_plan_agent"),
         )
@@ -399,31 +477,22 @@ class PlanAgent:
             history_fingerprints=history_fingerprints,
             mode="regular",
         )
-        pool_candidates = variant_selection.get("candidate_pool") if isinstance(variant_selection.get("candidate_pool"), list) else ideas
-        candidate_pool = build_s2_candidate_pool(
-            direction=s1_direction,
-            candidates=[item for item in pool_candidates if isinstance(item, dict)],
-            source=str(planning_result["metadata"].get("source") or "s2_directional_planner"),
-            used_shared_memory_refs=planning_result["metadata"].get("used_shared_memory_refs") if isinstance(planning_result.get("metadata"), dict) else [],
-        )
-        evidence_quality = read_json(self.context.project_root / "literature" / "c2c" / "evidence_quality_score.json", default={}) or {}
-        scorecard = build_s2_variant_scorecard(
+        score_adjustment_report = build_s2_score_adjustment_report(
             direction=s1_direction,
             candidate_pool=candidate_pool,
-            selected_variant=next_variant or selected,
-            evidence_quality=evidence_quality if isinstance(evidence_quality, dict) else {},
-            variant_fingerprint=variant_fingerprint_artifact,
-            planner_memory=planner_memory,
-            feedback=feedback,
-            config=self.context.config,
+            scorecard=scorecard,
+            adaptive_policy=adaptive_policy,
+            feedback_context=feedback_context,
         )
         planner_gate_report = build_s2_planner_gate_report(
             direction=s1_direction,
             candidate_pool=candidate_pool,
             scorecard=scorecard,
-            next_variant=next_variant or selected,
+            next_variant=next_variant,
             variant_contract=variant_contract,
             variant_fingerprint=variant_fingerprint_artifact,
+            adaptive_policy=adaptive_policy,
+            score_adjustment_report=score_adjustment_report,
             config=self.context.config,
         )
         plan["planner_decision"] = planner_decision
@@ -431,7 +500,10 @@ class PlanAgent:
         plan["variant_fingerprint"] = variant_fingerprint_artifact
         plan["s2_planner"] = {
             "candidate_pool": candidate_pool,
+            "feedback_context": feedback_context,
+            "adaptive_policy": adaptive_policy,
             "variant_scorecard": scorecard,
+            "score_adjustment_report": score_adjustment_report,
             "planner_gate_report": planner_gate_report,
         }
         plan["variant_selection"] = variant_selection
@@ -454,13 +526,43 @@ class PlanAgent:
             summary="S2a candidate variant pool generated from the selected S1 direction",
             source_paths=["literature/direction.json", "plan/performance_feedback.json", "plan/s2_planner_memory.json"],
         )
+        feedback_context_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "s2_planner/feedback_context.json",
+            feedback_context,
+            artifact_type="c2c_s2_feedback_context",
+            summary="S2 feedback context assembled from route, attempt, proxy, and memory history",
+            source_paths=[
+                "meta/attempt_ledger.json",
+                "meta/route_decision.json",
+                "experiment/results/c2c_proxy_calibration_policy.json",
+                "experiment/results/c2c_proxy_decision_report.json",
+                "plan/performance_feedback.json",
+            ],
+        )
+        adaptive_policy_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "s2_planner/adaptive_policy.json",
+            adaptive_policy,
+            artifact_type="c2c_s2_adaptive_policy",
+            summary="S2 adaptive variant selection policy derived from feedback context",
+            source_paths=[feedback_context_record["path"]],
+        )
         scorecard_record = self.context.artifacts.write_json(
             self.stage_key,
             "s2_planner/variant_scorecard.json",
             scorecard,
             artifact_type="c2c_s2_variant_scorecard",
-            summary="S2b deterministic variant scorecard and selected next variant",
-            source_paths=[candidate_pool_record["path"], "literature/c2c/evidence_quality_score.json", "plan/s2_planner_memory.json"],
+            summary="S2b adaptive deterministic variant scorecard and selected next variant",
+            source_paths=[candidate_pool_record["path"], feedback_context_record["path"], adaptive_policy_record["path"], "literature/c2c/evidence_quality_score.json", "plan/s2_planner_memory.json"],
+        )
+        score_adjustment_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "s2_planner/score_adjustment_report.json",
+            score_adjustment_report,
+            artifact_type="c2c_s2_score_adjustment_report",
+            summary="Per-variant adaptive score adjustments used by the S2 selector",
+            source_paths=[candidate_pool_record["path"], adaptive_policy_record["path"], scorecard_record["path"]],
         )
         planner_gate_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -468,7 +570,7 @@ class PlanAgent:
             planner_gate_report,
             artifact_type="c2c_s2_planner_gate_report",
             summary="S2c planner gate report for S2.5 handoff readiness",
-            source_paths=[candidate_pool_record["path"], scorecard_record["path"], "literature/direction.json"],
+            source_paths=[candidate_pool_record["path"], scorecard_record["path"], score_adjustment_record["path"], "literature/direction.json"],
         )
         s2_next_variant_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -607,7 +709,10 @@ class PlanAgent:
                 *code_patch_manifest.get("artifacts", []),
                 *([variant_selection_record["path"]] if variant_selection_record else []),
                 candidate_pool_record["path"],
+                feedback_context_record["path"],
+                adaptive_policy_record["path"],
                 scorecard_record["path"],
+                score_adjustment_record["path"],
                 s2_next_variant_record["path"],
                 planner_gate_record["path"],
                 planner_decision_record["path"],
@@ -721,6 +826,22 @@ class PlanAgent:
             used_shared_memory_refs=selected_patch_idea.get("used_shared_memory_refs") if isinstance(selected_patch_idea, dict) else [],
         )
         evidence_quality = read_json(self.context.project_root / "literature" / "c2c" / "evidence_quality_score.json", default={}) or {}
+        shared_memory = shared_method_memory_for_prompt(
+            self.context.config,
+            query_context=shared_method_memory_query_context(
+                self.context.config,
+                project_root=self.context.project_root,
+                selected_direction=s1_direction,
+                feedback=feedback,
+            ),
+        )
+        feedback_context = build_s2_feedback_context(
+            project_root=self.context.project_root,
+            direction=s1_direction,
+            config=self.context.config,
+            shared_memory=shared_memory,
+        )
+        adaptive_policy = build_s2_adaptive_policy(feedback_context, self.context.config)
         scorecard = build_s2_variant_scorecard(
             direction=s1_direction,
             candidate_pool=candidate_pool,
@@ -729,7 +850,16 @@ class PlanAgent:
             variant_fingerprint=variant_fingerprint_artifact,
             planner_memory=self._load_c2c_s2_planner_memory(),
             feedback=self._load_c2c_plan_feedback(),
+            feedback_context=feedback_context,
+            adaptive_policy=adaptive_policy,
             config=self.context.config,
+        )
+        score_adjustment_report = build_s2_score_adjustment_report(
+            direction=s1_direction,
+            candidate_pool=candidate_pool,
+            scorecard=scorecard,
+            adaptive_policy=adaptive_policy,
+            feedback_context=feedback_context,
         )
         planner_gate_report = build_s2_planner_gate_report(
             direction=s1_direction,
@@ -738,6 +868,8 @@ class PlanAgent:
             next_variant=selected_patch_idea,
             variant_contract=variant_contract,
             variant_fingerprint=variant_fingerprint_artifact,
+            adaptive_policy=adaptive_policy,
+            score_adjustment_report=score_adjustment_report,
             config=self.context.config,
         )
         plan["planner_decision"] = planner_decision
@@ -745,7 +877,10 @@ class PlanAgent:
         plan["variant_fingerprint"] = variant_fingerprint_artifact
         plan["s2_planner"] = {
             "candidate_pool": candidate_pool,
+            "feedback_context": feedback_context,
+            "adaptive_policy": adaptive_policy,
             "variant_scorecard": scorecard,
+            "score_adjustment_report": score_adjustment_report,
             "planner_gate_report": planner_gate_report,
         }
         candidate_pool_record = self.context.artifacts.write_json(
@@ -756,13 +891,37 @@ class PlanAgent:
             summary="S2a candidate pool reused for S2.5-only implementation repair",
             source_paths=["plan/performance_feedback.json", "plan/candidate_ideas.json"],
         )
+        feedback_context_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "s2_planner/feedback_context.json",
+            feedback_context,
+            artifact_type="c2c_s2_feedback_context",
+            summary="S2 feedback context for S2.5-only implementation repair",
+            source_paths=["plan/performance_feedback.json", "meta/route_decision.json", "meta/attempt_ledger.json"],
+        )
+        adaptive_policy_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "s2_planner/adaptive_policy.json",
+            adaptive_policy,
+            artifact_type="c2c_s2_adaptive_policy",
+            summary="S2 adaptive policy recorded for S2.5-only implementation repair",
+            source_paths=[feedback_context_record["path"]],
+        )
         scorecard_record = self.context.artifacts.write_json(
             self.stage_key,
             "s2_planner/variant_scorecard.json",
             scorecard,
             artifact_type="c2c_s2_variant_scorecard",
             summary="S2b deterministic scorecard for the S2.5-only repair variant",
-            source_paths=[candidate_pool_record["path"], "plan/s2_5_repair_dispatch.json"],
+            source_paths=[candidate_pool_record["path"], feedback_context_record["path"], adaptive_policy_record["path"], "plan/s2_5_repair_dispatch.json"],
+        )
+        score_adjustment_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "s2_planner/score_adjustment_report.json",
+            score_adjustment_report,
+            artifact_type="c2c_s2_score_adjustment_report",
+            summary="Adaptive score adjustment report for the S2.5-only repair variant",
+            source_paths=[candidate_pool_record["path"], adaptive_policy_record["path"], scorecard_record["path"]],
         )
         planner_gate_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -770,7 +929,7 @@ class PlanAgent:
             planner_gate_report,
             artifact_type="c2c_s2_planner_gate_report",
             summary="S2c planner gate report for S2.5-only implementation repair",
-            source_paths=[candidate_pool_record["path"], scorecard_record["path"]],
+            source_paths=[candidate_pool_record["path"], scorecard_record["path"], score_adjustment_record["path"]],
         )
         s2_next_variant_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -927,7 +1086,10 @@ class PlanAgent:
                 plan_record["path"],
                 *code_patch_manifest.get("artifacts", []),
                 candidate_pool_record["path"],
+                feedback_context_record["path"],
+                adaptive_policy_record["path"],
                 scorecard_record["path"],
+                score_adjustment_record["path"],
                 s2_next_variant_record["path"],
                 planner_gate_record["path"],
                 legacy_next_variant_record["path"],
@@ -2482,6 +2644,29 @@ def _s2_variant_fingerprint(variant: dict[str, Any]) -> str:
         "config_keys": sorted(_flatten_variant_config_keys((variant.get("experiment_contract") or {}).get("config_overrides") or {})),
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
+def _select_candidate_for_scorecard(
+    *,
+    ideas: list[dict[str, Any]],
+    pool_candidates: list[dict[str, Any]],
+    selected_variant_id: str,
+    fallback: dict[str, Any],
+) -> dict[str, Any]:
+    target = str(selected_variant_id or "").strip()
+    for collection in [ideas, pool_candidates]:
+        for item in collection:
+            if isinstance(item, dict) and str(item.get("id") or item.get("variant_id") or "").strip() == target:
+                return item
+    return fallback
+
+
+def _mark_selected_variant(ideas: list[dict[str, Any]], selected: dict[str, Any]) -> None:
+    selected_id = str(selected.get("id") or selected.get("variant_id") or "")
+    for idea in ideas:
+        if isinstance(idea, dict):
+            idea["selected"] = bool(selected_id and str(idea.get("id") or idea.get("variant_id") or "") == selected_id)
+    selected["selected"] = True
 
 
 def _variant_expected_files(variant: dict[str, Any]) -> list[str]:

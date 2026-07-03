@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS2ScoreAdjustmentReport",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "direction_id",
+    "policy_hash",
+    "selected_variant_id",
+    "adjustments"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "policy_hash": {"type": "string"},
+    "selected_variant_id": {"type": "string"},
+    "history_sufficient": {"type": "boolean"},
+    "adjustments": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["variant_id", "base_score", "adjusted_score", "applied"]
+      }
+    }
+  }
+}

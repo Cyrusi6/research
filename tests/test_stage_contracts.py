@@ -74,7 +74,10 @@ def test_stage_contract_declares_c2c_s2_planner_outputs(tmp_path: Path) -> None:
     s2 = manager.stage_started("S2_plan", iteration=1, config=config)
 
     assert "plan/s2_planner/candidate_pool.json" in s2["required_outputs"]
+    assert "plan/s2_planner/feedback_context.json" in s2["required_outputs"]
+    assert "plan/s2_planner/adaptive_policy.json" in s2["required_outputs"]
     assert "plan/s2_planner/variant_scorecard.json" in s2["required_outputs"]
+    assert "plan/s2_planner/score_adjustment_report.json" in s2["required_outputs"]
     assert "plan/s2_planner/next_variant.json" in s2["required_outputs"]
     assert "plan/s2_planner/planner_gate_report.json" in s2["required_outputs"]
     assert "plan/code_patches/implementation_contract.json" in s2["required_outputs"]

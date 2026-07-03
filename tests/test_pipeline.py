@@ -11,6 +11,7 @@ import auto_research.orchestrator as orchestrator_module
 from auto_research.adapters.literature import LiteratureProvider
 from auto_research.orchestrator import Orchestrator
 from auto_research.registry import block_stage
+from auto_research.s2_feedback_policy import build_s2_adaptive_policy, build_s2_feedback_context, build_s2_score_adjustment_report
 from auto_research.s2_planner_contracts import build_s2_candidate_pool, build_s2_planner_gate_report, build_s2_variant_scorecard
 from auto_research.utils import write_json, write_yaml
 
@@ -182,6 +183,8 @@ def _write_direction_and_variant_contracts(project_root: Path) -> list[str]:
     }
     write_json(project_root / "plan" / "variant_fingerprint.json", fingerprint)
     candidate_pool = build_s2_candidate_pool(direction=direction, candidates=[variant], source="test_fixture")
+    feedback_context = build_s2_feedback_context(project_root=project_root, direction=direction, config={})
+    adaptive_policy = build_s2_adaptive_policy(feedback_context, {})
     scorecard = build_s2_variant_scorecard(
         direction=direction,
         candidate_pool=candidate_pool,
@@ -190,7 +193,16 @@ def _write_direction_and_variant_contracts(project_root: Path) -> list[str]:
         variant_fingerprint=fingerprint,
         planner_memory={"entries": []},
         feedback=[],
+        feedback_context=feedback_context,
+        adaptive_policy=adaptive_policy,
         config={},
+    )
+    score_adjustment_report = build_s2_score_adjustment_report(
+        direction=direction,
+        candidate_pool=candidate_pool,
+        scorecard=scorecard,
+        adaptive_policy=adaptive_policy,
+        feedback_context=feedback_context,
     )
     planner_gate = build_s2_planner_gate_report(
         direction=direction,
@@ -199,11 +211,16 @@ def _write_direction_and_variant_contracts(project_root: Path) -> list[str]:
         next_variant=variant,
         variant_contract=contract,
         variant_fingerprint=fingerprint,
+        adaptive_policy=adaptive_policy,
+        score_adjustment_report=score_adjustment_report,
         config={},
     )
     write_json(project_root / "plan" / "next_variant.json", {"schema_version": "auto_research_planner_decision_v1", "direction_id": direction["direction_id"], "planner_summary": "Mocked S2 planner decision.", "planning_mode": "same_direction_variant", "used_shared_memory_refs": [], "next_variant": variant})
     write_json(project_root / "plan" / "s2_planner" / "candidate_pool.json", candidate_pool)
+    write_json(project_root / "plan" / "s2_planner" / "feedback_context.json", feedback_context)
+    write_json(project_root / "plan" / "s2_planner" / "adaptive_policy.json", adaptive_policy)
     write_json(project_root / "plan" / "s2_planner" / "variant_scorecard.json", scorecard)
+    write_json(project_root / "plan" / "s2_planner" / "score_adjustment_report.json", score_adjustment_report)
     write_json(project_root / "plan" / "s2_planner" / "next_variant.json", variant)
     write_json(project_root / "plan" / "s2_planner" / "planner_gate_report.json", planner_gate)
     return [
@@ -211,7 +228,10 @@ def _write_direction_and_variant_contracts(project_root: Path) -> list[str]:
         "plan/variant_contract.json",
         "plan/variant_fingerprint.json",
         "plan/s2_planner/candidate_pool.json",
+        "plan/s2_planner/feedback_context.json",
+        "plan/s2_planner/adaptive_policy.json",
         "plan/s2_planner/variant_scorecard.json",
+        "plan/s2_planner/score_adjustment_report.json",
         "plan/s2_planner/next_variant.json",
         "plan/s2_planner/planner_gate_report.json",
     ]

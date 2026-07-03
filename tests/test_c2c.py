@@ -30,6 +30,7 @@ from auto_research.direction_contracts import build_direction_contract, build_s1
 from auto_research.evidence_refs import resolve_s1_evidence_refs
 from auto_research.judges import gate_s0
 from auto_research.s2_planner_contracts import build_s2_candidate_pool, build_s2_planner_gate_report, build_s2_variant_scorecard
+from auto_research.s2_feedback_policy import build_s2_adaptive_policy, build_s2_feedback_context, build_s2_score_adjustment_report
 from auto_research.validators.s2_gate import S2GateValidator
 from auto_research.code_patch import (
     CodePatchAgent,
@@ -397,6 +398,8 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
     contract = json.loads((project / "plan" / "variant_contract.json").read_text(encoding="utf-8"))
     fingerprint = json.loads((project / "plan" / "variant_fingerprint.json").read_text(encoding="utf-8"))
     candidate_pool = build_s2_candidate_pool(direction=direction, candidates=[variant], source="test_fixture")
+    feedback_context = build_s2_feedback_context(project_root=project, direction=direction, config={})
+    adaptive_policy = build_s2_adaptive_policy(feedback_context, {})
     scorecard = build_s2_variant_scorecard(
         direction=direction,
         candidate_pool=candidate_pool,
@@ -405,7 +408,16 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
         variant_fingerprint=fingerprint,
         planner_memory={"entries": []},
         feedback=[],
+        feedback_context=feedback_context,
+        adaptive_policy=adaptive_policy,
         config={},
+    )
+    score_adjustment_report = build_s2_score_adjustment_report(
+        direction=direction,
+        candidate_pool=candidate_pool,
+        scorecard=scorecard,
+        adaptive_policy=adaptive_policy,
+        feedback_context=feedback_context,
     )
     planner_gate = build_s2_planner_gate_report(
         direction=direction,
@@ -414,12 +426,17 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
         next_variant=variant,
         variant_contract=contract,
         variant_fingerprint=fingerprint,
+        adaptive_policy=adaptive_policy,
+        score_adjustment_report=score_adjustment_report,
         config={},
     )
     (project / "plan" / "s2_planner").mkdir(parents=True, exist_ok=True)
     (project / "plan" / "next_variant.json").write_text((project / "plan" / "planner_decision.json").read_text(encoding="utf-8"), encoding="utf-8")
     (project / "plan" / "s2_planner" / "candidate_pool.json").write_text(json.dumps(candidate_pool), encoding="utf-8")
+    (project / "plan" / "s2_planner" / "feedback_context.json").write_text(json.dumps(feedback_context), encoding="utf-8")
+    (project / "plan" / "s2_planner" / "adaptive_policy.json").write_text(json.dumps(adaptive_policy), encoding="utf-8")
     (project / "plan" / "s2_planner" / "variant_scorecard.json").write_text(json.dumps(scorecard), encoding="utf-8")
+    (project / "plan" / "s2_planner" / "score_adjustment_report.json").write_text(json.dumps(score_adjustment_report), encoding="utf-8")
     (project / "plan" / "s2_planner" / "next_variant.json").write_text(json.dumps(variant), encoding="utf-8")
     (project / "plan" / "s2_planner" / "planner_gate_report.json").write_text(json.dumps(planner_gate), encoding="utf-8")
 
@@ -5997,8 +6014,16 @@ def test_c2c_s2_directional_planner_falls_back_without_real_llm(tmp_path: Path) 
     assert planned[0]["id"] == "utility_predicted_cache_routing"
     assert result["plan"]["directional_planning"]["status"] == "fallback_no_real_llm"
     assert (paths.root / "plan" / "s2_planner" / "candidate_pool.json").exists()
+    assert (paths.root / "plan" / "s2_planner" / "feedback_context.json").exists()
+    assert (paths.root / "plan" / "s2_planner" / "adaptive_policy.json").exists()
     assert (paths.root / "plan" / "s2_planner" / "variant_scorecard.json").exists()
+    assert (paths.root / "plan" / "s2_planner" / "score_adjustment_report.json").exists()
     assert (paths.root / "plan" / "s2_planner" / "next_variant.json").exists()
+    adaptive_policy = json.loads((paths.root / "plan" / "s2_planner" / "adaptive_policy.json").read_text(encoding="utf-8"))
+    scorecard = json.loads((paths.root / "plan" / "s2_planner" / "variant_scorecard.json").read_text(encoding="utf-8"))
+    adjustment = json.loads((paths.root / "plan" / "s2_planner" / "score_adjustment_report.json").read_text(encoding="utf-8"))
+    assert scorecard["policy_hash"] == adaptive_policy["policy_hash"]
+    assert adjustment["selected_variant_id"] == scorecard["selected_variant_id"]
     planner_gate = json.loads((paths.root / "plan" / "s2_planner" / "planner_gate_report.json").read_text(encoding="utf-8"))
     assert planner_gate["gate"] == "pass"
 
@@ -6146,6 +6171,7 @@ def test_c2c_s2_directional_planner_uses_direction_variants(tmp_path: Path) -> N
     assert result["plan"]["next_variant"]["variant_fingerprint"] == planned[0]["variant_fingerprint"]
     assert result["plan"]["next_variant"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
     assert (paths.root / "plan" / "next_variant.json").exists()
+
     saved = json.loads((paths.root / "plan" / "candidate_ideas.json").read_text(encoding="utf-8"))
     assert saved[0]["id"] == "utility_router_soft_residual_variant"
     assert saved[0]["s2_variant"]["variant_fingerprint"] == planned[0]["variant_fingerprint"]
@@ -6165,6 +6191,120 @@ def test_c2c_s2_directional_planner_uses_direction_variants(tmp_path: Path) -> N
     assert "utility_router_soft_residual_variant" in llm.prompts[-1]
     memory = json.loads((paths.root / "plan" / "s2_planner_memory.json").read_text(encoding="utf-8"))
     assert memory["entry_count"] == 2
+
+
+def test_c2c_s2_adaptive_selector_avoids_failed_integration_after_route_to_s2(tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
+        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
+        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py"],
+        "allowed_prefixes": ["rosetta/model"],
+        "s2_adaptive_policy": {"enabled": True},
+    }
+    config["code_patch"] = {"enabled": False}
+    config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
+    config["orchestration"]["route_policy"] = {"budgets": {"same_direction_proxy_failures": 2, "same_direction_full_s3_failures": 1}}
+    paths = init_workspace(config, "topic", project_id="proj_s2_adaptive_selector", simulate=False)
+    direction = {
+        "direction_id": "direction_x",
+        "title": "Utility routing",
+        "mechanism_axis": "routing",
+        "integration_point": "projector",
+        "control_signal": "utility",
+        "hypothesis": "Route cache by utility.",
+        "expected_metric_signature": {"primary_metric": "three_dataset_mean"},
+        "expected_files": ["rosetta/model/projector.py"],
+    }
+    ArtifactManager(paths.root).write_json("S1_literature", "direction.json", direction, artifact_type="direction", summary="direction")
+    ArtifactManager(paths.root).write_json(
+        "S1_literature",
+        "ideas.json",
+        [
+            {
+                "id": "direction_x",
+                "title": "Utility routing",
+                "selected": True,
+                "s1_direction_id": "direction_x",
+                "mechanism_axis": "routing",
+                "integration_point": "projector",
+                "control_signal": "utility",
+                "expected_files": ["rosetta/model/projector.py"],
+            }
+        ],
+        artifact_type="ideas",
+        summary="ideas",
+    )
+    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
+    write_json(
+        paths.root / "meta" / "route_decision.json",
+        {
+            "decision": "route_to_s2",
+            "failure_class": "proxy_false_positive",
+            "reason_codes": ["proxy_decision_report_route_hint_return_s2"],
+            "budget_effects": {"consumes_same_direction_attempt": True},
+        },
+    )
+    write_json(
+        paths.root / "meta" / "attempt_ledger.json",
+        {
+            "schema_version": "c2c_attempt_ledger_v1",
+            "project_id": paths.root.name,
+            "records": [],
+            "counters": {"by_direction": {"direction_x": {"proxy_failures": 1, "full_s3_failures": 0, "patch_repairs": 0, "resource_retries": 0}}},
+        },
+    )
+
+    class PlannerLLM(ModelClient):
+        def __init__(self, config, project_root=None):
+            super().__init__(config, project_root=project_root)
+            self.use_real_api = True
+
+        def generate_json_with_schema(self, **kwargs):
+            del kwargs
+            return {
+                "planner_summary": "Compare old and new integration points.",
+                "planning_mode": "same_direction_variant",
+                "used_shared_memory_refs": [],
+                "variant_candidates": [
+                    {
+                        "id": "old_projector_variant",
+                        "title": "Old projector variant",
+                        "mechanism_axis": "routing",
+                        "integration_point": "projector",
+                        "control_signal": "utility",
+                        "hypothesis": "Keep projector utility routing.",
+                        "expected_files": ["rosetta/model/projector.py"],
+                        "ablation_switch": "disable_old_projector",
+                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"], "ablation_switch": "disable_old_projector"},
+                    },
+                    {
+                        "id": "new_wrapper_variant",
+                        "title": "New wrapper variant",
+                        "mechanism_axis": "routing",
+                        "integration_point": "wrapper",
+                        "control_signal": "utility",
+                        "hypothesis": "Move utility routing to wrapper residual scaling.",
+                        "expected_files": ["rosetta/model/wrapper.py"],
+                        "ablation_switch": "disable_new_wrapper",
+                        "experiment_contract": {"expected_files": ["rosetta/model/wrapper.py"], "ablation_switch": "disable_new_wrapper"},
+                    },
+                ],
+            }
+
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerLLM(config, project_root=paths.root))
+    result = PlanAgent(context).run()
+
+    assert result["plan"]["next_variant"]["id"] == "new_wrapper_variant"
+    scorecard = json.loads((paths.root / "plan" / "s2_planner" / "variant_scorecard.json").read_text(encoding="utf-8"))
+    assert scorecard["selected_variant_id"] == "new_wrapper_variant"
+    old_row = next(row for row in scorecard["ranking"] if row["variant_id"] == "old_projector_variant")
+    assert old_row["components"]["route_history_prior"] < 0
 
 
 def test_c2c_implementation_failure_reruns_only_s2_5_patch_repair(monkeypatch, tmp_path: Path) -> None:

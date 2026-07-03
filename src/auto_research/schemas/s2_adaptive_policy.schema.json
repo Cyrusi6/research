@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS2AdaptivePolicy",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "direction_id",
+    "policy_hash",
+    "enabled",
+    "history_sufficient",
+    "penalties",
+    "bonuses",
+    "route_constraints",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "policy_hash": {"type": "string"},
+    "enabled": {"type": "boolean"},
+    "history_sufficient": {"type": "boolean"},
+    "penalties": {"type": "object"},
+    "bonuses": {"type": "object"},
+    "route_constraints": {"type": "object"},
+    "reason_codes": {"type": "array"}
+  }
+}

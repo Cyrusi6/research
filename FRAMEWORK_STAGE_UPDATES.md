@@ -2712,3 +2712,27 @@ uv run pytest -q tests/test_route_policy.py tests/test_attempt_ledger.py tests/t
 uv run pytest -q tests/test_pipeline.py -k 'proxy_rejected_routes_to_s2_same_direction'
 uv run pytest -q
 ```
+
+## 2026-07-03 C2C S2 Adaptive Feedback Selector
+
+C2C S2 selector 从固定启发式 scorecard 升级为 deterministic adaptive selector：S2 会先读取 route decision、attempt ledger、proxy calibration、recent S3 result 和 shared method memory，生成反馈上下文与 adaptive policy，再按 adjusted score 选择 `next_variant`。这样 proxy/full method failure 会惩罚重复机制路径，implementation/resource failure 不会误伤 method idea，dataset dragging 风险也会进入候选 variant 排序。
+
+修复：
+
+- 新增 `s2_feedback_policy.py`，提供 `build_s2_feedback_context()`、`build_s2_adaptive_policy()`、`build_s2_variant_failure_prior()`、`build_s2_proxy_calibration_prior()`、`build_s2_dataset_risk_prior()` 和 `build_s2_score_adjustment_report()`。
+- C2C S2 新增 artifacts：`plan/s2_planner/feedback_context.json`、`adaptive_policy.json` 和 `score_adjustment_report.json`。
+- `build_s2_variant_scorecard()` 支持 adaptive policy，把 `proxy_calibration_prior` 从固定常量升级为历史反馈分，并新增 `route_history_prior`、`dataset_risk_prior`、`patch_surface_prior`、`budget_prior`、`base_score` 和 `adjusted_score`。
+- PlanAgent 在 planner 生成 candidate pool 后执行 deterministic adaptive selection；如果 adjusted score 改变排序，会重写 `selected_idea`、`next_variant`、planner decision、variant contract 和 S2/S2.5 handoff artifacts。
+- `build_s2_planner_gate_report()` 校验 policy hash、adjusted selected score、adjustment report，并在 `force_new_integration_point` / `force_new_direction` 触发时阻止重复 integration 或要求回 S1。
+- `S2GateValidator` 硬校验新 adaptive artifacts、policy hash 一致性、adjustment 覆盖所有 candidates、adaptive components 存在，以及 force-new-direction 的 route-to-S1 gate 语义。
+- Route policy 回 S2 时显式 invalidate `feedback_context.json`、`adaptive_policy.json`、`variant_scorecard.json` 和 `score_adjustment_report.json`，防止复用旧 selector 结果。
+- C2C 默认配置增加 `c2c.s2_adaptive_policy`；stage contracts 和 schemas 增加 C2C S2 conditional outputs 与 JSON contract。
+
+验证：
+
+```text
+python -m py_compile tests/test_c2c.py src/auto_research/s2_feedback_policy.py src/auto_research/s2_planner_contracts.py src/auto_research/agents/plan.py src/auto_research/validators/s2_gate.py
+uv run pytest -q tests/test_s2_feedback_policy.py tests/test_s2_adaptive_scorecard.py tests/test_s2_planner_contracts.py tests/test_validators.py tests/test_stage_contracts.py tests/test_pipeline.py
+uv run pytest -q tests/test_c2c.py
+uv run pytest -q
+```

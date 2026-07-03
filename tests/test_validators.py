@@ -9,6 +9,7 @@ from auto_research.s2_planner_contracts import (
     build_s2_planner_gate_report,
     build_s2_variant_scorecard,
 )
+from auto_research.s2_feedback_policy import build_s2_adaptive_policy, build_s2_feedback_context, build_s2_score_adjustment_report
 from auto_research.utils import sha256_file
 from auto_research.validators import run_stage_gate
 from auto_research.workspace import init_workspace
@@ -349,6 +350,8 @@ def _write_s2_contracts(
     if mutate_next_variant:
         mutate_next_variant(next_variant)
     candidate_pool = build_s2_candidate_pool(direction=direction, candidates=[next_variant], source="test_fixture")
+    feedback_context = build_s2_feedback_context(project_root=paths.root, direction=direction, config={})
+    adaptive_policy = build_s2_adaptive_policy(feedback_context, {})
     scorecard = build_s2_variant_scorecard(
         direction=direction,
         candidate_pool=candidate_pool,
@@ -357,7 +360,16 @@ def _write_s2_contracts(
         variant_fingerprint=fingerprint,
         planner_memory={"entries": []},
         feedback=[],
+        feedback_context=feedback_context,
+        adaptive_policy=adaptive_policy,
         config={},
+    )
+    score_adjustment_report = build_s2_score_adjustment_report(
+        direction=direction,
+        candidate_pool=candidate_pool,
+        scorecard=scorecard,
+        adaptive_policy=adaptive_policy,
+        feedback_context=feedback_context,
     )
     if mutate_scorecard:
         mutate_scorecard(scorecard)
@@ -368,6 +380,8 @@ def _write_s2_contracts(
         next_variant=next_variant,
         variant_contract=contract,
         variant_fingerprint=fingerprint,
+        adaptive_policy=adaptive_policy,
+        score_adjustment_report=score_adjustment_report,
         config={},
     )
     if mutate_planner_gate:
@@ -379,7 +393,10 @@ def _write_s2_contracts(
     (plan_dir / "variant_contract.json").write_text(json.dumps(contract), encoding="utf-8")
     (plan_dir / "variant_fingerprint.json").write_text(json.dumps(fingerprint), encoding="utf-8")
     (planner_dir / "candidate_pool.json").write_text(json.dumps(candidate_pool), encoding="utf-8")
+    (planner_dir / "feedback_context.json").write_text(json.dumps(feedback_context), encoding="utf-8")
+    (planner_dir / "adaptive_policy.json").write_text(json.dumps(adaptive_policy), encoding="utf-8")
     (planner_dir / "variant_scorecard.json").write_text(json.dumps(scorecard), encoding="utf-8")
+    (planner_dir / "score_adjustment_report.json").write_text(json.dumps(score_adjustment_report), encoding="utf-8")
     (planner_dir / "next_variant.json").write_text(json.dumps(next_variant), encoding="utf-8")
     (planner_dir / "planner_gate_report.json").write_text(json.dumps(planner_gate), encoding="utf-8")
 
@@ -620,6 +637,40 @@ def test_s2_gate_retries_missing_s2_candidate_pool(tmp_path: Path) -> None:
 
     assert report["status"] == "NEEDS_RETRY"
     assert any(check["name"] == "s2_candidate_pool_json_exists" for check in report["checks"])
+
+
+def test_s2_gate_retries_adaptive_policy_hash_mismatch(tmp_path: Path) -> None:
+    paths = init_workspace(_config(tmp_path), "topic", project_id="proj_gate_s2_policy_hash", simulate=True)
+    _write_s1_contract(paths)
+    _write_minimal_c2c_plan(paths)
+    _write_s2_contracts(paths)
+    scorecard_path = paths.root / "plan" / "s2_planner" / "variant_scorecard.json"
+    scorecard = json.loads(scorecard_path.read_text(encoding="utf-8"))
+    scorecard["policy_hash"] = "wrong_hash"
+    scorecard_path.write_text(json.dumps(scorecard), encoding="utf-8")
+
+    report = run_stage_gate("S2_plan", paths.root, _config(tmp_path)).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    planner_gate = next(check for check in report["checks"] if check["name"] == "s2_planner_gate_contract")
+    assert "variant_scorecard.policy_hash must match adaptive_policy.policy_hash" in planner_gate["details"]["errors"]
+
+
+def test_s2_gate_retries_score_adjustment_missing_candidate_coverage(tmp_path: Path) -> None:
+    paths = init_workspace(_config(tmp_path), "topic", project_id="proj_gate_s2_adjustment_coverage", simulate=True)
+    _write_s1_contract(paths)
+    _write_minimal_c2c_plan(paths)
+    _write_s2_contracts(paths)
+    report_path = paths.root / "plan" / "s2_planner" / "score_adjustment_report.json"
+    adjustment = json.loads(report_path.read_text(encoding="utf-8"))
+    adjustment["adjustments"] = []
+    report_path.write_text(json.dumps(adjustment), encoding="utf-8")
+
+    report = run_stage_gate("S2_plan", paths.root, _config(tmp_path)).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    planner_gate = next(check for check in report["checks"] if check["name"] == "s2_planner_gate_contract")
+    assert any("score_adjustment_report.adjustments must cover every candidate" in error for error in planner_gate["details"]["errors"])
 
 
 def test_s2_gate_retries_s2_next_variant_direction_mismatch(tmp_path: Path) -> None:

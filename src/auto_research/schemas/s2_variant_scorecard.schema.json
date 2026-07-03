@@ -2,17 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "C2CS2VariantScorecard",
   "type": "object",
-  "required": ["schema_version", "direction_id", "selected_variant_id", "ranking", "rejected_variants"],
+  "required": ["schema_version", "direction_id", "selected_variant_id", "policy_hash", "ranking", "rejected_variants"],
   "properties": {
     "schema_version": {"type": "string"},
     "direction_id": {"type": "string"},
     "selected_variant_id": {"type": "string"},
+    "policy_hash": {"type": "string"},
     "ranking": {
       "type": "array",
       "minItems": 1,
       "items": {
         "type": "object",
-        "required": ["variant_id", "score", "components", "decision"],
+        "required": ["variant_id", "score", "base_score", "adjusted_score", "components", "decision"],
         "properties": {
           "variant_id": {"type": "string"},
           "variant_fingerprint": {"type": "string"},
@@ -28,11 +29,16 @@
               "implementation_feasibility",
               "ablation_readiness",
               "proxy_calibration_prior",
+              "route_history_prior",
+              "dataset_risk_prior",
+              "patch_surface_prior",
+              "budget_prior",
               "risk_penalty"
             ]
           },
           "decision": {"type": "string"},
-          "reasons": {"type": "array"}
+          "reasons": {"type": "array"},
+          "adjustments": {"type": "array"}
         }
       }
     },

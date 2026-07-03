@@ -5,6 +5,12 @@ from __future__ import annotations
 import fnmatch
 from typing import Any
 
+from .s2_feedback_policy import (
+    build_s2_dataset_risk_prior,
+    build_s2_proxy_calibration_prior,
+    build_s2_variant_failure_prior,
+)
+
 
 C2C_S2_CANDIDATE_POOL_SCHEMA_VERSION = "c2c_s2_candidate_pool_v1"
 C2C_S2_VARIANT_SCORECARD_SCHEMA_VERSION = "c2c_s2_variant_scorecard_v1"
@@ -40,6 +46,8 @@ def build_s2_variant_scorecard(
     variant_fingerprint: dict[str, Any] | None = None,
     planner_memory: dict[str, Any] | None = None,
     feedback: list[dict[str, Any]] | None = None,
+    feedback_context: dict[str, Any] | None = None,
+    adaptive_policy: dict[str, Any] | None = None,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     evidence_quality = evidence_quality if isinstance(evidence_quality, dict) else {}
@@ -57,8 +65,12 @@ def build_s2_variant_scorecard(
             variant_fingerprint=variant_fingerprint,
             history=history,
             feedback=feedback or [],
+            feedback_context=feedback_context if isinstance(feedback_context, dict) else {},
+            adaptive_policy=adaptive_policy if isinstance(adaptive_policy, dict) else {},
             config=config or {},
         )
+        adjustments = components.pop("_adjustments", [])
+        base_score = components.pop("_base_score", None)
         score = round(sum(float(value) for value in components.values()), 4)
         candidate_id = str(candidate.get("id") or "")
         ranking.append(
@@ -66,12 +78,19 @@ def build_s2_variant_scorecard(
                 "variant_id": candidate_id,
                 "variant_fingerprint": candidate.get("variant_fingerprint"),
                 "score": score,
+                "base_score": round(float(base_score), 4) if base_score is not None else score,
+                "adjusted_score": score,
                 "components": components,
-                "decision": "selected" if candidate_id == selected_id else "rejected",
+                "decision": "candidate",
                 "reasons": reasons,
+                "adjustments": adjustments,
             }
         )
-    ranking.sort(key=lambda item: (item["decision"] == "selected", item["score"]), reverse=True)
+    ranking.sort(key=lambda item: (item["score"], item["variant_id"] == selected_id), reverse=True)
+    if ranking:
+        selected_id = str(ranking[0].get("variant_id") or selected_id)
+        for idx, item in enumerate(ranking):
+            item["decision"] = "selected" if idx == 0 else "rejected"
     rejected = [
         {
             "variant_id": item["variant_id"],
@@ -81,17 +100,13 @@ def build_s2_variant_scorecard(
         for item in ranking
         if item.get("decision") != "selected"
     ]
-    if ranking and not any(item.get("decision") == "selected" for item in ranking):
-        ranking[0]["decision"] = "selected"
-        selected_id = str(ranking[0].get("variant_id") or selected_id)
-        rejected = [
-            {"variant_id": item["variant_id"], "score": item["score"], "reasons": item.get("reasons") or ["lower_ranked_variant"]}
-            for item in ranking[1:]
-        ]
     return {
         "schema_version": C2C_S2_VARIANT_SCORECARD_SCHEMA_VERSION,
         "direction_id": str(direction.get("direction_id") or direction.get("id") or ""),
         "selected_variant_id": selected_id,
+        "policy_hash": (adaptive_policy or {}).get("policy_hash") or "",
+        "adaptive_policy_ref": "plan/s2_planner/adaptive_policy.json" if adaptive_policy else None,
+        "feedback_context_ref": "plan/s2_planner/feedback_context.json" if feedback_context else None,
         "ranking": ranking,
         "rejected_variants": rejected,
     }
@@ -105,6 +120,8 @@ def build_s2_planner_gate_report(
     next_variant: dict[str, Any],
     variant_contract: dict[str, Any],
     variant_fingerprint: dict[str, Any],
+    adaptive_policy: dict[str, Any] | None = None,
+    score_adjustment_report: dict[str, Any] | None = None,
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     config = config or {}
@@ -118,6 +135,9 @@ def build_s2_planner_gate_report(
     score_rows = [item for item in scorecard.get("ranking") or [] if isinstance(item, dict)]
     selected_rows = [item for item in score_rows if item.get("decision") == "selected"]
     selected_score = float(selected_rows[0].get("score") or 0.0) if selected_rows else 0.0
+    adaptive_policy = adaptive_policy if isinstance(adaptive_policy, dict) else {}
+    score_adjustment_report = score_adjustment_report if isinstance(score_adjustment_report, dict) else {}
+    policy_hash = str(adaptive_policy.get("policy_hash") or scorecard.get("policy_hash") or "")
     if not candidates:
         errors.append("candidate_pool.candidates must be non-empty")
     if selected_id not in candidate_ids:
@@ -146,10 +166,26 @@ def build_s2_planner_gate_report(
         errors.append("variant_fingerprint repeats a previous same-direction variant")
     if scorecard.get("selected_variant_id") and str(scorecard.get("selected_variant_id")) != selected_id:
         errors.append("scorecard.selected_variant_id must match next_variant.id")
+    if policy_hash:
+        if str(scorecard.get("policy_hash") or "") != policy_hash:
+            errors.append("variant_scorecard.policy_hash must match adaptive_policy.policy_hash")
+        if score_adjustment_report and str(score_adjustment_report.get("policy_hash") or "") != policy_hash:
+            errors.append("score_adjustment_report.policy_hash must match adaptive_policy.policy_hash")
+        if score_adjustment_report and str(score_adjustment_report.get("selected_variant_id") or "") != selected_id:
+            errors.append("score_adjustment_report.selected_variant_id must match next_variant.id")
     if not selected_rows:
         errors.append("variant_scorecard must mark exactly one selected variant")
     elif len(selected_rows) > 1:
         errors.append("variant_scorecard must not select multiple variants")
+    if selected_rows and float(selected_rows[0].get("adjusted_score", selected_rows[0].get("score") or 0.0) or 0.0) != selected_score:
+        errors.append("selected_variant_score must use adjusted score")
+    route_constraints = adaptive_policy.get("route_constraints") if isinstance(adaptive_policy.get("route_constraints"), dict) else {}
+    if route_constraints.get("force_new_integration_point"):
+        failed_points = {str(item) for item in route_constraints.get("failed_integration_points") or [] if item}
+        if str(next_variant.get("integration_point") or "") in failed_points:
+            errors.append("adaptive_policy.force_new_integration_point requires a new integration_point")
+    if route_constraints.get("force_new_direction"):
+        errors.append("adaptive_policy.force_new_direction requires route_to_s1 instead of selecting another S2 variant")
     gate_cfg = ((config.get("c2c") or {}).get("s2_planner_gate") or {}) if isinstance(config.get("c2c"), dict) else {}
     min_score = float(gate_cfg.get("min_selected_variant_score", 0.0) or 0.0)
     if min_score and selected_score < min_score:
@@ -160,6 +196,7 @@ def build_s2_planner_gate_report(
         "schema_version": C2C_S2_PLANNER_GATE_REPORT_SCHEMA_VERSION,
         "direction_id": direction_id,
         "gate": "pass" if not errors else "fail",
+        "policy_hash": policy_hash,
         "selected_variant_id": selected_id,
         "selected_variant_fingerprint": selected_fp or expected_fp,
         "selected_variant_score": selected_score,
@@ -174,9 +211,13 @@ def build_s2_planner_gate_report(
             "ablation_switch_present": bool(_ablation_switch(next_variant) or _ablation_switch(variant_contract)),
             "not_repeated": not (variant_fingerprint.get("is_repeat") is True) or implementation_repair_mode,
             "scorecard_selected": bool(selected_rows),
+            "adaptive_policy_hash_matches": not policy_hash or str(scorecard.get("policy_hash") or "") == policy_hash,
+            "score_adjustment_selected_matches": not score_adjustment_report or str(score_adjustment_report.get("selected_variant_id") or "") == selected_id,
+            "force_new_integration_point_satisfied": not route_constraints.get("force_new_integration_point") or str(next_variant.get("integration_point") or "") not in {str(item) for item in route_constraints.get("failed_integration_points") or [] if item},
+            "force_new_direction": bool(route_constraints.get("force_new_direction")),
         },
         "errors": errors,
-        "return_to": "S2_planner" if errors else None,
+        "return_to": "S1_literature" if route_constraints.get("force_new_direction") else "S2_planner" if errors else None,
     }
 
 
@@ -319,6 +360,8 @@ def _score_components(
     variant_fingerprint: dict[str, Any],
     history: dict[str, set[str]],
     feedback: list[dict[str, Any]],
+    feedback_context: dict[str, Any],
+    adaptive_policy: dict[str, Any],
     config: dict[str, Any],
 ) -> tuple[dict[str, float], list[str]]:
     reasons: list[str] = []
@@ -348,27 +391,49 @@ def _score_components(
     ablation = 0.08 if _ablation_switch(candidate) else 0.0
     if not ablation:
         reasons.append("weak_ablation_switch")
-    proxy_prior = 0.02
+    proxy_prior = build_s2_proxy_calibration_prior(candidate, feedback_context, adaptive_policy)
+    route_prior = build_s2_variant_failure_prior(candidate, feedback_context, adaptive_policy)
+    dataset_prior = build_s2_dataset_risk_prior(candidate, feedback_context, adaptive_policy)
     risk_penalty = -0.10 if _forbidden_files(candidate) else 0.0
     if risk_penalty:
         reasons.append("forbidden_file_risk")
     base_score = candidate.get("variant_score") if isinstance(candidate.get("variant_score"), dict) else {}
     if base_score.get("reasons"):
         reasons.extend(str(item) for item in base_score.get("reasons") or [] if item)
-    return (
-        {
-            "s1_direction_alignment": round(alignment, 4),
-            "s1_evidence_support": round(evidence, 4),
-            "novelty": round(novelty, 4),
-            "anti_repeat": round(anti_repeat, 4),
-            "feedback_fit": round(feedback_fit, 4),
-            "implementation_feasibility": round(feasibility, 4),
-            "ablation_readiness": round(ablation, 4),
-            "proxy_calibration_prior": round(proxy_prior, 4),
-            "risk_penalty": round(risk_penalty, 4),
-        },
-        _dedupe(reasons) or ["ranked_by_deterministic_scorecard"],
-    )
+    components = {
+        "s1_direction_alignment": round(alignment, 4),
+        "s1_evidence_support": round(evidence, 4),
+        "novelty": round(novelty, 4),
+        "anti_repeat": round(anti_repeat, 4),
+        "feedback_fit": round(feedback_fit, 4),
+        "implementation_feasibility": round(feasibility, 4),
+        "ablation_readiness": round(ablation, 4),
+        "proxy_calibration_prior": round(float((proxy_prior.get("components") or {}).get("proxy_calibration_prior") or 0.0), 4),
+        "route_history_prior": round(float((route_prior.get("components") or {}).get("route_history_prior") or 0.0), 4),
+        "dataset_risk_prior": round(float((dataset_prior.get("components") or {}).get("dataset_risk_prior") or 0.0), 4),
+        "patch_surface_prior": round(float((route_prior.get("components") or {}).get("patch_surface_prior") or 0.0), 4),
+        "budget_prior": round(float((route_prior.get("components") or {}).get("budget_prior") or 0.0), 4),
+        "risk_penalty": round(risk_penalty, 4),
+    }
+    adaptive_adjustments = [
+        *(proxy_prior.get("applied") or []),
+        *(route_prior.get("applied") or []),
+        *(dataset_prior.get("applied") or []),
+    ]
+    reasons.extend(str(item.get("reason")) for item in adaptive_adjustments if isinstance(item, dict) and item.get("reason"))
+    core_keys = [
+        "s1_direction_alignment",
+        "s1_evidence_support",
+        "novelty",
+        "anti_repeat",
+        "feedback_fit",
+        "implementation_feasibility",
+        "ablation_readiness",
+        "risk_penalty",
+    ]
+    components["_base_score"] = round(sum(float(components[key]) for key in core_keys), 4)
+    components["_adjustments"] = adaptive_adjustments
+    return (components, _dedupe(reasons) or ["ranked_by_deterministic_scorecard"])
 
 
 def _history_summary(planner_memory: dict[str, Any]) -> dict[str, set[str]]:

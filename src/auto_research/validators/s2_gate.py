@@ -289,6 +289,24 @@ class S2GateValidator(StageGateValidator):
             "s2_variant_scorecard_schema",
             "s2_variant_scorecard.schema.json",
         )
+        feedback_context = self._read_required_json_with_schema(
+            "plan/s2_planner/feedback_context.json",
+            "s2_feedback_context_json_exists",
+            "s2_feedback_context_schema",
+            "s2_feedback_context.schema.json",
+        )
+        adaptive_policy = self._read_required_json_with_schema(
+            "plan/s2_planner/adaptive_policy.json",
+            "s2_adaptive_policy_json_exists",
+            "s2_adaptive_policy_schema",
+            "s2_adaptive_policy.schema.json",
+        )
+        score_adjustment_report = self._read_required_json_with_schema(
+            "plan/s2_planner/score_adjustment_report.json",
+            "s2_score_adjustment_report_json_exists",
+            "s2_score_adjustment_report_schema",
+            "s2_score_adjustment_report.schema.json",
+        )
         next_variant_path = self.require_file("plan/s2_planner/next_variant.json", check_name="s2_next_variant_json_exists")
         next_variant = self.read_json_artifact("plan/s2_planner/next_variant.json") if next_variant_path else None
         if isinstance(next_variant, dict):
@@ -301,7 +319,7 @@ class S2GateValidator(StageGateValidator):
             "s2_planner_gate_report_schema",
             "s2_planner_gate_report.schema.json",
         )
-        if not all(isinstance(item, dict) for item in [candidate_pool, scorecard, next_variant, planner_gate]):
+        if not all(isinstance(item, dict) for item in [candidate_pool, scorecard, feedback_context, adaptive_policy, score_adjustment_report, next_variant, planner_gate]):
             return
         errors: list[str] = []
         direction = self._safe_json("literature/direction.json")
@@ -312,8 +330,13 @@ class S2GateValidator(StageGateValidator):
         selected_id = str(planner_gate.get("selected_variant_id") or next_variant.get("id") or "")
         selected_fp = str(planner_gate.get("selected_variant_fingerprint") or next_variant.get("variant_fingerprint") or "")
         expected_fp = str(variant_fingerprint.get("variant_fingerprint") or "")
-        if planner_gate.get("gate") != "pass":
+        route_constraints = adaptive_policy.get("route_constraints") if isinstance(adaptive_policy.get("route_constraints"), dict) else {}
+        force_new_direction = route_constraints.get("force_new_direction") is True
+        if planner_gate.get("gate") != "pass" and not force_new_direction:
             errors.append("planner_gate_report.gate must be pass")
+        if force_new_direction:
+            if planner_gate.get("gate") != "fail" or planner_gate.get("return_to") != "S1_literature":
+                errors.append("adaptive_policy.force_new_direction requires planner_gate fail with return_to=S1_literature")
         next_direction = str(next_variant.get("direction_id") or next_variant.get("s1_direction_id") or "")
         if direction_id and next_direction != direction_id:
             errors.append("next_variant.direction_id must match literature/direction.json direction_id")
@@ -327,10 +350,41 @@ class S2GateValidator(StageGateValidator):
             errors.append("selected next_variant.variant_fingerprint must match variant_fingerprint.json")
         if str(scorecard.get("selected_variant_id") or "") != selected_id:
             errors.append("variant_scorecard.selected_variant_id must match planner_gate_report.selected_variant_id")
+        policy_hash = str(adaptive_policy.get("policy_hash") or "")
+        if not policy_hash:
+            errors.append("adaptive_policy.policy_hash must be non-empty")
+        if policy_hash and str(scorecard.get("policy_hash") or "") != policy_hash:
+            errors.append("variant_scorecard.policy_hash must match adaptive_policy.policy_hash")
+        if policy_hash and str(planner_gate.get("policy_hash") or "") != policy_hash:
+            errors.append("planner_gate_report.policy_hash must match adaptive_policy.policy_hash")
+        if policy_hash and str(score_adjustment_report.get("policy_hash") or "") != policy_hash:
+            errors.append("score_adjustment_report.policy_hash must match adaptive_policy.policy_hash")
+        if str(score_adjustment_report.get("selected_variant_id") or "") != selected_id:
+            errors.append("score_adjustment_report.selected_variant_id must match planner_gate_report.selected_variant_id")
         ranking = [item for item in scorecard.get("ranking") or [] if isinstance(item, dict)]
         selected_rows = [item for item in ranking if item.get("decision") == "selected"]
         if len(selected_rows) != 1:
             errors.append("variant_scorecard.ranking must contain exactly one selected row")
+        required_components = {
+            "proxy_calibration_prior",
+            "route_history_prior",
+            "dataset_risk_prior",
+            "patch_surface_prior",
+            "budget_prior",
+        }
+        missing_components = [
+            {"variant_id": item.get("variant_id"), "missing": sorted(required_components - set((item.get("components") or {}).keys()))}
+            for item in ranking
+            if isinstance(item.get("components"), dict) and required_components - set(item["components"].keys())
+        ]
+        if missing_components:
+            errors.append(f"variant_scorecard adaptive components missing: {missing_components[:3]}")
+        adjustment_ids = {str(item.get("variant_id") or "") for item in score_adjustment_report.get("adjustments") or [] if isinstance(item, dict)}
+        if candidate_ids - adjustment_ids:
+            errors.append(f"score_adjustment_report.adjustments must cover every candidate: {sorted(candidate_ids - adjustment_ids)[:5]}")
+        failed_points = {str(item) for item in route_constraints.get("failed_integration_points") or [] if item}
+        if route_constraints.get("force_new_integration_point") and str(next_variant.get("integration_point") or "") in failed_points:
+            errors.append("adaptive_policy.force_new_integration_point requires selected variant to use a new integration_point")
         expected_files = [str(item) for item in next_variant.get("expected_files") or [] if item]
         if not expected_files:
             errors.append("next_variant.expected_files must be non-empty")

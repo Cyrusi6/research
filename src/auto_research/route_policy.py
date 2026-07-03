@@ -475,6 +475,12 @@ def _artifact_effects_for_decision(decision: str) -> dict[str, Any]:
     if decision == "route_to_s2":
         return {
             "invalidate_from": "S2_plan",
+            "invalidate_artifacts": [
+                "plan/s2_planner/feedback_context.json",
+                "plan/s2_planner/adaptive_policy.json",
+                "plan/s2_planner/variant_scorecard.json",
+                "plan/s2_planner/score_adjustment_report.json",
+            ],
             "preserve_s1_direction": True,
             "preserve_s2_selected_variant": False,
             "preserve_s2_5_patch_lock": False,

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS2FeedbackContext",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "direction_id",
+    "current_iteration",
+    "route_summary",
+    "attempt_counters",
+    "proxy_calibration",
+    "recent_failures"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "current_iteration": {"type": "integer"},
+    "route_summary": {"type": "object"},
+    "attempt_counters": {"type": "object"},
+    "proxy_calibration": {"type": "object"},
+    "recent_failures": {"type": "array"},
+    "dragging_datasets": {"type": "array"}
+  }
+}
