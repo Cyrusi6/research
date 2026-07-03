@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CAttemptLedger",
+  "type": "object",
+  "required": ["schema_version", "project_id", "records", "counters"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "project_id": {"type": "string"},
+    "updated_at": {"type": "string"},
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "timestamp",
+          "iteration",
+          "direction_id",
+          "stage",
+          "failure_class",
+          "route_decision",
+          "consumes_same_direction_attempt",
+          "consumes_patch_repair_attempt",
+          "consumes_resource_retry",
+          "writes_method_memory"
+        ]
+      }
+    },
+    "counters": {"type": "object"}
+  }
+}

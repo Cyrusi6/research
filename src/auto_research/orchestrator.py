@@ -19,6 +19,7 @@ from .llm import ModelClient
 from .method_memory import append_shared_c2c_method_failure
 from .orchestration_state import OrchestrationStateManager
 from .reporting import build_project_report
+from .route_policy import build_route_context, decide_next_route, write_route_artifacts
 from .s0_enrichment import DeepSeekS0SemanticEnricher
 from .registry import begin_stage, block_stage, complete_stage, fail_stage, increment_judge_retry, invalidate_from, load_registry, pause_stage_retryable, save_registry, set_review_outcome
 from .stage_contracts import StageContractManager
@@ -274,6 +275,23 @@ class Orchestrator:
             elif stage_key == "S3_experiment":
                 result = ExperimentAgent(context).run()
                 if result.get("status") == "blocked":
+                    policy_route = self._apply_c2c_route_policy_feedback(
+                        project_root,
+                        registry_path,
+                        registry,
+                        state,
+                        contracts,
+                        stage_key,
+                        result,
+                        result["blocked_reason"],
+                        config=config,
+                        trigger_source="s3_agent_blocked",
+                    )
+                    if policy_route:
+                        if policy_route.get("continue"):
+                            context = self._context(project_root, load_project_config(project_root))
+                            continue
+                        return policy_route["response"]
                     resource_pause = self._s3_resource_retry_pause_details(project_root, result, result["blocked_reason"])
                     if resource_pause:
                         pause_stage_retryable(registry, stage_key, resource_pause["reason"], pause_type=resource_pause["pause_type"])
@@ -396,6 +414,25 @@ class Orchestrator:
                 gate_payload["report_path"] = gate_record["path"]
                 state.gate_recorded(registry, stage_key, passed=ok, reason=reason, report=gate_payload)
                 contracts.gate_recorded(stage_key, gate_payload, report_path=gate_record["path"])
+                if not ok:
+                    policy_route = self._apply_c2c_route_policy_feedback(
+                        project_root,
+                        registry_path,
+                        registry,
+                        state,
+                        contracts,
+                        stage_key,
+                        result,
+                        reason,
+                        config=config,
+                        trigger_source="s3_gate",
+                        gate_status=gate_report.status,
+                    )
+                    if policy_route:
+                        if policy_route.get("continue"):
+                            context = self._context(project_root, load_project_config(project_root))
+                            continue
+                        return policy_route["response"]
                 if not ok and self._should_route_s3_implementation_failure_to_s2(config, project_root, registry):
                     routed = self._route_s3_repairable_proxy_to_s2(project_root, registry, result, reason, config=config)
                     save_registry(registry_path, registry)
@@ -555,6 +592,24 @@ class Orchestrator:
                     "resume_instruction": registry.get("resume_instruction"),
                 }
 
+            s2_5_policy_route = self._apply_c2c_s2_5_route_policy_feedback(
+                project_root,
+                registry_path,
+                registry,
+                state,
+                contracts,
+                stage_key,
+                result,
+                gate_report,
+                reason,
+                config=config,
+            )
+            if s2_5_policy_route:
+                if s2_5_policy_route.get("continue"):
+                    context = self._context(project_root, load_project_config(project_root))
+                    continue
+                return s2_5_policy_route["response"]
+
             s2_5_implementation_repair = self._route_s2_5_validation_failure_to_repair(
                 project_root,
                 registry,
@@ -593,6 +648,238 @@ class Orchestrator:
             return {"status": "failed", "stage": stage_key, "reason": reason}
         state.mark_completed(registry)
         return {"status": registry["status"], "project_id": registry["project_id"]}
+
+    @staticmethod
+    def _route_policy_enabled(config: dict[str, Any], project_root: Path) -> bool:
+        route_cfg = ((config or {}).get("orchestration") or {}).get("route_policy")
+        if not isinstance(route_cfg, dict):
+            return False
+        if route_cfg.get("enabled") is False:
+            return False
+        if route_cfg.get("c2c_only", True) and not bool(((config or {}).get("c2c") or {}).get("enabled")):
+            return False
+        return bool((project_root / "intake" / "c2c" / "static_bundle.json").exists() or ((config or {}).get("c2c") or {}).get("enabled"))
+
+    @staticmethod
+    def _legacy_route_fallback_enabled(config: dict[str, Any]) -> bool:
+        route_cfg = ((config or {}).get("orchestration") or {}).get("route_policy")
+        return bool(route_cfg.get("legacy_route_fallback", True)) if isinstance(route_cfg, dict) else True
+
+    def _route_policy_bundle(
+        self,
+        project_root: Path,
+        registry: dict[str, Any],
+        config: dict[str, Any],
+        *,
+        stage_key: str,
+        trigger_source: str,
+        status: str,
+        reason: str,
+        gate_status: str | None = None,
+    ) -> dict[str, Any]:
+        route_context = build_route_context(
+            project_root,
+            registry,
+            config,
+            trigger={
+                "stage": stage_key,
+                "source": trigger_source,
+                "status": status,
+                "reason": reason,
+                "gate_status": gate_status,
+            },
+        )
+        route_decision = decide_next_route(route_context, config)
+        return write_route_artifacts(project_root, route_context, route_decision)
+
+    def _apply_c2c_route_policy_feedback(
+        self,
+        project_root: Path,
+        registry_path: Path,
+        registry: dict[str, Any],
+        state: OrchestrationStateManager,
+        contracts: StageContractManager,
+        stage_key: str,
+        result: dict[str, Any],
+        reason: str,
+        *,
+        config: dict[str, Any],
+        trigger_source: str,
+        gate_status: str | None = None,
+    ) -> dict[str, Any] | None:
+        if not self._route_policy_enabled(config, project_root):
+            return None
+        bundle = self._route_policy_bundle(
+            project_root,
+            registry,
+            config,
+            stage_key=stage_key,
+            trigger_source=trigger_source,
+            status="failed",
+            reason=reason,
+            gate_status=gate_status,
+        )
+        decision = bundle["route_decision"]
+        route = decision.get("decision")
+        route_reason = "; ".join(decision.get("reason_codes") or []) or reason
+        if route in {"pause", "retry_resource"}:
+            pause_type = "s3_proxy_resource_retry" if stage_key == "S3_experiment" else "route_policy_resource_retry"
+            pause_stage_retryable(registry, stage_key, route_reason, pause_type=pause_type)
+            save_registry(registry_path, registry)
+            state.stage_retryable_paused(registry, stage_key, route_reason)
+            contracts.stage_stopped(
+                stage_key,
+                status="retryable_paused",
+                reason=route_reason,
+                artifacts=result.get("artifacts", []),
+                config=config,
+                iteration=registry.get("iteration"),
+            )
+            self._log_session(project_root, action="route_policy_pause", details=decision)
+            return {
+                "response": {
+                    "status": "retryable_paused",
+                    "stage": stage_key,
+                    "reason": route_reason,
+                    "pause_type": pause_type,
+                    "resume_instruction": registry.get("resume_instruction"),
+                    "route_decision_path": "meta/route_decision.json",
+                }
+            }
+        if route == "block":
+            block_stage(registry, stage_key, route_reason)
+            save_registry(registry_path, registry)
+            state.stage_blocked(registry, stage_key, route_reason)
+            contracts.stage_stopped(stage_key, status="blocked", reason=route_reason, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+            self._log_session(project_root, action="route_policy_blocked", details=decision)
+            return {"response": {"status": "blocked", "stage": stage_key, "reason": route_reason, "route_decision_path": "meta/route_decision.json"}}
+        routed = self._execute_c2c_route_decision(project_root, registry, result, reason, config=config, route_decision=decision)
+        if routed and routed.get("status") == "routed":
+            routed.update(
+                {
+                    "route_decision_path": "meta/route_decision.json",
+                    "route_decision": {
+                        "decision": decision.get("decision"),
+                        "next_stage": decision.get("next_stage"),
+                        "failure_class": decision.get("failure_class"),
+                        "reason_codes": decision.get("reason_codes") or [],
+                    },
+                    "attempt_record": bundle.get("attempt_record"),
+                }
+            )
+            save_registry(registry_path, registry)
+            state.failure_feedback_routed(registry, routed)
+            contracts.stage_stopped(
+                stage_key,
+                status="feedback_routed",
+                reason=reason,
+                artifacts=result.get("artifacts", []),
+                config=config,
+                iteration=registry.get("iteration"),
+            )
+            self._log_session(project_root, action=f"route_policy_{route}", details=routed)
+            return {"continue": True, "routed": routed}
+        if routed and routed.get("status") == "blocked":
+            save_registry(registry_path, registry)
+            state.stage_blocked(registry, stage_key, routed["reason"])
+            contracts.stage_stopped(stage_key, status="blocked", reason=routed["reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+            return {"response": {"status": "blocked", "stage": stage_key, "reason": routed["reason"], "route_decision_path": "meta/route_decision.json"}}
+        return None if self._legacy_route_fallback_enabled(config) else {
+            "response": {
+                "status": "blocked",
+                "stage": stage_key,
+                "reason": f"Route policy decision {route} could not be executed.",
+                "route_decision_path": "meta/route_decision.json",
+            }
+        }
+
+    def _apply_c2c_s2_5_route_policy_feedback(
+        self,
+        project_root: Path,
+        registry_path: Path,
+        registry: dict[str, Any],
+        state: OrchestrationStateManager,
+        contracts: StageContractManager,
+        stage_key: str,
+        result: dict[str, Any],
+        gate_report: Any,
+        reason: str,
+        *,
+        config: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if stage_key != "S2_plan" or not self._route_policy_enabled(config, project_root):
+            return None
+        bundle = self._route_policy_bundle(
+            project_root,
+            registry,
+            config,
+            stage_key=stage_key,
+            trigger_source="s2_gate",
+            status="failed",
+            reason=reason,
+            gate_status=getattr(gate_report, "status", None),
+        )
+        decision = bundle["route_decision"]
+        route = decision.get("decision")
+        if route == "route_to_s2_5":
+            routed = self._route_s2_5_validation_failure_to_repair(
+                project_root,
+                registry,
+                result,
+                gate_report,
+                reason,
+                config=config,
+            )
+            if routed:
+                routed.update(
+                    {
+                        "route_decision_path": "meta/route_decision.json",
+                        "route_decision": {
+                            "decision": decision.get("decision"),
+                            "next_stage": decision.get("next_stage"),
+                            "failure_class": decision.get("failure_class"),
+                            "reason_codes": decision.get("reason_codes") or [],
+                        },
+                        "attempt_record": bundle.get("attempt_record"),
+                    }
+                )
+                save_registry(registry_path, registry)
+                state.failure_feedback_routed(registry, routed)
+                self._log_session(project_root, action="route_policy_s2_5_repair", details=routed)
+                contracts.stage_stopped(
+                    stage_key,
+                    status="feedback_routed",
+                    reason=routed["reason"],
+                    artifacts=result.get("artifacts", []),
+                    config=config,
+                    iteration=registry.get("iteration"),
+                )
+                return {"continue": True, "routed": routed}
+        return None
+
+    @staticmethod
+    def _execute_c2c_route_decision(
+        project_root: Path,
+        registry: dict[str, Any],
+        result: dict[str, Any],
+        reason: str,
+        *,
+        config: dict[str, Any],
+        route_decision: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        route = route_decision.get("decision")
+        failure_class = str(route_decision.get("failure_class") or "")
+        if route == "route_to_s2_5":
+            return Orchestrator._route_s3_repairable_proxy_to_s2(project_root, registry, result, reason, config=config)
+        if route == "route_to_s2":
+            if "full_s3" in failure_class:
+                return Orchestrator._route_s3_full_failure_to_s2(project_root, registry, result, reason, config=config)
+            return Orchestrator._route_s3_proxy_rejected_to_s2(project_root, registry, result, reason, config=config)
+        if route == "route_to_s1":
+            if "proxy" in failure_class:
+                return Orchestrator._route_s3_proxy_rejected_to_s1(project_root, registry, result, reason, config=config)
+            return Orchestrator._route_s3_failure_to_s1(project_root, registry, result, reason, config=config)
+        return None
 
     @staticmethod
     def _retryable_pause_details(project_root: Path, stage_key: str, gate_report: Any, reason: str) -> dict[str, Any] | None:
@@ -931,6 +1218,8 @@ class Orchestrator:
                 performance_feedback=performance_feedback,
                 direction_scorecard=scorecard,
                 route=repair_route,
+                route_decision=read_json(project_root / "meta" / "route_decision.json", default={}) or {},
+                attempt_record=_latest_route_attempt_record(project_root),
             )
             repair_dispatch = {}
         write_json(project_root / "plan" / "performance_feedback.json", performance_feedback)
@@ -1023,6 +1312,8 @@ class Orchestrator:
             performance_feedback=performance_feedback,
             direction_scorecard=scorecard,
             route="repairable_proxy_risk",
+            route_decision=read_json(project_root / "meta" / "route_decision.json", default={}) or {},
+            attempt_record=_latest_route_attempt_record(project_root),
         )
         write_json(project_root / "plan" / "performance_feedback.json", performance_feedback)
         routed = Orchestrator._route_s3_failure_to_s1(project_root, registry, result, reason, config=config)
@@ -1067,6 +1358,8 @@ class Orchestrator:
             performance_feedback=performance_feedback,
             direction_scorecard=scorecard,
             route="proxy_rejected_same_direction",
+            route_decision=read_json(project_root / "meta" / "route_decision.json", default={}) or {},
+            attempt_record=_latest_route_attempt_record(project_root),
         )
         write_json(project_root / "plan" / "performance_feedback.json", performance_feedback)
         trace_path = project_root / "meta" / "iteration_trace.jsonl"
@@ -1087,6 +1380,78 @@ class Orchestrator:
         with trace_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(trace, ensure_ascii=False) + "\n")
         invalidate_from(registry, "S2_plan", invalidated_by="s3_proxy_performance_feedback")
+        for stage_key in ["S2_plan", "S3_experiment"]:
+            registry["stages"][stage_key]["judge_retries"] = 0
+        return {
+            "status": "routed",
+            "reason": reason,
+            "next_stage": "S2_plan",
+            "iteration": registry.get("iteration"),
+            "route_count": proxy_rejected_routes[iteration_key],
+            "same_direction_failure_count": failure_count,
+            "same_direction_failure_budget": max_failures,
+            "performance_feedback_path": "plan/performance_feedback.json",
+        }
+
+    @staticmethod
+    def _route_s3_full_failure_to_s2(
+        project_root: Path,
+        registry: dict[str, Any],
+        result: dict[str, Any],
+        reason: str,
+        *,
+        config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        feedback_cfg = (config or {}).get("orchestration", {}).get("failure_feedback", {})
+        iteration_key = str(registry.get("iteration") or 1)
+        proxy_rejected_routes = registry.setdefault("proxy_rejected_routes", {})
+        proxy_rejected_routes[iteration_key] = int(proxy_rejected_routes.get(iteration_key) or 0) + 1
+        max_failures = _same_direction_proxy_failure_budget(feedback_cfg)
+        failure_count = _same_direction_proxy_failure_count(registry, iteration_key)
+        performance_feedback = _s3_full_performance_feedback(project_root, registry, result, reason)
+        summary = performance_feedback.setdefault("summary", {})
+        summary["route"] = "full_s3_failure_same_direction"
+        summary["same_direction_failure_count"] = failure_count
+        summary["same_direction_failure_budget"] = max_failures
+        summary["recommended_s2_action"] = "mechanism_repair"
+        summary["next_action"] = "repair_or_variant_same_direction"
+        summary["s2_action_policy"] = {
+            "action": "mechanism_repair",
+            "matched_rule": "proxy_pass_full_s3_failed",
+            "reason": "Proxy passed or was neutral enough for full S3, but full S3 acceptance failed.",
+            "signals": ["proxy_full_false_positive"],
+        }
+        scorecard = _update_c2c_direction_scorecard(project_root, registry, performance_feedback)
+        performance_feedback["direction_scorecard"] = scorecard.get("current_direction")
+        performance_feedback["direction_scorecard_path"] = "plan/direction_scorecard.json"
+        performance_feedback["shared_method_memory"] = append_shared_c2c_method_failure(
+            config or {},
+            project_root=project_root,
+            performance_feedback=performance_feedback,
+            direction_scorecard=scorecard,
+            route="full_s3_failure_same_direction",
+            route_decision=read_json(project_root / "meta" / "route_decision.json", default={}) or {},
+            attempt_record=_latest_route_attempt_record(project_root),
+        )
+        write_json(project_root / "plan" / "performance_feedback.json", performance_feedback)
+        trace_path = project_root / "meta" / "iteration_trace.jsonl"
+        trace_path.parent.mkdir(parents=True, exist_ok=True)
+        trace = {
+            "timestamp": now_utc(),
+            "from_stage": "S3_experiment",
+            "to_stage": "S2_plan",
+            "iteration": registry.get("iteration"),
+            "reason": reason,
+            "result_status": result.get("status"),
+            "repair_route": "full_s3_failure_same_direction",
+            "route_count": proxy_rejected_routes[iteration_key],
+            "same_direction_failure_count": failure_count,
+            "same_direction_failure_budget": max_failures,
+            "performance_feedback": performance_feedback.get("summary", {}),
+        }
+        with trace_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(trace, ensure_ascii=False) + "\n")
+        invalidate_from(registry, "S2_plan", invalidated_by="s3_full_performance_feedback")
         for stage_key in ["S2_plan", "S3_experiment"]:
             registry["stages"][stage_key]["judge_retries"] = 0
         return {
@@ -1132,6 +1497,8 @@ class Orchestrator:
             performance_feedback=performance_feedback,
             direction_scorecard=scorecard,
             route="proxy_rejected_same_direction",
+            route_decision=read_json(project_root / "meta" / "route_decision.json", default={}) or {},
+            attempt_record=_latest_route_attempt_record(project_root),
         )
         write_json(project_root / "plan" / "performance_feedback.json", performance_feedback)
         routed = Orchestrator._route_s3_failure_to_s1(project_root, registry, result, reason, config=config)
@@ -1196,11 +1563,15 @@ class Orchestrator:
             performance_feedback=performance_feedback,
             direction_scorecard=direction_scorecard if isinstance(direction_scorecard, dict) else {},
             route="full_s3_failure",
+            route_decision=read_json(project_root / "meta" / "route_decision.json", default={}) or {},
+            attempt_record=_latest_route_attempt_record(project_root),
             source_paths=[
                 "experiment/results/main_results.json",
                 "experiment/results/failure_feedback.json",
                 "experiment/results/proxy_calibration.json",
                 "plan/direction_scorecard.json",
+                "meta/route_decision.json",
+                "meta/attempt_ledger.json",
             ],
         )
 
@@ -1381,6 +1752,14 @@ def _names_for_summary(items: list[Any]) -> list[str]:
         else:
             names.append(str(item))
     return names
+
+
+def _latest_route_attempt_record(project_root: Path) -> dict[str, Any]:
+    ledger = read_json(project_root / "meta" / "attempt_ledger.json", default={}) or {}
+    records = ledger.get("records") if isinstance(ledger, dict) else []
+    if isinstance(records, list) and records and isinstance(records[-1], dict):
+        return records[-1]
+    return {}
 
 
 def _same_direction_proxy_failure_budget(feedback_cfg: dict[str, Any]) -> int:

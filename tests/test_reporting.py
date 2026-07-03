@@ -89,6 +89,46 @@ def test_project_report_summarizes_c2c_route(tmp_path, monkeypatch, capsys) -> N
             "candidate_results": [],
         },
     )
+    write_json(
+        project / "meta" / "route_decision.json",
+        {
+            "schema_version": "c2c_route_decision_v1",
+            "created_at": "2026-07-03T00:00:00Z",
+            "trigger_stage": "S3_experiment",
+            "trigger_source": "s3_gate",
+            "failure_class": "proxy_negative",
+            "decision": "route_to_s2",
+            "next_stage": "S2_plan",
+            "reason_codes": ["proxy_decision_report_route_hint_return_s2"],
+            "budget_effects": {
+                "consumes_same_direction_attempt": True,
+                "consumes_patch_repair_attempt": False,
+                "consumes_resource_retry": False,
+                "increments_iteration": False,
+            },
+            "memory_effects": {"write_shared_method_memory": True, "memory_kind": "proxy_rejected_variant"},
+            "artifact_effects": {
+                "invalidate_from": "S2_plan",
+                "preserve_s1_direction": True,
+                "preserve_s2_selected_variant": False,
+                "preserve_s2_5_patch_lock": False,
+            },
+            "orchestrator_action": {"registry_current_stage": "S2_plan", "status": "feedback_routed"},
+        },
+    )
+    write_json(
+        project / "meta" / "attempt_ledger.json",
+        {
+            "schema_version": "c2c_attempt_ledger_v1",
+            "project_id": "proj_report",
+            "records": [],
+            "counters": {"by_direction": {"utility_predicted_cache_routing": {"proxy_failures": 1, "full_s3_failures": 0, "patch_repairs": 0, "resource_retries": 0}}},
+        },
+    )
+    write_json(project / "literature" / "c2c" / "evidence_quality_score.json", {"gate": "pass", "novelty_score": 0.68})
+    write_json(project / "plan" / "s2_planner" / "planner_gate_report.json", {"gate": "pass", "selected_variant_id": "utility_v2"})
+    write_json(project / "plan" / "s2_planner" / "variant_scorecard.json", {"ranking": [{"variant_id": "utility_v2", "score": 0.72, "decision": "selected"}]})
+    write_json(project / "experiment" / "results" / "c2c_proxy_decision_report.json", {"decision": "proxy_rejected", "route_hint": "return_s2", "failure_class": "proxy_negative"})
     (project / "plan" / "code_patches").mkdir()
     write_json(
         project / "plan" / "code_patches" / "patch_manifest.json",
@@ -115,10 +155,16 @@ def test_project_report_summarizes_c2c_route(tmp_path, monkeypatch, capsys) -> N
     assert report["same_direction_attempt"]["count"] == 2
     assert report["current_best_patch"]["candidate_id"] == "utility_v2"
     assert "stage_states" in report
-    assert report["next_route"]["action"] == "mechanism_repair"
+    assert report["next_route"]["action"] == "route_to_s2"
+    assert report["route"]["last_decision"] == "route_to_s2"
+    assert report["s1_quality"]["evidence_gate"] == "pass"
+    assert report["s2_planner"]["selected_variant_score"] == 0.72
+    assert report["s3_proxy"]["route_hint"] == "return_s2"
+    assert report["attempt_ledger"]["same_direction_proxy_failures"] == 1
     assert "S1 direction: utility_predicted_cache_routing" in text
     assert "Stage states:" in text
-    assert "Next route: mechanism_repair" in text
+    assert "Next route: route_to_s2" in text
+    assert "Route decision: route_to_s2 -> S2_plan" in text
 
     import auto_research.config as config_module
     import auto_research.orchestrator as orchestrator_module
@@ -132,7 +178,7 @@ def test_project_report_summarizes_c2c_route(tmp_path, monkeypatch, capsys) -> N
 
     main(["report", "--project-id", "proj_report", "--json"])
     payload = json.loads(capsys.readouterr().out)
-    assert payload["next_route"]["matched_rule"] == "single_dataset_small_drop"
+    assert payload["next_route"]["matched_rule"] == "proxy_decision_report_route_hint_return_s2"
 
 
 def test_memory_report_summarizes_shared_pool_and_project_retrieval(tmp_path, monkeypatch, capsys) -> None:

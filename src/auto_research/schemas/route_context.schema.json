@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CRouteContext",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at",
+    "project_id",
+    "iteration",
+    "current_stage",
+    "trigger",
+    "s1",
+    "s2",
+    "s2_5",
+    "s3",
+    "budgets",
+    "artifacts"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "project_id": {"type": "string"},
+    "iteration": {"type": "integer"},
+    "current_stage": {"type": "string"},
+    "trigger": {
+      "type": "object",
+      "required": ["source", "status", "reason"]
+    },
+    "s1": {"type": "object"},
+    "s2": {"type": "object"},
+    "s2_5": {"type": "object"},
+    "s3": {"type": "object"},
+    "budgets": {
+      "type": "object",
+      "required": [
+        "same_direction_proxy_failures",
+        "max_same_direction_proxy_failures",
+        "patch_repair_attempts",
+        "max_patch_repair_attempts",
+        "resource_retries",
+        "max_resource_retries"
+      ]
+    },
+    "artifacts": {"type": "object"}
+  }
+}

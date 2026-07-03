@@ -86,13 +86,23 @@ def append_shared_c2c_method_failure(
     performance_feedback: dict[str, Any],
     direction_scorecard: dict[str, Any] | None = None,
     route: str | None = None,
+    route_decision: dict[str, Any] | None = None,
+    attempt_record: dict[str, Any] | None = None,
     source_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     if not shared_method_memory_enabled(config):
         return {"status": "disabled"}
     if not _shared_method_memory_project_write_allowed(config or {}, project_root):
         return {"status": "skipped", "reason": "non_workspace_project_not_written_to_global_method_memory"}
-    if _is_implementation_failure(performance_feedback):
+    memory_effects = route_decision.get("memory_effects") if isinstance(route_decision, dict) else {}
+    if isinstance(memory_effects, dict) and route_decision:
+        if memory_effects.get("write_shared_method_memory") is not True:
+            return {
+                "status": "skipped",
+                "reason": memory_effects.get("skip_reason") or "route_decision_skipped_method_memory",
+                "route_decision": route_decision.get("decision"),
+            }
+    elif _is_implementation_failure(performance_feedback):
         return {"status": "skipped", "reason": "implementation_failure_is_not_method_memory"}
     proxy_calibration = _load_proxy_calibration_signal(project_root)
 
@@ -125,6 +135,28 @@ def append_shared_c2c_method_failure(
                 if proxy_calibration
                 else []
             ),
+            *(
+                [
+                    {
+                        "kind": "c2c_route_decision",
+                        "source_path": "meta/route_decision.json",
+                        "route_decision": _compact_route_decision(route_decision),
+                    }
+                ]
+                if isinstance(route_decision, dict) and route_decision
+                else []
+            ),
+            *(
+                [
+                    {
+                        "kind": "c2c_attempt_record",
+                        "source_path": "meta/attempt_ledger.json",
+                        "attempt_record": _compact_attempt_record(attempt_record),
+                    }
+                ]
+                if isinstance(attempt_record, dict) and attempt_record
+                else []
+            ),
         ],
         project_id=project_root.name,
         iteration=(performance_feedback.get("summary") or {}).get("iteration"),
@@ -133,6 +165,8 @@ def append_shared_c2c_method_failure(
             "plan/performance_feedback.json",
             "plan/direction_scorecard.json",
             "experiment/results/proxy_calibration.json",
+            "meta/route_decision.json",
+            "meta/attempt_ledger.json",
         ],
         view="method",
     )
@@ -146,17 +180,21 @@ def append_shared_c2c_method_failure(
         "topic": _project_topic(project_root),
         "kind": "shared_c2c_method_failure",
         "route": route or (performance_feedback.get("summary") or {}).get("route"),
-        "failure_class": "method_failure",
+        "failure_class": (route_decision or {}).get("failure_class") or "method_failure",
         "source_project_paths": source_paths
         or [
             "plan/performance_feedback.json",
             "plan/direction_scorecard.json",
             "experiment/results/main_results.json",
             "experiment/results/failure_feedback.json",
+            "meta/route_decision.json",
+            "meta/attempt_ledger.json",
         ],
         "summary": method_entries.get("summary") or {},
         "entries": method_entries.get("entries") or [],
         "proxy_calibration": proxy_calibration,
+        "route_decision": _compact_route_decision(route_decision),
+        "attempt_record": _compact_attempt_record(attempt_record),
         "source_repo_fingerprint": _source_repo_fingerprint(config, project_root),
         "direction_scorecard": (direction_scorecard or {}).get("current_direction")
         if isinstance(direction_scorecard, dict)
@@ -411,6 +449,8 @@ def _compact_shared_method_memory_entry(entry: dict[str, Any]) -> dict[str, Any]
         "method_context": method_context,
         "entries": compact_entries,
         "proxy_calibration": _compact_persisted_proxy_calibration(proxy_calibration),
+        "route_decision": _compact_route_decision(entry.get("route_decision")),
+        "attempt_record": _compact_attempt_record(entry.get("attempt_record")),
         "source_repo_fingerprint": entry.get("source_repo_fingerprint") if isinstance(entry.get("source_repo_fingerprint"), dict) else {},
     }
     if entry.get("memory_id"):
@@ -427,6 +467,8 @@ def _method_memory_source_paths(paths: Any) -> list[str]:
         "plan/performance_feedback.json",
         "experiment/results/main_results.json",
         "experiment/results/proxy_calibration.json",
+        "meta/route_decision.json",
+        "meta/attempt_ledger.json",
     ]
     blocked_markers = [
         "direction_scorecard",
@@ -448,9 +490,54 @@ def _method_memory_source_paths(paths: Any) -> list[str]:
     return result
 
 
+def _compact_route_decision(route_decision: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(route_decision, dict) or not route_decision:
+        return {}
+    return _strip_empty(
+        {
+            "decision": route_decision.get("decision"),
+            "next_stage": route_decision.get("next_stage"),
+            "failure_class": route_decision.get("failure_class"),
+            "reason_codes": route_decision.get("reason_codes") or [],
+            "budget_effects": route_decision.get("budget_effects")
+            if isinstance(route_decision.get("budget_effects"), dict)
+            else {},
+            "memory_effects": route_decision.get("memory_effects")
+            if isinstance(route_decision.get("memory_effects"), dict)
+            else {},
+        }
+    )
+
+
+def _compact_attempt_record(attempt_record: dict[str, Any] | None) -> dict[str, Any]:
+    if not isinstance(attempt_record, dict) or not attempt_record:
+        return {}
+    return _strip_empty(
+        {
+            "iteration": attempt_record.get("iteration"),
+            "direction_id": attempt_record.get("direction_id"),
+            "variant_id": attempt_record.get("variant_id"),
+            "patch_id": attempt_record.get("patch_id"),
+            "stage": attempt_record.get("stage"),
+            "failure_class": attempt_record.get("failure_class"),
+            "route_decision": attempt_record.get("route_decision"),
+            "consumes_same_direction_attempt": attempt_record.get("consumes_same_direction_attempt"),
+            "consumes_patch_repair_attempt": attempt_record.get("consumes_patch_repair_attempt"),
+            "consumes_resource_retry": attempt_record.get("consumes_resource_retry"),
+            "writes_method_memory": attempt_record.get("writes_method_memory"),
+        }
+    )
+
+
 def _compact_method_memory_evidence_item(item: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(item, dict):
         return {}
+    if item.get("kind") == "c2c_route_decision":
+        compact = _compact_route_decision(item.get("route_decision"))
+        return {"kind": "c2c_route_decision", "source_path": item.get("source_path"), "route_decision": compact} if compact else {}
+    if item.get("kind") == "c2c_attempt_record":
+        compact = _compact_attempt_record(item.get("attempt_record"))
+        return {"kind": "c2c_attempt_record", "source_path": item.get("source_path"), "attempt_record": compact} if compact else {}
     if item.get("kind") == "c2c_direction_scorecard":
         return {}
     if item.get("kind") == "c2c_proxy_calibration":

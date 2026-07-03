@@ -24,13 +24,21 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
     main_results = read_json(project_root / "experiment" / "results" / "main_results.json", default={}) or {}
     readiness = read_json(project_root / "experiment" / "results" / "full_s3_readiness_report.json", default={}) or {}
     patch_manifest = read_json(project_root / "plan" / "code_patches" / "patch_manifest.json", default={}) or {}
+    route_decision = read_json(project_root / "meta" / "route_decision.json", default={}) or {}
+    attempt_ledger = read_json(project_root / "meta" / "attempt_ledger.json", default={}) or {}
+    evidence_quality = read_json(project_root / "literature" / "c2c" / "evidence_quality_score.json", default={}) or {}
+    planner_gate = read_json(project_root / "plan" / "s2_planner" / "planner_gate_report.json", default={}) or {}
+    variant_scorecard = read_json(project_root / "plan" / "s2_planner" / "variant_scorecard.json", default={}) or {}
+    patch_gate = read_json(project_root / "plan" / "code_patches" / "patch_gate_report.json", default={}) or {}
+    proxy_decision = read_json(project_root / "experiment" / "results" / "c2c_proxy_decision_report.json", default={}) or {}
+    worthiness = read_json(project_root / "experiment" / "results" / "c2c_full_s3_worthiness.json", default={}) or {}
     selected_idea = _selected_idea(ideas)
     current_direction = _current_direction(selected_idea, direction_scorecard)
     attempts = _direction_attempts(direction_scorecard, main_results)
     best_patch = _best_patch(main_results, patch_manifest)
     stage_states = _stage_states(main_results, readiness, best_patch)
     latest_failure = _latest_failure(performance_feedback, main_results, registry)
-    next_route = _next_route(performance_feedback, registry)
+    next_route = _next_route(performance_feedback, registry, route_decision)
     return {
         "schema_version": "auto_research_project_report_v1",
         "project_id": registry.get("project_id") or project_root.name,
@@ -48,6 +56,12 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
         "stage_states": stage_states,
         "latest_failure": latest_failure,
         "next_route": next_route,
+        "route": _route_report(route_decision),
+        "s1_quality": _s1_quality_report(evidence_quality),
+        "s2_planner": _s2_planner_report(planner_gate, variant_scorecard),
+        "s2_5_patch": _s2_5_patch_report(patch_gate),
+        "s3_proxy": _s3_proxy_report(proxy_decision, worthiness),
+        "attempt_ledger": _attempt_ledger_report(attempt_ledger, current_direction),
         "artifact_paths": {
             "direction": "literature/direction.json" if (project_root / "literature" / "direction.json").exists() else None,
             "ideas": "literature/ideas.json" if (project_root / "literature" / "ideas.json").exists() else None,
@@ -56,6 +70,12 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
             "main_results": "experiment/results/main_results.json" if (project_root / "experiment" / "results" / "main_results.json").exists() else None,
             "full_s3_readiness_report": "experiment/results/full_s3_readiness_report.json" if (project_root / "experiment" / "results" / "full_s3_readiness_report.json").exists() else None,
             "patch_manifest": "plan/code_patches/patch_manifest.json" if (project_root / "plan" / "code_patches" / "patch_manifest.json").exists() else None,
+            "route_decision": "meta/route_decision.json" if (project_root / "meta" / "route_decision.json").exists() else None,
+            "attempt_ledger": "meta/attempt_ledger.json" if (project_root / "meta" / "attempt_ledger.json").exists() else None,
+            "s1_evidence_quality": "literature/c2c/evidence_quality_score.json" if (project_root / "literature" / "c2c" / "evidence_quality_score.json").exists() else None,
+            "planner_gate": "plan/s2_planner/planner_gate_report.json" if (project_root / "plan" / "s2_planner" / "planner_gate_report.json").exists() else None,
+            "patch_gate": "plan/code_patches/patch_gate_report.json" if (project_root / "plan" / "code_patches" / "patch_gate_report.json").exists() else None,
+            "proxy_decision": "experiment/results/c2c_proxy_decision_report.json" if (project_root / "experiment" / "results" / "c2c_proxy_decision_report.json").exists() else None,
         },
     }
 
@@ -67,6 +87,7 @@ def format_project_report(report: dict[str, Any]) -> str:
     states = report.get("stage_states") if isinstance(report.get("stage_states"), dict) else {}
     failure = report.get("latest_failure") if isinstance(report.get("latest_failure"), dict) else {}
     route = report.get("next_route") if isinstance(report.get("next_route"), dict) else {}
+    route_report = report.get("route") if isinstance(report.get("route"), dict) else {}
     lines = [
         f"Project: {report.get('project_id')}",
         f"Status: {report.get('status')} | Stage: {report.get('current_stage')} | Iteration: {report.get('iteration')}",
@@ -96,6 +117,7 @@ def format_project_report(report: dict[str, Any]) -> str:
             f"Stage states: proxy={states.get('proxy') or 'n/a'} activation={states.get('activation') or 'n/a'} full={states.get('full') or 'n/a'} ablation={states.get('ablation') or 'n/a'}",
             f"Recent failure: {failure.get('reason') or 'none'}",
             f"Next route: {route.get('action') or states.get('next_route_hint') or 'unknown'} ({route.get('reason') or states.get('next_route_hint') or 'no reason recorded'})",
+            f"Route decision: {route_report.get('last_decision') or 'none'} -> {route_report.get('next_stage') or 'n/a'}",
         ]
     )
     if report.get("status") == "retryable_paused":
@@ -402,7 +424,80 @@ def _latest_failure(feedback: dict[str, Any], main_results: dict[str, Any], regi
     return {"reason": registry.get("blocked_reason"), "route": None, "signals": []}
 
 
-def _next_route(feedback: dict[str, Any], registry: dict[str, Any]) -> dict[str, Any]:
+def _route_report(route_decision: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(route_decision, dict) or not route_decision:
+        return {"last_decision": None, "next_stage": None, "reason_codes": [], "budget_effects": {}}
+    return {
+        "last_decision": route_decision.get("decision"),
+        "next_stage": route_decision.get("next_stage"),
+        "failure_class": route_decision.get("failure_class"),
+        "reason_codes": route_decision.get("reason_codes") or [],
+        "budget_effects": route_decision.get("budget_effects") if isinstance(route_decision.get("budget_effects"), dict) else {},
+        "memory_effects": route_decision.get("memory_effects") if isinstance(route_decision.get("memory_effects"), dict) else {},
+    }
+
+
+def _s1_quality_report(evidence_quality: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "evidence_gate": evidence_quality.get("gate") or evidence_quality.get("status"),
+        "novelty_score": evidence_quality.get("novelty_score"),
+        "support_coverage": evidence_quality.get("support_coverage") if isinstance(evidence_quality.get("support_coverage"), dict) else {},
+    }
+
+
+def _s2_planner_report(planner_gate: dict[str, Any], variant_scorecard: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "planner_gate": planner_gate.get("gate") or planner_gate.get("status"),
+        "selected_variant_id": planner_gate.get("selected_variant_id") or variant_scorecard.get("selected_variant_id"),
+        "selected_variant_score": _selected_variant_score(variant_scorecard),
+    }
+
+
+def _s2_5_patch_report(patch_gate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "patch_gate": patch_gate.get("gate") or patch_gate.get("status"),
+        "failure_class": patch_gate.get("failure_class"),
+        "repairable": patch_gate.get("repairable"),
+    }
+
+
+def _s3_proxy_report(proxy_decision: dict[str, Any], worthiness: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "decision": proxy_decision.get("decision"),
+        "route_hint": proxy_decision.get("route_hint"),
+        "failure_class": proxy_decision.get("failure_class"),
+        "worthiness_score": worthiness.get("score") or ((proxy_decision.get("full_s3_worthiness") or {}).get("score") if isinstance(proxy_decision.get("full_s3_worthiness"), dict) else None),
+    }
+
+
+def _attempt_ledger_report(attempt_ledger: dict[str, Any], current_direction: dict[str, Any]) -> dict[str, Any]:
+    direction_id = current_direction.get("direction_id") if isinstance(current_direction, dict) else None
+    by_direction = ((attempt_ledger.get("counters") or {}).get("by_direction") or {}) if isinstance(attempt_ledger, dict) else {}
+    counters = by_direction.get(direction_id) if direction_id else None
+    if not isinstance(counters, dict):
+        counters = next(iter(by_direction.values()), {}) if by_direction else {}
+    records = attempt_ledger.get("records") if isinstance(attempt_ledger.get("records"), list) else []
+    return {
+        "same_direction_proxy_failures": counters.get("proxy_failures", 0),
+        "full_s3_failures": counters.get("full_s3_failures", 0),
+        "patch_repairs": counters.get("patch_repairs", 0),
+        "resource_retries": counters.get("resource_retries", 0),
+        "record_count": len(records),
+    }
+
+
+def _selected_variant_score(scorecard: dict[str, Any]) -> float | None:
+    if not isinstance(scorecard, dict):
+        return None
+    rows = [item for item in scorecard.get("ranking") or [] if isinstance(item, dict)]
+    selected = next((item for item in rows if item.get("decision") == "selected"), None)
+    try:
+        return float(selected["score"]) if selected and selected.get("score") is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _next_route(feedback: dict[str, Any], registry: dict[str, Any], route_decision: dict[str, Any] | None = None) -> dict[str, Any]:
     if registry.get("status") == "retryable_paused":
         pause_type = registry.get("pause_type") or "retryable_paused"
         action = "resume_after_gpu_resource_available" if pause_type == "runtime_smoke_resource_retry" else "resume_after_quota_recovery"
@@ -411,6 +506,14 @@ def _next_route(feedback: dict[str, Any], registry: dict[str, Any]) -> dict[str,
             "reason": registry.get("blocked_reason") or "retryable external quota/rate-limit pause",
             "matched_rule": pause_type,
             "next_action": registry.get("resume_instruction"),
+        }
+    if isinstance(route_decision, dict) and route_decision.get("decision"):
+        reason_codes = route_decision.get("reason_codes") or []
+        return {
+            "action": route_decision.get("decision"),
+            "reason": ", ".join(str(item) for item in reason_codes) or route_decision.get("failure_class"),
+            "matched_rule": reason_codes[0] if reason_codes else None,
+            "next_action": route_decision.get("next_stage"),
         }
     summary = feedback.get("summary") if isinstance(feedback.get("summary"), dict) else {}
     policy = summary.get("s2_action_policy") if isinstance(summary.get("s2_action_policy"), dict) else {}

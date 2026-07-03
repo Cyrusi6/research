@@ -12,6 +12,7 @@ from .s2_gate import S2GateValidator
 from .s3_gate import S3GateValidator
 from .s4_gate import S4GateValidator
 from .s5_gate import S5GateValidator
+from .route_policy_gate import RoutePolicyGateValidator
 
 
 VALIDATORS = {
@@ -29,4 +30,4 @@ def run_stage_gate(stage_key: str, project_root: Path, config: dict[str, Any] | 
     return validator_cls(project_root, config).validate()
 
 
-__all__ = ["FAIL", "NEEDS_RETRY", "PASS", "GateReport", "run_stage_gate"]
+__all__ = ["FAIL", "NEEDS_RETRY", "PASS", "GateReport", "RoutePolicyGateValidator", "run_stage_gate"]

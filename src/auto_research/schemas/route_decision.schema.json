@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CRouteDecision",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at",
+    "trigger_stage",
+    "trigger_source",
+    "failure_class",
+    "decision",
+    "reason_codes",
+    "budget_effects",
+    "memory_effects",
+    "artifact_effects",
+    "orchestrator_action"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "trigger_stage": {"type": "string"},
+    "trigger_source": {"type": "string"},
+    "failure_class": {"type": "string"},
+    "decision": {
+      "type": "string",
+      "enum": [
+        "route_to_s1",
+        "route_to_s2",
+        "route_to_s2_5",
+        "retry_resource",
+        "pause",
+        "block",
+        "continue_stage",
+        "complete"
+      ]
+    },
+    "reason_codes": {"type": "array"},
+    "budget_effects": {
+      "type": "object",
+      "required": [
+        "consumes_same_direction_attempt",
+        "consumes_patch_repair_attempt",
+        "consumes_resource_retry",
+        "increments_iteration"
+      ]
+    },
+    "memory_effects": {
+      "type": "object",
+      "required": ["write_shared_method_memory"]
+    },
+    "artifact_effects": {
+      "type": "object",
+      "required": [
+        "preserve_s1_direction",
+        "preserve_s2_selected_variant",
+        "preserve_s2_5_patch_lock"
+      ]
+    },
+    "orchestrator_action": {
+      "type": "object",
+      "required": ["status"]
+    }
+  }
+}

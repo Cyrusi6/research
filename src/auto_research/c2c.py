@@ -320,6 +320,26 @@ def build_c2c_project_config(
         "orchestration": {
             "auto_mode": True,
             "stop_after_stage": "S3_experiment",
+            "route_policy": {
+                "enabled": True,
+                "c2c_only": True,
+                "write_route_context": True,
+                "write_attempt_ledger": True,
+                "legacy_route_fallback": True,
+                "require_route_decision_for_s3_feedback": True,
+                "budgets": {
+                    "patch_repair_attempts_per_variant": 2,
+                    "same_direction_proxy_failures": 2,
+                    "same_direction_full_s3_failures": 1,
+                    "resource_retries_per_stage": 3,
+                },
+                "memory": {
+                    "write_method_memory_for_proxy_rejected": True,
+                    "write_method_memory_for_full_s3_failure": True,
+                    "skip_method_memory_for_implementation_failure": True,
+                    "skip_method_memory_for_resource_failure": True,
+                },
+            },
             "failure_feedback": {
                 "enabled": True,
                 "route_s3_failure_to_s1": True,

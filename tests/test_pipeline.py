@@ -1445,6 +1445,18 @@ def test_s3_blocked_repairable_proxy_routes_before_final_block(monkeypatch, tmp_
 def test_s3_blocked_proxy_rejected_routes_to_s2_same_direction(monkeypatch, tmp_path: Path) -> None:
     project_root = tmp_path / "proj_proxy_rejected_route"
     config = _test_config(tmp_path, simulate=False)
+    config["c2c"] = {"enabled": True}
+    config["orchestration"]["route_policy"] = {
+        "enabled": True,
+        "c2c_only": True,
+        "legacy_route_fallback": False,
+        "budgets": {
+            "same_direction_proxy_failures": 5,
+            "same_direction_full_s3_failures": 1,
+            "patch_repair_attempts_per_variant": 2,
+            "resource_retries_per_stage": 3,
+        },
+    }
     config["orchestration"]["failure_feedback"] = {
         "enabled": True,
         "route_s3_failure_to_s1": True,
@@ -1521,7 +1533,13 @@ def test_s3_blocked_proxy_rejected_routes_to_s2_same_direction(monkeypatch, tmp_
             ]
         },
     )
-    write_json(project_root / "literature" / "ideas.json", [{"title": "idea"}])
+    write_json(project_root / "literature" / "ideas.json", [{"id": "direction_x", "title": "idea", "selected": True}])
+    write_json(project_root / "literature" / "direction.json", {"direction_id": "direction_x", "mechanism_axis": "routing", "integration_point": "projector", "control_signal": "utility"})
+    write_json(project_root / "literature" / "c2c" / "evidence_quality_score.json", {"direction_id": "direction_x", "gate": "pass", "novelty_score": 0.68})
+    write_json(project_root / "plan" / "s2_planner" / "planner_gate_report.json", {"gate": "pass", "selected_variant_id": "idea_a"})
+    write_json(project_root / "plan" / "s2_planner" / "variant_scorecard.json", {"ranking": [{"variant_id": "idea_a", "score": 0.72, "decision": "selected"}]})
+    write_json(project_root / "plan" / "code_patches" / "patch_gate_report.json", {"gate": "pass", "repairable": False})
+    write_json(project_root / "experiment" / "results" / "c2c_proxy_decision_report.json", {"decision": "proxy_rejected", "route_hint": "return_s2", "failure_class": "proxy_negative", "variant_id": "idea_a"})
 
     def fake_run(self):
         return {
@@ -1557,8 +1575,13 @@ def test_s3_blocked_proxy_rejected_routes_to_s2_same_direction(monkeypatch, tmp_
     assert "single_dataset_small_drop" in feedback["summary"]["repair_vs_variant_signals"]
     assert feedback["candidate_results"][0]["dragging_datasets"][0]["dataset"] == "mmlu-redux"
     assert feedback["candidate_results"][0]["runtime_validation"]["runtime_smoke"] == "passed"
+    route_decision = json.loads((project_root / "meta" / "route_decision.json").read_text(encoding="utf-8"))
+    assert route_decision["decision"] == "route_to_s2"
+    assert route_decision["attempt_record"]["direction_id"] == "direction_x"
+    attempt_ledger = json.loads((project_root / "meta" / "attempt_ledger.json").read_text(encoding="utf-8"))
+    assert attempt_ledger["counters"]["by_direction"]["direction_x"]["proxy_failures"] == 1
     session_log = (project_root / "meta" / "session_log.jsonl").read_text(encoding="utf-8")
-    assert "s3_proxy_rejected_to_s2" in session_log
+    assert "route_policy_route_to_s2" in session_log
 
 
 def test_s3_proxy_feedback_recommends_patch_repair_for_runtime_failure(tmp_path: Path) -> None:

@@ -2687,3 +2687,28 @@ uv run pytest -q tests/test_s3_proxy_contracts.py tests/test_validators.py tests
 uv run pytest -q tests/test_stage_contracts.py tests/test_pipeline.py tests/test_validators.py
 uv run pytest -q
 ```
+
+## 2026-07-03 C2C Route Policy Decision Table
+
+C2C failure routing 从 orchestrator 内部多分支判断升级为 deterministic route policy：S1/S2/S2.5/S3 产出的 contract 被聚合为 `meta/route_context.json`，策略层输出唯一可审计的 `meta/route_decision.json`，orchestrator 只按 decision 执行 pause/block/回 S1/回 S2/回 S2.5 repair。
+
+修复：
+
+- 新增 `route_policy.py`，提供 `build_route_context()`、`decide_next_route()`、`build_route_decision()` 和 `apply_route_decision_summary()`。
+- 新增 route artifacts：`meta/route_context.json`、`meta/route_decision.json`、`meta/attempt_ledger.json` 和追加式 `meta/iteration_trace.jsonl`。
+- 新增 `attempt_ledger` counters，区分 same-direction proxy failure、full-S3 failure、patch repair 和 resource retry 是否被消耗。
+- C2C 默认配置增加 `orchestration.route_policy`，保留 legacy route fallback，但 C2C S3 blocked/gate-fail 默认先走 route policy。
+- S3 execution 层按 `route_decision.decision` 调用现有薄路由动作，并为 full-S3 false positive 增加专门的回 S2 feedback 路径。
+- S2.5 patch gate/manifest implementation failure 路由会先写 route decision，再进入 S2.5-only repair dispatch。
+- `append_shared_c2c_method_failure()` 支持 `route_decision` 和 `attempt_record`，由 `memory_effects.write_shared_method_memory` 决定是否写入 shared method memory。
+- `reporting.py` 展示最近 route decision、S1 evidence gate、S2 planner gate/score、S2.5 patch gate、S3 proxy decision/worthiness 和 ledger counters。
+- 新增 route schemas 和轻量 `RoutePolicyGateValidator`，用于 route 发生时校验 `route_decision` 与 `attempt_ledger`。
+
+验证：
+
+```text
+python -m py_compile src/auto_research/route_policy.py src/auto_research/orchestrator.py src/auto_research/method_memory.py src/auto_research/reporting.py src/auto_research/validators/route_policy_gate.py
+uv run pytest -q tests/test_route_policy.py tests/test_attempt_ledger.py tests/test_reporting.py
+uv run pytest -q tests/test_pipeline.py -k 'proxy_rejected_routes_to_s2_same_direction'
+uv run pytest -q
+```
