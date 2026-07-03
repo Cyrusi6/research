@@ -36,6 +36,17 @@
 - S2 gate 现在校验 direction id 一致性、机制轴/入口/控制信号、expected files、metric signature、ablation switch/control、failure routing 条件、variant fingerprint 重复，以及 C2C allowed edit surface。
 - `plan.yaml`、`plan/candidate_ideas.json`、`plan/next_variant.json` 仍保留给 S2.5/S3/报告路径兼容；新 artifact 是 source of truth，旧 artifact 是派生视图。
 
+## 2026-07-03 C2C S1 Evidence Quality Gate
+
+本次把 C2C S1 的“证据驱动选方向”从 prompt 约束升级为 deterministic hard gate，防止 JSON 结构合法但证据过薄的方向进入 S2：
+
+- C2C S1 新增并写出 `literature/c2c/evidence_quality_score.json`、`literature/c2c/evidence_retrieval_trace.json`、`literature/c2c/direction_fingerprint.json`。
+- `evidence_quality_score.json` 采用 `c2c_s1_evidence_quality_v1`，由现有 `evidence_bundle`、`resolve_s1_evidence_refs()` 报告、direction contract、novelty audit 和 direction fingerprint 计算；除 novelty score 外不依赖 GPT 判断。
+- 硬通过规则固定为：`unresolved_ref_count == 0`、paper coverage >= 2、code coverage >= 2、counterevidence count >= 1、implementation surface coverage >= 0.6、novelty score >= 0.60。
+- Codex evidence-agent 路径在 `_run_s1_codex_evidence_agent(mode="c2c")` 内先执行质量门；失败会作为 JSON repair reason 反馈给同一个 resume loop，而不是等 stage gate 才失败。
+- legacy C2C debate 路径也写同样的 deterministic artifact；S1 gate 在检测到 C2C 项目时要求并 schema-check 三个 artifact，并用 `s1_evidence_quality_gate` 返回 `NEEDS_RETRY`。
+- `stage_contracts.py` 将三个新 artifact 作为 C2C S1 conditional outputs，方便 manifest、orchestrator 和报告路径追踪。
+
 ## 2026-06-26 External S2.5 Worktree Storage
 
 真实 C2C 迭代积累后发现 `workspace/<project_id>/plan/code_worktrees/<idea>/vN/repo` 会把完整 Git worktree 放进当前 VS Code workspace。打开项目根目录时 VS Code 会递归 watch 历史 artifact 和 worktree repo，当前本地 `workspace/` 已达到 109G、15 万以上文件，触发 20 万量级 watcher。

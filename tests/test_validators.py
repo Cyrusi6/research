@@ -84,6 +84,79 @@ def _write_s1_contract(paths, *, direction_id: str = "utility_predicted_cache_ro
     )
 
 
+def _write_c2c_s1_gate_context(paths, *, quality_gate: str = "pass", mutate_quality=None) -> None:
+    intake = paths.root / "intake" / "c2c"
+    literature = paths.root / "literature"
+    c2c_literature = literature / "c2c"
+    intake.mkdir(parents=True, exist_ok=True)
+    c2c_literature.mkdir(parents=True, exist_ok=True)
+    for rel, payload in {
+        "static_bundle.json": {"schema_version": "c2c_static_bundle_v1"},
+        "evidence_brief.json": {"summary": "brief"},
+        "repo_card.json": {"repo": "c2c"},
+        "paper_cards.json": [{"id": "p"}],
+        "rebuttal_concern_matrix.json": {"top_concerns": []},
+        "negative_result_memory.json": {"blocked": []},
+        "baseline_evidence.json": {"name": "base", "mean": 50.0},
+    }.items():
+        (intake / rel).write_text(json.dumps(payload), encoding="utf-8")
+    (intake / "result_ledger.csv").write_text("id,metric\n", encoding="utf-8")
+    (literature / "idea_debate.json").write_text(json.dumps({"strategy": "legacy_debate", "selected_ideas": []}), encoding="utf-8")
+    (literature / "negative_constraints.json").write_text(json.dumps({"forbidden_patterns": []}), encoding="utf-8")
+    (c2c_literature / "baseline_evidence.json").write_text(json.dumps({"name": "base", "mean": 50.0}), encoding="utf-8")
+    (c2c_literature / "rebuttal_concern_matrix.json").write_text(json.dumps({"top_concerns": []}), encoding="utf-8")
+    quality = {
+        "schema_version": "c2c_s1_evidence_quality_v1",
+        "direction_id": "utility_predicted_cache_routing",
+        "support_coverage": {"paper": 3, "rebuttal": 1, "code": 2, "failure_memory": 1},
+        "counterevidence": {"count": 2, "resolved_count": 2},
+        "implementation_surface_coverage": 0.75,
+        "implementation_surface": {"target_count": 4, "covered_count": 3, "targets": [], "covered": []},
+        "unresolved_ref_count": 0,
+        "shared_memory_checked": True,
+        "novelty_score": 0.68,
+        "same_direction_similarity": 0.21,
+        "thresholds": {},
+        "failed_rules": [] if quality_gate == "pass" else ["support_coverage.paper"],
+        "coverage_contributors": {},
+        "gate": quality_gate,
+    }
+    if mutate_quality:
+        mutate_quality(quality)
+    (c2c_literature / "evidence_quality_score.json").write_text(json.dumps(quality), encoding="utf-8")
+    (c2c_literature / "evidence_retrieval_trace.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "c2c_s1_evidence_retrieval_trace_v1",
+                "direction_id": "utility_predicted_cache_routing",
+                "evidence_requests": [],
+                "resolved_ref_count": 6,
+                "unresolved_ref_count": quality["unresolved_ref_count"],
+                "resolved_refs": [],
+                "unresolved_refs": [],
+                "coverage_contributors": {},
+                "quality_gate": {"gate": quality["gate"], "failed_rules": quality["failed_rules"], "thresholds": {}},
+                "direction_fingerprint": {"fingerprint": "fp", "same_direction_similarity": 0.21, "artifact": "literature/c2c/direction_fingerprint.json"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (c2c_literature / "direction_fingerprint.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "c2c_s1_direction_fingerprint_v1",
+                "direction_id": "utility_predicted_cache_routing",
+                "fingerprint": "fp",
+                "features": {"mechanism_axis": "routing"},
+                "feature_tokens": ["routing"],
+                "history": [],
+                "same_direction_similarity": 0.21,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_s2_contracts(paths, *, direction_id: str = "utility_predicted_cache_routing", mutate_contract=None, mutate_fingerprint=None) -> None:
     plan_dir = paths.root / "plan"
     direction = _direction_payload(direction_id)
@@ -219,6 +292,40 @@ def test_s1_gate_passes_direction_contract(tmp_path: Path) -> None:
     assert report["status"] == "PASS"
     assert any(check["name"] == "direction_schema" and check["status"] == "PASS" for check in report["checks"])
     assert any(check["name"] == "novelty_audit_schema" and check["status"] == "PASS" for check in report["checks"])
+
+
+def test_s1_gate_passes_c2c_evidence_quality_contract(tmp_path: Path) -> None:
+    paths = init_workspace(_config(tmp_path), "topic", project_id="proj_s1_c2c_quality_pass", simulate=True)
+    _write_s1_contract(paths)
+    _write_c2c_s1_gate_context(paths)
+
+    report = run_stage_gate("S1_literature", paths.root, _config(tmp_path)).to_dict()
+
+    assert report["status"] == "PASS"
+    assert any(check["name"] == "c2c_s1_evidence_quality_schema" and check["status"] == "PASS" for check in report["checks"])
+    assert any(check["name"] == "s1_evidence_quality_gate" and check["status"] == "PASS" for check in report["checks"])
+
+
+def test_s1_gate_retries_thin_c2c_evidence_quality_contract(tmp_path: Path) -> None:
+    paths = init_workspace(_config(tmp_path), "topic", project_id="proj_s1_c2c_quality_thin", simulate=True)
+    _write_s1_contract(paths)
+    _write_c2c_s1_gate_context(
+        paths,
+        quality_gate="fail",
+        mutate_quality=lambda quality: quality.update(
+            {
+                "support_coverage": {"paper": 1, "rebuttal": 1, "code": 2, "failure_memory": 1},
+                "failed_rules": ["support_coverage.paper"],
+            }
+        ),
+    )
+
+    report = run_stage_gate("S1_literature", paths.root, _config(tmp_path)).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    quality = next(check for check in report["checks"] if check["name"] == "s1_evidence_quality_gate")
+    assert quality["status"] == "NEEDS_RETRY"
+    assert "support_coverage.paper" in quality["details"]["failed_rules"]
 
 
 def test_s2_gate_passes_c2c_plan_contract(tmp_path: Path) -> None:

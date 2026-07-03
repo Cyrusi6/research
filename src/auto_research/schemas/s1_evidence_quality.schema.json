@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS1EvidenceQualityScore",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "direction_id",
+    "support_coverage",
+    "counterevidence",
+    "implementation_surface_coverage",
+    "unresolved_ref_count",
+    "shared_memory_checked",
+    "novelty_score",
+    "same_direction_similarity",
+    "thresholds",
+    "failed_rules",
+    "gate"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "support_coverage": {
+      "type": "object",
+      "required": ["paper", "rebuttal", "code", "failure_memory"],
+      "properties": {
+        "paper": {"type": "integer"},
+        "rebuttal": {"type": "integer"},
+        "code": {"type": "integer"},
+        "failure_memory": {"type": "integer"}
+      }
+    },
+    "counterevidence": {
+      "type": "object",
+      "required": ["count", "resolved_count"],
+      "properties": {
+        "count": {"type": "integer"},
+        "resolved_count": {"type": "integer"}
+      }
+    },
+    "implementation_surface_coverage": {"type": "number"},
+    "implementation_surface": {"type": "object"},
+    "unresolved_ref_count": {"type": "integer"},
+    "shared_memory_checked": {"type": "boolean"},
+    "novelty_score": {"type": "number"},
+    "same_direction_similarity": {"type": "number"},
+    "thresholds": {"type": "object"},
+    "failed_rules": {"type": "array"},
+    "coverage_contributors": {"type": "object"},
+    "gate": {"type": "string"}
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS1DirectionFingerprint",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "direction_id",
+    "fingerprint",
+    "features",
+    "feature_tokens",
+    "history",
+    "same_direction_similarity"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "fingerprint": {"type": "string"},
+    "features": {"type": "object"},
+    "feature_tokens": {"type": "array"},
+    "history": {"type": "array"},
+    "same_direction_similarity": {"type": "number"}
+  }
+}

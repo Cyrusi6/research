@@ -191,12 +191,17 @@ class S1GateValidator(StageGateValidator):
             "literature/negative_constraints.json",
             "literature/c2c/baseline_evidence.json",
             "literature/c2c/rebuttal_concern_matrix.json",
+            "literature/c2c/evidence_quality_score.json",
+            "literature/c2c/evidence_retrieval_trace.json",
+            "literature/c2c/direction_fingerprint.json",
         ]
         missing = [rel for rel in required if not (self.project_root / rel).exists()]
         if missing:
             self.retry_check("c2c_s1_evidence_bundle", f"C2C S1 evidence missing: {', '.join(Path(item).name for item in missing)}", details={"missing": missing})
         else:
             self.pass_check("c2c_s1_evidence_bundle", details={"required_count": len(required)})
+
+        self._validate_c2c_evidence_quality_gate()
 
         invalid_contracts = []
         for idea in ideas[:3]:
@@ -284,6 +289,81 @@ class S1GateValidator(StageGateValidator):
         else:
             self.pass_check("c2c_s1_codex_evidence_agent_contract", artifact="literature/idea_debate.json")
 
+    def _validate_c2c_evidence_quality_gate(self) -> None:
+        required = {
+            "literature/c2c/evidence_quality_score.json": "s1_evidence_quality.schema.json",
+            "literature/c2c/evidence_retrieval_trace.json": "s1_evidence_retrieval_trace.schema.json",
+            "literature/c2c/direction_fingerprint.json": "s1_direction_fingerprint.schema.json",
+        }
+        missing = [rel for rel in required if not (self.project_root / rel).exists()]
+        if missing:
+            self.retry_check(
+                "c2c_s1_evidence_quality_artifacts",
+                "C2C S1 evidence quality artifacts missing",
+                artifact="literature/c2c/evidence_quality_score.json",
+                details={"missing": missing},
+            )
+            return
+        payloads: dict[str, object] = {}
+        schema_errors: dict[str, list[str]] = {}
+        expected_versions = {
+            "literature/c2c/evidence_quality_score.json": "c2c_s1_evidence_quality_v1",
+            "literature/c2c/evidence_retrieval_trace.json": "c2c_s1_evidence_retrieval_trace_v1",
+            "literature/c2c/direction_fingerprint.json": "c2c_s1_direction_fingerprint_v1",
+        }
+        for rel, schema_name in required.items():
+            payload = self._safe_json(rel)
+            payloads[rel] = payload
+            errors = validate_min_schema(payload, load_schema(schema_name))
+            if not isinstance(payload, dict):
+                errors.append("payload must be an object")
+            elif payload.get("schema_version") != expected_versions[rel]:
+                errors.append(f"schema_version must be {expected_versions[rel]}")
+            if errors:
+                schema_errors[rel] = errors[:10]
+        if schema_errors:
+            self.retry_check(
+                "c2c_s1_evidence_quality_schema",
+                "C2C S1 evidence quality artifacts do not satisfy schema",
+                artifact="literature/c2c/evidence_quality_score.json",
+                details={"errors": schema_errors},
+            )
+            return
+        self.pass_check("c2c_s1_evidence_quality_schema", artifact="literature/c2c/evidence_quality_score.json")
+        self.pass_check("c2c_s1_evidence_retrieval_trace_schema", artifact="literature/c2c/evidence_retrieval_trace.json")
+        self.pass_check("c2c_s1_direction_fingerprint_schema", artifact="literature/c2c/direction_fingerprint.json")
+
+        quality = payloads["literature/c2c/evidence_quality_score.json"]
+        failed_rules = _c2c_quality_failed_rules(quality if isinstance(quality, dict) else {})
+        declared_failed = quality.get("failed_rules") if isinstance(quality, dict) and isinstance(quality.get("failed_rules"), list) else []
+        if isinstance(quality, dict) and quality.get("gate") == "pass" and not failed_rules:
+            self.pass_check(
+                "s1_evidence_quality_gate",
+                artifact="literature/c2c/evidence_quality_score.json",
+                details={
+                    "support_coverage": quality.get("support_coverage"),
+                    "counterevidence": quality.get("counterevidence"),
+                    "implementation_surface_coverage": quality.get("implementation_surface_coverage"),
+                    "novelty_score": quality.get("novelty_score"),
+                    "same_direction_similarity": quality.get("same_direction_similarity"),
+                },
+            )
+            return
+        self.retry_check(
+            "s1_evidence_quality_gate",
+            "C2C S1 evidence quality gate did not pass",
+            artifact="literature/c2c/evidence_quality_score.json",
+            details={
+                "failed_rules": failed_rules or declared_failed,
+                "declared_gate": quality.get("gate") if isinstance(quality, dict) else None,
+                "support_coverage": quality.get("support_coverage") if isinstance(quality, dict) else None,
+                "counterevidence": quality.get("counterevidence") if isinstance(quality, dict) else None,
+                "implementation_surface_coverage": quality.get("implementation_surface_coverage") if isinstance(quality, dict) else None,
+                "novelty_score": quality.get("novelty_score") if isinstance(quality, dict) else None,
+                "unresolved_ref_count": quality.get("unresolved_ref_count") if isinstance(quality, dict) else None,
+            },
+        )
+
     def _safe_json(self, rel_path: str):
         path = self.project_root / rel_path
         if not path.exists():
@@ -307,3 +387,22 @@ def _direction_semantic_errors(direction: object) -> list[str]:
         if not isinstance(direction.get(field), list) or not direction.get(field):
             errors.append(f"{field} must be a non-empty list")
     return errors
+
+
+def _c2c_quality_failed_rules(quality: dict) -> list[str]:
+    coverage = quality.get("support_coverage") if isinstance(quality.get("support_coverage"), dict) else {}
+    counter = quality.get("counterevidence") if isinstance(quality.get("counterevidence"), dict) else {}
+    failed = []
+    if int(quality.get("unresolved_ref_count") or 0) != 0:
+        failed.append("unresolved_ref_count")
+    if int(coverage.get("paper") or 0) < 2:
+        failed.append("support_coverage.paper")
+    if int(coverage.get("code") or 0) < 2:
+        failed.append("support_coverage.code")
+    if int(counter.get("count") or 0) < 1:
+        failed.append("counterevidence.count")
+    if float(quality.get("implementation_surface_coverage") or 0.0) < 0.6:
+        failed.append("implementation_surface_coverage")
+    if float(quality.get("novelty_score") or 0.0) < 0.6:
+        failed.append("novelty_score")
+    return failed

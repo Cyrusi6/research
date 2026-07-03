@@ -44,6 +44,22 @@ def test_stage_contract_keeps_c2c_inputs_conditional_for_generic_project(tmp_pat
     assert s3["missing_inputs"] == ["plan/plan.yaml"]
 
 
+def test_stage_contract_declares_c2c_s1_quality_outputs(tmp_path: Path) -> None:
+    config = {
+        "project": {"workspace_root": str(tmp_path)},
+        "review": {"max_iterations": 2},
+        "c2c": {"enabled": True},
+    }
+    paths = init_workspace(config, "topic", project_id="proj_c2c_s1_outputs", simulate=True)
+    manager = StageContractManager(paths.root)
+
+    s1 = manager.stage_started("S1_literature", iteration=1, config=config)
+
+    assert "literature/c2c/evidence_quality_score.json" in s1["required_outputs"]
+    assert "literature/c2c/evidence_retrieval_trace.json" in s1["required_outputs"]
+    assert "literature/c2c/direction_fingerprint.json" in s1["required_outputs"]
+
+
 def test_stage_contract_activates_c2c_small_loop_inputs(tmp_path: Path) -> None:
     config = {
         "project": {"workspace_root": str(tmp_path)},

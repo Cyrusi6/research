@@ -20,6 +20,9 @@ from ..adapters.literature import LiteratureProvider
 from ..direction_contracts import (
     build_direction_contract,
     build_direction_scorecard,
+    build_s1_direction_fingerprint,
+    build_s1_evidence_quality_score,
+    build_s1_evidence_retrieval_trace,
     normalize_novelty_audit,
 )
 from ..evidence_refs import evidence_ref_errors_for_repair, resolve_s1_evidence_refs
@@ -560,6 +563,9 @@ class LiteratureAgent:
         evidence_session_record = None
         evidence_ref_report_record = None
         novelty_record = None
+        evidence_quality_record = None
+        evidence_retrieval_trace_record = None
+        direction_fingerprint_record = None
         debate: dict[str, Any] = {}
         if self.context.config.get("ideation", {}).get("debate", {}).get("enabled", True):
             if _use_legacy_c2c_debate(self.context.config):
@@ -776,6 +782,51 @@ class LiteratureAgent:
             summary="Root C2C S1 direction readiness scorecard",
             source_paths=[root_direction_record["path"], root_novelty_record["path"], root_evidence_bundle_record["path"]],
         )
+        root_evidence_ref_report = debate.get("evidence_ref_report") if isinstance(debate.get("evidence_ref_report"), dict) else resolve_s1_evidence_refs(self.context.project_root, root_direction_payload, mode="c2c")
+        root_quality_artifacts = _build_c2c_s1_quality_artifacts(
+            project_root=self.context.project_root,
+            payload=root_direction_payload,
+            direction=root_direction,
+            evidence_bundle=root_evidence_bundle,
+            evidence_ref_report=root_evidence_ref_report,
+            novelty_audit=root_novelty_audit,
+            shared_memory_checked=bool(debate.get("strategy") == "codex_resume_evidence_agent" or root_direction_payload.get("used_shared_memory_refs")),
+        )
+        direction_fingerprint_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/direction_fingerprint.json",
+            root_quality_artifacts["direction_fingerprint"],
+            artifact_type="c2c_s1_direction_fingerprint",
+            summary="Deterministic identity and history similarity for the selected C2C S1 direction",
+            source_paths=[root_direction_record["path"], negative_record["path"]],
+        )
+        evidence_quality_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/evidence_quality_score.json",
+            root_quality_artifacts["evidence_quality_score"],
+            artifact_type="c2c_s1_evidence_quality_score",
+            summary="Deterministic C2C S1 evidence quality gate score",
+            source_paths=[
+                root_direction_record["path"],
+                root_evidence_bundle_record["path"],
+                root_novelty_record["path"],
+                direction_fingerprint_record["path"],
+                evidence_ref_report_record["path"] if evidence_ref_report_record else root_scorecard_record["path"],
+            ],
+        )
+        evidence_retrieval_trace_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "c2c/evidence_retrieval_trace.json",
+            root_quality_artifacts["evidence_retrieval_trace"],
+            artifact_type="c2c_s1_evidence_retrieval_trace",
+            summary="Resolved and unresolved refs used by the C2C S1 evidence quality gate",
+            source_paths=[
+                root_direction_record["path"],
+                root_evidence_bundle_record["path"],
+                evidence_quality_record["path"],
+                direction_fingerprint_record["path"],
+            ],
+        )
         survey_record = self.context.artifacts.write_text(
             self.stage_key,
             "survey.md",
@@ -817,6 +868,9 @@ class LiteratureAgent:
                 root_direction_record["path"],
                 root_novelty_record["path"],
                 root_scorecard_record["path"],
+                direction_fingerprint_record["path"],
+                evidence_quality_record["path"],
+                evidence_retrieval_trace_record["path"],
                 *(
                     [
                         evidence_requests_record["path"],
@@ -876,6 +930,9 @@ class LiteratureAgent:
                 root_direction_record["path"],
                 root_novelty_record["path"],
                 root_scorecard_record["path"],
+                direction_fingerprint_record["path"],
+                evidence_quality_record["path"],
+                evidence_retrieval_trace_record["path"],
                 *(
                     [
                         evidence_requests_record["path"],
@@ -1077,6 +1134,21 @@ class LiteratureAgent:
         direction_payload["negative_constraints"] = negative_constraints
         direction = build_direction_contract(direction_payload, mode="c2c", used_shared_memory_refs=used_shared_memory_refs)
         novelty_audit = normalize_novelty_audit(result.get("novelty_audits", []), direction_id=str(direction.get("direction_id") or ""))
+        quality_artifacts = {
+            "evidence_quality_score": result.get("evidence_quality_score"),
+            "evidence_retrieval_trace": result.get("evidence_retrieval_trace"),
+            "direction_fingerprint": result.get("direction_fingerprint"),
+        }
+        if not all(isinstance(value, dict) for value in quality_artifacts.values()):
+            quality_artifacts = _build_c2c_s1_quality_artifacts(
+                project_root=self.context.project_root,
+                payload=direction_payload,
+                direction=direction,
+                evidence_bundle=evidence_bundle,
+                evidence_ref_report=evidence_ref_report,
+                novelty_audit=novelty_audit,
+                shared_memory_checked=True,
+            )
         return {
             "status": "ok",
             "strategy": "codex_resume_evidence_agent",
@@ -1101,6 +1173,9 @@ class LiteratureAgent:
             "evidence_requests": evidence_requests,
             "evidence_bundle": evidence_bundle,
             "evidence_ref_report": evidence_ref_report,
+            "evidence_quality_score": quality_artifacts.get("evidence_quality_score"),
+            "evidence_retrieval_trace": quality_artifacts.get("evidence_retrieval_trace"),
+            "direction_fingerprint": quality_artifacts.get("direction_fingerprint"),
             "evidence_session": {
                 "schema_version": "c2c_s1_codex_evidence_session_v1",
                 "status": "ok",
@@ -2073,6 +2148,40 @@ def _generic_s1_codex_evidence_prompt(
     )
 
 
+def _build_c2c_s1_quality_artifacts(
+    *,
+    project_root: Path,
+    payload: dict[str, Any],
+    direction: dict[str, Any],
+    evidence_bundle: dict[str, Any],
+    evidence_ref_report: dict[str, Any],
+    novelty_audit: dict[str, Any] | list[Any],
+    shared_memory_checked: bool,
+) -> dict[str, Any]:
+    direction_fingerprint = build_s1_direction_fingerprint(direction, project_root=project_root)
+    evidence_quality_score = build_s1_evidence_quality_score(
+        direction,
+        payload=payload,
+        evidence_bundle=evidence_bundle,
+        evidence_ref_report=evidence_ref_report,
+        novelty_audit=novelty_audit,
+        direction_fingerprint=direction_fingerprint,
+        shared_memory_checked=shared_memory_checked,
+    )
+    evidence_retrieval_trace = build_s1_evidence_retrieval_trace(
+        direction,
+        payload=payload,
+        evidence_ref_report=evidence_ref_report,
+        evidence_quality_score=evidence_quality_score,
+        direction_fingerprint=direction_fingerprint,
+    )
+    return {
+        "evidence_quality_score": evidence_quality_score,
+        "evidence_retrieval_trace": evidence_retrieval_trace,
+        "direction_fingerprint": direction_fingerprint,
+    }
+
+
 def _run_s1_codex_evidence_agent(
     *,
     project_root: Path,
@@ -2148,6 +2257,45 @@ def _run_s1_codex_evidence_agent(
                     previous_status = "novelty_rejected"
                     previous_output = _s1_revision_feedback_prompt(novelty_audit.get("audit") or novelty_audit, payload, mode=mode)
                     continue
+                quality_artifacts: dict[str, Any] = {}
+                if mode == "c2c":
+                    used_shared_memory_refs = collect_used_shared_memory_refs(payload, shared_memory)
+                    direction_decision = dict(payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {})
+                    direction_decision["used_shared_memory_refs"] = used_shared_memory_refs
+                    selected_ideas = _s1_codex_direction_cards(payload, used_shared_memory_refs=used_shared_memory_refs)
+                    negative_constraints = dict(payload.get("negative_constraints") if isinstance(payload.get("negative_constraints"), dict) else {})
+                    negative_constraints["used_shared_memory_refs"] = used_shared_memory_refs
+                    direction_payload = dict(payload)
+                    direction_payload["direction_decision"] = direction_decision
+                    direction_payload["selected_ideas"] = selected_ideas
+                    direction_payload["negative_constraints"] = negative_constraints
+                    direction_payload["used_shared_memory_refs"] = used_shared_memory_refs
+                    direction = build_direction_contract(direction_payload, mode="c2c", used_shared_memory_refs=used_shared_memory_refs)
+                    normalized_novelty = normalize_novelty_audit(novelty_audits, direction_id=str(direction.get("direction_id") or ""))
+                    quality_artifacts = _build_c2c_s1_quality_artifacts(
+                        project_root=project_root,
+                        payload=direction_payload,
+                        direction=direction,
+                        evidence_bundle=payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {"items": []},
+                        evidence_ref_report=evidence_ref_report,
+                        novelty_audit=normalized_novelty,
+                        shared_memory_checked=True,
+                    )
+                    quality_score = quality_artifacts.get("evidence_quality_score") if isinstance(quality_artifacts.get("evidence_quality_score"), dict) else {}
+                    if quality_score.get("gate") != "pass":
+                        failed_rules = quality_score.get("failed_rules") if isinstance(quality_score.get("failed_rules"), list) else []
+                        validation_errors = [f"s1_evidence_quality_gate_failed: {rule}" for rule in failed_rules] or ["s1_evidence_quality_gate_failed"]
+                        previous_status = "contract_invalid"
+                        previous_output = json.dumps(
+                            {
+                                "validation_errors": validation_errors,
+                                "evidence_quality_score": quality_score,
+                                "evidence_retrieval_trace": quality_artifacts.get("evidence_retrieval_trace"),
+                                "repair_instruction": "Return a revised S1 C2C JSON contract with enough resolved paper/code evidence, counterevidence, implementation surface coverage, and novelty to pass the deterministic quality gate.",
+                            },
+                            ensure_ascii=False,
+                        )[-4000:]
+                        continue
                 post_reset = _record_s1_codex_session_health(
                     project_root,
                     session_key,
@@ -2166,6 +2314,7 @@ def _run_s1_codex_evidence_agent(
                     "repair_count": attempt_idx,
                     "attempts": attempts,
                     "novelty_audits": novelty_audits,
+                    **quality_artifacts,
                     "session_reset": bool(reset_info or post_reset),
                     "session_reset_reason": (post_reset or reset_info or {}).get("reason"),
                 }

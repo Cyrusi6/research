@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS1EvidenceRetrievalTrace",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "direction_id",
+    "evidence_requests",
+    "resolved_ref_count",
+    "unresolved_ref_count",
+    "resolved_refs",
+    "unresolved_refs",
+    "coverage_contributors",
+    "quality_gate",
+    "direction_fingerprint"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "evidence_requests": {"type": "array"},
+    "resolved_ref_count": {"type": "integer"},
+    "unresolved_ref_count": {"type": "integer"},
+    "resolved_refs": {"type": "array"},
+    "unresolved_refs": {"type": "array"},
+    "coverage_contributors": {"type": "object"},
+    "quality_gate": {"type": "object"},
+    "direction_fingerprint": {"type": "object"}
+  }
+}

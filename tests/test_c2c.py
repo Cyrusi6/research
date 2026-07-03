@@ -26,6 +26,8 @@ from auto_research.agents.base import AgentContext
 from auto_research.failure_log import build_c2c_feedback_bundle, load_c2c_feedback_bundle
 from auto_research.artifacts import ArtifactManager
 from auto_research.c2c import C2CAdapter, C2CPatchGuard, DEFAULT_C2C_PROXY_SCREEN, c2c_idea_novelty_report, collect_c2c_eval_smoke, default_c2c_ideas
+from auto_research.direction_contracts import build_direction_contract, build_s1_direction_fingerprint, build_s1_evidence_quality_score
+from auto_research.evidence_refs import resolve_s1_evidence_refs
 from auto_research.judges import gate_s0
 from auto_research.validators.s2_gate import S2GateValidator
 from auto_research.code_patch import (
@@ -159,21 +161,65 @@ def _s1_codex_direction_payload(
                 "source_type": "code",
                 "desired_evidence": "implementation",
                 "why_needed": "S2 needs a bounded place to turn the direction into a patch.",
+            },
+            {
+                "query": "paper evidence for utility-controlled cache transfer",
+                "source_type": "paper",
+                "desired_evidence": "support",
+                "why_needed": "S1 must ground the mechanism direction in at least two paper refs.",
+            },
+            {
+                "query": "reviewer counterevidence for cache routing collapse",
+                "source_type": "rebuttal",
+                "desired_evidence": "counterevidence",
+                "why_needed": "S1 must inspect at least one risk before sending the direction to S2.",
             }
         ],
         "evidence_bundle": {
             "items": [
                 {
+                    "source_path": "intake/c2c/paper_chunks.jsonl",
+                    "source_label": "paper:cache_utility_signal",
+                    "source_type": "paper",
+                    "summary": "Prior transfer methods benefit from utility-aware cache selection.",
+                    "supports": ["utility_predicted_cache_routing"],
+                    "risks": [],
+                },
+                {
+                    "source_path": "intake/c2c/paper_chunks.jsonl",
+                    "source_label": "paper:coverage_preserving_transfer",
+                    "source_type": "paper",
+                    "summary": "Coverage-preserving transfer avoids regressions from over-filtered cache states.",
+                    "supports": ["utility_predicted_cache_routing"],
+                    "risks": [],
+                },
+                {
+                    "source_path": "intake/c2c/rebuttal_chunks.jsonl",
+                    "source_label": "rebuttal:coverage_collapse",
+                    "source_type": "rebuttal",
+                    "summary": "Reviewer concerns emphasize OOD failure and dataset-level coverage collapse.",
+                    "supports": [],
+                    "risks": ["coverage_collapse"],
+                },
+                {
                     "chunk_id": code_chunk_id,
-                    "source_path": "intake/c2c/code_chunks.jsonl",
+                    "source_path": "rosetta/model/aligner.py",
                     "source_type": "code",
                     "summary": "Alignment and cache transfer surfaces are localized in rosetta/model files.",
                     "supports": ["utility_predicted_cache_routing"],
                     "risks": [],
                 },
                 {
-                    "chunk_id": "feedback:coverage_collapse",
+                    "source_path": "rosetta/model/projector.py",
+                    "source_label": "rosetta/model/projector.py",
+                    "source_type": "code",
+                    "summary": "Projector code is a second bounded cache transfer surface for S2.",
+                    "supports": ["utility_predicted_cache_routing"],
+                    "risks": [],
+                },
+                {
                     "source_path": "intake/c2c/negative_result_memory.json",
+                    "source_label": "feedback:coverage_collapse",
                     "source_type": "failure_feedback",
                     "summary": "Prior hard-gate style changes risk all-dataset collapse.",
                     "supports": [],
@@ -209,9 +255,22 @@ def _s1_codex_direction_payload(
                 "reviewer_risk_response": "Track transfer coverage and per-dataset regressions; forbid evaluator edits and hard-gate stacking.",
                 "expected_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
                 "verification_commands": ["py_compile", "small2048_train", "three_dataset_eval"],
-                "evidence_refs": [{"source_type": "code", "source_label": code_chunk_id, "claim": "bounded implementation surface"}],
-                "counterevidence_refs": [{"source_type": "failure_feedback", "source_label": "feedback:coverage_collapse", "claim": "avoid hard gate collapse"}],
-                "code_refs": [{"source_type": "code", "source_label": "rosetta/model/aligner.py", "claim": "alignment/cache routing surface"}],
+                "evidence_refs": [
+                    {"source_type": "paper", "source_path": "intake/c2c/paper_chunks.jsonl", "source_label": "paper:cache_utility_signal", "claim": "utility signal supports cache routing"},
+                    {"source_type": "paper", "source_path": "intake/c2c/paper_chunks.jsonl", "source_label": "paper:coverage_preserving_transfer", "claim": "coverage preservation is required for safe transfer"},
+                ],
+                "counterevidence_refs": [
+                    {
+                        "source_type": "failure_feedback",
+                        "source_path": "intake/c2c/negative_result_memory.json",
+                        "source_label": "feedback:coverage_collapse",
+                        "claim": "avoid hard gate collapse",
+                    }
+                ],
+                "code_refs": [
+                    {"source_type": "code", "source_label": "rosetta/model/aligner.py", "claim": "alignment/cache routing surface"},
+                    {"source_type": "code", "source_label": "rosetta/model/projector.py", "claim": "projector/cache transfer surface"},
+                ],
                 "s1_allowed_variants": ["soft residual utility scaling", "coverage-preserving utility modulation"],
                 "s1_forbidden_patterns": ["extra hard accept/reject gate", "evaluator changes"],
                 "used_shared_memory_refs": used_shared_memory_refs,
@@ -225,7 +284,7 @@ def _s1_codex_direction_payload(
             "used_shared_memory_refs": used_shared_memory_refs,
         },
         "decision_chain": {
-            "evidence": [code_chunk_id],
+            "evidence": ["paper:cache_utility_signal", "paper:coverage_preserving_transfer", code_chunk_id, "rosetta/model/projector.py"],
             "counterevidence": ["feedback:coverage_collapse"],
             "conclusion": "Use utility-predicted cache routing as the S1 direction and let S2 choose concrete variants.",
             "used_shared_memory_refs": used_shared_memory_refs,
@@ -335,7 +394,7 @@ def _write_minimal_s1_ref_catalog(project_root: Path) -> None:
     (project_root / "literature" / "c2c").mkdir(parents=True, exist_ok=True)
     chunk_index = {
         "schema_version": "c2c_full_chunk_index_v1",
-        "counts": {"paper": 1, "rebuttal": 1, "code": 1, "total": 3},
+        "counts": {"paper": 2, "rebuttal": 1, "code": 2, "total": 6},
         "entries": [
             {
                 "chunk_id": "code:rosetta/model/aligner.py",
@@ -346,6 +405,16 @@ def _write_minimal_s1_ref_catalog(project_root: Path) -> None:
                 "text_preview": "aligner",
                 "path": "rosetta/model/aligner.py",
                 "symbol": "aligner",
+            },
+            {
+                "chunk_id": "code:rosetta/model/projector.py",
+                "source_type": "code",
+                "source_path": "rosetta/model/projector.py",
+                "section": "file",
+                "keywords": ["projector"],
+                "text_preview": "projector",
+                "path": "rosetta/model/projector.py",
+                "symbol": "projector",
             },
             {
                 "chunk_id": "feedback:coverage_collapse",
@@ -363,14 +432,145 @@ def _write_minimal_s1_ref_catalog(project_root: Path) -> None:
                 "keywords": ["cache"],
                 "text_preview": "cache routing",
             },
+            {
+                "chunk_id": "paper:coverage_preserving_transfer",
+                "source_type": "paper",
+                "source_path": "intake/c2c/paper_chunks.jsonl",
+                "section": "method",
+                "keywords": ["coverage"],
+                "text_preview": "coverage-preserving transfer",
+            },
+            {
+                "chunk_id": "rebuttal:coverage_collapse",
+                "source_type": "rebuttal",
+                "source_path": "intake/c2c/rebuttal_chunks.jsonl",
+                "section": "concern",
+                "keywords": ["collapse"],
+                "text_preview": "coverage collapse concern",
+            },
         ],
     }
     (intake / "chunk_index.json").write_text(json.dumps(chunk_index), encoding="utf-8")
-    (intake / "code_file_manifest.json").write_text(json.dumps({"files": [{"path": "rosetta/model/aligner.py"}]}), encoding="utf-8")
-    (intake / "code_symbols.jsonl").write_text(json.dumps({"symbol": "aligner", "path": "rosetta/model/aligner.py"}) + "\n", encoding="utf-8")
-    (intake / "code_chunks.jsonl").write_text(json.dumps({"chunk_id": "code:rosetta/model/aligner.py", "path": "rosetta/model/aligner.py", "symbol": "aligner"}) + "\n", encoding="utf-8")
+    (intake / "code_file_manifest.json").write_text(json.dumps({"files": [{"path": "rosetta/model/aligner.py"}, {"path": "rosetta/model/projector.py"}, {"path": "rosetta/model/wrapper.py"}]}), encoding="utf-8")
+    (intake / "code_symbols.jsonl").write_text(
+        json.dumps({"symbol": "aligner", "path": "rosetta/model/aligner.py"}) + "\n" + json.dumps({"symbol": "projector", "path": "rosetta/model/projector.py"}) + "\n",
+        encoding="utf-8",
+    )
+    (intake / "code_chunks.jsonl").write_text(
+        json.dumps({"chunk_id": "code:rosetta/model/aligner.py", "path": "rosetta/model/aligner.py", "symbol": "aligner"})
+        + "\n"
+        + json.dumps({"chunk_id": "code:rosetta/model/projector.py", "path": "rosetta/model/projector.py", "symbol": "projector"})
+        + "\n",
+        encoding="utf-8",
+    )
     (intake / "negative_result_memory.json").write_text(json.dumps({"blocked": ["coverage"]}), encoding="utf-8")
-    (intake / "paper_chunks.jsonl").write_text(json.dumps({"chunk_id": "paper:cache_routing", "source_path": "paper.md"}) + "\n", encoding="utf-8")
+    (intake / "paper_chunks.jsonl").write_text(
+        json.dumps({"chunk_id": "paper:cache_routing", "source_path": "paper.md"})
+        + "\n"
+        + json.dumps({"chunk_id": "paper:coverage_preserving_transfer", "source_path": "paper.md"})
+        + "\n",
+        encoding="utf-8",
+    )
+    (intake / "rebuttal_chunks.jsonl").write_text(json.dumps({"chunk_id": "rebuttal:coverage_collapse", "source_path": "rebuttal.md"}) + "\n", encoding="utf-8")
+
+
+def _quality_score_for_s1_payload(project_root: Path, payload: dict, *, novelty_score: float = 0.68) -> dict:
+    report = resolve_s1_evidence_refs(project_root, payload, mode="c2c")
+    direction = build_direction_contract(payload, mode="c2c", used_shared_memory_refs=payload.get("used_shared_memory_refs") or [])
+    fingerprint = build_s1_direction_fingerprint(direction, project_root=project_root)
+    return build_s1_evidence_quality_score(
+        direction,
+        payload=payload,
+        evidence_bundle=payload.get("evidence_bundle"),
+        evidence_ref_report=report,
+        novelty_audit={
+            "schema_version": "auto_research_novelty_audit_v1",
+            "direction_id": direction.get("direction_id"),
+            "status": "ok",
+            "enabled": True,
+            "passed": novelty_score >= 0.6,
+            "threshold": 0.6,
+            "latest": {"status": "ok", "passed": novelty_score >= 0.6, "audit": {"novelty_score": novelty_score}},
+            "audits": [],
+        },
+        direction_fingerprint=fingerprint,
+        shared_memory_checked=True,
+    )
+
+
+def test_c2c_s1_evidence_quality_score_passes_with_required_coverage(tmp_path: Path) -> None:
+    project_root = tmp_path / "p_quality_pass"
+    project_root.mkdir()
+    _write_minimal_s1_ref_catalog(project_root)
+
+    score = _quality_score_for_s1_payload(project_root, _s1_codex_direction_payload())
+
+    assert score["gate"] == "pass"
+    assert score["support_coverage"]["paper"] >= 2
+    assert score["support_coverage"]["code"] >= 2
+    assert score["counterevidence"]["count"] >= 1
+    assert score["implementation_surface_coverage"] >= 0.6
+    assert score["novelty_score"] >= 0.6
+
+
+@pytest.mark.parametrize(
+    ("case_name", "mutate", "expected_rule"),
+    [
+        (
+            "unresolved_ref",
+            lambda payload: payload["selected_ideas"][0]["code_refs"].append({"source_type": "code", "source_label": "missing/file.py", "claim": "bad ref"}),
+            "unresolved_ref_count",
+        ),
+        (
+            "too_few_paper_refs",
+            lambda payload: (
+                payload["selected_ideas"][0].update({"evidence_refs": payload["selected_ideas"][0]["evidence_refs"][:1]}),
+                payload["evidence_bundle"].update({"items": [item for item in payload["evidence_bundle"]["items"] if item.get("source_type") != "paper"] + [payload["evidence_bundle"]["items"][0]]}),
+            ),
+            "support_coverage.paper",
+        ),
+        (
+            "too_few_code_refs",
+            lambda payload: (
+                payload["selected_ideas"][0].update({"code_refs": payload["selected_ideas"][0]["code_refs"][:1]}),
+                payload["evidence_bundle"].update({"items": [item for item in payload["evidence_bundle"]["items"] if item.get("source_type") != "code" or item.get("source_path") == "rosetta/model/aligner.py"]}),
+            ),
+            "support_coverage.code",
+        ),
+        (
+            "missing_counterevidence",
+            lambda payload: (
+                payload["selected_ideas"][0].update({"counterevidence_refs": []}),
+                [item.update({"risks": []}) for item in payload["evidence_bundle"]["items"]],
+            ),
+            "counterevidence.count",
+        ),
+        (
+            "low_surface_coverage",
+            lambda payload: (
+                payload["direction_decision"].update({"expected_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py", "rosetta/model/router.py", "rosetta/model/loss.py"]}),
+                payload["selected_ideas"][0].update({"expected_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py", "rosetta/model/router.py", "rosetta/model/loss.py"]}),
+            ),
+            "implementation_surface_coverage",
+        ),
+        (
+            "low_novelty",
+            lambda payload: None,
+            "novelty_score",
+        ),
+    ],
+)
+def test_c2c_s1_evidence_quality_score_fails_hard_rules(tmp_path: Path, case_name: str, mutate, expected_rule: str) -> None:
+    project_root = tmp_path / f"p_quality_{case_name}"
+    project_root.mkdir()
+    _write_minimal_s1_ref_catalog(project_root)
+    payload = json.loads(json.dumps(_s1_codex_direction_payload()))
+    mutate(payload)
+
+    score = _quality_score_for_s1_payload(project_root, payload, novelty_score=0.59 if case_name == "low_novelty" else 0.68)
+
+    assert score["gate"] == "fail"
+    assert expected_rule in score["failed_rules"]
 
 
 def test_c2c_s1_merges_s0_semantic_enrichment_into_chunk_catalog(tmp_path: Path) -> None:
@@ -4712,6 +4912,9 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert (root / "literature/c2c/evidence_bundle.json").exists()
     assert (root / "literature/c2c/direction_decision.json").exists()
     assert (root / "literature/c2c/evidence_session.json").exists()
+    assert (root / "literature/c2c/evidence_quality_score.json").exists()
+    assert (root / "literature/c2c/evidence_retrieval_trace.json").exists()
+    assert (root / "literature/c2c/direction_fingerprint.json").exists()
     assert (root / "literature/c2c/repo_card.json").exists()
     assert (root / "literature/c2c/rebuttal_concern_matrix.json").exists()
     assert (root / "literature/c2c/negative_result_memory.json").exists()
@@ -4736,6 +4939,10 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert bundle["code_intake_report"]["counts"]["chunks"] > 0
     assert bundle["implementation_surface_map"]["surfaces"]
     assert bundle["code_retrieval_index"]["default_queries"]
+    evidence_quality = json.loads((root / "literature/c2c/evidence_quality_score.json").read_text(encoding="utf-8"))
+    assert evidence_quality["gate"] == "pass"
+    assert evidence_quality["support_coverage"]["paper"] >= 2
+    assert evidence_quality["support_coverage"]["code"] >= 2
     ideas = json.loads((root / "literature/ideas.json").read_text(encoding="utf-8"))
     assert len(ideas) == 1
     assert ideas[0]["id"] == "utility_predicted_cache_routing"
