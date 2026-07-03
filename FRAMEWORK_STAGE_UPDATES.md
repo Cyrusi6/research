@@ -25,6 +25,17 @@
 - 普通项目写出 `literature/evidence_requests.json`、`literature/evidence_bundle.json`、`literature/direction_decision.json`、`literature/evidence_session.json`。
 - C2C 项目写出对应的 `literature/c2c/...` 证据和方向产物，并保留 C2C 专属 contract/gate。
 
+## 2026-07-03 S1 Direction / S2 Variant Contract Upgrade
+
+本次把文档里的“高层方向由 S1 产生、具体 variant 由 S2 产生”落到可执行 schema 和 gate：
+
+- S1 主合同从旧 `literature/ideas.json` 切到 `literature/direction.json`、`literature/direction_scorecard.json`、`literature/evidence_bundle.json`、`literature/novelty_audit.json`。
+- `literature/ideas.json`、`literature/direction_decision.json` 继续作为兼容镜像写出，但 S1 gate 不再用旧 idea list 的 `id/title/novelty_score/feasibility_score` 作为主通过条件。
+- `direction.json` 显式记录 `direction_id`、`mechanism_axis`、`integration_point`、`control_signal`、`hypothesis`、baseline failure model、metric signature、证据/反证 refs、implementation surface refs、负记忆 refs，以及进入 S2 / 回 S1 条件。
+- S2 新增 `plan/planner_decision.json`、`plan/variant_contract.json`、`plan/variant_fingerprint.json`，把原来的 `next_variant` 从 prompt 约定升级为可审计合同。
+- S2 gate 现在校验 direction id 一致性、机制轴/入口/控制信号、expected files、metric signature、ablation switch/control、failure routing 条件、variant fingerprint 重复，以及 C2C allowed edit surface。
+- `plan.yaml`、`plan/candidate_ideas.json`、`plan/next_variant.json` 仍保留给 S2.5/S3/报告路径兼容；新 artifact 是 source of truth，旧 artifact 是派生视图。
+
 ## 2026-06-26 External S2.5 Worktree Storage
 
 真实 C2C 迭代积累后发现 `workspace/<project_id>/plan/code_worktrees/<idea>/vN/repo` 会把完整 Git worktree 放进当前 VS Code workspace。打开项目根目录时 VS Code 会递归 watch 历史 artifact 和 worktree repo，当前本地 `workspace/` 已达到 109G、15 万以上文件，触发 20 万量级 watcher。

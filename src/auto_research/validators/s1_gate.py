@@ -15,30 +15,47 @@ class S1GateValidator(StageGateValidator):
     validator_name = "s1_literature_gate_v1"
 
     def validate(self):
-        ideas_path = self.require_file("literature/ideas.json", check_name="ideas_json_exists")
+        direction_path = self.require_file("literature/direction.json", check_name="direction_json_exists")
+        evidence_bundle_path = self.require_file("literature/evidence_bundle.json", check_name="evidence_bundle_json_exists")
+        scorecard_path = self.require_file("literature/direction_scorecard.json", check_name="direction_scorecard_json_exists")
+        novelty_path = self.require_file("literature/novelty_audit.json", check_name="novelty_audit_json_exists")
         manifest_path = self.require_file("references/papers/manifest.json", check_name="reference_manifest_exists")
-        if not ideas_path or not manifest_path:
+        if not direction_path or not evidence_bundle_path or not scorecard_path or not novelty_path or not manifest_path:
             return self.finalize()
 
-        ideas = self.read_json_artifact("literature/ideas.json")
-        if ideas is None:
+        direction = self.read_json_artifact("literature/direction.json")
+        evidence_bundle = self.read_json_artifact("literature/evidence_bundle.json")
+        scorecard = self.read_json_artifact("literature/direction_scorecard.json")
+        novelty_audit = self.read_json_artifact("literature/novelty_audit.json")
+        if direction is None or evidence_bundle is None or scorecard is None or novelty_audit is None:
             return self.finalize()
-        schema_errors = validate_min_schema(ideas, load_schema("idea.schema.json"))
-        if schema_errors:
-            self.retry_check("ideas_schema", "ideas.json does not satisfy idea contract", artifact="literature/ideas.json", details={"errors": schema_errors[:10]})
+
+        direction_errors = validate_min_schema(direction, load_schema("direction.schema.json"))
+        direction_errors.extend(_direction_semantic_errors(direction))
+        if direction_errors:
+            self.retry_check("direction_schema", "direction.json does not satisfy direction contract", artifact="literature/direction.json", details={"errors": direction_errors[:10]})
         else:
-            self.pass_check("ideas_schema", artifact="literature/ideas.json", details={"idea_count": len(ideas)})
+            self.pass_check("direction_schema", artifact="literature/direction.json", details={"direction_id": direction.get("direction_id")})
 
-        if isinstance(ideas, list):
-            low_scores = [
-                idea.get("id") or idea.get("title") or f"idea_{idx}"
-                for idx, idea in enumerate(ideas)
-                if float(idea.get("novelty_score") or 0) < 4 or float(idea.get("feasibility_score") or 0) < 4
-            ]
-            if low_scores:
-                self.fail_check("idea_score_thresholds", "idea score below threshold", artifact="literature/ideas.json", details={"ideas": low_scores[:10]})
-            else:
-                self.pass_check("idea_score_thresholds", artifact="literature/ideas.json")
+        bundle_errors = validate_min_schema(evidence_bundle, load_schema("evidence_bundle.schema.json"))
+        if bundle_errors:
+            self.retry_check("evidence_bundle_schema", "evidence_bundle.json does not satisfy evidence bundle contract", artifact="literature/evidence_bundle.json", details={"errors": bundle_errors[:10]})
+        else:
+            self.pass_check("evidence_bundle_schema", artifact="literature/evidence_bundle.json", details={"item_count": len(evidence_bundle.get("items") or []) if isinstance(evidence_bundle, dict) else 0})
+
+        scorecard_errors = validate_min_schema(scorecard, load_schema("direction_scorecard.schema.json"))
+        if scorecard_errors:
+            self.retry_check("direction_scorecard_schema", "direction_scorecard.json does not satisfy direction scorecard contract", artifact="literature/direction_scorecard.json", details={"errors": scorecard_errors[:10]})
+        else:
+            self.pass_check("direction_scorecard_schema", artifact="literature/direction_scorecard.json")
+
+        novelty_errors = validate_min_schema(novelty_audit, load_schema("novelty_audit.schema.json"))
+        if novelty_errors:
+            self.retry_check("novelty_audit_schema", "novelty_audit.json does not satisfy novelty audit contract", artifact="literature/novelty_audit.json", details={"errors": novelty_errors[:10]})
+        else:
+            self.pass_check("novelty_audit_schema", artifact="literature/novelty_audit.json")
+
+        ideas = self._optional_legacy_ideas_check()
 
         manifest = self.read_json_artifact("references/papers/manifest.json")
         paper_metadata_exists = (self.project_root / "literature" / "papers" / "metadata.json").exists()
@@ -55,18 +72,50 @@ class S1GateValidator(StageGateValidator):
         self._validate_s1_novelty_audit()
         return self.finalize()
 
-    def _validate_s1_novelty_audit(self) -> None:
-        path = self.project_root / "literature" / "c2c" / "novelty_audit.json"
+    def _optional_legacy_ideas_check(self):
+        path = self.project_root / "literature" / "ideas.json"
         if not path.exists():
-            path = self.project_root / "literature" / "novelty_audit.json"
+            self.pass_check("ideas_json_compatibility", message="legacy ideas.json mirror not present; direction.json is authoritative")
+            return []
+        try:
+            ideas = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            self.pass_check("ideas_json_compatibility", message="legacy ideas.json mirror is invalid but no longer gates S1")
+            self.artifacts_checked.append("literature/ideas.json")
+            return []
+        self.artifacts_checked.append("literature/ideas.json")
+        schema_errors = validate_min_schema(ideas, load_schema("idea.schema.json"))
+        if schema_errors:
+            self.pass_check(
+                "ideas_json_compatibility",
+                artifact="literature/ideas.json",
+                message="legacy ideas.json mirror does not satisfy old idea contract",
+                details={"errors": schema_errors[:10]},
+            )
+        else:
+            self.pass_check("ideas_json_compatibility", artifact="literature/ideas.json", details={"idea_count": len(ideas) if isinstance(ideas, list) else 0})
+        return ideas
+
+    def _validate_s1_novelty_audit(self) -> None:
+        path = self.project_root / "literature" / "novelty_audit.json"
+        if not path.exists():
+            path = self.project_root / "literature" / "c2c" / "novelty_audit.json"
         if not path.exists():
             self.pass_check("s1_novelty_audit", details={"status": "not_configured"})
             return
         try:
-            audits = json.loads(path.read_text(encoding="utf-8"))
+            payload = json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             self.retry_check("s1_novelty_audit", "novelty audit artifact is not valid JSON", artifact=str(path.relative_to(self.project_root)))
             return
+        if isinstance(payload, dict) and payload.get("schema_version") == "auto_research_novelty_audit_v1":
+            latest = payload.get("latest") if isinstance(payload.get("latest"), dict) else {}
+            if payload.get("passed") is True or payload.get("status") == "skipped" or payload.get("enabled") is False:
+                self.pass_check("s1_novelty_audit", artifact=str(path.relative_to(self.project_root)), details={"status": payload.get("status"), "threshold": payload.get("threshold")})
+            else:
+                self.retry_check("s1_novelty_audit", "S1 novelty audit did not pass", artifact=str(path.relative_to(self.project_root)), details={"latest": latest or payload})
+            return
+        audits = payload
         if not isinstance(audits, list) or not audits:
             self.retry_check("s1_novelty_audit", "novelty audit artifact must be a non-empty list", artifact=str(path.relative_to(self.project_root)))
             return
@@ -83,7 +132,7 @@ class S1GateValidator(StageGateValidator):
         required = [
             "literature/evidence_requests.json",
             "literature/evidence_bundle.json",
-            "literature/direction_decision.json",
+            "literature/direction.json",
             "literature/evidence_session.json",
             "literature/evidence_ref_report.json",
         ]
@@ -96,13 +145,13 @@ class S1GateValidator(StageGateValidator):
                 details={"missing": missing},
             )
             return
-        direction = self._safe_json("literature/direction_decision.json")
+        direction = self._safe_json("literature/direction.json")
         bundle = self._safe_json("literature/evidence_bundle.json")
         session = self._safe_json("literature/evidence_session.json")
         ref_report = self._safe_json("literature/evidence_ref_report.json")
         errors = []
-        if not isinstance(direction, dict) or not direction.get("direction_id") or not direction.get("core_hypothesis"):
-            errors.append("direction_decision must include direction_id and core_hypothesis")
+        if not isinstance(direction, dict) or not direction.get("direction_id") or not direction.get("hypothesis"):
+            errors.append("direction.json must include direction_id and hypothesis")
         if not isinstance(bundle, dict) or not bundle.get("items"):
             errors.append("evidence_bundle.items must be non-empty")
         if not isinstance(session, dict) or session.get("status") != "ok":
@@ -111,9 +160,9 @@ class S1GateValidator(StageGateValidator):
             errors.append("evidence_ref_report must exist")
         elif ref_report.get("status") != "pass":
             errors.append("evidence_ref_report.status must be pass")
-        if len(ideas) != 1:
-            errors.append("S1 Codex evidence agent must pass exactly one high-level idea/direction to S2")
-        if not errors:
+        if ideas and len(ideas) != 1:
+            errors.append("legacy ideas.json mirror should contain exactly one selected high-level direction")
+        if not errors and ideas:
             payload = {"evidence_bundle": bundle, "selected_ideas": ideas}
             live_report = resolve_s1_evidence_refs(self.project_root, payload, mode="generic")
             if live_report.get("status") != "pass":
@@ -183,6 +232,8 @@ class S1GateValidator(StageGateValidator):
 
     def _validate_c2c_codex_evidence_agent_contract(self, debate: dict) -> None:
         required = [
+            "literature/direction.json",
+            "literature/evidence_bundle.json",
             "literature/c2c/evidence_requests.json",
             "literature/c2c/evidence_bundle.json",
             "literature/c2c/direction_decision.json",
@@ -198,13 +249,16 @@ class S1GateValidator(StageGateValidator):
                 details={"missing": missing},
             )
             return
-        direction = self._safe_json("literature/c2c/direction_decision.json")
+        direction = self._safe_json("literature/direction.json")
+        legacy_direction = self._safe_json("literature/c2c/direction_decision.json")
         bundle = self._safe_json("literature/c2c/evidence_bundle.json")
         session = self._safe_json("literature/c2c/evidence_session.json")
         ref_report = self._safe_json("literature/c2c/evidence_ref_report.json")
         errors = []
-        if not isinstance(direction, dict) or not direction.get("direction_id") or not direction.get("core_hypothesis"):
-            errors.append("direction_decision must include direction_id and core_hypothesis")
+        if not isinstance(direction, dict) or not direction.get("direction_id") or not direction.get("hypothesis"):
+            errors.append("direction.json must include direction_id and hypothesis")
+        if not isinstance(legacy_direction, dict) or not legacy_direction.get("direction_id") or not legacy_direction.get("core_hypothesis"):
+            errors.append("c2c direction_decision compatibility mirror must include direction_id and core_hypothesis")
         if not isinstance(bundle, dict) or not bundle.get("items"):
             errors.append("evidence_bundle.items must be non-empty")
         if not isinstance(session, dict) or session.get("status") != "ok":
@@ -238,3 +292,18 @@ class S1GateValidator(StageGateValidator):
             return json.loads(path.read_text(encoding="utf-8"))
         except Exception:
             return None
+
+
+def _direction_semantic_errors(direction: object) -> list[str]:
+    if not isinstance(direction, dict):
+        return ["direction must be an object"]
+    errors: list[str] = []
+    for field in ["direction_id", "mechanism_axis", "integration_point", "control_signal", "hypothesis", "why_baseline_fails"]:
+        if not str(direction.get(field) or "").strip():
+            errors.append(f"{field} must be non-empty")
+    if not isinstance(direction.get("expected_metric_signature"), dict) or not direction.get("expected_metric_signature"):
+        errors.append("expected_metric_signature must be a non-empty object")
+    for field in ["required_evidence_refs", "counterevidence_refs", "implementation_surface_refs", "go_to_s2_conditions", "return_to_s1_conditions"]:
+        if not isinstance(direction.get(field), list) or not direction.get(field):
+            errors.append(f"{field} must be a non-empty list")
+    return errors

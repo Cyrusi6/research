@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AutoResearchDirectionScorecardContract",
+  "type": "object",
+  "required": [
+    "direction_id",
+    "evidence_item_count",
+    "required_evidence_ref_count",
+    "counterevidence_ref_count",
+    "implementation_surface_ref_count",
+    "novelty",
+    "go_to_s2_ready",
+    "go_to_s2_conditions",
+    "return_to_s1_conditions"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "title": {"type": "string"},
+    "mechanism_axis": {"type": "string"},
+    "integration_point": {"type": "string"},
+    "control_signal": {"type": "string"},
+    "evidence_item_count": {"type": "integer"},
+    "required_evidence_ref_count": {"type": "integer"},
+    "counterevidence_ref_count": {"type": "integer"},
+    "implementation_surface_ref_count": {"type": "integer"},
+    "novelty": {"type": "object"},
+    "go_to_s2_ready": {"type": "boolean"},
+    "go_to_s2_conditions": {"type": "array", "minItems": 1},
+    "return_to_s1_conditions": {"type": "array", "minItems": 1},
+    "used_shared_memory_refs": {"type": "array"}
+  }
+}

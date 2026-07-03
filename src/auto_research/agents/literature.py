@@ -17,6 +17,11 @@ from ..c2c import (
     is_c2c_project,
 )
 from ..adapters.literature import LiteratureProvider
+from ..direction_contracts import (
+    build_direction_contract,
+    build_direction_scorecard,
+    normalize_novelty_audit,
+)
 from ..evidence_refs import evidence_ref_errors_for_repair, resolve_s1_evidence_refs
 from ..importers import ConsensusImporter
 from ..itr_ideas import build_itr_theme_map, collect_consensus_entries, theme_map_markdown
@@ -141,11 +146,35 @@ class LiteratureAgent:
         )
         direction_record = self.context.artifacts.write_json(
             self.stage_key,
+            "direction.json",
+            evidence_result.get("direction", {}),
+            artifact_type="s1_direction",
+            summary="S1 selected high-level research direction",
+            source_paths=[evidence_bundle_record["path"]],
+        )
+        direction_decision_record = self.context.artifacts.write_json(
+            self.stage_key,
             "direction_decision.json",
             evidence_result.get("direction_decision", {}),
             artifact_type="s1_direction_decision",
-            summary="S1 selected high-level idea/direction",
-            source_paths=[evidence_bundle_record["path"]],
+            summary="Compatibility mirror for the S1 selected direction",
+            source_paths=[direction_record["path"], evidence_bundle_record["path"]],
+        )
+        novelty_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "novelty_audit.json",
+            evidence_result.get("novelty_audit", {}),
+            artifact_type="s1_novelty_audit",
+            summary="Normalized S1 novelty audit for the selected direction",
+            source_paths=[direction_record["path"], evidence_bundle_record["path"]],
+        )
+        scorecard_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "direction_scorecard.json",
+            evidence_result.get("direction_scorecard", {}),
+            artifact_type="s1_direction_scorecard",
+            summary="S1 direction readiness scorecard",
+            source_paths=[direction_record["path"], novelty_record["path"], evidence_bundle_record["path"]],
         )
         evidence_session_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -155,17 +184,15 @@ class LiteratureAgent:
             summary="S1 Codex evidence-on-demand session transcript",
             source_paths=[evidence_requests_record["path"], evidence_bundle_record["path"], direction_record["path"]],
         )
-        evidence_records = [evidence_requests_record, evidence_bundle_record, direction_record, evidence_session_record]
-        if evidence_result.get("novelty_audits"):
-            novelty_record = self.context.artifacts.write_json(
-                self.stage_key,
-                "novelty_audit.json",
-                evidence_result.get("novelty_audits", []),
-                artifact_type="s1_novelty_audit",
-                summary="Independent S1 novelty audit against shared and local memory",
-                source_paths=[direction_record["path"], evidence_session_record["path"]],
-            )
-            evidence_records.append(novelty_record)
+        evidence_records = [
+            evidence_requests_record,
+            evidence_bundle_record,
+            direction_record,
+            direction_decision_record,
+            novelty_record,
+            scorecard_record,
+            evidence_session_record,
+        ]
         evidence_ref_report_record = self.context.artifacts.write_json(
             self.stage_key,
             "evidence_ref_report.json",
@@ -533,6 +560,7 @@ class LiteratureAgent:
         evidence_session_record = None
         evidence_ref_report_record = None
         novelty_record = None
+        debate: dict[str, Any] = {}
         if self.context.config.get("ideation", {}).get("debate", {}).get("enabled", True):
             if _use_legacy_c2c_debate(self.context.config):
                 debate = MultiAgentReasoningService(self.context).run_c2c_debate(
@@ -690,6 +718,64 @@ class LiteratureAgent:
                 summary="C2C reviewer and failure constraints",
                 source_paths=[debate_record["path"]],
             )
+        root_evidence_bundle = (
+            debate.get("evidence_bundle")
+            if isinstance(debate.get("evidence_bundle"), dict)
+            else _evidence_bundle_from_selected_ideas(ideas)
+        )
+        root_direction_payload = {
+            "direction_decision": debate.get("direction_decision") if isinstance(debate.get("direction_decision"), dict) else {},
+            "selected_ideas": ideas[:1] if isinstance(ideas, list) else [],
+            "evidence_bundle": root_evidence_bundle,
+            "negative_constraints": debate.get("negative_constraints") if isinstance(debate.get("negative_constraints"), dict) else {},
+            "used_shared_memory_refs": debate.get("used_shared_memory_refs") if isinstance(debate.get("used_shared_memory_refs"), list) else [],
+        }
+        root_direction = build_direction_contract(
+            root_direction_payload,
+            mode="c2c",
+            used_shared_memory_refs=root_direction_payload.get("used_shared_memory_refs") or None,
+        )
+        root_novelty_audit = normalize_novelty_audit(
+            debate.get("novelty_audits") if isinstance(debate.get("novelty_audits"), list) else [],
+            direction_id=str(root_direction.get("direction_id") or ""),
+        )
+        root_direction_scorecard = build_direction_scorecard(
+            root_direction,
+            evidence_bundle=root_evidence_bundle,
+            novelty_audit=root_novelty_audit,
+        )
+        root_evidence_bundle_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "evidence_bundle.json",
+            root_evidence_bundle,
+            artifact_type="s1_evidence_bundle",
+            summary="Root S1 evidence bundle for the selected C2C direction",
+            source_paths=[evidence_bundle_record["path"] if evidence_bundle_record else "literature/ideas.json"],
+        )
+        root_direction_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "direction.json",
+            root_direction,
+            artifact_type="s1_direction",
+            summary="Root S1 selected C2C mechanism direction",
+            source_paths=[root_evidence_bundle_record["path"]],
+        )
+        root_novelty_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "novelty_audit.json",
+            root_novelty_audit,
+            artifact_type="s1_novelty_audit",
+            summary="Root normalized C2C S1 novelty audit",
+            source_paths=[root_direction_record["path"]],
+        )
+        root_scorecard_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "direction_scorecard.json",
+            root_direction_scorecard,
+            artifact_type="s1_direction_scorecard",
+            summary="Root C2C S1 direction readiness scorecard",
+            source_paths=[root_direction_record["path"], root_novelty_record["path"], root_evidence_bundle_record["path"]],
+        )
         survey_record = self.context.artifacts.write_text(
             self.stage_key,
             "survey.md",
@@ -727,6 +813,10 @@ class LiteratureAgent:
                 retrieval_plan_record["path"],
                 followup_bundle_record["path"],
                 negative_record["path"],
+                root_evidence_bundle_record["path"],
+                root_direction_record["path"],
+                root_novelty_record["path"],
+                root_scorecard_record["path"],
                 *(
                     [
                         evidence_requests_record["path"],
@@ -782,6 +872,10 @@ class LiteratureAgent:
                 retrieval_plan_record["path"],
                 followup_bundle_record["path"],
                 negative_record["path"],
+                root_evidence_bundle_record["path"],
+                root_direction_record["path"],
+                root_novelty_record["path"],
+                root_scorecard_record["path"],
                 *(
                     [
                         evidence_requests_record["path"],
@@ -869,13 +963,22 @@ class LiteratureAgent:
         _attach_s1_novelty_audit_to_ideas(ideas, result.get("novelty_audits", []))
         direction_decision = dict(payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {})
         direction_decision["used_shared_memory_refs"] = used_shared_memory_refs
+        direction_payload = dict(payload)
+        direction_payload["direction_decision"] = direction_decision
+        direction_payload["selected_ideas"] = ideas
+        direction = build_direction_contract(direction_payload, mode="generic", used_shared_memory_refs=used_shared_memory_refs)
+        novelty_audit = normalize_novelty_audit(result.get("novelty_audits", []), direction_id=str(direction.get("direction_id") or ""))
+        evidence_bundle = payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {"items": []}
         evidence_ref_report = result.get("evidence_ref_report") or resolve_s1_evidence_refs(self.context.project_root, payload, mode="generic")
         return {
             "status": "ok",
             "strategy": "codex_resume_evidence_agent",
             "ideas": ideas,
             "evidence_requests": payload.get("evidence_requests") if isinstance(payload.get("evidence_requests"), list) else [],
-            "evidence_bundle": payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {"items": []},
+            "evidence_bundle": evidence_bundle,
+            "direction": direction,
+            "direction_scorecard": build_direction_scorecard(direction, evidence_bundle=evidence_bundle, novelty_audit=novelty_audit),
+            "novelty_audit": novelty_audit,
             "direction_decision": direction_decision,
             "used_shared_memory_refs": used_shared_memory_refs,
             "evidence_ref_report": evidence_ref_report,
@@ -968,6 +1071,12 @@ class LiteratureAgent:
         decision_chain = payload.get("decision_chain") if isinstance(payload.get("decision_chain"), dict) else direction_decision.get("decision_chain")
         if not isinstance(decision_chain, dict):
             decision_chain = _s1_codex_decision_chain(payload, selected_ideas)
+        direction_payload = dict(payload)
+        direction_payload["direction_decision"] = direction_decision
+        direction_payload["selected_ideas"] = selected_ideas
+        direction_payload["negative_constraints"] = negative_constraints
+        direction = build_direction_contract(direction_payload, mode="c2c", used_shared_memory_refs=used_shared_memory_refs)
+        novelty_audit = normalize_novelty_audit(result.get("novelty_audits", []), direction_id=str(direction.get("direction_id") or ""))
         return {
             "status": "ok",
             "strategy": "codex_resume_evidence_agent",
@@ -982,7 +1091,10 @@ class LiteratureAgent:
             },
             "decision_chain": decision_chain,
             "direction_decision": direction_decision,
+            "direction": direction,
+            "direction_scorecard": build_direction_scorecard(direction, evidence_bundle=evidence_bundle, novelty_audit=novelty_audit),
             "novelty_audits": result.get("novelty_audits", []),
+            "novelty_audit": novelty_audit,
             "selected_ideas": selected_ideas,
             "negative_constraints": negative_constraints,
             "used_shared_memory_refs": used_shared_memory_refs,
@@ -1749,7 +1861,18 @@ def _s1_codex_evidence_prompt(
             "direction_id": "stable snake_case id",
             "mechanism_direction": "short mechanism name",
             "mechanism_type": "recognized mechanism label",
+            "mechanism_axis": "scoring|routing|span_selection|normalization|training_signal|fallback",
+            "integration_point": "aligner|projector|wrapper|train_loss|recipe",
+            "control_signal": "confidence|entropy|span_agreement|utility|pathology|semantic_similarity",
             "core_hypothesis": "effect hypothesis",
+            "why_baseline_fails": "why the current baseline lacks this mechanism",
+            "expected_metric_signature": {"primary_metric": "three_dataset_mean", "expected_direction": "increase", "diagnostics": []},
+            "required_evidence_refs": [{"source_type": "paper|rebuttal|code|artifact", "source_label": "chunk or artifact", "claim": "supporting evidence"}],
+            "counterevidence_refs": [{"source_type": "paper|rebuttal|code|artifact|failure_feedback", "source_label": "chunk or artifact", "claim": "risk evidence"}],
+            "implementation_surface_refs": [{"source_type": "code", "source_label": "file or symbol", "claim": "likely implementation surface"}],
+            "known_negative_memory_refs": ["memory_id or failed pattern ids"],
+            "go_to_s2_conditions": ["conditions that make this direction ready for S2 variant planning"],
+            "return_to_s1_conditions": ["method-level conditions that should abandon this direction"],
             "allowed_variants": ["variant families allowed inside this direction"],
             "forbidden_patterns": ["patterns not to repeat"],
             "target_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
@@ -1883,7 +2006,18 @@ def _generic_s1_codex_evidence_prompt(
         "direction_decision": {
             "direction_id": "stable snake_case id",
             "title": "high-level research idea title",
+            "mechanism_axis": "method axis S2 should explore",
+            "integration_point": "likely experiment/code integration point",
+            "control_signal": "signal or variable S2 should control",
             "core_hypothesis": "main effect hypothesis",
+            "why_baseline_fails": "why current baselines are expected to miss the effect",
+            "expected_metric_signature": {"primary_metric": "primary_metric", "expected_direction": "increase", "diagnostics": []},
+            "required_evidence_refs": [{"source_type": "paper|artifact|code|memory", "source_label": "paper or artifact", "claim": "supporting evidence"}],
+            "counterevidence_refs": [{"source_type": "paper|artifact|code|memory", "source_label": "paper or artifact", "claim": "risk evidence"}],
+            "implementation_surface_refs": [{"source_type": "artifact|code", "source_label": "resource or file", "claim": "likely S2 implementation surface"}],
+            "known_negative_memory_refs": ["memory_id or failed direction ids"],
+            "go_to_s2_conditions": ["conditions that make this direction ready for S2 planning"],
+            "return_to_s1_conditions": ["method-level conditions that should abandon this direction"],
             "allowed_variants": ["broad variant families S2 may explore"],
             "forbidden_patterns": ["method patterns not to repeat"],
             "target_datasets": ["dataset or benchmark names if known"],
@@ -2584,6 +2718,44 @@ def _s1_codex_payload_refs(payload: dict[str, Any]) -> tuple[list[dict[str, Any]
             }
         )
     return evidence_refs, counter_refs, code_refs
+
+
+def _evidence_bundle_from_selected_ideas(ideas: list[dict[str, Any]]) -> dict[str, Any]:
+    selected = next((idea for idea in ideas if isinstance(idea, dict) and idea.get("selected")), ideas[0] if ideas else {})
+    items: list[dict[str, Any]] = []
+    for ref in selected.get("evidence_refs") or []:
+        if isinstance(ref, dict):
+            items.append(
+                {
+                    "source_path": ref.get("source_path") or ref.get("source_label") or "literature/ideas.json",
+                    "source_type": ref.get("source_type") or "artifact",
+                    "summary": ref.get("claim") or ref.get("summary") or "Evidence supporting the selected direction.",
+                    "supports": [selected.get("id") or selected.get("direction_id") or "selected_direction"],
+                    "risks": [],
+                }
+            )
+    for ref in selected.get("counterevidence_refs") or []:
+        if isinstance(ref, dict):
+            items.append(
+                {
+                    "source_path": ref.get("source_path") or ref.get("source_label") or "literature/ideas.json",
+                    "source_type": ref.get("source_type") or "artifact",
+                    "summary": ref.get("claim") or ref.get("summary") or "Counterevidence or risk for the selected direction.",
+                    "supports": [],
+                    "risks": [ref.get("claim") or ref.get("summary") or "risk"],
+                }
+            )
+    if not items:
+        items.append(
+            {
+                "source_path": "literature/ideas.json",
+                "source_type": "artifact",
+                "summary": "Selected S1 direction compatibility artifact.",
+                "supports": [selected.get("id") or "selected_direction"],
+                "risks": [],
+            }
+        )
+    return {"schema_version": "auto_research_evidence_bundle_v1", "items": items}
 
 
 def _s1_codex_decision_chain(payload: dict[str, Any], ideas: list[dict[str, Any]]) -> dict[str, Any]:

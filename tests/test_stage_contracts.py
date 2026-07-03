@@ -13,12 +13,15 @@ def test_stage_contract_records_inputs_outputs_and_hashes(tmp_path: Path) -> Non
     started = manager.stage_started("S2_plan", iteration=3)
     assert started["status"] == "running"
     assert started["iteration"] == 3
-    assert any(item["path"] == "literature/ideas.json" and not item["exists"] for item in started["resolved_inputs"])
-    assert "literature/ideas.json" in started["missing_inputs"]
+    assert any(item["path"] == "literature/direction.json" and not item["exists"] for item in started["resolved_inputs"])
+    assert "literature/direction.json" in started["missing_inputs"]
     assert "literature/c2c/baseline_evidence.json" not in started["missing_inputs"]
 
     (paths.root / "plan" / "plan.yaml").write_text("hypotheses: []\n", encoding="utf-8")
-    completed = manager.stage_completed("S2_plan", artifacts=["plan/plan.yaml"])
+    (paths.root / "plan" / "planner_decision.json").write_text("{}\n", encoding="utf-8")
+    (paths.root / "plan" / "variant_contract.json").write_text("{}\n", encoding="utf-8")
+    (paths.root / "plan" / "variant_fingerprint.json").write_text("{}\n", encoding="utf-8")
+    completed = manager.stage_completed("S2_plan", artifacts=["plan/plan.yaml", "plan/planner_decision.json", "plan/variant_contract.json", "plan/variant_fingerprint.json"])
 
     assert completed["status"] == "completed"
     assert completed["output_hash"]

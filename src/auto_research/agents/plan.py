@@ -15,6 +15,13 @@ from typing import Any
 from ..adapters.runner import ExperimentRunner
 from ..c2c import C2CAdapter, c2c_idea_novelty_report, c2c_implementation_scope_report, is_c2c_project, normalize_c2c_mechanism_fields
 from ..code_patch import CodePatchAgent
+from ..direction_contracts import (
+    build_planner_decision_artifact,
+    build_variant_contract,
+    build_variant_fingerprint_artifact,
+    direction_to_legacy_idea,
+    load_direction_or_legacy_idea,
+)
 from ..failure_log import load_c2c_feedback_bundle
 from ..method_memory import collect_used_shared_memory_refs, shared_method_memory_for_prompt, shared_method_memory_query_context
 from ..itr_ideas import build_quick_screen_execution
@@ -35,9 +42,14 @@ class PlanAgent:
     def run(self) -> dict[str, Any]:
         if is_c2c_project(self.context.config):
             return self._run_c2c_plan()
-        ideas_path = self.context.project_root / "literature" / "ideas.json"
-        ideas = json.loads(ideas_path.read_text(encoding="utf-8"))
+        direction, ideas = load_direction_or_legacy_idea(self.context.project_root)
         selected = next((idea for idea in ideas if idea.get("selected")), ideas[0])
+        selected.setdefault("s1_direction_id", direction.get("direction_id"))
+        selected.setdefault("direction_id", direction.get("direction_id"))
+        selected.setdefault("mechanism_axis", direction.get("mechanism_axis"))
+        selected.setdefault("integration_point", direction.get("integration_point"))
+        selected.setdefault("control_signal", direction.get("control_signal"))
+        selected.setdefault("expected_signature", direction.get("expected_metric_signature"))
         simulate = bool(self.context.config.get("experiment", {}).get("simulate"))
         resources = discover_local_mm_resources(self.context.config)
         datasets = self._datasets_for_topic(selected["title"], resources, selected)
@@ -92,13 +104,58 @@ class PlanAgent:
             "local_resources": resources,
             "execution": execution,
         }
+        planner_decision = build_planner_decision_artifact(
+            direction=direction,
+            planner_summary="Generic S2 plan derived from the selected S1 direction.",
+            planning_mode="single_direction_plan",
+            next_variant=selected,
+            used_shared_memory_refs=direction.get("used_shared_memory_refs") if isinstance(direction, dict) else [],
+            source="generic_plan_agent",
+        )
+        variant_fingerprint = _s2_variant_fingerprint(selected)
+        selected["variant_fingerprint"] = selected.get("variant_fingerprint") or variant_fingerprint
+        variant_contract = build_variant_contract(direction=direction, variant=selected, plan=plan, mode="generic")
+        variant_fingerprint_artifact = build_variant_fingerprint_artifact(
+            direction=direction,
+            variant=selected,
+            fingerprint=selected.get("variant_fingerprint"),
+            history_fingerprints=[],
+            mode="generic",
+        )
+        plan["planner_decision"] = planner_decision
+        plan["variant_contract"] = variant_contract
+        plan["variant_fingerprint"] = variant_fingerprint_artifact
+        planner_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "planner_decision.json",
+            planner_decision,
+            artifact_type="s2_planner_decision",
+            summary="S2 planner decision for the selected direction",
+            source_paths=["literature/direction.json"],
+        )
+        variant_contract_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "variant_contract.json",
+            variant_contract,
+            artifact_type="s2_variant_contract",
+            summary="Executable S2 variant contract for S2.5/S3",
+            source_paths=["literature/direction.json"],
+        )
+        variant_fingerprint_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "variant_fingerprint.json",
+            variant_fingerprint_artifact,
+            artifact_type="s2_variant_fingerprint",
+            summary="Stable S2 variant fingerprint",
+            source_paths=["literature/direction.json"],
+        )
         plan_record = self.context.artifacts.write_yaml(
             self.stage_key,
             "plan.yaml",
             plan,
             artifact_type="plan",
             summary="Structured experiment plan",
-            source_paths=["literature/ideas.json"],
+            source_paths=["literature/direction.json", "literature/ideas.json"],
         )
         hypotheses = self._hypotheses_md(plan["hypotheses"])
         hypotheses_record = self.context.artifacts.write_text(
@@ -117,7 +174,17 @@ class PlanAgent:
             summary="Human-readable task graph",
             source_paths=[plan_record["path"]],
         )
-        return {"plan": plan, "artifacts": [plan_record["path"], hypotheses_record["path"], task_graph["path"]]}
+        return {
+            "plan": plan,
+            "artifacts": [
+                planner_record["path"],
+                variant_contract_record["path"],
+                variant_fingerprint_record["path"],
+                plan_record["path"],
+                hypotheses_record["path"],
+                task_graph["path"],
+            ],
+        }
 
     def _run_c2c_plan(self) -> dict[str, Any]:
         adapter = C2CAdapter(self.context.project_root, self.context.config)
@@ -128,9 +195,14 @@ class PlanAgent:
 
     def _run_c2c_plan_regular(self, adapter: C2CAdapter | None = None) -> dict[str, Any]:
         adapter = adapter or C2CAdapter(self.context.project_root, self.context.config)
-        ideas_path = self.context.project_root / "literature" / "ideas.json"
-        s1_ideas = json.loads(ideas_path.read_text(encoding="utf-8"))
+        s1_direction, s1_ideas = load_direction_or_legacy_idea(self.context.project_root)
         s1_selected = next((idea for idea in s1_ideas if idea.get("selected")), s1_ideas[0])
+        s1_selected.setdefault("s1_direction_id", s1_direction.get("direction_id"))
+        s1_selected.setdefault("direction_id", s1_direction.get("direction_id"))
+        s1_selected.setdefault("mechanism_axis", s1_direction.get("mechanism_axis"))
+        s1_selected.setdefault("integration_point", s1_direction.get("integration_point"))
+        s1_selected.setdefault("control_signal", s1_direction.get("control_signal"))
+        s1_selected.setdefault("expected_signature", s1_direction.get("expected_metric_signature"))
         baseline_path = self.context.project_root / "literature" / "c2c" / "baseline_evidence.json"
         baseline = json.loads(baseline_path.read_text(encoding="utf-8")) if baseline_path.exists() else adapter.baseline
         concern_path = self.context.project_root / "literature" / "c2c" / "rebuttal_concern_matrix.json"
@@ -307,6 +379,54 @@ class PlanAgent:
             )
         else:
             variant_selection_record = None
+        history_fingerprints = []
+        if isinstance(variant_selection.get("history_summary"), dict):
+            history_fingerprints = [str(item) for item in variant_selection["history_summary"].get("fingerprints") or [] if item]
+        if not selected.get("variant_fingerprint"):
+            selected["variant_fingerprint"] = _s2_variant_fingerprint(selected)
+        planner_decision = build_planner_decision_artifact(
+            direction=s1_direction,
+            planner_summary=planning_result["metadata"].get("planner_summary"),
+            planning_mode=planning_result["metadata"].get("planning_mode"),
+            next_variant=next_variant or selected,
+            used_shared_memory_refs=planning_result["metadata"].get("used_shared_memory_refs") if isinstance(planning_result.get("metadata"), dict) else [],
+            source=str(planning_result["metadata"].get("source") or "c2c_plan_agent"),
+        )
+        variant_contract = build_variant_contract(direction=s1_direction, variant=selected, plan=plan, execution=short_loop, mode="c2c")
+        variant_fingerprint_artifact = build_variant_fingerprint_artifact(
+            direction=s1_direction,
+            variant=selected,
+            fingerprint=selected.get("variant_fingerprint"),
+            history_fingerprints=history_fingerprints,
+            mode="regular",
+        )
+        plan["planner_decision"] = planner_decision
+        plan["variant_contract"] = variant_contract
+        plan["variant_fingerprint"] = variant_fingerprint_artifact
+        planner_decision_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "planner_decision.json",
+            planner_decision,
+            artifact_type="s2_planner_decision",
+            summary="C2C S2 planner decision for the next variant",
+            source_paths=["literature/direction.json", "plan/performance_feedback.json", "plan/s2_planner_memory.json"],
+        )
+        variant_contract_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "variant_contract.json",
+            variant_contract,
+            artifact_type="s2_variant_contract",
+            summary="C2C executable variant contract for S2.5",
+            source_paths=["literature/direction.json", "plan/next_variant.json", "plan/plan.yaml"],
+        )
+        variant_fingerprint_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "variant_fingerprint.json",
+            variant_fingerprint_artifact,
+            artifact_type="s2_variant_fingerprint",
+            summary="C2C stable variant fingerprint and history check",
+            source_paths=["literature/direction.json", "plan/next_variant.json", "plan/s2_planner_memory.json"],
+        )
         short_loop["patch_source"] = "s2_5_frozen_codex_patch" if code_patch_manifest.get("status") != "disabled" else "config_overrides_only"
         memory_record = self._append_c2c_s2_planner_memory(
             planning_result=planning_result,
@@ -379,6 +499,9 @@ class PlanAgent:
                 plan_record["path"],
                 *code_patch_manifest.get("artifacts", []),
                 *([variant_selection_record["path"]] if variant_selection_record else []),
+                planner_decision_record["path"],
+                variant_contract_record["path"],
+                variant_fingerprint_record["path"],
                 memory_record["artifact"]["path"],
                 candidate_record["path"],
                 short_loop_record["path"],
@@ -460,6 +583,52 @@ class PlanAgent:
             "patch_eligible_for_s3": patch_eligible,
             "implementation_blocked": not patch_eligible,
         }
+        s1_direction, _ = load_direction_or_legacy_idea(self.context.project_root)
+        if not selected_patch_idea.get("variant_fingerprint"):
+            selected_patch_idea["variant_fingerprint"] = _candidate_variant_fingerprint(selected_patch_idea) or _s2_variant_fingerprint(selected_patch_idea)
+        planner_decision = build_planner_decision_artifact(
+            direction=s1_direction,
+            planner_summary="S2 planner skipped; implementation failure routes directly to S2.5 repair.",
+            planning_mode="s2_5_only_implementation_repair",
+            next_variant=selected_patch_idea,
+            used_shared_memory_refs=selected_patch_idea.get("used_shared_memory_refs") if isinstance(selected_patch_idea, dict) else [],
+            source="s2_5_patch_only_repair",
+        )
+        variant_contract = build_variant_contract(direction=s1_direction, variant=selected_patch_idea, plan=plan, mode="implementation_repair")
+        variant_fingerprint_artifact = build_variant_fingerprint_artifact(
+            direction=s1_direction,
+            variant=selected_patch_idea,
+            fingerprint=selected_patch_idea.get("variant_fingerprint"),
+            history_fingerprints=[],
+            mode="implementation_repair",
+        )
+        plan["planner_decision"] = planner_decision
+        plan["variant_contract"] = variant_contract
+        plan["variant_fingerprint"] = variant_fingerprint_artifact
+        planner_decision_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "planner_decision.json",
+            planner_decision,
+            artifact_type="s2_planner_decision",
+            summary="S2.5-only implementation repair planner decision",
+            source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json", "plan/candidate_ideas.json"],
+        )
+        variant_contract_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "variant_contract.json",
+            variant_contract,
+            artifact_type="s2_variant_contract",
+            summary="S2.5-only implementation repair variant contract",
+            source_paths=["plan/performance_feedback.json", "plan/candidate_ideas.json"],
+        )
+        variant_fingerprint_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "variant_fingerprint.json",
+            variant_fingerprint_artifact,
+            artifact_type="s2_variant_fingerprint",
+            summary="S2.5-only implementation repair variant fingerprint",
+            source_paths=["plan/performance_feedback.json", "plan/candidate_ideas.json"],
+        )
         plan_record = self.context.artifacts.write_yaml(
             self.stage_key,
             "plan.yaml",
@@ -536,6 +705,9 @@ class PlanAgent:
             "artifacts": [
                 plan_record["path"],
                 *code_patch_manifest.get("artifacts", []),
+                planner_decision_record["path"],
+                variant_contract_record["path"],
+                variant_fingerprint_record["path"],
                 patch_only_record["path"],
                 candidate_record["path"],
                 feedback_record["path"],
@@ -619,6 +791,63 @@ class PlanAgent:
             "patch_eligible_for_s3": False,
             "implementation_blocked": True,
         }
+        s1_direction, _ = load_direction_or_legacy_idea(self.context.project_root)
+        repair_variant = {
+            "id": repair_dispatch.get("selected_candidate_id") or "implementation_blocked",
+            "title": "Implementation repair blocked",
+            "selected": True,
+            "s1_direction_id": s1_direction.get("direction_id"),
+            "variant_fingerprint": repair_dispatch.get("variant_fingerprint") or "implementation_blocked",
+            "mechanism_axis": s1_direction.get("mechanism_axis"),
+            "integration_point": s1_direction.get("integration_point"),
+            "control_signal": s1_direction.get("control_signal"),
+            "hypothesis": s1_direction.get("hypothesis") or reason,
+            "expected_files": s1_direction.get("expected_files") or ["S2.5 repair target unavailable"],
+            "expected_signature": s1_direction.get("expected_metric_signature") or {},
+        }
+        planner_decision = build_planner_decision_artifact(
+            direction=s1_direction,
+            planner_summary="S2 planner skipped; implementation repair blocked before patch generation.",
+            planning_mode="s2_5_only_implementation_repair_blocked",
+            next_variant=repair_variant,
+            used_shared_memory_refs=s1_direction.get("used_shared_memory_refs") if isinstance(s1_direction, dict) else [],
+            source="s2_5_patch_only_blocked",
+        )
+        variant_contract = build_variant_contract(direction=s1_direction, variant=repair_variant, plan=plan, mode="implementation_repair")
+        variant_fingerprint_artifact = build_variant_fingerprint_artifact(
+            direction=s1_direction,
+            variant=repair_variant,
+            fingerprint=repair_variant.get("variant_fingerprint"),
+            history_fingerprints=[],
+            mode="implementation_repair",
+        )
+        plan["planner_decision"] = planner_decision
+        plan["variant_contract"] = variant_contract
+        plan["variant_fingerprint"] = variant_fingerprint_artifact
+        planner_decision_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "planner_decision.json",
+            planner_decision,
+            artifact_type="s2_planner_decision",
+            summary="Blocked S2.5-only implementation repair planner decision",
+            source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json"],
+        )
+        variant_contract_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "variant_contract.json",
+            variant_contract,
+            artifact_type="s2_variant_contract",
+            summary="Blocked S2.5-only implementation repair variant contract",
+            source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json"],
+        )
+        variant_fingerprint_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "variant_fingerprint.json",
+            variant_fingerprint_artifact,
+            artifact_type="s2_variant_fingerprint",
+            summary="Blocked S2.5-only implementation repair variant fingerprint",
+            source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json"],
+        )
         plan_record = self.context.artifacts.write_yaml(
             self.stage_key,
             "plan.yaml",
@@ -659,6 +888,9 @@ class PlanAgent:
             "artifacts": [
                 plan_record["path"],
                 patch_manifest_record["path"],
+                planner_decision_record["path"],
+                variant_contract_record["path"],
+                variant_fingerprint_record["path"],
                 blocked_record["path"],
             ],
         }

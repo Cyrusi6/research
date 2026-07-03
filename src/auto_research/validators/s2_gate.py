@@ -25,9 +25,135 @@ class S2GateValidator(StageGateValidator):
         else:
             self.pass_check("plan_schema", artifact="plan/plan.yaml")
 
+        planner = self._read_required_json_with_schema(
+            "plan/planner_decision.json",
+            "planner_decision_json_exists",
+            "planner_decision_schema",
+            "planner_decision.schema.json",
+        )
+        variant_contract = self._read_required_json_with_schema(
+            "plan/variant_contract.json",
+            "variant_contract_json_exists",
+            "variant_contract_schema",
+            "variant_contract.schema.json",
+        )
+        variant_fingerprint = self._read_required_json_with_schema(
+            "plan/variant_fingerprint.json",
+            "variant_fingerprint_json_exists",
+            "variant_fingerprint_schema",
+            "variant_fingerprint.schema.json",
+        )
+        if isinstance(planner, dict) and isinstance(variant_contract, dict) and isinstance(variant_fingerprint, dict):
+            self._validate_variant_handoff(plan, planner, variant_contract, variant_fingerprint)
+
         if plan.get("execution", {}).get("collector") == "c2c_small_loop":
             self._validate_c2c_plan(plan)
         return self.finalize()
+
+    def _read_required_json_with_schema(self, rel_path: str, exists_check: str, schema_check: str, schema_name: str):
+        path = self.require_file(rel_path, check_name=exists_check)
+        if not path:
+            return None
+        payload = self.read_json_artifact(rel_path)
+        if payload is None:
+            return None
+        schema_errors = validate_min_schema(payload, load_schema(schema_name))
+        if schema_errors:
+            self.retry_check(schema_check, f"{rel_path} does not satisfy contract", artifact=rel_path, details={"errors": schema_errors[:10]})
+        else:
+            self.pass_check(schema_check, artifact=rel_path)
+        return payload
+
+    def _validate_variant_handoff(
+        self,
+        plan: dict,
+        planner: dict,
+        variant_contract: dict,
+        variant_fingerprint: dict,
+    ) -> None:
+        direction = self._safe_json("literature/direction.json")
+        errors: list[str] = []
+        direction_id = direction.get("direction_id") if isinstance(direction, dict) else None
+        ids = {
+            "literature.direction": direction_id,
+            "planner_decision": planner.get("direction_id"),
+            "variant_contract": variant_contract.get("direction_id"),
+            "variant_fingerprint": variant_fingerprint.get("direction_id"),
+        }
+        present_ids = {str(value) for value in ids.values() if value}
+        if len(present_ids) > 1:
+            errors.append(f"direction_id mismatch: {ids}")
+        for key in ["mechanism_axis", "integration_point", "control_signal"]:
+            contract_value = str(variant_contract.get(key) or "").strip()
+            fingerprint_value = str(variant_fingerprint.get(key) or "").strip()
+            if not contract_value:
+                errors.append(f"variant_contract.{key} must be non-empty")
+            if not fingerprint_value:
+                errors.append(f"variant_fingerprint.{key} must be non-empty")
+            if contract_value and fingerprint_value and contract_value != fingerprint_value:
+                errors.append(f"{key} mismatch between variant_contract and variant_fingerprint")
+        if not isinstance(variant_contract.get("resource_budget"), dict):
+            errors.append("variant_contract.resource_budget must be an object")
+        if not isinstance(variant_contract.get("expected_metric_signature"), dict) or not variant_contract.get("expected_metric_signature"):
+            errors.append("variant_contract.expected_metric_signature must be a non-empty object")
+        if not _non_empty_list(variant_contract.get("expected_files")):
+            errors.append("variant_contract.expected_files must be non-empty")
+        if not _non_empty_list(variant_contract.get("implementation_surface_refs")):
+            errors.append("variant_contract.implementation_surface_refs must be non-empty")
+        ablation = variant_contract.get("ablation") if isinstance(variant_contract.get("ablation"), dict) else {}
+        if not ablation.get("switch"):
+            errors.append("variant_contract.ablation.switch must be present")
+        if not ablation.get("control"):
+            errors.append("variant_contract.ablation.control must be present")
+        routing = variant_contract.get("failure_routing") if isinstance(variant_contract.get("failure_routing"), dict) else {}
+        for key in ["go_to_s3_conditions", "return_to_s2_conditions", "return_to_s1_conditions"]:
+            if not _non_empty_list(routing.get(key)):
+                errors.append(f"variant_contract.failure_routing.{key} must be non-empty")
+        fingerprint = str(variant_fingerprint.get("variant_fingerprint") or "").strip()
+        contract_fingerprint = str(variant_contract.get("variant_fingerprint") or "").strip()
+        if fingerprint and contract_fingerprint and fingerprint != contract_fingerprint:
+            errors.append("variant_fingerprint does not match variant_contract.variant_fingerprint")
+        next_variant = planner.get("next_variant") if isinstance(planner.get("next_variant"), dict) else {}
+        next_fingerprint = str(next_variant.get("variant_fingerprint") or "").strip()
+        if next_fingerprint and fingerprint and next_fingerprint != fingerprint:
+            errors.append("planner_decision.next_variant fingerprint does not match variant_fingerprint")
+        mode = str(variant_fingerprint.get("mode") or variant_contract.get("mode") or "")
+        if variant_fingerprint.get("is_repeat") is True and not mode.startswith("implementation_repair"):
+            errors.append("variant_fingerprint repeats a previous same-direction variant")
+        if plan.get("execution", {}).get("collector") == "c2c_small_loop" and not mode.startswith("implementation_repair"):
+            disallowed = self._disallowed_c2c_expected_files(variant_contract)
+            if disallowed:
+                errors.append(f"variant_contract expected_files outside allowed C2C edit surface: {disallowed[:5]}")
+        if errors:
+            self.retry_check(
+                "s2_variant_handoff_contract",
+                "S2 variant contract is not ready for S2.5/S3",
+                artifact="plan/variant_contract.json",
+                details={"errors": errors[:12]},
+            )
+        else:
+            self.pass_check("s2_variant_handoff_contract", artifact="plan/variant_contract.json")
+
+    def _safe_json(self, rel_path: str):
+        path = self.project_root / rel_path
+        if not path.exists():
+            return None
+        return self.read_json_artifact(rel_path)
+
+    def _disallowed_c2c_expected_files(self, variant_contract: dict) -> list[str]:
+        files = [str(item) for item in variant_contract.get("expected_files") or [] if item]
+        c2c_cfg = self.config.get("c2c", {}) if isinstance(self.config.get("c2c"), dict) else {}
+        allowed_files = {str(item).strip("/") for item in c2c_cfg.get("allowed_files") or [] if item}
+        allowed_prefixes = [str(item).strip("/") for item in c2c_cfg.get("allowed_prefixes") or [] if item]
+        if not allowed_files and not allowed_prefixes:
+            return []
+        disallowed = []
+        for file_path in files:
+            normalized = file_path.strip("/")
+            if normalized in allowed_files or any(normalized.startswith(prefix.rstrip("/") + "/") or normalized == prefix for prefix in allowed_prefixes):
+                continue
+            disallowed.append(file_path)
+        return disallowed
 
     def _validate_c2c_plan(self, plan: dict) -> None:
         discovery_mode = code_patch_gate_mode(self.config) == "discovery"
@@ -247,3 +373,7 @@ def _patch_manifest_has_resource_retry(patch_manifest: dict) -> bool:
             if isinstance(check, dict) and (check.get("resource_retry") is True or check.get("failure_category") == "runtime_smoke_resource_retry"):
                 return True
     return False
+
+
+def _non_empty_list(value) -> bool:
+    return isinstance(value, list) and any(item not in (None, "", [], {}) for item in value)

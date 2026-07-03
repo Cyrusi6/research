@@ -233,6 +233,102 @@ def _s1_codex_direction_payload(
     }
 
 
+def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: str = "utility_predicted_cache_routing") -> None:
+    (project / "literature").mkdir(parents=True, exist_ok=True)
+    (project / "plan").mkdir(parents=True, exist_ok=True)
+    direction = {
+        "schema_version": "auto_research_direction_v1",
+        "direction_id": direction_id,
+        "title": "Utility Predicted Cache Routing",
+        "mechanism_type": "utility_predicted_cache_routing",
+        "mechanism_axis": "routing",
+        "integration_point": "wrapper",
+        "control_signal": "utility",
+        "hypothesis": "Predict utility for transferred cache states.",
+        "why_baseline_fails": "The baseline lacks downstream utility control.",
+        "expected_metric_signature": {"primary_metric": "three_dataset_mean", "expected_direction": "increase"},
+        "required_evidence_refs": [{"source_type": "code", "source_label": "rosetta/model/wrapper.py", "claim": "surface"}],
+        "counterevidence_refs": [{"source_type": "failure_feedback", "source_label": "risk", "claim": "avoid hard gates"}],
+        "implementation_surface_refs": [{"source_type": "code", "source_label": "rosetta/model/wrapper.py", "claim": "surface"}],
+        "known_negative_memory_refs": [],
+        "go_to_s2_conditions": ["evidence resolved"],
+        "return_to_s1_conditions": ["budget exhausted"],
+        "expected_files": ["rosetta/model/wrapper.py"],
+        "verification_commands": ["py_compile"],
+        "used_shared_memory_refs": [],
+    }
+    variant = {
+        "id": "wrapper_utility_variant",
+        "title": "Wrapper utility variant",
+        "variant_fingerprint": "fp_wrapper_utility",
+        "mechanism_axis": "routing",
+        "integration_point": "wrapper",
+        "control_signal": "utility",
+        "expected_files": ["rosetta/model/wrapper.py"],
+    }
+    (project / "literature" / "direction.json").write_text(json.dumps(direction), encoding="utf-8")
+    (project / "plan" / "planner_decision.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "auto_research_planner_decision_v1",
+                "direction_id": direction_id,
+                "planner_summary": "Select wrapper utility variant.",
+                "planning_mode": "same_direction_variant",
+                "used_shared_memory_refs": [],
+                "next_variant": variant,
+            }
+        ),
+        encoding="utf-8",
+    )
+    (project / "plan" / "variant_contract.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "auto_research_variant_contract_v1",
+                "direction_id": direction_id,
+                "variant_id": variant["id"],
+                "title": variant["title"],
+                "mode": "regular",
+                "variant_fingerprint": variant["variant_fingerprint"],
+                "mechanism_axis": "routing",
+                "integration_point": "wrapper",
+                "control_signal": "utility",
+                "hypothesis": direction["hypothesis"],
+                "why_next": "Wrapper utility routing.",
+                "expected_files": ["rosetta/model/wrapper.py"],
+                "implementation_surface_refs": direction["implementation_surface_refs"],
+                "resource_budget": {},
+                "expected_metric_signature": direction["expected_metric_signature"],
+                "ablation": {"switch": "disable_wrapper_utility", "control": "ablation-off"},
+                "acceptance": {"min_delta_to_pass": 0.1, "max_dataset_regression": 2.0},
+                "failure_routing": {
+                    "go_to_s3_conditions": ["gate passes"],
+                    "return_to_s2_conditions": ["patch invalid"],
+                    "return_to_s1_conditions": ["budget exhausted"],
+                },
+                "used_shared_memory_refs": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    (project / "plan" / "variant_fingerprint.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "auto_research_variant_fingerprint_v1",
+                "direction_id": direction_id,
+                "variant_id": variant["id"],
+                "variant_fingerprint": variant["variant_fingerprint"],
+                "mechanism_axis": "routing",
+                "integration_point": "wrapper",
+                "control_signal": "utility",
+                "history_fingerprints": [],
+                "is_repeat": False,
+                "mode": "regular",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
 def _write_minimal_s1_ref_catalog(project_root: Path) -> None:
     intake = project_root / "intake" / "c2c"
     intake.mkdir(parents=True, exist_ok=True)
@@ -3443,6 +3539,7 @@ def test_code_patch_agent_marks_codex_429_as_retryable(tmp_path: Path) -> None:
     )
     (plan_dir / "short_loop_plan.yaml").write_text("run: true\n", encoding="utf-8")
     (plan_dir / "candidate_ideas.json").write_text(json.dumps(default_c2c_ideas("topic", config["c2c"]["baseline"])), encoding="utf-8")
+    _write_direction_and_variant_gate_artifacts(paths.root)
     report = S2GateValidator(paths.root, config).validate().to_dict()
 
     assert manifest["status"] == "retryable_no_valid_patch"
@@ -4607,6 +4704,10 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert (root / "plan/short_loop_plan.yaml").exists()
     assert (root / "literature/idea_debate.json").exists()
     assert (root / "literature/negative_constraints.json").exists()
+    assert (root / "literature/direction.json").exists()
+    assert (root / "literature/direction_scorecard.json").exists()
+    assert (root / "literature/evidence_bundle.json").exists()
+    assert (root / "literature/novelty_audit.json").exists()
     assert (root / "literature/c2c/evidence_requests.json").exists()
     assert (root / "literature/c2c/evidence_bundle.json").exists()
     assert (root / "literature/c2c/direction_decision.json").exists()
@@ -4625,6 +4726,9 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert (root / "literature/c2c/chunk_index.json").exists()
     assert (root / "literature/c2c/retrieval_plan.json").exists()
     assert (root / "literature/c2c/retrieval_followup.json").exists()
+    assert (root / "plan/planner_decision.json").exists()
+    assert (root / "plan/variant_contract.json").exists()
+    assert (root / "plan/variant_fingerprint.json").exists()
     bundle = json.loads((root / "intake/c2c/static_bundle.json").read_text(encoding="utf-8"))
     assert bundle["chunk_index"]["counts"]["paper"] > 0
     assert bundle["chunk_index"]["counts"]["rebuttal"] > 0
@@ -4641,6 +4745,12 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     direction = json.loads((root / "literature/c2c/direction_decision.json").read_text(encoding="utf-8"))
     assert direction["direction_id"] == "utility_predicted_cache_routing"
     assert direction["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
+    root_direction = json.loads((root / "literature/direction.json").read_text(encoding="utf-8"))
+    assert root_direction["direction_id"] == "utility_predicted_cache_routing"
+    assert root_direction["mechanism_axis"]
+    variant_contract = json.loads((root / "plan/variant_contract.json").read_text(encoding="utf-8"))
+    assert variant_contract["direction_id"] == "utility_predicted_cache_routing"
+    assert variant_contract["ablation"]["switch"]
     debate = json.loads((root / "literature/idea_debate.json").read_text(encoding="utf-8"))
     assert debate["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     constraints = json.loads((root / "literature/negative_constraints.json").read_text(encoding="utf-8"))
@@ -6553,6 +6663,7 @@ def test_s2_gate_tracks_missing_coverage_controls_as_debt_by_default(tmp_path: P
         "reviewer_risk_controls": {"top_concerns": []},
     }
     (project / "plan" / "plan.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
+    _write_direction_and_variant_gate_artifacts(project)
 
     report = S2GateValidator(project, {}).validate()
 
@@ -6593,6 +6704,7 @@ def test_s2_gate_requires_coverage_controls_in_strict_mode(tmp_path: Path) -> No
         "reviewer_risk_controls": {"top_concerns": []},
     }
     (project / "plan" / "plan.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
+    _write_direction_and_variant_gate_artifacts(project)
 
     report = S2GateValidator(project, {"code_patch": {"validation": {"gate_mode": "strict"}}}).validate()
 

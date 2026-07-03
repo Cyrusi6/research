@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AutoResearchPlannerDecisionContract",
+  "type": "object",
+  "required": ["direction_id", "planner_summary", "planning_mode", "used_shared_memory_refs", "next_variant"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "planner_summary": {"type": "string"},
+    "planning_mode": {"type": "string"},
+    "used_shared_memory_refs": {"type": "array"},
+    "next_variant": {"type": "object"},
+    "source": {"type": "string"}
+  }
+}

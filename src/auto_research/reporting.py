@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_project_config, load_root_config
+from .direction_contracts import direction_to_legacy_idea
 from .method_memory import load_shared_method_memory, shared_method_memory_for_prompt
 from .registry import load_registry
 from .utils import read_json
@@ -14,7 +15,10 @@ from .utils import read_json
 
 def build_project_report(project_root: Path) -> dict[str, Any]:
     registry = load_registry(project_root / "meta" / "registry.yaml")
+    direction = read_json(project_root / "literature" / "direction.json", default={}) or {}
     ideas = _read_list(project_root / "literature" / "ideas.json")
+    if isinstance(direction, dict) and direction.get("direction_id"):
+        ideas = ideas or [direction_to_legacy_idea(direction)]
     direction_scorecard = read_json(project_root / "plan" / "direction_scorecard.json", default={}) or {}
     performance_feedback = read_json(project_root / "plan" / "performance_feedback.json", default={}) or {}
     main_results = read_json(project_root / "experiment" / "results" / "main_results.json", default={}) or {}
@@ -45,6 +49,7 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
         "latest_failure": latest_failure,
         "next_route": next_route,
         "artifact_paths": {
+            "direction": "literature/direction.json" if (project_root / "literature" / "direction.json").exists() else None,
             "ideas": "literature/ideas.json" if (project_root / "literature" / "ideas.json").exists() else None,
             "direction_scorecard": "plan/direction_scorecard.json" if (project_root / "plan" / "direction_scorecard.json").exists() else None,
             "performance_feedback": "plan/performance_feedback.json" if (project_root / "plan" / "performance_feedback.json").exists() else None,

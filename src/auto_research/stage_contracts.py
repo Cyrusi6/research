@@ -89,12 +89,21 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             },
         ],
         "required_outputs": [
-            "literature/ideas.json",
+            "literature/direction.json",
+            "literature/direction_scorecard.json",
+            "literature/evidence_bundle.json",
+            "literature/novelty_audit.json",
             "literature/survey.md",
             "literature/feasibility_check.md",
             "literature/gate_report.json",
         ],
-        "optional_outputs": [],
+        "optional_outputs": [
+            "literature/ideas.json",
+            "literature/direction_decision.json",
+            "literature/evidence_requests.json",
+            "literature/evidence_session.json",
+            "literature/evidence_ref_report.json",
+        ],
         "conditional_outputs": [
             {
                 "when": "project.mode == c2c",
@@ -122,9 +131,10 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
     },
     "S2_plan": {
         "required_inputs": [
-            "literature/ideas.json",
+            "literature/direction.json",
         ],
         "optional_inputs": [
+            "literature/ideas.json",
             "experiment/results/failure_feedback.json",
             "plan/performance_feedback.json",
         ],
@@ -146,11 +156,15 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
         ],
         "required_outputs": [
             "plan/plan.yaml",
+            "plan/planner_decision.json",
+            "plan/variant_contract.json",
+            "plan/variant_fingerprint.json",
             "plan/gate_report.json",
         ],
         "optional_outputs": [
             "plan/code_patches/patch_manifest.json",
             "plan/plan_feedback.json",
+            "plan/next_variant.json",
         ],
         "conditional_outputs": [
             {

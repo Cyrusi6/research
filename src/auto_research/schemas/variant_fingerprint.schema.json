@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AutoResearchVariantFingerprintContract",
+  "type": "object",
+  "required": [
+    "direction_id",
+    "variant_id",
+    "variant_fingerprint",
+    "mechanism_axis",
+    "integration_point",
+    "control_signal",
+    "history_fingerprints",
+    "is_repeat",
+    "mode"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "variant_id": {"type": "string"},
+    "variant_fingerprint": {"type": "string"},
+    "mechanism_axis": {"type": "string"},
+    "integration_point": {"type": "string"},
+    "control_signal": {"type": "string"},
+    "history_fingerprints": {"type": "array"},
+    "is_repeat": {"type": "boolean"},
+    "mode": {"type": "string"}
+  }
+}

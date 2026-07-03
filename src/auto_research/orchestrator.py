@@ -12,6 +12,7 @@ from .artifacts import ArtifactManager
 from .c2c import build_c2c_project_config, snapshot_c2c_repo, write_c2c_project_config
 from .code_patch import is_retryable_patch_manifest
 from .config import apply_runtime_overrides, load_project_config, load_root_config
+from .direction_contracts import direction_to_legacy_idea
 from .judges import gate_s0, gate_s1, gate_s2, gate_s3, gate_s4, gate_s5
 from .importers import ConsensusImporter
 from .llm import ModelClient
@@ -170,8 +171,13 @@ class Orchestrator:
         project_root = self._project_root(project_id)
         registry = load_registry(project_root / "meta" / "registry.yaml")
         selected_idea = "not selected"
+        direction_path = project_root / "literature" / "direction.json"
+        if direction_path.exists():
+            direction = read_json(direction_path, default={}) or {}
+            if isinstance(direction, dict) and direction.get("direction_id"):
+                selected_idea = str(direction.get("title") or direction.get("direction_id"))
         ideas_path = project_root / "literature" / "ideas.json"
-        if ideas_path.exists():
+        if selected_idea == "not selected" and ideas_path.exists():
             ideas = json.loads(ideas_path.read_text(encoding="utf-8"))
             selected_idea = next((idea["title"] for idea in ideas if idea.get("selected")), ideas[0]["title"])
         plan_summary = "No plan yet."
@@ -1266,14 +1272,23 @@ class Orchestrator:
         stage_label = STAGE_LABELS.get(stage_key, stage_key)
         # Build stage-specific summary
         if stage_key == "S1_literature":
-            ideas_path = project_root / "literature" / "ideas.json"
-            if ideas_path.exists():
-                ideas = json.loads(ideas_path.read_text(encoding="utf-8"))
-                for idea in ideas[:3]:
-                    selected = " [选中]" if idea.get("selected") else ""
+            direction_path = project_root / "literature" / "direction.json"
+            if direction_path.exists():
+                direction = read_json(direction_path, default={}) or {}
+                if isinstance(direction, dict) and direction.get("direction_id"):
+                    idea = direction_to_legacy_idea(direction)
                     summary_lines.append(
-                        f"• **{idea['title']}**{selected}: novelty={idea['novelty_score']}, feasibility={idea['feasibility_score']}"
+                        f"• **{idea['title']}** [选中]: axis={direction.get('mechanism_axis')}, point={direction.get('integration_point')}, signal={direction.get('control_signal')}"
                     )
+            else:
+                ideas_path = project_root / "literature" / "ideas.json"
+                if ideas_path.exists():
+                    ideas = json.loads(ideas_path.read_text(encoding="utf-8"))
+                    for idea in ideas[:3]:
+                        selected = " [选中]" if idea.get("selected") else ""
+                        summary_lines.append(
+                            f"• **{idea['title']}**{selected}: novelty={idea['novelty_score']}, feasibility={idea['feasibility_score']}"
+                        )
         elif stage_key == "S2_plan":
             plan_path = project_root / "plan" / "plan.yaml"
             if plan_path.exists():
@@ -2398,6 +2413,7 @@ def _update_c2c_direction_scorecard(project_root: Path, registry: dict[str, Any]
 def _current_c2c_direction(project_root: Path, performance_feedback: dict[str, Any]) -> dict[str, Any]:
     candidate_results = performance_feedback.get("candidate_results") if isinstance(performance_feedback.get("candidate_results"), list) else []
     candidate = next((item for item in candidate_results if isinstance(item, dict)), {})
+    direction = read_json(project_root / "literature" / "direction.json", default={}) or {}
     candidates_path = project_root / "plan" / "candidate_ideas.json"
     ideas = read_json(candidates_path, default=[]) or []
     selected = next((idea for idea in ideas if isinstance(idea, dict) and idea.get("selected")), None)
@@ -2408,7 +2424,7 @@ def _current_c2c_direction(project_root: Path, performance_feedback: dict[str, A
     s1_selected = next((idea for idea in s1_ideas if isinstance(idea, dict) and idea.get("selected")), None)
     if selected is None:
         selected = s1_selected
-    direction_id = (
+    direction_id = (direction.get("direction_id") if isinstance(direction, dict) else None) or (
         (selected or {}).get("s1_planner", {}).get("s1_direction_id")
         if isinstance((selected or {}).get("s1_planner"), dict)
         else None
@@ -2420,10 +2436,10 @@ def _current_c2c_direction(project_root: Path, performance_feedback: dict[str, A
         else direction_id
     )
     direction_id = direction_id or (selected or {}).get("id") or candidate.get("id") or "unknown_direction"
-    mechanism_type = (selected or {}).get("mechanism_type") or (s1_selected or {}).get("mechanism_type") or candidate.get("mechanism_type")
+    mechanism_type = (direction.get("mechanism_type") if isinstance(direction, dict) else None) or (selected or {}).get("mechanism_type") or (s1_selected or {}).get("mechanism_type") or candidate.get("mechanism_type")
     return {
         "id": str(direction_id),
-        "title": (selected or {}).get("title") or (s1_selected or {}).get("title") or candidate.get("title"),
+        "title": (direction.get("title") if isinstance(direction, dict) else None) or (selected or {}).get("title") or (s1_selected or {}).get("title") or candidate.get("title"),
         "mechanism_type": mechanism_type,
     }
 

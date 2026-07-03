@@ -7,6 +7,8 @@ import re
 from typing import Any
 
 from ..adapters.latex import LatexCompiler
+from ..direction_contracts import direction_to_legacy_idea
+from ..utils import read_json
 from ..utils import compact_markdown, split_sentences
 from .base import AgentContext
 
@@ -22,7 +24,11 @@ class WritingAgent:
         summary = self._read_markdown("experiment/results/summary.md")
         verification = self._read_markdown("experiment/results/hypothesis_verification.md")
         survey = self._read_markdown("literature/survey.md")
-        ideas = json.loads((self.context.project_root / "literature" / "ideas.json").read_text(encoding="utf-8"))
+        direction = read_json(self.context.project_root / "literature" / "direction.json", default={}) or {}
+        if isinstance(direction, dict) and direction.get("direction_id"):
+            ideas = [direction_to_legacy_idea(direction)]
+        else:
+            ideas = json.loads((self.context.project_root / "literature" / "ideas.json").read_text(encoding="utf-8"))
         selected = next((idea for idea in ideas if idea.get("selected")), ideas[0])
         plan_yaml = self._read_markdown("plan/plan.yaml")
 

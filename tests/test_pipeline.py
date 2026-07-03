@@ -91,6 +91,94 @@ def _generic_s1_codex_payload() -> dict:
     }
 
 
+def _write_direction_and_variant_contracts(project_root: Path) -> list[str]:
+    direction = {
+        "schema_version": "auto_research_direction_v1",
+        "direction_id": "utility_predicted_cache_routing",
+        "title": "Utility-predicted cache routing",
+        "mechanism_type": "utility_predicted_cache_routing",
+        "mechanism_axis": "routing",
+        "integration_point": "projector",
+        "control_signal": "utility",
+        "hypothesis": "Predict transferred-cache utility before routing.",
+        "why_baseline_fails": "The baseline lacks downstream utility control.",
+        "expected_metric_signature": {"primary_metric": "three_dataset_mean", "expected_direction": "increase"},
+        "required_evidence_refs": [{"source_type": "code", "source_label": "rosetta/model/projector.py", "claim": "surface"}],
+        "counterevidence_refs": [{"source_type": "failure_feedback", "source_label": "risk", "claim": "avoid hard gates"}],
+        "implementation_surface_refs": [{"source_type": "code", "source_label": "rosetta/model/projector.py", "claim": "surface"}],
+        "known_negative_memory_refs": [],
+        "go_to_s2_conditions": ["evidence resolved"],
+        "return_to_s1_conditions": ["budget exhausted"],
+        "expected_files": ["rosetta/model/projector.py"],
+        "verification_commands": ["py_compile"],
+        "used_shared_memory_refs": [],
+    }
+    variant = {
+        "id": "utility_predicted_cache_routing",
+        "title": "Utility-predicted cache routing",
+        "variant_fingerprint": "fp_utility_router",
+        "mechanism_axis": "routing",
+        "integration_point": "projector",
+        "control_signal": "utility",
+    }
+    write_json(project_root / "literature" / "direction.json", direction)
+    write_json(
+        project_root / "plan" / "planner_decision.json",
+        {
+            "schema_version": "auto_research_planner_decision_v1",
+            "direction_id": direction["direction_id"],
+            "planner_summary": "Mocked S2 planner decision.",
+            "planning_mode": "same_direction_variant",
+            "used_shared_memory_refs": [],
+            "next_variant": variant,
+        },
+    )
+    write_json(
+        project_root / "plan" / "variant_contract.json",
+        {
+            "schema_version": "auto_research_variant_contract_v1",
+            "direction_id": direction["direction_id"],
+            "variant_id": variant["id"],
+            "title": variant["title"],
+            "mode": "regular",
+            "variant_fingerprint": variant["variant_fingerprint"],
+            "mechanism_axis": "routing",
+            "integration_point": "projector",
+            "control_signal": "utility",
+            "hypothesis": direction["hypothesis"],
+            "why_next": "Mocked retryable S2 plan.",
+            "expected_files": ["rosetta/model/projector.py"],
+            "implementation_surface_refs": direction["implementation_surface_refs"],
+            "resource_budget": {},
+            "expected_metric_signature": direction["expected_metric_signature"],
+            "ablation": {"switch": "disable_utility_router", "control": "ablation-off"},
+            "acceptance": {"min_delta_to_pass": 0.1, "max_dataset_regression": 2.0},
+            "failure_routing": {
+                "go_to_s3_conditions": ["gate passes"],
+                "return_to_s2_conditions": ["patch invalid"],
+                "return_to_s1_conditions": ["budget exhausted"],
+            },
+            "used_shared_memory_refs": [],
+        },
+    )
+    write_json(
+        project_root / "plan" / "variant_fingerprint.json",
+        {
+            "schema_version": "auto_research_variant_fingerprint_v1",
+            "direction_id": direction["direction_id"],
+            "variant_id": variant["id"],
+            "variant_fingerprint": variant["variant_fingerprint"],
+            "mechanism_axis": "routing",
+            "integration_point": "projector",
+            "control_signal": "utility",
+            "history_fingerprints": [],
+            "is_repeat": False,
+            "mode": "regular",
+        },
+    )
+    return ["plan/planner_decision.json", "plan/variant_contract.json", "plan/variant_fingerprint.json"]
+
+
 def _mock_generic_s1_codex(monkeypatch):
     monkeypatch.setattr(literature_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
     original_subprocess_run = literature_module.subprocess.run
@@ -143,8 +231,15 @@ def test_simulated_pipeline_runs_to_completion(monkeypatch, tmp_path: Path) -> N
     assert s1_contract["gate"]["status"] == "PASS"
     assert s1_contract["input_hash"]
     assert s1_contract["output_hash"]
+    assert any(item["path"] == "literature/direction.json" and item["exists"] for item in s1_contract["produced_outputs"])
     assert any(item["path"] == "literature/ideas.json" and item["exists"] for item in s1_contract["produced_outputs"])
+    assert (tmp_path / project_id / "literature" / "direction.json").exists()
+    assert (tmp_path / project_id / "literature" / "direction_scorecard.json").exists()
+    assert (tmp_path / project_id / "literature" / "novelty_audit.json").exists()
     assert (tmp_path / project_id / "literature" / "evidence_session.json").exists()
+    assert (tmp_path / project_id / "plan" / "planner_decision.json").exists()
+    assert (tmp_path / project_id / "plan" / "variant_contract.json").exists()
+    assert (tmp_path / project_id / "plan" / "variant_fingerprint.json").exists()
     ideas = json.loads((tmp_path / project_id / "literature" / "ideas.json").read_text(encoding="utf-8"))
     assert len(ideas) == 1
     assert ideas[0]["s1_evidence_agent"]["source"] == "codex_resume_evidence_agent"
@@ -486,7 +581,8 @@ def test_s2_retryable_codex_limit_pauses_without_consuming_judge_retry(monkeypat
                 }
             ],
         )
-        return {"artifacts": ["plan/plan.yaml", "plan/short_loop_plan.yaml", "plan/candidate_ideas.json", "plan/code_patches/patch_manifest.json"]}
+        variant_artifacts = _write_direction_and_variant_contracts(self.context.project_root)
+        return {"artifacts": ["plan/plan.yaml", *variant_artifacts, "plan/short_loop_plan.yaml", "plan/candidate_ideas.json", "plan/code_patches/patch_manifest.json"]}
 
     monkeypatch.setattr(config_module, "load_root_config", lambda: config)
     monkeypatch.setattr(orchestrator_module, "load_root_config", lambda: config)
@@ -603,7 +699,8 @@ def test_s2_runtime_smoke_resource_retry_pauses_without_codex_repair(monkeypatch
                 }
             ],
         )
-        return {"artifacts": ["plan/plan.yaml", "plan/short_loop_plan.yaml", "plan/candidate_ideas.json", "plan/code_patches/patch_manifest.json"]}
+        variant_artifacts = _write_direction_and_variant_contracts(self.context.project_root)
+        return {"artifacts": ["plan/plan.yaml", *variant_artifacts, "plan/short_loop_plan.yaml", "plan/candidate_ideas.json", "plan/code_patches/patch_manifest.json"]}
 
     monkeypatch.setattr(config_module, "load_root_config", lambda: config)
     monkeypatch.setattr(orchestrator_module, "load_root_config", lambda: config)

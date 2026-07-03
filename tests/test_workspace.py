@@ -24,7 +24,7 @@ def test_init_workspace_creates_stage_dirs_and_reference_manifest(tmp_path: Path
     assert s1_contract["stage_key"] == "S1_literature"
     assert "meta/project_config.yaml" in s1_contract["required_inputs"]
     assert "experiment/results/failure_feedback.json" not in s1_contract["required_inputs"]
-    assert "literature/ideas.json" in s1_contract["declared_outputs"]
+    assert "literature/direction.json" in s1_contract["declared_outputs"]
     state = json.loads((paths.root / "orchestration" / "state.json").read_text(encoding="utf-8"))
     assert state["project_id"] == "proj_demo"
     assert state["current_stage"] == "S0_intake"

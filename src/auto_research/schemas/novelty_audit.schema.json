@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AutoResearchNoveltyAuditContract",
+  "type": "object",
+  "required": ["direction_id", "status", "passed", "latest", "audits"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "status": {"type": "string"},
+    "enabled": {"type": "boolean"},
+    "passed": {"type": "boolean"},
+    "threshold": {},
+    "latest": {"type": "object"},
+    "audits": {"type": "array"}
+  }
+}
