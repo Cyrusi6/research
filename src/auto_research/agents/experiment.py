@@ -18,6 +18,14 @@ from ..code_patch import DynamicEditPolicy, FrozenPatchGuard, archive_patched_co
 from ..adapters.runner import ExperimentRunner
 from ..failure_log import FailureLogManager, build_c2c_feedback_bundle, is_retryable_c2c_candidate
 from ..itr_ideas import screening_summary_markdown
+from ..s3_proxy_contracts import (
+    build_c2c_effective_proxy_policy,
+    build_c2c_full_s3_worthiness_score,
+    build_c2c_proxy_baseline_fingerprint,
+    build_c2c_proxy_cache_report,
+    build_c2c_proxy_calibration_policy,
+    build_c2c_proxy_decision_report,
+)
 from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, sha256_file, write_json
 from .base import AgentContext
 
@@ -708,6 +716,7 @@ class ExperimentAgent:
         proxy_calibration = self._append_c2c_proxy_calibration(main_payload)
         main_payload["proxy_calibration"] = proxy_calibration.get("current_iteration")
         main_payload["proxy_calibration_summary"] = proxy_calibration.get("summary")
+        self._write_c2c_proxy_policy_contracts(plan=plan, execution=execution, main_payload=main_payload, include_baseline=False)
         history = self._append_c2c_iteration_history(main_payload)
         main_payload["iteration_history"] = {
             "path": "experiment/results/c2c_iteration_history.json",
@@ -944,6 +953,18 @@ class ExperimentAgent:
                     self.context.project_root,
                     ((selected.get("code_patch") or {}).get("implementation_contract") if isinstance(selected.get("code_patch"), dict) else None),
                 ),
+                "selected_patch_gate_report": _c2c_selection_artifact_lock(
+                    self.context.project_root,
+                    "plan/code_patches/patch_gate_report.json",
+                ),
+                "selected_planner_gate_report": _c2c_selection_artifact_lock(
+                    self.context.project_root,
+                    "plan/s2_planner/planner_gate_report.json",
+                ),
+                "selected_variant_scorecard": _c2c_selection_artifact_lock(
+                    self.context.project_root,
+                    "plan/s2_planner/variant_scorecard.json",
+                ),
                 "selected_patch_status": (selected.get("code_patch") or {}).get("status") if isinstance(selected.get("code_patch"), dict) else None,
                 "reason": "S3 is locked to the S2.5 patch_manifest selected candidate.",
             }
@@ -1153,6 +1174,187 @@ class ExperimentAgent:
         write_json(calibration_path, calibration)
         return calibration
 
+    def _write_c2c_proxy_policy_contracts(
+        self,
+        *,
+        plan: dict[str, Any] | None = None,
+        execution: dict[str, Any] | None = None,
+        candidate: dict[str, Any] | None = None,
+        run_spec: dict[str, Any] | None = None,
+        config: dict[str, Any] | None = None,
+        main_payload: dict[str, Any] | None = None,
+        include_baseline: bool = True,
+    ) -> dict[str, Any]:
+        cfg = config or self.context.config
+        proxy_cfg = c2c_proxy_screen_config(cfg)
+        if not proxy_cfg.get("enabled", False):
+            return {}
+        results_dir = self.context.project_root / "experiment" / "results"
+        direction_fingerprint = read_json(self.context.project_root / "literature" / "c2c" / "direction_fingerprint.json", default={}) or {}
+        variant_scorecard = read_json(self.context.project_root / "plan" / "s2_planner" / "variant_scorecard.json", default={}) or {}
+        next_variant = read_json(self.context.project_root / "plan" / "s2_planner" / "next_variant.json", default={}) or {}
+        patch_gate_report = read_json(self.context.project_root / "plan" / "code_patches" / "patch_gate_report.json", default={}) or {}
+        calibration_policy = build_c2c_proxy_calibration_policy(
+            project_root=self.context.project_root,
+            config=cfg,
+            direction_fingerprint=direction_fingerprint,
+        )
+        effective_policy = build_c2c_effective_proxy_policy(
+            static_proxy_config=proxy_cfg,
+            calibration_policy=calibration_policy,
+            variant_scorecard=variant_scorecard,
+            next_variant=next_variant,
+            patch_gate_report=patch_gate_report,
+            direction_fingerprint=direction_fingerprint,
+        )
+        write_json(results_dir / "c2c_proxy_calibration_policy.json", calibration_policy)
+        write_json(results_dir / "c2c_effective_proxy_policy.json", effective_policy)
+        baseline_contracts = (
+            self._write_c2c_proxy_baseline_contracts(
+                plan=plan,
+                execution=execution,
+                candidate=candidate,
+                run_spec=run_spec,
+                config=cfg,
+                proxy_cfg=proxy_cfg,
+            )
+            if include_baseline
+            else {}
+        )
+        if main_payload is not None:
+            main_payload["proxy_calibration_policy"] = {
+                "path": "experiment/results/c2c_proxy_calibration_policy.json",
+                "policy_hash": calibration_policy.get("policy_hash"),
+                "adjustments_active": calibration_policy.get("adjustments_active"),
+            }
+            main_payload["effective_proxy_policy"] = {
+                "path": "experiment/results/c2c_effective_proxy_policy.json",
+                "policy_hash": effective_policy.get("policy_hash"),
+                "effective_policy": effective_policy.get("effective_policy"),
+            }
+        return {
+            "calibration_policy": calibration_policy,
+            "effective_proxy_policy": effective_policy,
+            **baseline_contracts,
+        }
+
+    def _write_c2c_proxy_baseline_contracts(
+        self,
+        *,
+        plan: dict[str, Any] | None = None,
+        execution: dict[str, Any] | None = None,
+        candidate: dict[str, Any] | None = None,
+        run_spec: dict[str, Any] | None = None,
+        config: dict[str, Any] | None = None,
+        proxy_cfg: dict[str, Any] | None = None,
+        existing_fingerprint: dict[str, Any] | None = None,
+        baseline_cache_exists: bool | None = None,
+    ) -> dict[str, Any]:
+        cfg = config or self.context.config
+        proxy_cfg = proxy_cfg or c2c_proxy_screen_config(cfg)
+        fingerprint_cfg = proxy_cfg.get("baseline_fingerprint") if isinstance(proxy_cfg.get("baseline_fingerprint"), dict) else {}
+        if not fingerprint_cfg.get("enabled", True):
+            return {}
+        results_dir = self.context.project_root / "experiment" / "results"
+        fingerprint_path = results_dir / "c2c_proxy_baseline_fingerprint.json"
+        previous = existing_fingerprint
+        if previous is None and fingerprint_path.exists():
+            previous = read_json(fingerprint_path, default={}) or {}
+        baseline_path = self.context.project_root / str(proxy_cfg.get("baseline_cache_path") or "experiment/results/c2c_proxy_baseline.json")
+        fingerprint = build_c2c_proxy_baseline_fingerprint(
+            project_root=self.context.project_root,
+            config=cfg,
+            plan=plan,
+            execution=execution,
+            proxy_config=proxy_cfg,
+            run_spec=run_spec,
+            candidate=candidate,
+        )
+        cache_report = build_c2c_proxy_cache_report(
+            expected_fingerprint=fingerprint,
+            actual_fingerprint=previous if isinstance(previous, dict) else {},
+            baseline_cache_path=baseline_path,
+            baseline_cache_exists=baseline_cache_exists,
+            require_cache_fingerprint_match=bool(fingerprint_cfg.get("require_cache_fingerprint_match", True)),
+        )
+        write_json(fingerprint_path, fingerprint)
+        write_json(results_dir / "c2c_proxy_cache_report.json", cache_report)
+        return {"baseline_fingerprint": fingerprint, "cache_report": cache_report}
+
+    def _write_c2c_proxy_decision_contracts(
+        self,
+        *,
+        candidate: dict[str, Any],
+        proxy_screen: dict[str, Any],
+        run_state: dict[str, Any],
+        run_spec: dict[str, Any],
+        config: dict[str, Any],
+    ) -> dict[str, Any]:
+        proxy_cfg = c2c_proxy_screen_config(config)
+        results_dir = self.context.project_root / "experiment" / "results"
+        contracts = self._write_c2c_proxy_policy_contracts(candidate=candidate, run_spec=run_spec, config=config, include_baseline=False)
+        baseline_fingerprint = contracts.get("baseline_fingerprint") or read_json(results_dir / "c2c_proxy_baseline_fingerprint.json", default={}) or {}
+        effective_policy = contracts.get("effective_proxy_policy") or read_json(results_dir / "c2c_effective_proxy_policy.json", default={}) or {}
+        calibration_policy = contracts.get("calibration_policy") or read_json(results_dir / "c2c_proxy_calibration_policy.json", default={}) or {}
+        variant_scorecard = read_json(self.context.project_root / "plan" / "s2_planner" / "variant_scorecard.json", default={}) or {}
+        patch_gate_report = read_json(self.context.project_root / "plan" / "code_patches" / "patch_gate_report.json", default={}) or {}
+        planner_gate_report = read_json(self.context.project_root / "plan" / "s2_planner" / "planner_gate_report.json", default={}) or {}
+        novelty_audit = read_json(self.context.project_root / "literature" / "novelty_audit.json", default={}) or {}
+        if isinstance(run_state.get("activation_smoke"), dict):
+            proxy_screen["activation_smoke"] = run_state["activation_smoke"]
+        worthiness = None
+        worth_cfg = proxy_cfg.get("full_s3_worthiness") if isinstance(proxy_cfg.get("full_s3_worthiness"), dict) else {}
+        if worth_cfg.get("enabled", True) and proxy_screen.get("status") == "passed":
+            worthiness = build_c2c_full_s3_worthiness_score(
+                candidate=candidate,
+                proxy_screen=proxy_screen,
+                effective_proxy_policy=effective_policy,
+                variant_scorecard=variant_scorecard,
+                patch_gate_report=patch_gate_report,
+                novelty_audit=novelty_audit,
+                calibration_policy=calibration_policy,
+                config=config,
+                neutral_proxy_budget_remaining=True,
+            )
+            write_json(results_dir / "c2c_full_s3_worthiness.json", worthiness)
+        decision_report = build_c2c_proxy_decision_report(
+            candidate=candidate,
+            proxy_screen=proxy_screen,
+            baseline_fingerprint=baseline_fingerprint,
+            effective_proxy_policy=effective_policy,
+            patch_gate_report=patch_gate_report,
+            planner_gate_report=planner_gate_report,
+            variant_scorecard=variant_scorecard,
+            full_s3_worthiness=worthiness,
+        )
+        write_json(results_dir / "c2c_proxy_decision_report.json", decision_report)
+        proxy_screen.setdefault("artifact_paths", {})
+        proxy_screen["artifact_paths"].update(
+            {
+                "proxy_baseline_fingerprint": "experiment/results/c2c_proxy_baseline_fingerprint.json",
+                "proxy_cache_report": "experiment/results/c2c_proxy_cache_report.json",
+                "effective_proxy_policy": "experiment/results/c2c_effective_proxy_policy.json",
+                "proxy_decision_report": "experiment/results/c2c_proxy_decision_report.json",
+                "proxy_calibration_policy": "experiment/results/c2c_proxy_calibration_policy.json",
+            }
+        )
+        if worthiness:
+            proxy_screen["artifact_paths"]["full_s3_worthiness"] = "experiment/results/c2c_full_s3_worthiness.json"
+            proxy_screen["full_s3_worthiness"] = {
+                "score": worthiness.get("score"),
+                "threshold": worthiness.get("threshold"),
+                "decision": worthiness.get("decision"),
+            }
+        proxy_screen["proxy_decision_report"] = {
+            "decision": decision_report.get("decision"),
+            "route_hint": decision_report.get("route_hint"),
+            "failure_class": decision_report.get("failure_class"),
+            "path": "experiment/results/c2c_proxy_decision_report.json",
+        }
+        run_state["proxy_screen"] = proxy_screen
+        run_state["proxy_decision_report"] = decision_report
+        return decision_report
+
     @staticmethod
     def _snapshot_c2c_core_files(adapter: C2CAdapter) -> dict[str, str]:
         return {key: value["content"] for key, value in ExperimentAgent._snapshot_c2c_repo_state(adapter).items() if value.get("existed")}
@@ -1218,6 +1420,7 @@ class ExperimentAgent:
             else {"status": "skipped"}
         )
         run_spec = adapter.materialize_candidate_configs(candidate, gpu_selection, proxy_gpu_selection=proxy_gpu_selection)
+        self._write_c2c_proxy_policy_contracts(candidate=candidate, run_spec=run_spec, config=adapter.config)
         output_pollution_before = _c2c_original_output_state(original_repo_root, run_spec)
         execution_repo_audit = _c2c_execution_repo_path_audit(
             original_repo_root=original_repo_root,
@@ -1487,6 +1690,22 @@ class ExperimentAgent:
                         logs.append({"candidate_id": candidate.get("id"), "event": "proxy_baseline", "status": baseline_proxy.get("status"), "proxy_baseline": baseline_proxy})
                     if command_status not in {"failed", "blocked"} and block_for_execution_repo_audit("proxy_baseline"):
                         metrics = None
+                    if command_status == "blocked" and isinstance(run_state.get("proxy_screen"), dict):
+                        decision_report = self._write_c2c_proxy_decision_contracts(
+                            candidate=candidate,
+                            proxy_screen=run_state["proxy_screen"],
+                            run_state=run_state,
+                            run_spec=run_spec,
+                            config=adapter.config,
+                        )
+                        logs.append(
+                            {
+                                "candidate_id": candidate.get("id"),
+                                "event": "proxy_decision",
+                                "decision": decision_report.get("decision"),
+                                "route_hint": decision_report.get("route_hint"),
+                            }
+                        )
                 if command_status not in {"failed", "blocked"}:
                     if proxy_enabled:
                         proxy_screen = self._run_c2c_proxy_screen(
@@ -1515,6 +1734,22 @@ class ExperimentAgent:
                         command_status = "proxy_repairable"
                     if command_status not in {"failed", "proxy_rejected", "proxy_repairable", "blocked"} and block_for_execution_repo_audit("proxy_screen"):
                         metrics = None
+                    if command_status in {"failed", "proxy_rejected", "proxy_repairable", "blocked"}:
+                        decision_report = self._write_c2c_proxy_decision_contracts(
+                            candidate=candidate,
+                            proxy_screen=run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else proxy_screen,
+                            run_state=run_state,
+                            run_spec=run_spec,
+                            config=adapter.config,
+                        )
+                        logs.append(
+                            {
+                                "candidate_id": candidate.get("id"),
+                                "event": "proxy_decision",
+                                "decision": decision_report.get("decision"),
+                                "route_hint": decision_report.get("route_hint"),
+                            }
+                        )
                 if proxy_enabled and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
                     activation_smoke = self._run_c2c_proxy_activation_smoke(
                         adapter=adapter,
@@ -1620,6 +1855,53 @@ class ExperimentAgent:
                             run_state["proxy_screen"] = proxy_screen
                     if command_status not in {"failed", "proxy_rejected", "proxy_repairable", "blocked"} and block_for_execution_repo_audit("activation_smoke"):
                         metrics = None
+                if proxy_enabled and command_status not in {"failed", "blocked"} and isinstance(run_state.get("proxy_screen"), dict) and not run_state.get("proxy_decision_report"):
+                    proxy_screen = run_state["proxy_screen"]
+                    decision_report = self._write_c2c_proxy_decision_contracts(
+                        candidate=candidate,
+                        proxy_screen=proxy_screen,
+                        run_state=run_state,
+                        run_spec=run_spec,
+                        config=adapter.config,
+                    )
+                    logs.append(
+                        {
+                            "candidate_id": candidate.get("id"),
+                            "event": "proxy_decision",
+                            "decision": decision_report.get("decision"),
+                            "route_hint": decision_report.get("route_hint"),
+                            "failure_class": decision_report.get("failure_class"),
+                        }
+                    )
+                    if decision_report.get("decision") == "blocked":
+                        command_status = "blocked"
+                        proxy_screen.update(
+                            {
+                                "status": "blocked",
+                                "reason": decision_report.get("failure_class") or "proxy decision blocked full S3",
+                                "repair_route": decision_report.get("route_hint"),
+                            }
+                        )
+                    elif decision_report.get("decision") == "proxy_repairable":
+                        command_status = "proxy_repairable"
+                        proxy_screen.update(
+                            {
+                                "status": "repairable_proxy_risk",
+                                "reason": decision_report.get("failure_class") or "proxy decision requires repair before full S3",
+                                "repair_route": decision_report.get("route_hint"),
+                                "repair_mode": decision_report.get("failure_class") or "proxy_decision_repair",
+                            }
+                        )
+                    elif decision_report.get("decision") == "proxy_rejected":
+                        command_status = "proxy_rejected"
+                        proxy_screen.update(
+                            {
+                                "status": "rejected",
+                                "reason": decision_report.get("failure_class") or "proxy decision rejected full S3",
+                                "repair_route": decision_report.get("route_hint"),
+                            }
+                        )
+                    run_state["proxy_screen"] = proxy_screen
                 if proxy_enabled and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
                     readiness = self._record_c2c_full_s3_readiness(
                         candidate=candidate,
@@ -1687,6 +1969,28 @@ class ExperimentAgent:
                     if command_status == "proxy_repairable":
                         metrics = None
                 if command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
+                    if proxy_enabled:
+                        full_s3_decision = {
+                            "schema_version": "c2c_full_s3_decision_v1",
+                            "created_at": now_utc(),
+                            "candidate_id": candidate.get("id"),
+                            "run_id": run_spec.get("run_id"),
+                            "decision": "run_full_s3",
+                            "proxy_decision": (run_state.get("proxy_decision_report") or {}).get("decision") if isinstance(run_state.get("proxy_decision_report"), dict) else None,
+                            "proxy_route_hint": (run_state.get("proxy_decision_report") or {}).get("route_hint") if isinstance(run_state.get("proxy_decision_report"), dict) else None,
+                            "full_s3_readiness": {
+                                "status": (run_state.get("full_s3_readiness") or {}).get("status") if isinstance(run_state.get("full_s3_readiness"), dict) else None,
+                                "full_train_allowed": (run_state.get("full_s3_readiness") or {}).get("full_train_allowed") if isinstance(run_state.get("full_s3_readiness"), dict) else None,
+                            },
+                            "source_artifacts": {
+                                "proxy_decision_report": "experiment/results/c2c_proxy_decision_report.json",
+                                "effective_proxy_policy": "experiment/results/c2c_effective_proxy_policy.json",
+                                "full_s3_worthiness": "experiment/results/c2c_full_s3_worthiness.json",
+                                "full_s3_readiness_report": "experiment/results/full_s3_readiness_report.json",
+                            },
+                        }
+                        write_json(self.context.project_root / "experiment" / "results" / "c2c_full_s3_decision.json", full_s3_decision)
+                        run_state["full_s3_decision"] = full_s3_decision
                     train_result = self.runner.run_step(
                         name="train",
                         command=run_spec["commands"]["train"],
@@ -1862,6 +2166,7 @@ class ExperimentAgent:
             "command_status": command_status,
             "preflight": preflight,
             "proxy_screen": _compact_proxy_screen(run_state.get("proxy_screen")),
+            "proxy_decision_report": _compact_proxy_decision_report(run_state.get("proxy_decision_report")),
             "activation_smoke": _compact_activation_smoke(run_state.get("activation_smoke")),
             "full_s3_readiness": _compact_full_s3_readiness(run_state.get("full_s3_readiness")),
             "run_state_path": str(run_spec["run_state_path"]),
@@ -2126,10 +2431,16 @@ class ExperimentAgent:
         patch_result: dict[str, Any],
         has_executable_change: bool,
         baseline: dict[str, Any],
+        effective_proxy_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         proxy_cfg = c2c_proxy_screen_config(self.context.config)
         if not proxy_cfg.get("enabled", False):
             return {"enabled": False, "status": "skipped", "reason": "proxy_screen disabled"}
+        if effective_proxy_policy is None:
+            effective_proxy_policy = read_json(self.context.project_root / "experiment" / "results" / "c2c_effective_proxy_policy.json", default={}) or {}
+        threshold_proxy_cfg = dict(proxy_cfg)
+        if isinstance(effective_proxy_policy, dict) and isinstance(effective_proxy_policy.get("effective_policy"), dict):
+            threshold_proxy_cfg.update(effective_proxy_policy["effective_policy"])
 
         proxy = self._c2c_static_proxy_screen(
             candidate=candidate,
@@ -2196,6 +2507,7 @@ class ExperimentAgent:
         metrics = adapter.collect_proxy_metrics(run_spec)
         eval_smoke = adapter.collect_proxy_eval_smoke(run_spec)
         baseline_metrics = adapter.proxy_baseline_metrics(run_spec)
+        proxy["require_proxy_metrics"] = bool(threshold_proxy_cfg.get("require_proxy_metrics", proxy_cfg.get("require_proxy_metrics", False)))
         proxy["attempts"] = attempts
         proxy["commands"] = rendered_commands
         proxy["metrics"] = metrics
@@ -2204,7 +2516,7 @@ class ExperimentAgent:
         threshold_decision = self._c2c_proxy_metric_decision(
             metrics=metrics,
             baseline=baseline,
-            proxy_cfg=proxy_cfg,
+            proxy_cfg=threshold_proxy_cfg,
             proxy_baseline=baseline_metrics,
             patch_risk=proxy.get("patch_risk") or {},
             eval_smoke=eval_smoke,
@@ -2445,12 +2757,37 @@ class ExperimentAgent:
         if not proxy_cfg.get("enabled", False) or not proxy_cfg.get("require_paired_baseline", True):
             return {"enabled": bool(proxy_cfg.get("enabled", False)), "status": "skipped", "reason": "paired proxy baseline disabled"}
         cached = adapter.proxy_baseline_metrics(candidate_run_spec)
-        if cached and cached.get("source") != "configured_full_baseline_subset_fallback":
-            return {"enabled": True, "status": "cached", "metrics": cached, "path": str((candidate_run_spec.get("proxy_screen") or {}).get("baseline_metrics_path") or "")}
+        baseline_path = Path((candidate_run_spec.get("proxy_screen") or {}).get("baseline_metrics_path") or self.context.project_root / str(proxy_cfg.get("baseline_cache_path") or "experiment/results/c2c_proxy_baseline.json"))
+        has_real_cache = bool(cached and cached.get("source") != "configured_full_baseline_subset_fallback" and baseline_path.exists())
+        baseline_contracts = self._write_c2c_proxy_baseline_contracts(
+            candidate=(candidate_run_spec.get("candidate") if isinstance(candidate_run_spec.get("candidate"), dict) else None),
+            run_spec=candidate_run_spec,
+            config=adapter.config,
+            proxy_cfg=proxy_cfg,
+            baseline_cache_exists=has_real_cache,
+        )
+        cache_report = baseline_contracts.get("cache_report") if isinstance(baseline_contracts.get("cache_report"), dict) else {}
+        if has_real_cache and cache_report.get("action") == "reuse":
+            return {
+                "enabled": True,
+                "status": "cached",
+                "metrics": cached,
+                "path": str(baseline_path),
+                "cache_report": cache_report,
+                "baseline_fingerprint": baseline_contracts.get("baseline_fingerprint"),
+            }
         if not proxy_cfg.get("run_baseline_if_missing", True):
             if cached:
-                return {"enabled": True, "status": "fallback", "metrics": cached, "reason": "using configured baseline subset fallback"}
-            return {"enabled": True, "status": "blocked", "reason": "proxy baseline cache missing and run_baseline_if_missing is false"}
+                if has_real_cache:
+                    return {
+                        "enabled": True,
+                        "status": "blocked",
+                        "reason": "proxy baseline cache fingerprint mismatch and run_baseline_if_missing is false",
+                        "cache_report": cache_report,
+                        "baseline_fingerprint": baseline_contracts.get("baseline_fingerprint"),
+                    }
+                return {"enabled": True, "status": "fallback", "metrics": cached, "reason": "using configured baseline subset fallback", "cache_report": cache_report}
+            return {"enabled": True, "status": "blocked", "reason": "proxy baseline cache missing and run_baseline_if_missing is false", "cache_report": cache_report}
 
         patched_state = self._snapshot_c2c_repo_state(adapter) if baseline_repo_state is not None else None
         if baseline_repo_state is not None:
@@ -2529,7 +2866,30 @@ class ExperimentAgent:
             metrics = dict(metrics)
             metrics.setdefault("source", "proxy_baseline_run")
             write_json(Path(baseline_spec["metrics_path"]), metrics)
-            return {"enabled": True, "status": "ok", "metrics": metrics, "path": str(baseline_spec["metrics_path"]), "attempts": attempts}
+            post_run_contracts = self._write_c2c_proxy_baseline_contracts(
+                candidate=(candidate_run_spec.get("candidate") if isinstance(candidate_run_spec.get("candidate"), dict) else None),
+                run_spec=candidate_run_spec,
+                config=adapter.config,
+                proxy_cfg=proxy_cfg,
+                baseline_cache_exists=True,
+            )
+            final_cache_report = post_run_contracts.get("cache_report")
+            if isinstance(cache_report, dict) and cache_report.get("action") == "rerun_baseline":
+                final_cache_report = {
+                    **cache_report,
+                    "rerun_status": "ok",
+                    "post_rerun_fingerprint_hash": (post_run_contracts.get("baseline_fingerprint") or {}).get("fingerprint_hash"),
+                }
+                write_json(self.context.project_root / "experiment" / "results" / "c2c_proxy_cache_report.json", final_cache_report)
+            return {
+                "enabled": True,
+                "status": "ok",
+                "metrics": metrics,
+                "path": str(baseline_spec["metrics_path"]),
+                "attempts": attempts,
+                "cache_report": final_cache_report,
+                "baseline_fingerprint": post_run_contracts.get("baseline_fingerprint"),
+            }
         finally:
             if patched_state is not None:
                 self._restore_c2c_repo_state(adapter, patched_state)
@@ -5159,6 +5519,8 @@ def _compact_proxy_screen(proxy_screen: dict[str, Any] | None) -> dict[str, Any]
         "signals",
         "patch_risk",
         "quality_repair",
+        "proxy_decision_report",
+        "full_s3_worthiness",
         "artifact_paths",
         "patch_fingerprint",
     ]:
@@ -5178,6 +5540,22 @@ def _compact_proxy_screen(proxy_screen: dict[str, Any] | None) -> dict[str, Any]
     if isinstance(compact.get("proxy_effect_repair_contract"), dict):
         compact["proxy_effect_repair_contract"] = _compact_proxy_effect_repair_contract(compact["proxy_effect_repair_contract"])
     return _compact_c2c_result_payload(compact)
+
+
+def _compact_proxy_decision_report(report: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(report, dict):
+        return report
+    compact = {
+        "candidate_id": report.get("candidate_id"),
+        "decision": report.get("decision"),
+        "failure_class": report.get("failure_class"),
+        "route_hint": report.get("route_hint"),
+        "reason_codes": list(report.get("reason_codes") or [])[:8],
+        "path": "experiment/results/c2c_proxy_decision_report.json",
+    }
+    if isinstance(report.get("full_s3_worthiness"), dict):
+        compact["full_s3_worthiness"] = report["full_s3_worthiness"]
+    return {key: value for key, value in compact.items() if value not in (None, "", [], {})}
 
 
 def _proxy_screen_for_failure_attribution(proxy_screen: dict[str, Any]) -> dict[str, Any]:
@@ -5204,6 +5582,8 @@ def _proxy_screen_for_failure_attribution(proxy_screen: dict[str, Any]) -> dict[
         "soft_fail",
         "soft_flags",
         "artifact_paths",
+        "proxy_decision_report",
+        "full_s3_worthiness",
     ]
     compact = {key: proxy_screen.get(key) for key in keep if key in proxy_screen}
     if isinstance(proxy_screen.get("command_failure"), dict):

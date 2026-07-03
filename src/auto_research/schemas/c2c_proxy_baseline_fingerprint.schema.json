@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CProxyBaselineFingerprint",
+  "type": "object",
+  "required": ["schema_version", "created_at", "fingerprint_hash", "inputs"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "fingerprint_hash": {"type": "string"},
+    "inputs": {
+      "type": "object",
+      "required": [
+        "snapshot_path",
+        "snapshot_manifest_hash",
+        "plan_hash",
+        "execution_hash",
+        "proxy_config_hash",
+        "eval_recipe_hash",
+        "dataset_signature",
+        "baseline_model_signature",
+        "evaluator_file_hashes",
+        "s2_5_locks",
+        "env_signature"
+      ]
+    }
+  }
+}

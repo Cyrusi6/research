@@ -226,7 +226,21 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             "experiment/results/c2c_small_loop_results.json",
             "experiment/code_snapshots",
         ],
-        "conditional_outputs": [],
+        "conditional_outputs": [
+            {
+                "when": "execution.collector == c2c_small_loop",
+                "paths": [
+                    "experiment/results/s3_candidate_selection.json",
+                    "experiment/results/c2c_proxy_baseline_fingerprint.json",
+                    "experiment/results/c2c_proxy_cache_report.json",
+                    "experiment/results/c2c_effective_proxy_policy.json",
+                    "experiment/results/c2c_proxy_decision_report.json",
+                    "experiment/results/c2c_proxy_calibration_policy.json",
+                    "experiment/results/c2c_full_s3_worthiness.json",
+                    "experiment/results/c2c_full_s3_decision.json",
+                ],
+            }
+        ],
         "required_config": ["experiment"],
         "conditional_config": [{"when": "project.mode == c2c", "keys": ["c2c", "llm.execution_provider"]}],
         "gate_validator": "s3_experiment_gate_v1",

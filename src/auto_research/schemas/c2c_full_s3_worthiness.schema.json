@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CFullS3Worthiness",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at",
+    "candidate_id",
+    "score",
+    "threshold",
+    "components",
+    "decision",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "candidate_id": {"type": "string"},
+    "score": {"type": "number", "minimum": 0, "maximum": 1},
+    "threshold": {"type": "number"},
+    "components": {"type": "object"},
+    "neutral_proxy_budget_remaining": {"type": "boolean"},
+    "decision": {"type": "string", "enum": ["run_full_s3", "do_not_run_full_s3"]},
+    "reason_codes": {"type": "array"}
+  }
+}

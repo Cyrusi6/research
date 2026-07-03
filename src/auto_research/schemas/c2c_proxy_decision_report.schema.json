@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CProxyDecisionReport",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at",
+    "candidate_id",
+    "variant_id",
+    "baseline_fingerprint_hash",
+    "effective_policy_hash",
+    "proxy_metrics",
+    "paired_baseline_metrics",
+    "deltas",
+    "static_checks",
+    "decision",
+    "route_hint",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "candidate_id": {"type": "string"},
+    "variant_id": {"type": "string"},
+    "variant_fingerprint": {"type": "string"},
+    "baseline_fingerprint_hash": {"type": "string"},
+    "effective_policy_hash": {"type": "string"},
+    "proxy_metrics": {"type": "object"},
+    "paired_baseline_metrics": {"type": "object"},
+    "deltas": {
+      "type": "object",
+      "required": ["mean_delta", "worst_dataset_regression", "dataset_deltas"]
+    },
+    "static_checks": {"type": "object"},
+    "decision": {
+      "type": "string",
+      "enum": ["proxy_pass", "proxy_rejected", "proxy_repairable", "neutral_proxy_full_s3", "blocked"]
+    },
+    "failure_class": {"type": ["string", "null"]},
+    "route_hint": {
+      "type": "string",
+      "enum": ["run_full_s3", "repair_s2_5", "return_s2", "return_s1", "block_resource"]
+    },
+    "reason_codes": {"type": "array"},
+    "full_s3_worthiness": {"type": "object"}
+  }
+}

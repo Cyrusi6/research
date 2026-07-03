@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CProxyCacheReport",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at",
+    "cache_status",
+    "reason",
+    "expected_fingerprint_hash",
+    "baseline_cache_path",
+    "action"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "cache_status": {"type": "string", "enum": ["hit", "miss", "invalidated", "missing"]},
+    "reason": {"type": "string"},
+    "expected_fingerprint_hash": {"type": "string"},
+    "actual_fingerprint_hash": {"type": ["string", "null"]},
+    "baseline_cache_path": {"type": "string"},
+    "action": {"type": "string", "enum": ["reuse", "rerun_baseline", "block"]}
+  }
+}

@@ -2663,3 +2663,27 @@ uv run pytest -q tests/test_s2_planner_contracts.py tests/test_stage_contracts.p
 uv run pytest -q tests/test_c2c.py
 uv run pytest -q tests/test_stage_contracts.py tests/test_pipeline.py tests/test_validators.py tests/test_s2_planner_contracts.py
 ```
+
+## 2026-07-03 C2C S3 Proxy Decision Contracts
+
+C2C S3 proxy screen 从“固定阈值直接判断”升级为 deterministic decision contract：先用 fingerprint 验证 paired proxy baseline cache 是否可信，再根据历史 proxy/full calibration 生成 effective policy，最后用独立 decision report 决定 full S3 / repair / return S2 / resource block。GPT 不参与这些统计或路由。
+
+修复：
+
+- 新增 `s3_proxy_contracts.py`，提供 baseline fingerprint、cache report、calibration policy、effective proxy policy、proxy decision report 和 neutral full-S3 worthiness builder。
+- C2C S3 写出 `c2c_proxy_baseline_fingerprint.json`、`c2c_proxy_cache_report.json`、`c2c_effective_proxy_policy.json`、`c2c_proxy_decision_report.json`、`c2c_full_s3_worthiness.json` 和 `c2c_proxy_calibration_policy.json`。
+- paired baseline cache 只有在 fingerprint hash 完全一致时复用；config/dataset/eval recipe/S2.5 locks/env signature 变化会触发 rerun baseline。
+- proxy metric threshold 使用 `c2c_effective_proxy_policy.json`，历史 false-positive 足够多时按配置收紧 mean delta 和 dataset regression 阈值。
+- neutral proxy 进入 full S3 前必须计算 deterministic worthiness score；低分或 budget 不足会 route 回 S2，不再无条件消耗 full S3。
+- S3 candidate selection 额外锁定 `patch_gate_report`、`planner_gate_report` 和 `variant_scorecard`，确保执行真相包含 planner/patch gate。
+- `S3GateValidator` 新增 C2C proxy contract gate：校验 proxy artifact schema、cache action、effective policy hash、decision/metrics 一致性、neutral worthiness，以及新增 S2.5/planner locks。
+- `stage_contracts.py` 增加 C2C S3 conditional outputs；默认 C2C proxy config 增加 baseline fingerprint、adaptive policy 和 full-S3 worthiness 配置。
+
+验证：
+
+```text
+python -m py_compile src/auto_research/s3_proxy_contracts.py src/auto_research/agents/experiment.py src/auto_research/validators/s3_gate.py src/auto_research/c2c.py src/auto_research/stage_contracts.py
+uv run pytest -q tests/test_s3_proxy_contracts.py tests/test_validators.py tests/test_c2c.py
+uv run pytest -q tests/test_stage_contracts.py tests/test_pipeline.py tests/test_validators.py
+uv run pytest -q
+```

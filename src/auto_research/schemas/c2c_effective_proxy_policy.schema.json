@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CEffectiveProxyPolicy",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at",
+    "static_policy",
+    "calibration_adjustments",
+    "effective_policy",
+    "reason_codes",
+    "policy_hash"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "static_policy": {"type": "object"},
+    "calibration_adjustments": {"type": "object"},
+    "effective_policy": {
+      "type": "object",
+      "required": ["min_proxy_mean_delta", "max_proxy_dataset_regression", "allow_neutral_proxy_full_s3"]
+    },
+    "reason_codes": {"type": "array"},
+    "policy_hash": {"type": "string"}
+  }
+}

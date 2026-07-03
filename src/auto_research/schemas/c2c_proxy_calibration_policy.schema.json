@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CProxyCalibrationPolicy",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "created_at",
+    "history_count",
+    "min_history_for_adjustment",
+    "adjustments_active",
+    "mechanism_false_positive_rate",
+    "integration_point_false_positive_rate",
+    "dataset_misprediction_risk",
+    "recommended_min_proxy_mean_delta",
+    "recommended_max_proxy_dataset_regression",
+    "neutral_proxy_allowed",
+    "reason_codes",
+    "policy_hash"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "history_count": {"type": "integer"},
+    "min_history_for_adjustment": {"type": "integer"},
+    "adjustments_active": {"type": "boolean"},
+    "mechanism_false_positive_rate": {"type": "number"},
+    "integration_point_false_positive_rate": {"type": "number"},
+    "dataset_misprediction_risk": {"type": "object"},
+    "recommended_min_proxy_mean_delta": {"type": "number"},
+    "recommended_max_proxy_dataset_regression": {"type": "number"},
+    "neutral_proxy_allowed": {"type": "boolean"},
+    "reason_codes": {"type": "array"},
+    "policy_hash": {"type": "string"}
+  }
+}

@@ -108,6 +108,28 @@ DEFAULT_C2C_PROXY_SCREEN = {
     "allow_neutral_proxy_full_s3": True,
     "neutral_proxy_min_delta": -0.1,
     "neutral_proxy_max_dataset_regression": 0.25,
+    "baseline_fingerprint": {
+        "enabled": True,
+        "require_cache_fingerprint_match": True,
+        "include_eval_recipe_hash": True,
+        "include_dataset_signature": True,
+        "include_s2_5_locks": True,
+        "include_env_signature": True,
+    },
+    "adaptive_policy": {
+        "enabled": True,
+        "min_history_for_adjustment": 3,
+        "false_positive_rate_threshold": 0.5,
+        "tighten_min_proxy_delta_to": -0.1,
+        "tighten_max_dataset_regression_to": 0.75,
+        "allow_mechanism_specific_adjustment": True,
+    },
+    "full_s3_worthiness": {
+        "enabled": True,
+        "min_score": 0.60,
+        "neutral_proxy_budget_per_direction": 1,
+        "block_if_false_positive_rate_above": 0.6,
+    },
     "baseline_cache_path": "experiment/results/c2c_proxy_baseline.json",
     "eval_smoke": {
         "enabled": True,
