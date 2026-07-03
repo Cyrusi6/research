@@ -2615,3 +2615,28 @@ python -m py_compile src/auto_research/failure_log.py src/auto_research/agents/e
 uv run pytest -q tests/test_failure_log.py -k 'feedback_loader_filters_retryable_resource_pause_noise or feedback_loader_splits_method_and_implementation_views or shared_method_memory_records_only_method_failures'
 uv run pytest -q tests/test_pipeline.py -k 's3_proxy_oom_pauses_as_resource_retry_not_s2_5_repair or retryable_paused'
 ```
+
+## 2026-07-03 C2C S1 Deterministic Retrieval / Direction Split
+
+C2C S1 的 evidence-on-demand 路径进一步拆成三段硬合同：S1a 只产出 evidence request plan，S1b deterministic retriever 只根据 S0 chunk/code/memory catalog 产出 evidence bundle，S1c direction agent 只能消费 S1b bundle 里的 refs 来选择方向。这样可以防止 direction agent 一边“要求证据”一边自己发明 refs，避免 JSON 合法但证据来源不可复现的 S1 输出进入 S2。
+
+修复：
+
+- 新增 `s1_retrieval.py`，提供 `c2c_s1_evidence_request_plan_v1`、`c2c_s1_deterministic_evidence_bundle_v1`、`c2c_s1_deterministic_retrieval_trace_v1` 的 deterministic 检索实现。
+- C2C S1 Codex 路径改为 `evidence_request_agent -> deterministic_retriever -> direction_agent`：
+  - S1a 禁止输出 `direction_decision / selected_ideas / evidence_bundle / expected_files`；
+  - S1b 写出 `literature/c2c/evidence_request_plan.json`、deterministic `evidence_bundle.json` 和真实 retrieval trace；
+  - S1c prompt 只暴露 `allowed_refs`，并要求 direction/idea refs 必须来自 bundle。
+- 新增 `validate_direction_refs_subset_of_bundle()`，校验 required evidence、counterevidence、code refs 都是 S1b bundle 子集，并检查 expected files 被 code refs 覆盖。
+- `build_s1_evidence_quality_score()` 纳入 direction-vs-bundle subset report；C2C S1 quality gate 在原有 paper/code/counterevidence/novelty/surface 规则之外，也会硬拦截 direction refs 不来自 bundle 的输出。
+- `S1GateValidator` 新增 two-phase contract gate，要求 request plan、deterministic bundle、direction decision、deterministic retrieval trace、evidence session 同时存在且 producer/schema/subset/coverage 合法。
+- deterministic retriever 的 implementation surface 排序改为优先真实 allowed code surface，避免 README/备忘录这类 runtime docs 被选作 S2 implementation surface。
+- S1 stage contract 增加 C2C conditional output `literature/c2c/evidence_request_plan.json`。
+
+验证：
+
+```text
+python -m py_compile src/auto_research/s1_retrieval.py src/auto_research/evidence_refs.py src/auto_research/direction_contracts.py src/auto_research/agents/literature.py src/auto_research/validators/s1_gate.py src/auto_research/stage_contracts.py
+uv run pytest -q tests/test_s1_retrieval.py tests/test_validators.py tests/test_stage_contracts.py
+uv run pytest -q tests/test_c2c.py
+```

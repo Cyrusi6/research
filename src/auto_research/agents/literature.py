@@ -25,7 +25,12 @@ from ..direction_contracts import (
     build_s1_evidence_retrieval_trace,
     normalize_novelty_audit,
 )
-from ..evidence_refs import evidence_ref_errors_for_repair, resolve_s1_evidence_refs
+from ..evidence_refs import (
+    direction_bundle_ref_errors_for_repair,
+    evidence_ref_errors_for_repair,
+    resolve_s1_evidence_refs,
+    validate_direction_refs_subset_of_bundle,
+)
 from ..importers import ConsensusImporter
 from ..itr_ideas import build_itr_theme_map, collect_consensus_entries, theme_map_markdown
 from ..failure_log import load_c2c_feedback_bundle
@@ -38,6 +43,12 @@ from ..s0_enrichment import (
     S0_CODE_SEMANTIC_ENRICHMENT_PROMPT_VERSION,
     S0_SEMANTIC_ENRICHMENT_PROMPT_VERSION,
     S0_SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
+)
+from ..s1_retrieval import (
+    default_c2c_evidence_request_plan,
+    normalize_c2c_evidence_request_plan,
+    retrieve_s1_c2c_requested_evidence,
+    validate_c2c_evidence_request_plan,
 )
 from ..utils import compact_markdown, now_utc, read_json, read_yaml, sanitize_filename, split_sentences, write_yaml
 from .base import AgentContext
@@ -557,6 +568,7 @@ class LiteratureAgent:
         debate_record = None
         debate_md_record = None
         constraints_record = None
+        evidence_request_plan_record = None
         evidence_requests_record = None
         evidence_bundle_record = None
         direction_record = None
@@ -617,14 +629,23 @@ class LiteratureAgent:
                         "blocked_reason": debate.get("blocked_reason") or debate.get("reason") or "S1 Codex evidence agent blocked",
                     }
             ideas = debate["selected_ideas"]
-            if debate.get("strategy") == "codex_resume_evidence_agent":
+            if debate.get("strategy") in {"codex_resume_evidence_agent", "codex_two_phase_evidence_direction"}:
+                if isinstance(debate.get("evidence_request_plan"), dict):
+                    evidence_request_plan_record = self.context.artifacts.write_json(
+                        self.stage_key,
+                        "c2c/evidence_request_plan.json",
+                        debate.get("evidence_request_plan", {}),
+                        artifact_type="c2c_s1_evidence_request_plan",
+                        summary="S1a requested evidence plan before deterministic C2C retrieval",
+                        source_paths=["intake/c2c/evidence_brief.json", "intake/c2c/chunk_index.json"],
+                    )
                 evidence_requests_record = self.context.artifacts.write_json(
                     self.stage_key,
                     "c2c/evidence_requests.json",
                     debate.get("evidence_requests", []),
                     artifact_type="c2c_s1_evidence_requests",
                     summary="S1 requested evidence before direction choice",
-                    source_paths=["intake/c2c/evidence_brief.json", "intake/c2c/chunk_index.json"],
+                    source_paths=[evidence_request_plan_record["path"] if evidence_request_plan_record else "intake/c2c/evidence_brief.json"],
                 )
                 evidence_bundle_record = self.context.artifacts.write_json(
                     self.stage_key,
@@ -697,6 +718,7 @@ class LiteratureAgent:
                     *(
                         [
                             evidence_requests_record["path"],
+                            *( [evidence_request_plan_record["path"]] if evidence_request_plan_record else [] ),
                             evidence_bundle_record["path"],
                             direction_record["path"],
                             evidence_session_record["path"],
@@ -783,6 +805,12 @@ class LiteratureAgent:
             source_paths=[root_direction_record["path"], root_novelty_record["path"], root_evidence_bundle_record["path"]],
         )
         root_evidence_ref_report = debate.get("evidence_ref_report") if isinstance(debate.get("evidence_ref_report"), dict) else resolve_s1_evidence_refs(self.context.project_root, root_direction_payload, mode="c2c")
+        root_direction_bundle_ref_report = (
+            debate.get("direction_bundle_ref_report")
+            if isinstance(debate.get("direction_bundle_ref_report"), dict)
+            else validate_direction_refs_subset_of_bundle(root_direction_payload, root_evidence_bundle)
+        )
+        root_deterministic_trace = debate.get("evidence_retrieval_trace") if isinstance(debate.get("evidence_retrieval_trace"), dict) and debate.get("evidence_retrieval_trace", {}).get("deterministic") is True else None
         root_quality_artifacts = _build_c2c_s1_quality_artifacts(
             project_root=self.context.project_root,
             payload=root_direction_payload,
@@ -790,7 +818,9 @@ class LiteratureAgent:
             evidence_bundle=root_evidence_bundle,
             evidence_ref_report=root_evidence_ref_report,
             novelty_audit=root_novelty_audit,
-            shared_memory_checked=bool(debate.get("strategy") == "codex_resume_evidence_agent" or root_direction_payload.get("used_shared_memory_refs")),
+            shared_memory_checked=bool(debate.get("strategy") in {"codex_resume_evidence_agent", "codex_two_phase_evidence_direction"} or root_direction_payload.get("used_shared_memory_refs")),
+            direction_bundle_ref_report=root_direction_bundle_ref_report,
+            deterministic_trace=root_deterministic_trace,
         )
         direction_fingerprint_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -874,6 +904,7 @@ class LiteratureAgent:
                 *(
                     [
                         evidence_requests_record["path"],
+                        *( [evidence_request_plan_record["path"]] if evidence_request_plan_record else [] ),
                         evidence_bundle_record["path"],
                         direction_record["path"],
                         evidence_session_record["path"],
@@ -936,6 +967,7 @@ class LiteratureAgent:
                 *(
                     [
                         evidence_requests_record["path"],
+                        *( [evidence_request_plan_record["path"]] if evidence_request_plan_record else [] ),
                         evidence_bundle_record["path"],
                         direction_record["path"],
                         evidence_session_record["path"],
@@ -1073,39 +1105,7 @@ class LiteratureAgent:
         rebuttal_matrix: dict[str, Any],
         feedback: list[dict[str, Any]],
     ) -> dict[str, Any]:
-        cfg = _s1_codex_agent_config(self.context.config)
-        result = _run_s1_codex_evidence_agent(
-            project_root=self.context.project_root,
-            config=self.context.config,
-            prompt=_s1_codex_evidence_prompt(
-                topic=topic,
-                evidence_brief=evidence_brief,
-                chunk_index=chunk_index,
-                code_intake_report=code_intake_report,
-                implementation_surface_map=implementation_surface_map,
-                code_retrieval_index=code_retrieval_index,
-                baseline=baseline,
-                negative_memory=negative_memory,
-                rebuttal_matrix=rebuttal_matrix,
-                feedback=feedback,
-                config=self.context.config,
-            ),
-            max_repairs=int(cfg.get("max_json_repairs") or 2),
-            timeout_seconds=int(cfg.get("timeout_seconds") or (self.context.config.get("llm", {}) or {}).get("timeout_seconds") or 1800),
-            mode="c2c",
-        )
-        if result.get("status") != "ok":
-            return {
-                "status": "blocked",
-                "strategy": "codex_resume_evidence_agent",
-                "blocked_reason": result.get("reason") or "S1 Codex evidence agent did not return valid JSON.",
-                "evidence_session": result,
-                "selected_ideas": [],
-                "negative_constraints": {},
-            }
-        payload = result.get("payload") if isinstance(result.get("payload"), dict) else {}
-        evidence_requests = payload.get("evidence_requests") if isinstance(payload.get("evidence_requests"), list) else []
-        evidence_bundle = payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {"items": []}
+        two_phase_cfg = _c2c_s1_two_phase_config(self.context.config)
         shared_memory = shared_method_memory_for_prompt(
             self.context.config,
             limit=12,
@@ -1117,14 +1117,100 @@ class LiteratureAgent:
                 negative_memory=negative_memory,
             ),
         )
+        retrieval_feedback: list[str] = []
+        request_result: dict[str, Any] = {}
+        evidence_bundle: dict[str, Any] = {}
+        deterministic_trace: dict[str, Any] = {}
+        max_request_rounds = int(two_phase_cfg.get("max_request_revision_rounds") or 1)
+        for request_round in range(max_request_rounds + 1):
+            request_result = _run_s1_c2c_evidence_request_agent(
+                project_root=self.context.project_root,
+                config=self.context.config,
+                topic=topic,
+                evidence_brief=evidence_brief,
+                chunk_index=chunk_index,
+                code_intake_report=code_intake_report,
+                implementation_surface_map=implementation_surface_map,
+                code_retrieval_index=code_retrieval_index,
+                baseline=baseline,
+                negative_memory=negative_memory,
+                rebuttal_matrix=rebuttal_matrix,
+                feedback=feedback,
+                shared_memory=shared_memory,
+                retrieval_feedback=retrieval_feedback,
+            )
+            if request_result.get("status") != "ok":
+                return _blocked_c2c_two_phase_result(
+                    reason=request_result.get("reason") or "S1a evidence request agent did not return valid request plan.",
+                    phases=[request_result],
+                )
+            request_plan = request_result.get("evidence_request_plan") if isinstance(request_result.get("evidence_request_plan"), dict) else default_c2c_evidence_request_plan(topic=topic)
+            evidence_bundle, deterministic_trace = retrieve_s1_c2c_requested_evidence(
+                request_plan,
+                chunk_index=chunk_index,
+                paper_chunks=paper_chunks,
+                rebuttal_chunks=rebuttal_chunks,
+                code_chunks=code_chunks,
+                code_edges=code_edges,
+                code_retrieval_index=code_retrieval_index,
+                implementation_surface_map=implementation_surface_map,
+                negative_memory=negative_memory,
+                feedback=feedback,
+                shared_memory=shared_memory,
+                config=self.context.config,
+            )
+            retrieval_feedback = _s1b_retrieval_blockers(deterministic_trace)
+            if not retrieval_feedback:
+                break
+            if request_round >= max_request_rounds:
+                return _blocked_c2c_two_phase_result(
+                    reason="S1b deterministic retriever could not satisfy required C2C evidence coverage.",
+                    phases=[
+                        request_result,
+                        {
+                            "phase": "deterministic_retriever",
+                            "status": "blocked",
+                            "retrieval_trace": deterministic_trace,
+                            "validation_errors": retrieval_feedback,
+                        },
+                    ],
+                )
+
+        direction_result = _run_s1_c2c_direction_agent(
+            project_root=self.context.project_root,
+            config=self.context.config,
+            topic=topic,
+            baseline=baseline,
+            negative_memory=negative_memory,
+            feedback=feedback,
+            evidence_bundle=evidence_bundle,
+            retrieval_trace=deterministic_trace,
+            shared_memory=shared_memory,
+        )
+        if direction_result.get("status") != "ok":
+            return _blocked_c2c_two_phase_result(
+                reason=direction_result.get("reason") or "S1c direction agent did not return valid direction JSON.",
+                phases=[request_result, {"phase": "deterministic_retriever", "status": "ok", "retrieval_trace": deterministic_trace}, direction_result],
+            )
+        payload = direction_result.get("payload") if isinstance(direction_result.get("payload"), dict) else {}
+        evidence_requests = (request_result.get("evidence_request_plan") or {}).get("evidence_requests") if isinstance(request_result.get("evidence_request_plan"), dict) else []
+        payload = dict(payload)
+        payload["evidence_requests"] = evidence_requests
+        payload["evidence_bundle"] = evidence_bundle
         used_shared_memory_refs = collect_used_shared_memory_refs(payload, shared_memory)
+        payload["used_shared_memory_refs"] = used_shared_memory_refs
+        payload["s1_agent_source"] = "codex_two_phase_direction_agent"
         direction_decision = dict(payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {})
         direction_decision["used_shared_memory_refs"] = used_shared_memory_refs
         selected_ideas = _s1_codex_direction_cards(payload, used_shared_memory_refs=used_shared_memory_refs)
-        _attach_s1_novelty_audit_to_ideas(selected_ideas, result.get("novelty_audits", []))
+        _attach_s1_novelty_audit_to_ideas(selected_ideas, direction_result.get("novelty_audits", []))
         negative_constraints = payload.get("negative_constraints") if isinstance(payload.get("negative_constraints"), dict) else {}
         negative_constraints["used_shared_memory_refs"] = used_shared_memory_refs
-        evidence_ref_report = result.get("evidence_ref_report") or resolve_s1_evidence_refs(self.context.project_root, payload, mode="c2c")
+        payload["direction_decision"] = direction_decision
+        payload["selected_ideas"] = selected_ideas
+        payload["negative_constraints"] = negative_constraints
+        evidence_ref_report = resolve_s1_evidence_refs(self.context.project_root, payload, mode="c2c")
+        direction_bundle_ref_report = validate_direction_refs_subset_of_bundle(payload, evidence_bundle)
         decision_chain = payload.get("decision_chain") if isinstance(payload.get("decision_chain"), dict) else direction_decision.get("decision_chain")
         if not isinstance(decision_chain, dict):
             decision_chain = _s1_codex_decision_chain(payload, selected_ideas)
@@ -1133,39 +1219,43 @@ class LiteratureAgent:
         direction_payload["selected_ideas"] = selected_ideas
         direction_payload["negative_constraints"] = negative_constraints
         direction = build_direction_contract(direction_payload, mode="c2c", used_shared_memory_refs=used_shared_memory_refs)
-        novelty_audit = normalize_novelty_audit(result.get("novelty_audits", []), direction_id=str(direction.get("direction_id") or ""))
-        quality_artifacts = {
-            "evidence_quality_score": result.get("evidence_quality_score"),
-            "evidence_retrieval_trace": result.get("evidence_retrieval_trace"),
-            "direction_fingerprint": result.get("direction_fingerprint"),
-        }
-        if not all(isinstance(value, dict) for value in quality_artifacts.values()):
-            quality_artifacts = _build_c2c_s1_quality_artifacts(
-                project_root=self.context.project_root,
-                payload=direction_payload,
-                direction=direction,
-                evidence_bundle=evidence_bundle,
-                evidence_ref_report=evidence_ref_report,
-                novelty_audit=novelty_audit,
-                shared_memory_checked=True,
-            )
+        novelty_audit = normalize_novelty_audit(direction_result.get("novelty_audits", []), direction_id=str(direction.get("direction_id") or ""))
+        quality_artifacts = _build_c2c_s1_quality_artifacts(
+            project_root=self.context.project_root,
+            payload=direction_payload,
+            direction=direction,
+            evidence_bundle=evidence_bundle,
+            evidence_ref_report=evidence_ref_report,
+            novelty_audit=novelty_audit,
+            shared_memory_checked=True,
+            direction_bundle_ref_report=direction_bundle_ref_report,
+            deterministic_trace=deterministic_trace,
+        )
+        evidence_session = _c2c_two_phase_session(
+            request_result=request_result,
+            deterministic_trace=deterministic_trace,
+            direction_result=direction_result,
+            quality_artifacts=quality_artifacts,
+            used_shared_memory_refs=used_shared_memory_refs,
+        )
         return {
             "status": "ok",
-            "strategy": "codex_resume_evidence_agent",
-            "roles": ["codex_evidence_agent"],
+            "strategy": "codex_two_phase_evidence_direction",
+            "roles": ["evidence_request_agent", "deterministic_retriever", "direction_agent"],
             "rounds": [],
             "meta_judge": {
-                "role": "codex_evidence_agent",
+                "role": "direction_agent",
                 "status": "ok",
-                "session_id": result.get("session_id"),
+                "session_id": direction_result.get("session_id"),
                 "decision_chain": decision_chain,
                 "decision_rationale": direction_decision.get("rationale") or direction_decision.get("why_this_direction") or decision_chain.get("conclusion"),
             },
             "decision_chain": decision_chain,
+            "evidence_request_plan": request_result.get("evidence_request_plan"),
             "direction_decision": direction_decision,
             "direction": direction,
             "direction_scorecard": build_direction_scorecard(direction, evidence_bundle=evidence_bundle, novelty_audit=novelty_audit),
-            "novelty_audits": result.get("novelty_audits", []),
+            "novelty_audits": direction_result.get("novelty_audits", []),
             "novelty_audit": novelty_audit,
             "selected_ideas": selected_ideas,
             "negative_constraints": negative_constraints,
@@ -1173,25 +1263,13 @@ class LiteratureAgent:
             "evidence_requests": evidence_requests,
             "evidence_bundle": evidence_bundle,
             "evidence_ref_report": evidence_ref_report,
+            "direction_bundle_ref_report": direction_bundle_ref_report,
             "evidence_quality_score": quality_artifacts.get("evidence_quality_score"),
             "evidence_retrieval_trace": quality_artifacts.get("evidence_retrieval_trace"),
             "direction_fingerprint": quality_artifacts.get("direction_fingerprint"),
-            "evidence_session": {
-                "schema_version": "c2c_s1_codex_evidence_session_v1",
-                "status": "ok",
-                "session_key": result.get("session_key"),
-                "session_id": result.get("session_id"),
-                "used_existing_session": result.get("used_existing_session"),
-                "attempts": result.get("attempts", []),
-                "repair_count": result.get("repair_count", 0),
-                "novelty_audits": result.get("novelty_audits", []),
-                "session_reset": result.get("session_reset"),
-                "session_reset_reason": result.get("session_reset_reason"),
-                "used_shared_memory_refs": used_shared_memory_refs,
-                "source": "codex_cli",
-            },
+            "evidence_session": evidence_session,
             "quality_flags": [],
-            "run_log": {"progress_path": "literature/c2c/evidence_session.json", "events": result.get("attempts", [])},
+            "run_log": {"progress_path": "literature/c2c/evidence_session.json", "events": evidence_session.get("attempts", [])},
         }
 
     def _run_related_work_audit(self) -> dict[str, Any]:
@@ -1853,6 +1931,45 @@ def _s1_codex_agent_config(config: dict[str, Any], *, mode: str = "c2c") -> dict
     return cfg
 
 
+def _c2c_s1_two_phase_config(config: dict[str, Any]) -> dict[str, Any]:
+    raw = (((config.get("ideation") or {}).get("c2c_s1_two_phase") or {}) if isinstance(config.get("ideation"), dict) else {})
+    raw = raw if isinstance(raw, dict) else {}
+    llm_timeout = int((config.get("llm", {}) or {}).get("timeout_seconds") or 900)
+    request_raw = raw.get("request_agent") if isinstance(raw.get("request_agent"), dict) else {}
+    direction_raw = raw.get("direction_agent") if isinstance(raw.get("direction_agent"), dict) else {}
+    retriever_raw = raw.get("retriever") if isinstance(raw.get("retriever"), dict) else {}
+    return {
+        "enabled": bool(raw.get("enabled", True)),
+        "max_request_revision_rounds": int(raw.get("max_request_revision_rounds") or 1),
+        "request_agent": {
+            "session_key": request_raw.get("session_key") or "s1:c2c_evidence_request",
+            "max_json_repairs": int(request_raw.get("max_json_repairs") or ((_s1_codex_agent_config(config, mode="c2c").get("max_json_repairs") or 2))),
+            "timeout_seconds": int(request_raw.get("timeout_seconds") or llm_timeout),
+            "resume_enabled": bool(request_raw.get("resume_enabled", True)),
+            "sandbox": request_raw.get("sandbox") or "read-only",
+            "approval_policy": request_raw.get("approval_policy") or "never",
+            "json_events": bool(request_raw.get("json_events", True)),
+            "model": request_raw.get("model"),
+        },
+        "retriever": {
+            "top_k_per_request": int(retriever_raw.get("top_k_per_request") or 2),
+            "min_score": float(retriever_raw.get("min_score") or 0.0),
+            "max_total_items": int(retriever_raw.get("max_total_items") or 12),
+            "require_deterministic_bundle": bool(retriever_raw.get("require_deterministic_bundle", True)),
+        },
+        "direction_agent": {
+            "session_key": direction_raw.get("session_key") or "s1:c2c_direction_decision",
+            "max_json_repairs": int(direction_raw.get("max_json_repairs") or ((_s1_codex_agent_config(config, mode="c2c").get("max_json_repairs") or 2))),
+            "timeout_seconds": int(direction_raw.get("timeout_seconds") or llm_timeout),
+            "resume_enabled": bool(direction_raw.get("resume_enabled", True)),
+            "sandbox": direction_raw.get("sandbox") or "read-only",
+            "approval_policy": direction_raw.get("approval_policy") or "never",
+            "json_events": bool(direction_raw.get("json_events", True)),
+            "model": direction_raw.get("model"),
+        },
+    }
+
+
 def _s1_codex_evidence_prompt(
     *,
     topic: str,
@@ -2148,6 +2265,517 @@ def _generic_s1_codex_evidence_prompt(
     )
 
 
+def _run_s1_c2c_evidence_request_agent(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+    topic: str,
+    evidence_brief: dict[str, Any],
+    chunk_index: dict[str, Any],
+    code_intake_report: dict[str, Any],
+    implementation_surface_map: dict[str, Any],
+    code_retrieval_index: dict[str, Any],
+    baseline: dict[str, Any],
+    negative_memory: dict[str, Any],
+    rebuttal_matrix: dict[str, Any],
+    feedback: list[dict[str, Any]],
+    shared_memory: dict[str, Any],
+    retrieval_feedback: list[str] | None = None,
+) -> dict[str, Any]:
+    cfg = _c2c_s1_two_phase_config(config)
+    agent_cfg = dict(cfg.get("request_agent") or {})
+    session_key = str(agent_cfg.get("session_key") or "s1:c2c_evidence_request")
+    if not shutil.which("codex"):
+        return {"status": "blocked", "phase": "evidence_request_agent", "reason": "codex executable not found", "session_key": session_key, "attempts": []}
+    session_record = _load_s1_codex_session_record(project_root, session_key)
+    session_id = _session_id_from_record(session_record) if agent_cfg.get("resume_enabled", True) else None
+    attempts: list[dict[str, Any]] = []
+    validation_errors: list[str] = []
+    previous_output = ""
+    previous_status = ""
+    for attempt_idx in range(max(1, int(agent_cfg.get("max_json_repairs") or 2) + 1)):
+        prompt = (
+            _s1_c2c_json_repair_prompt("evidence_request_agent", validation_errors, previous_output, previous_status)
+            if attempt_idx > 0
+            else _s1_c2c_evidence_request_prompt(
+                topic=topic,
+                evidence_brief=evidence_brief,
+                chunk_index=chunk_index,
+                code_intake_report=code_intake_report,
+                implementation_surface_map=implementation_surface_map,
+                code_retrieval_index=code_retrieval_index,
+                baseline=baseline,
+                negative_memory=negative_memory,
+                rebuttal_matrix=rebuttal_matrix,
+                feedback=feedback,
+                shared_memory=shared_memory,
+                retrieval_feedback=retrieval_feedback or [],
+            )
+        )
+        call = _run_s1_codex_cli_once(
+            project_root=project_root,
+            config=config,
+            session_key=session_key,
+            session_id=session_id,
+            prompt=prompt,
+            timeout_seconds=int(agent_cfg.get("timeout_seconds") or (config.get("llm", {}) or {}).get("timeout_seconds") or 900),
+            repair_attempt=attempt_idx > 0,
+            attempt=attempt_idx + 1,
+            mode="c2c",
+            task_prefix="Follow this task exactly. You are S1a evidence_request_agent. Do not choose a direction. Return only valid JSON.",
+            agent_config={**_s1_codex_agent_config(config, mode="c2c"), **agent_cfg, "session_key": session_key},
+        )
+        if call.get("session_id"):
+            session_id = str(call["session_id"])
+        attempts.append(_s1_codex_attempt_summary(call))
+        payload = call.get("payload") if isinstance(call.get("payload"), dict) else None
+        if call.get("status") == "ok" and payload is not None:
+            plan = normalize_c2c_evidence_request_plan(payload, topic=topic)
+            validation_errors = validate_c2c_evidence_request_plan(plan)
+            if not validation_errors:
+                return {
+                    "status": "ok",
+                    "phase": "evidence_request_agent",
+                    "evidence_request_plan": plan,
+                    "session_key": session_key,
+                    "session_id": session_id,
+                    "repair_count": attempt_idx,
+                    "attempts": attempts,
+                }
+            previous_status = "contract_invalid"
+        else:
+            validation_errors = [str(call.get("reason") or "codex output invalid")]
+            previous_status = str(call.get("status") or "invalid")
+            if call.get("failure_category"):
+                return _s1_codex_backend_blocked_result(
+                    session_key=session_key,
+                    session_id=session_id,
+                    used_existing_session=bool(session_record),
+                    repair_count=attempt_idx,
+                    attempts=attempts,
+                    novelty_audits=[],
+                    reset_info=None,
+                    call=call,
+                    validation_errors=validation_errors,
+                )
+        previous_output = json.dumps(payload if payload is not None else call.get("raw_text") or call.get("reason") or "", ensure_ascii=False)[-4000:]
+    return {
+        "status": "blocked",
+        "phase": "evidence_request_agent",
+        "reason": "S1a evidence request agent did not return a valid request plan",
+        "session_key": session_key,
+        "session_id": session_id,
+        "repair_count": max(0, len(attempts) - 1),
+        "attempts": attempts,
+        "validation_errors": validation_errors,
+    }
+
+
+def _run_s1_c2c_direction_agent(
+    *,
+    project_root: Path,
+    config: dict[str, Any],
+    topic: str,
+    baseline: dict[str, Any],
+    negative_memory: dict[str, Any],
+    feedback: list[dict[str, Any]],
+    evidence_bundle: dict[str, Any],
+    retrieval_trace: dict[str, Any],
+    shared_memory: dict[str, Any],
+) -> dict[str, Any]:
+    cfg = _c2c_s1_two_phase_config(config)
+    agent_cfg = dict(cfg.get("direction_agent") or {})
+    novelty_cfg = _s1_novelty_auditor_config(config, mode="c2c")
+    session_key = str(agent_cfg.get("session_key") or "s1:c2c_direction_decision")
+    if not shutil.which("codex"):
+        return {"status": "blocked", "phase": "direction_agent", "reason": "codex executable not found", "session_key": session_key, "attempts": []}
+    session_record = _load_s1_codex_session_record(project_root, session_key)
+    session_id = _session_id_from_record(session_record) if agent_cfg.get("resume_enabled", True) else None
+    attempts: list[dict[str, Any]] = []
+    validation_errors: list[str] = []
+    previous_output = ""
+    previous_status = ""
+    novelty_audits: list[dict[str, Any]] = []
+    total_attempts = max(1, int(agent_cfg.get("max_json_repairs") or 2) + 1)
+    total_attempts += max(0, int(novelty_cfg.get("max_revision_rounds") or 0)) if novelty_cfg.get("enabled") else 0
+    for attempt_idx in range(total_attempts):
+        if attempt_idx > 0 and previous_status == "novelty_rejected":
+            prompt = previous_output
+        elif attempt_idx > 0:
+            prompt = _s1_c2c_json_repair_prompt("direction_agent", validation_errors, previous_output, previous_status)
+        else:
+            prompt = _s1_c2c_direction_prompt(
+                topic=topic,
+                baseline=baseline,
+                negative_memory=negative_memory,
+                feedback=feedback,
+                evidence_bundle=evidence_bundle,
+                retrieval_trace=retrieval_trace,
+                shared_memory=shared_memory,
+            )
+        call = _run_s1_codex_cli_once(
+            project_root=project_root,
+            config=config,
+            session_key=session_key,
+            session_id=session_id,
+            prompt=prompt,
+            timeout_seconds=int(agent_cfg.get("timeout_seconds") or (config.get("llm", {}) or {}).get("timeout_seconds") or 1200),
+            repair_attempt=attempt_idx > 0,
+            attempt=attempt_idx + 1,
+            mode="c2c",
+            task_prefix="Follow this task exactly. You are S1c direction_agent. Use only evidence_bundle refs. Return only valid JSON.",
+            agent_config={**_s1_codex_agent_config(config, mode="c2c"), **agent_cfg, "session_key": session_key},
+        )
+        if call.get("session_id"):
+            session_id = str(call["session_id"])
+        attempts.append(_s1_codex_attempt_summary(call))
+        payload = call.get("payload") if isinstance(call.get("payload"), dict) else None
+        if call.get("status") == "ok" and payload is not None:
+            validation_errors = _validate_s1_c2c_direction_payload(payload, evidence_bundle=evidence_bundle)
+            if not validation_errors:
+                novelty_payload = {**payload, "evidence_bundle": evidence_bundle}
+                novelty_audit = _run_s1_novelty_auditor(project_root=project_root, config=config, payload=novelty_payload, shared_memory=shared_memory, mode="c2c")
+                novelty_audits.append(novelty_audit)
+                if not novelty_audit.get("passed", True):
+                    validation_errors = ["s1_novelty_audit_rejected: direction too similar to prior ideas or memories"]
+                    previous_status = "novelty_rejected"
+                    previous_output = _s1_revision_feedback_prompt(novelty_audit.get("audit") or novelty_audit, payload, mode="c2c")
+                    continue
+                return {
+                    "status": "ok",
+                    "phase": "direction_agent",
+                    "payload": payload,
+                    "session_key": session_key,
+                    "session_id": session_id,
+                    "repair_count": attempt_idx,
+                    "attempts": attempts,
+                    "novelty_audits": novelty_audits,
+                }
+            previous_status = "contract_invalid"
+        else:
+            validation_errors = [str(call.get("reason") or "codex output invalid")]
+            previous_status = str(call.get("status") or "invalid")
+            if call.get("failure_category"):
+                return _s1_codex_backend_blocked_result(
+                    session_key=session_key,
+                    session_id=session_id,
+                    used_existing_session=bool(session_record),
+                    repair_count=attempt_idx,
+                    attempts=attempts,
+                    novelty_audits=novelty_audits,
+                    reset_info=None,
+                    call=call,
+                    validation_errors=validation_errors,
+                )
+        previous_output = json.dumps(payload if payload is not None else call.get("raw_text") or call.get("reason") or "", ensure_ascii=False)[-4000:]
+    return {
+        "status": "blocked",
+        "phase": "direction_agent",
+        "reason": "S1c direction agent did not return valid bundle-grounded direction JSON",
+        "session_key": session_key,
+        "session_id": session_id,
+        "repair_count": max(0, len(attempts) - 1),
+        "attempts": attempts,
+        "novelty_audits": novelty_audits,
+        "validation_errors": validation_errors,
+    }
+
+
+def _s1_c2c_evidence_request_prompt(
+    *,
+    topic: str,
+    evidence_brief: dict[str, Any],
+    chunk_index: dict[str, Any],
+    code_intake_report: dict[str, Any],
+    implementation_surface_map: dict[str, Any],
+    code_retrieval_index: dict[str, Any],
+    baseline: dict[str, Any],
+    negative_memory: dict[str, Any],
+    rebuttal_matrix: dict[str, Any],
+    feedback: list[dict[str, Any]],
+    shared_memory: dict[str, Any],
+    retrieval_feedback: list[str],
+) -> str:
+    output_contract = default_c2c_evidence_request_plan(topic=topic)
+    context_payload = {
+        "schema_version": "c2c_s1a_evidence_request_context_v1",
+        "topic": topic,
+        "task": "Create evidence requests only. Do not choose a research direction.",
+        "baseline": _compact_json_value(baseline, max_chars=3000),
+        "evidence_brief": _compact_json_value(evidence_brief, max_chars=6000),
+        "chunk_catalog_summary": _compact_json_value(_summarize_chunk_index_for_prompt(chunk_index), max_chars=6000),
+        "code_intake_summary": _compact_json_value(code_intake_report, max_chars=3500),
+        "implementation_surface_summary": _compact_json_value(implementation_surface_map, max_chars=3500),
+        "code_retrieval_summary": _compact_json_value(code_retrieval_index, max_chars=3000),
+        "negative_memory_summary": _compact_json_value(negative_memory, max_chars=3500),
+        "rebuttal_matrix_summary": _compact_json_value(rebuttal_matrix, max_chars=3500),
+        "method_feedback_summary": _compact_json_value(feedback[:8], max_chars=4500),
+        "shared_method_memory_summary": _compact_json_value(shared_memory, max_chars=4500),
+        "retrieval_feedback_to_fix": retrieval_feedback,
+        "available_source_types": ["paper", "rebuttal", "code", "failure_memory", "feedback"],
+    }
+    return "\n\n".join(
+        [
+            "You are S1a evidence_request_agent.",
+            "You are not a direction selection agent.",
+            "You must only produce an evidence request plan.",
+            "Do not output direction_decision, selected_ideas, evidence_bundle, expected_files, or any research direction.",
+            "Requests should cover paper support, code implementation surface, counterevidence, and failure memory when available.",
+            "Return only one valid JSON object.",
+            "Context JSON:",
+            json.dumps(context_payload, ensure_ascii=False, indent=2),
+            "Required JSON shape:",
+            json.dumps(output_contract, ensure_ascii=False, indent=2),
+        ]
+    )
+
+
+def _s1_c2c_direction_prompt(
+    *,
+    topic: str,
+    baseline: dict[str, Any],
+    negative_memory: dict[str, Any],
+    feedback: list[dict[str, Any]],
+    evidence_bundle: dict[str, Any],
+    retrieval_trace: dict[str, Any],
+    shared_memory: dict[str, Any],
+) -> str:
+    evidence_items = [
+        {
+            "evidence_id": item.get("evidence_id"),
+            "request_id": item.get("request_id"),
+            "source_type": item.get("source_type"),
+            "purpose": item.get("purpose"),
+            "ref": item.get("ref"),
+            "excerpt": item.get("excerpt") or item.get("text") or item.get("summary"),
+            "score": item.get("score"),
+        }
+        for item in (evidence_bundle.get("items") or [])
+        if isinstance(item, dict)
+    ]
+    allowed_refs = [item.get("ref") for item in evidence_items if isinstance(item.get("ref"), dict)]
+    output_contract = {
+        "schema_version": "c2c_s1_direction_agent_v1",
+        "status": "ok",
+        "direction_decision": {
+            "direction_id": "stable snake_case id",
+            "mechanism_direction": "human-readable high-level direction",
+            "mechanism_type": "mechanism family",
+            "mechanism_axis": "routing|alignment|normalization|training_signal|scoring",
+            "integration_point": "wrapper|aligner|projector|train_loss|recipe",
+            "control_signal": "signal S2 should manipulate",
+            "core_hypothesis": "one high-level mechanism hypothesis",
+            "why_baseline_fails": "why baseline misses this effect",
+            "why_this_direction": "why bundle evidence supports this direction",
+            "expected_metric_signature": {"primary_metric": "three_dataset_mean", "expected_direction": "increase", "diagnostics": []},
+            "required_evidence_refs": ["must be copied exactly from allowed_refs"],
+            "counterevidence_refs": ["must be copied exactly from allowed_refs and support counterevidence"],
+            "implementation_surface_refs": ["must be copied exactly from allowed_refs with source_type=code"],
+            "expected_files": ["files covered by code refs only"],
+            "allowed_variants": ["broad S2 variant families"],
+            "forbidden_patterns": ["patterns S2 should avoid"],
+            "failure_routing_hints": ["when S2/S3 should return to S1"],
+            "s2_affordance": "what S2 can instantiate from this direction",
+            "verification_commands": ["py_compile", "small2048_train", "three_dataset_eval"],
+            "target_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+            "failure_focus": ["diagnostics to watch"],
+            "used_shared_memory_refs": ["memory ids if used, or []"],
+        },
+        "selected_ideas": [
+            {
+                "id": "same as direction_id",
+                "title": "same high-level direction",
+                "selected": True,
+                "hypothesis": "same core hypothesis",
+                "novelty_score": 7,
+                "feasibility_score": 7,
+                "mechanism_type": "same mechanism family",
+                "description": "high-level direction only; S2 creates concrete variants",
+                "motivation": "why S2 should plan this direction",
+                "reviewer_risk_response": "how S2/S3 should watch counterevidence",
+                "expected_files": ["code files covered by code_refs"],
+                "verification_commands": ["py_compile", "small2048_train", "three_dataset_eval"],
+                "evidence_refs": ["refs copied exactly from allowed_refs"],
+                "counterevidence_refs": ["refs copied exactly from allowed_refs"],
+                "code_refs": ["code refs copied exactly from allowed_refs"],
+                "s1_allowed_variants": ["broad S2 families"],
+                "s1_forbidden_patterns": ["patterns to avoid"],
+                "used_shared_memory_refs": ["memory ids if used, or []"],
+            }
+        ],
+        "negative_constraints": {"forbidden_idea_ids": [], "forbidden_patterns": [], "failure_feedback_rules": []},
+        "decision_chain": {"evidence": ["evidence_id values"], "counterevidence": ["evidence_id values"], "conclusion": "one sentence"},
+    }
+    context_payload = {
+        "schema_version": "c2c_s1c_direction_context_v1",
+        "topic": topic,
+        "baseline": _compact_json_value(baseline, max_chars=3000),
+        "negative_memory_summary": _compact_json_value(negative_memory, max_chars=3500),
+        "feedback_summary": _compact_json_value(feedback[:8], max_chars=4500),
+        "shared_method_memory_summary": _compact_json_value(shared_memory, max_chars=4500),
+        "evidence_bundle": {"producer": evidence_bundle.get("producer"), "retriever_version": evidence_bundle.get("retriever_version"), "items": evidence_items},
+        "retrieval_trace_coverage": _compact_json_value({key: retrieval_trace.get(key) for key in ["coverage", "candidate_counts", "unfilled_must_resolve_requests", "request_plan_id"]}, max_chars=4500),
+        "allowed_refs": allowed_refs,
+    }
+    return "\n\n".join(
+        [
+            "You are S1c direction_agent.",
+            "You can only choose a high-level research direction from the supplied deterministic evidence_bundle.",
+            "You must not output evidence_requests or evidence_bundle.",
+            "You must not invent refs, papers, code facts, rebuttal facts, or failure memories outside evidence_bundle.items.",
+            "All evidence_refs, counterevidence_refs, and code_refs must be copied exactly from allowed_refs.",
+            "If evidence is insufficient, return status=insufficient_evidence with no selected_ideas instead of inventing evidence.",
+            "expected_files must be covered by code_refs from evidence_bundle.",
+            "Return only one valid JSON object.",
+            "Context JSON:",
+            json.dumps(context_payload, ensure_ascii=False, indent=2),
+            "Required JSON shape:",
+            json.dumps(output_contract, ensure_ascii=False, indent=2),
+        ]
+    )
+
+
+def _validate_s1_c2c_direction_payload(payload: dict[str, Any], *, evidence_bundle: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if not isinstance(payload, dict):
+        return ["direction output must be an object"]
+    for field in ["evidence_requests", "evidence_bundle"]:
+        if field in payload:
+            errors.append(f"direction_agent must not output {field}")
+    if str(payload.get("status") or "ok").lower() not in {"ok", "direction_selected"}:
+        errors.append("status must be ok or direction_selected")
+    decision = payload.get("direction_decision")
+    if not isinstance(decision, dict) or not decision:
+        errors.append("direction_decision must be a non-empty object")
+    else:
+        for field in ["direction_id", "mechanism_direction", "mechanism_type", "mechanism_axis", "integration_point", "control_signal", "core_hypothesis", "why_baseline_fails", "why_this_direction", "expected_files"]:
+            if decision.get(field) in (None, "", []):
+                errors.append(f"direction_decision missing {field}")
+        for field in ["required_evidence_refs", "counterevidence_refs", "implementation_surface_refs"]:
+            if not isinstance(decision.get(field), list) or not decision.get(field):
+                errors.append(f"direction_decision.{field} must be a non-empty list")
+    ideas = payload.get("selected_ideas")
+    if not isinstance(ideas, list) or len(ideas) != 1:
+        errors.append("selected_ideas must contain exactly one high-level direction card")
+    else:
+        idea = ideas[0]
+        if not isinstance(idea, dict):
+            errors.append("selected_ideas[0] must be an object")
+        else:
+            for field in ["id", "title", "hypothesis", "novelty_score", "feasibility_score", "expected_files", "verification_commands", "evidence_refs", "counterevidence_refs", "code_refs", "reviewer_risk_response", "mechanism_type"]:
+                if idea.get(field) in (None, "", []):
+                    errors.append(f"selected_ideas[0] missing {field}")
+    if not isinstance(payload.get("negative_constraints"), dict):
+        errors.append("negative_constraints must be an object")
+    if not errors:
+        report = validate_direction_refs_subset_of_bundle(payload, evidence_bundle)
+        if report.get("status") != "pass":
+            errors.extend(direction_bundle_ref_errors_for_repair(report))
+    return errors
+
+
+def _s1_c2c_json_repair_prompt(role: str, validation_errors: list[str], previous_output: str, previous_status: str) -> str:
+    return "\n\n".join(
+        [
+            f"You are repairing S1 {role} JSON only.",
+            f"Previous status: {previous_status or 'invalid'}",
+            "Validation errors:",
+            json.dumps(validation_errors[:20], ensure_ascii=False, indent=2),
+            "Previous output tail:",
+            str(previous_output)[-3000:],
+            "Return one corrected JSON object. Do not include markdown or prose.",
+        ]
+    )
+
+
+def _s1b_retrieval_blockers(trace: dict[str, Any]) -> list[str]:
+    coverage = trace.get("coverage") if isinstance(trace.get("coverage"), dict) else {}
+    blockers = []
+    for item in trace.get("unfilled_must_resolve_requests") or []:
+        if isinstance(item, dict):
+            blockers.append(f"unfilled_must_resolve_request:{item.get('request_id')}")
+    if int(coverage.get("paper") or 0) < 2:
+        blockers.append("retrieval_coverage.paper<2")
+    if int(coverage.get("code") or 0) < 2:
+        blockers.append("retrieval_coverage.code<2")
+    if int(coverage.get("counterevidence") or 0) < 1:
+        blockers.append("retrieval_coverage.counterevidence<1")
+    return blockers
+
+
+def _blocked_c2c_two_phase_result(*, reason: str, phases: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "status": "blocked",
+        "strategy": "codex_two_phase_evidence_direction",
+        "blocked_reason": reason,
+        "evidence_session": {
+            "schema_version": "c2c_s1_two_phase_session_v1",
+            "status": "blocked",
+            "source": "codex_cli_and_deterministic_retriever",
+            "phases": phases,
+            "attempts": [attempt for phase in phases for attempt in (phase.get("attempts") or []) if isinstance(phase, dict)],
+            "repair_count": sum(int(phase.get("repair_count") or 0) for phase in phases if isinstance(phase, dict)),
+            "reason": reason,
+        },
+        "selected_ideas": [],
+        "negative_constraints": {},
+    }
+
+
+def _c2c_two_phase_session(
+    *,
+    request_result: dict[str, Any],
+    deterministic_trace: dict[str, Any],
+    direction_result: dict[str, Any],
+    quality_artifacts: dict[str, Any],
+    used_shared_memory_refs: list[str],
+) -> dict[str, Any]:
+    phases = [
+        {
+            "phase": "evidence_request_agent",
+            "status": request_result.get("status"),
+            "session_key": request_result.get("session_key"),
+            "session_id": request_result.get("session_id"),
+            "repair_count": request_result.get("repair_count", 0),
+            "attempts": request_result.get("attempts", []),
+        },
+        {
+            "phase": "deterministic_retriever",
+            "status": "ok",
+            "retriever_version": deterministic_trace.get("retriever_version"),
+            "request_plan_id": deterministic_trace.get("request_plan_id"),
+            "selected_ref_count": len(deterministic_trace.get("selected_refs") or []),
+            "coverage": deterministic_trace.get("coverage"),
+            "unfilled_must_resolve_requests": deterministic_trace.get("unfilled_must_resolve_requests") or [],
+        },
+        {
+            "phase": "direction_agent",
+            "status": direction_result.get("status"),
+            "session_key": direction_result.get("session_key"),
+            "session_id": direction_result.get("session_id"),
+            "repair_count": direction_result.get("repair_count", 0),
+            "attempts": direction_result.get("attempts", []),
+            "novelty_audits": direction_result.get("novelty_audits", []),
+        },
+        {
+            "phase": "quality_gate",
+            "status": (quality_artifacts.get("evidence_quality_score") or {}).get("gate"),
+            "failed_rules": (quality_artifacts.get("evidence_quality_score") or {}).get("failed_rules", []),
+        },
+    ]
+    attempts = [attempt for phase in phases for attempt in (phase.get("attempts") or []) if isinstance(attempt, dict)]
+    return {
+        "schema_version": "c2c_s1_two_phase_session_v1",
+        "status": "ok",
+        "source": "codex_cli_and_deterministic_retriever",
+        "phases": phases,
+        "attempts": attempts,
+        "repair_count": int(request_result.get("repair_count") or 0) + int(direction_result.get("repair_count") or 0),
+        "used_shared_memory_refs": used_shared_memory_refs,
+        "novelty_audits": direction_result.get("novelty_audits", []),
+    }
+
+
 def _build_c2c_s1_quality_artifacts(
     *,
     project_root: Path,
@@ -2157,6 +2785,8 @@ def _build_c2c_s1_quality_artifacts(
     evidence_ref_report: dict[str, Any],
     novelty_audit: dict[str, Any] | list[Any],
     shared_memory_checked: bool,
+    direction_bundle_ref_report: dict[str, Any] | None = None,
+    deterministic_trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     direction_fingerprint = build_s1_direction_fingerprint(direction, project_root=project_root)
     evidence_quality_score = build_s1_evidence_quality_score(
@@ -2166,6 +2796,7 @@ def _build_c2c_s1_quality_artifacts(
         evidence_ref_report=evidence_ref_report,
         novelty_audit=novelty_audit,
         direction_fingerprint=direction_fingerprint,
+        direction_bundle_ref_report=direction_bundle_ref_report,
         shared_memory_checked=shared_memory_checked,
     )
     evidence_retrieval_trace = build_s1_evidence_retrieval_trace(
@@ -2174,6 +2805,7 @@ def _build_c2c_s1_quality_artifacts(
         evidence_ref_report=evidence_ref_report,
         evidence_quality_score=evidence_quality_score,
         direction_fingerprint=direction_fingerprint,
+        deterministic_trace=deterministic_trace,
     )
     return {
         "evidence_quality_score": evidence_quality_score,
@@ -2782,7 +3414,7 @@ def _s1_codex_direction_cards(payload: dict[str, Any], *, used_shared_memory_ref
         card["selected"] = True
         card["used_shared_memory_refs"] = list(used_shared_memory_refs if used_shared_memory_refs is not None else card.get("used_shared_memory_refs") or [])
         card["s1_evidence_agent"] = {
-            "source": "codex_resume_evidence_agent",
+            "source": str(payload.get("s1_agent_source") or "codex_resume_evidence_agent"),
             "direction_id": card.get("s1_direction_id") or card.get("direction_id") or direction_id,
             "evidence_bundle_items": len((payload.get("evidence_bundle") or {}).get("items") or []) if isinstance(payload.get("evidence_bundle"), dict) else 0,
             "used_shared_memory_refs": list(used_shared_memory_refs or []),

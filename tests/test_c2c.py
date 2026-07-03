@@ -4812,7 +4812,22 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     source_repo = _fake_c2c_repo(tmp_path)
     ref_paper = tmp_path / "paper.txt"
     ref_rebuttal = tmp_path / "rebuttal.md"
-    ref_paper.write_text("paper text", encoding="utf-8")
+    ref_paper.write_text(
+        (
+            "Method evidence. Cache transfer needs a utility signal for routing and mechanism selection. "
+            "The baseline transfers hidden states without downstream utility prediction, so a learned "
+            "soft routing signal can preserve useful spans while reducing harmful transfer. "
+        )
+        * 18
+        + "\n\n"
+        + (
+            "Coverage evidence. Coverage-preserving transfer avoids regressions by keeping the original "
+            "communication path available and using diagnostics for span coverage, dataset regressions, "
+            "and ablation controls. "
+        )
+        * 18,
+        encoding="utf-8",
+    )
     ref_rebuttal.write_text("review text", encoding="utf-8")
     config = _base_config(tmp_path / "workspace", simulate=True)
     config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
@@ -4845,33 +4860,95 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     s1_codex_prompts = []
     original_subprocess_run = literature_module.subprocess.run
 
+    def prompt_context(prompt: str) -> dict:
+        return json.loads(prompt.split("Context JSON:", 1)[1].split("Required JSON shape:", 1)[0])
+
+    def direction_from_allowed_refs(prompt: str) -> dict:
+        context = prompt_context(prompt)
+        allowed_refs = [ref for ref in context["allowed_refs"] if isinstance(ref, dict)]
+        paper_refs = [ref for ref in allowed_refs if ref.get("source_type") == "paper"][:2]
+        code_refs = [ref for ref in allowed_refs if ref.get("source_type") == "code"][:2]
+        counter_refs = [ref for ref in allowed_refs if ref.get("source_type") in {"rebuttal", "failure_feedback"}][:1]
+        expected_files = [ref.get("source_path") or ref.get("source_label") for ref in code_refs]
+        return {
+            "schema_version": "c2c_s1_direction_agent_v1",
+            "status": "ok",
+            "used_shared_memory_refs": ["mem_s1_avoid_hard_gate"],
+            "direction_decision": {
+                "direction_id": "utility_predicted_cache_routing",
+                "mechanism_direction": "Utility Predicted Cache Routing",
+                "mechanism_type": "utility_predicted_cache_routing",
+                "mechanism_axis": "routing",
+                "integration_point": "wrapper",
+                "control_signal": "utility",
+                "core_hypothesis": "Predict downstream utility for transferred cache states and let S2 explore soft routing mechanisms that preserve baseline coverage.",
+                "why_baseline_fails": "The baseline lacks downstream utility control.",
+                "why_this_direction": "The deterministic bundle contains paper support, code surfaces, and counterevidence against hard gates.",
+                "expected_metric_signature": {"primary_metric": "three_dataset_mean", "expected_direction": "increase", "diagnostics": ["transfer coverage"]},
+                "required_evidence_refs": paper_refs,
+                "counterevidence_refs": counter_refs,
+                "implementation_surface_refs": code_refs,
+                "expected_files": expected_files,
+                "allowed_variants": ["soft residual utility scaling", "coverage-preserving utility modulation"],
+                "forbidden_patterns": ["extra hard accept/reject gate", "evaluator changes"],
+                "failure_routing_hints": ["return to S1 if coverage-preserving routing repeatedly collapses"],
+                "s2_affordance": "S2 can instantiate utility-modulated routing on the retrieved code surfaces.",
+                "target_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+                "failure_focus": ["dataset-level coverage collapse", "mmlu-redux regression"],
+                "verification_commands": ["py_compile", "small2048_train", "three_dataset_eval"],
+                "used_shared_memory_refs": ["mem_s1_avoid_hard_gate"],
+            },
+            "selected_ideas": [
+                {
+                    "id": "utility_predicted_cache_routing",
+                    "title": "Utility Predicted Cache Routing",
+                    "selected": True,
+                    "hypothesis": "Predict downstream utility for transferred cache states and route them without reducing baseline transfer coverage.",
+                    "novelty_score": 7,
+                    "feasibility_score": 7,
+                    "mechanism_type": "utility_predicted_cache_routing",
+                    "description": "High-level S1 direction only; S2 will generate concrete implementation candidates.",
+                    "motivation": "Baseline transfer lacks a downstream utility signal and previous failures warn against hard gating.",
+                    "reviewer_risk_response": "Track transfer coverage and per-dataset regressions; forbid evaluator edits and hard-gate stacking.",
+                    "expected_files": expected_files,
+                    "verification_commands": ["py_compile", "small2048_train", "three_dataset_eval"],
+                    "evidence_refs": paper_refs,
+                    "counterevidence_refs": counter_refs,
+                    "code_refs": code_refs,
+                    "s1_allowed_variants": ["soft residual utility scaling", "coverage-preserving utility modulation"],
+                    "s1_forbidden_patterns": ["extra hard accept/reject gate", "evaluator changes"],
+                    "used_shared_memory_refs": ["mem_s1_avoid_hard_gate"],
+                }
+            ],
+            "negative_constraints": {
+                "reviewer_concerns": ["failure_modes_ood", "coverage collapse"],
+                "forbidden_idea_ids": ["hard_gate_stack"],
+                "forbidden_patterns": ["extra hard accept/reject gate", "evaluator changes"],
+                "failure_feedback_rules": ["Use method-level failures only; ignore S2.5 coding noise in S1."],
+                "used_shared_memory_refs": ["mem_s1_avoid_hard_gate"],
+            },
+            "decision_chain": {
+                "evidence": ["paper_support", "code_surface"],
+                "counterevidence": ["counterevidence"],
+                "conclusion": "Use utility-predicted cache routing as the S1 direction and let S2 choose concrete variants.",
+            },
+        }
+
     def fake_s1_codex_run(command, **kwargs):
         if not command or command[0] != "codex":
             return original_subprocess_run(command, **kwargs)
         s1_codex_commands.append(command)
-        s1_codex_prompts.append(kwargs.get("input") or "")
+        prompt = kwargs.get("input") or ""
+        s1_codex_prompts.append(prompt)
         output_path = Path(command[command.index("--output-last-message") + 1])
         if len(s1_codex_commands) == 1:
             output_path.write_text("not json", encoding="utf-8")
             stdout = '{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174001"}\n'
+        elif "evidence_request_agent" in prompt:
+            output_path.write_text(json.dumps(literature_module.default_c2c_evidence_request_plan(topic="cross tokenizer cache")), encoding="utf-8")
+            stdout = ""
         else:
-            assert "resume" in command
-            chunk_index_path = Path(kwargs["cwd"]) / "intake/c2c/chunk_index.json"
-            chunk_index = json.loads(chunk_index_path.read_text(encoding="utf-8"))
-            code_chunk_id = next(
-                entry["chunk_id"]
-                for entry in chunk_index["entries"]
-                if entry.get("source_type") == "code" and entry.get("path") == "rosetta/model/aligner.py"
-            )
-            output_path.write_text(
-                json.dumps(
-                    _s1_codex_direction_payload(
-                        code_chunk_id=code_chunk_id,
-                        used_shared_memory_refs=["mem_s1_avoid_hard_gate"],
-                    )
-                ),
-                encoding="utf-8",
-            )
+            output_path.write_text(json.dumps(direction_from_allowed_refs(prompt)), encoding="utf-8")
             stdout = ""
         return SimpleNamespace(returncode=0, stdout=stdout, stderr="")
 
@@ -4908,6 +4985,7 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert (root / "literature/direction_scorecard.json").exists()
     assert (root / "literature/evidence_bundle.json").exists()
     assert (root / "literature/novelty_audit.json").exists()
+    assert (root / "literature/c2c/evidence_request_plan.json").exists()
     assert (root / "literature/c2c/evidence_requests.json").exists()
     assert (root / "literature/c2c/evidence_bundle.json").exists()
     assert (root / "literature/c2c/direction_decision.json").exists()
@@ -4943,11 +5021,16 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert evidence_quality["gate"] == "pass"
     assert evidence_quality["support_coverage"]["paper"] >= 2
     assert evidence_quality["support_coverage"]["code"] >= 2
+    retrieval_trace = json.loads((root / "literature/c2c/evidence_retrieval_trace.json").read_text(encoding="utf-8"))
+    assert retrieval_trace["deterministic"] is True
+    assert retrieval_trace["schema_version"] == "c2c_s1_deterministic_retrieval_trace_v1"
+    deterministic_bundle = json.loads((root / "literature/c2c/evidence_bundle.json").read_text(encoding="utf-8"))
+    assert deterministic_bundle["producer"] == "deterministic_retriever"
     ideas = json.loads((root / "literature/ideas.json").read_text(encoding="utf-8"))
     assert len(ideas) == 1
     assert ideas[0]["id"] == "utility_predicted_cache_routing"
     assert ideas[0]["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
-    assert ideas[0]["s1_evidence_agent"]["source"] == "codex_resume_evidence_agent"
+    assert ideas[0]["s1_evidence_agent"]["source"] == "codex_two_phase_direction_agent"
     assert ideas[0]["s1_evidence_agent"]["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     direction = json.loads((root / "literature/c2c/direction_decision.json").read_text(encoding="utf-8"))
     assert direction["direction_id"] == "utility_predicted_cache_routing"
@@ -4963,11 +5046,12 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     constraints = json.loads((root / "literature/negative_constraints.json").read_text(encoding="utf-8"))
     assert constraints["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     evidence_session = json.loads((root / "literature/c2c/evidence_session.json").read_text(encoding="utf-8"))
+    assert evidence_session["schema_version"] == "c2c_s1_two_phase_session_v1"
     assert evidence_session["repair_count"] == 1
     assert evidence_session["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
-    assert len(evidence_session["attempts"]) == 2
+    assert len(evidence_session["attempts"]) == 3
     assert "resume" in s1_codex_commands[1]
-    assert "errors_to_fix" in s1_codex_prompts[1]
+    assert "Validation errors" in s1_codex_prompts[1]
 
 
 def test_gpu_selector_auto_limits_to_six(monkeypatch) -> None:

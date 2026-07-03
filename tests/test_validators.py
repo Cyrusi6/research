@@ -101,10 +101,101 @@ def _write_c2c_s1_gate_context(paths, *, quality_gate: str = "pass", mutate_qual
     }.items():
         (intake / rel).write_text(json.dumps(payload), encoding="utf-8")
     (intake / "result_ledger.csv").write_text("id,metric\n", encoding="utf-8")
+    (intake / "paper_chunks.jsonl").write_text(
+        json.dumps({"chunk_id": "paper:p1", "source_type": "paper", "source_path": "intake/c2c/paper_chunks.jsonl"})
+        + "\n"
+        + json.dumps({"chunk_id": "paper:p2", "source_type": "paper", "source_path": "intake/c2c/paper_chunks.jsonl"})
+        + "\n",
+        encoding="utf-8",
+    )
+    (intake / "code_file_manifest.json").write_text(
+        json.dumps({"files": [{"path": "rosetta/model/wrapper.py"}, {"path": "rosetta/model/aligner.py"}]}),
+        encoding="utf-8",
+    )
+    (intake / "code_chunks.jsonl").write_text(
+        json.dumps({"chunk_id": "code:wrapper", "source_type": "code", "path": "rosetta/model/wrapper.py"})
+        + "\n"
+        + json.dumps({"chunk_id": "code:aligner", "source_type": "code", "path": "rosetta/model/aligner.py"})
+        + "\n",
+        encoding="utf-8",
+    )
     (literature / "idea_debate.json").write_text(json.dumps({"strategy": "legacy_debate", "selected_ideas": []}), encoding="utf-8")
     (literature / "negative_constraints.json").write_text(json.dumps({"forbidden_patterns": []}), encoding="utf-8")
     (c2c_literature / "baseline_evidence.json").write_text(json.dumps({"name": "base", "mean": 50.0}), encoding="utf-8")
     (c2c_literature / "rebuttal_concern_matrix.json").write_text(json.dumps({"top_concerns": []}), encoding="utf-8")
+    paper_ref = {"source_type": "paper", "source_path": "intake/c2c/paper_chunks.jsonl", "source_label": "paper:p1", "claim": "support"}
+    paper_ref2 = {"source_type": "paper", "source_path": "intake/c2c/paper_chunks.jsonl", "source_label": "paper:p2", "claim": "support 2"}
+    code_ref = {"source_type": "code", "source_path": "rosetta/model/wrapper.py", "source_label": "rosetta/model/wrapper.py", "claim": "surface"}
+    code_ref2 = {"source_type": "code", "source_path": "rosetta/model/aligner.py", "source_label": "rosetta/model/aligner.py", "claim": "surface 2"}
+    counter_ref = {"source_type": "failure_feedback", "source_path": "intake/c2c/negative_result_memory.json", "source_label": "feedback:risk", "claim": "risk"}
+    request_plan = {
+        "schema_version": "c2c_s1_evidence_request_plan_v1",
+        "request_plan_id": "req_plan",
+        "evidence_requests": [
+            {"request_id": "paper_support", "source_type": "paper", "query": "paper support", "keywords": ["paper"], "purpose": "support", "top_k": 2, "filters": {}, "must_resolve": True},
+            {"request_id": "code_surface", "source_type": "code", "query": "code surface", "keywords": ["wrapper"], "purpose": "implementation_surface", "top_k": 2, "filters": {}, "must_resolve": True},
+            {"request_id": "counter", "source_type": "failure_memory", "query": "risk", "keywords": ["risk"], "purpose": "counterevidence", "top_k": 1, "filters": {}, "must_resolve": True},
+        ],
+        "required_source_coverage": {"paper": 2, "code": 2, "counterevidence": 1},
+        "retrieval_budget": {"top_k_per_request": 2, "max_total_items": 8, "min_score": 0.0},
+        "forbidden_outputs": ["direction_decision", "selected_ideas", "evidence_bundle", "expected_files"],
+        "request_rationale": "cover support, implementation, and counterevidence",
+    }
+    bundle = {
+        "schema_version": "c2c_s1_deterministic_evidence_bundle_v1",
+        "producer": "deterministic_retriever",
+        "retriever_version": "c2c_s1_deterministic_keyword_v1",
+        "request_plan_id": "req_plan",
+        "items": [
+            {"evidence_id": "ev_p1", "ref": paper_ref, "request_id": "paper_support", "purpose": "support", "source_type": "paper", "locator": "paper:p1", "source_path": paper_ref["source_path"], "source_label": paper_ref["source_label"], "summary": "support", "score": 3.0, "score_components": {}, "why_selected": "match", "source_hash": "h1"},
+            {"evidence_id": "ev_p2", "ref": paper_ref2, "request_id": "paper_support", "purpose": "support", "source_type": "paper", "locator": "paper:p2", "source_path": paper_ref2["source_path"], "source_label": paper_ref2["source_label"], "summary": "support 2", "score": 3.0, "score_components": {}, "why_selected": "match", "source_hash": "h2"},
+            {"evidence_id": "ev_code", "ref": code_ref, "request_id": "code_surface", "purpose": "implementation_surface", "source_type": "code", "locator": "rosetta/model/wrapper.py", "source_path": code_ref["source_path"], "source_label": code_ref["source_label"], "summary": "surface", "score": 3.0, "score_components": {}, "why_selected": "match", "source_hash": "h3"},
+            {"evidence_id": "ev_code2", "ref": code_ref2, "request_id": "code_surface", "purpose": "implementation_surface", "source_type": "code", "locator": "rosetta/model/aligner.py", "source_path": code_ref2["source_path"], "source_label": code_ref2["source_label"], "summary": "surface 2", "score": 3.0, "score_components": {}, "why_selected": "match", "source_hash": "h4"},
+            {"evidence_id": "ev_risk", "ref": counter_ref, "request_id": "counter", "purpose": "counterevidence", "source_type": "failure_feedback", "locator": "feedback:risk", "source_path": counter_ref["source_path"], "source_label": counter_ref["source_label"], "summary": "risk", "risks": ["risk"], "score": 3.0, "score_components": {}, "why_selected": "match", "source_hash": "h5"},
+        ],
+    }
+    direction_decision = {
+        "direction_id": "utility_predicted_cache_routing",
+        "mechanism_direction": "Utility Predicted Cache Routing",
+        "mechanism_type": "utility_predicted_cache_routing",
+        "mechanism_axis": "routing",
+        "integration_point": "wrapper",
+        "control_signal": "utility",
+        "core_hypothesis": "Route transferred cache states with a utility signal.",
+        "why_baseline_fails": "The baseline lacks downstream utility control.",
+        "why_this_direction": "Retrieved evidence supports utility routing.",
+        "required_evidence_refs": [paper_ref, paper_ref2],
+        "counterevidence_refs": [counter_ref],
+        "implementation_surface_refs": [code_ref, code_ref2],
+        "expected_files": ["rosetta/model/wrapper.py", "rosetta/model/aligner.py"],
+        "allowed_variants": ["soft utility routing"],
+        "forbidden_patterns": ["hard gate"],
+        "failure_focus": ["coverage"],
+        "verification_commands": ["py_compile"],
+    }
+    idea = {
+        "id": "utility_predicted_cache_routing",
+        "title": "Utility Predicted Cache Routing",
+        "selected": True,
+        "hypothesis": direction_decision["core_hypothesis"],
+        "novelty_score": 7,
+        "feasibility_score": 7,
+        "mechanism_type": "utility_predicted_cache_routing",
+        "reviewer_risk_response": "watch coverage",
+        "expected_files": direction_decision["expected_files"],
+        "verification_commands": ["py_compile"],
+        "evidence_refs": [paper_ref, paper_ref2],
+        "counterevidence_refs": [counter_ref],
+        "code_refs": [code_ref, code_ref2],
+    }
+    (literature / "ideas.json").write_text(json.dumps([idea]), encoding="utf-8")
+    (literature / "idea_debate.json").write_text(json.dumps({"strategy": "codex_two_phase_evidence_direction", "selected_ideas": [idea]}), encoding="utf-8")
+    (c2c_literature / "evidence_request_plan.json").write_text(json.dumps(request_plan), encoding="utf-8")
+    (c2c_literature / "evidence_requests.json").write_text(json.dumps(request_plan["evidence_requests"]), encoding="utf-8")
+    (c2c_literature / "evidence_bundle.json").write_text(json.dumps(bundle), encoding="utf-8")
+    (c2c_literature / "direction_decision.json").write_text(json.dumps(direction_decision), encoding="utf-8")
+    (c2c_literature / "evidence_session.json").write_text(json.dumps({"schema_version": "c2c_s1_two_phase_session_v1", "status": "ok", "phases": []}), encoding="utf-8")
+    (c2c_literature / "evidence_ref_report.json").write_text(json.dumps({"schema_version": "s1_evidence_ref_report_v1", "status": "pass", "counts": {"resolved": 5, "unresolved": 0}, "resolved": [], "errors": []}), encoding="utf-8")
     quality = {
         "schema_version": "c2c_s1_evidence_quality_v1",
         "direction_id": "utility_predicted_cache_routing",
@@ -116,6 +207,7 @@ def _write_c2c_s1_gate_context(paths, *, quality_gate: str = "pass", mutate_qual
         "shared_memory_checked": True,
         "novelty_score": 0.68,
         "same_direction_similarity": 0.21,
+        "direction_bundle_ref_report": {"schema_version": "s1_direction_bundle_ref_report_v1", "status": "pass", "counts": {"errors": 0}, "errors": []},
         "thresholds": {},
         "failed_rules": [] if quality_gate == "pass" else ["support_coverage.paper"],
         "coverage_contributors": {},
@@ -127,14 +219,23 @@ def _write_c2c_s1_gate_context(paths, *, quality_gate: str = "pass", mutate_qual
     (c2c_literature / "evidence_retrieval_trace.json").write_text(
         json.dumps(
             {
-                "schema_version": "c2c_s1_evidence_retrieval_trace_v1",
+                "schema_version": "c2c_s1_deterministic_retrieval_trace_v1",
                 "direction_id": "utility_predicted_cache_routing",
+                "retriever_version": "c2c_s1_deterministic_keyword_v1",
+                "request_plan_id": "req_plan",
+                "requests": [],
                 "evidence_requests": [],
+                "candidate_counts": {"paper": 2, "code": 2, "failure_memory": 1},
+                "selected_refs": [paper_ref, paper_ref2, code_ref, code_ref2, counter_ref],
                 "resolved_ref_count": 6,
                 "unresolved_ref_count": quality["unresolved_ref_count"],
                 "resolved_refs": [],
                 "unresolved_refs": [],
+                "unfilled_must_resolve_requests": [],
+                "coverage": {"paper": 3, "code": 2, "counterevidence": 2},
                 "coverage_contributors": {},
+                "deterministic": True,
+                "retrieval_inputs_hash": "tracehash",
                 "quality_gate": {"gate": quality["gate"], "failed_rules": quality["failed_rules"], "thresholds": {}},
                 "direction_fingerprint": {"fingerprint": "fp", "same_direction_similarity": 0.21, "artifact": "literature/c2c/direction_fingerprint.json"},
             }

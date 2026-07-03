@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS1DeterministicEvidenceBundle",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "producer",
+    "retriever_version",
+    "request_plan_id",
+    "items"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "producer": {"type": "string"},
+    "retriever_version": {"type": "string"},
+    "request_plan_id": {"type": "string"},
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "evidence_id",
+          "ref",
+          "request_id",
+          "source_type",
+          "locator",
+          "summary",
+          "score",
+          "score_components",
+          "why_selected",
+          "source_hash"
+        ],
+        "properties": {
+          "evidence_id": {"type": "string"},
+          "ref": {"type": "object"},
+          "request_id": {"type": "string"},
+          "purpose": {"type": "string"},
+          "source_type": {"type": "string"},
+          "locator": {"type": "string"},
+          "chunk_id": {"type": "string"},
+          "source_path": {"type": "string"},
+          "source_label": {"type": "string"},
+          "summary": {"type": "string"},
+          "text": {"type": "string"},
+          "excerpt": {"type": "string"},
+          "supports": {"type": "array"},
+          "risks": {"type": "array"},
+          "score": {"type": "number"},
+          "score_components": {"type": "object"},
+          "why_selected": {"type": "string"},
+          "source_hash": {"type": "string"}
+        }
+      }
+    }
+  }
+}

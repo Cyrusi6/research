@@ -43,6 +43,7 @@
     "shared_memory_checked": {"type": "boolean"},
     "novelty_score": {"type": "number"},
     "same_direction_similarity": {"type": "number"},
+    "direction_bundle_ref_report": {"type": "object"},
     "thresholds": {"type": "object"},
     "failed_rules": {"type": "array"},
     "coverage_contributors": {"type": "object"},

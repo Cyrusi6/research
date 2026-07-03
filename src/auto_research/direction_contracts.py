@@ -18,6 +18,7 @@ VARIANT_CONTRACT_SCHEMA_VERSION = "auto_research_variant_contract_v1"
 VARIANT_FINGERPRINT_SCHEMA_VERSION = "auto_research_variant_fingerprint_v1"
 C2C_S1_EVIDENCE_QUALITY_SCHEMA_VERSION = "c2c_s1_evidence_quality_v1"
 C2C_S1_EVIDENCE_RETRIEVAL_TRACE_SCHEMA_VERSION = "c2c_s1_evidence_retrieval_trace_v1"
+C2C_S1_DETERMINISTIC_RETRIEVAL_TRACE_SCHEMA_VERSION = "c2c_s1_deterministic_retrieval_trace_v1"
 C2C_S1_DIRECTION_FINGERPRINT_SCHEMA_VERSION = "c2c_s1_direction_fingerprint_v1"
 
 
@@ -268,6 +269,7 @@ def build_s1_evidence_quality_score(
     evidence_ref_report: dict[str, Any] | None = None,
     novelty_audit: dict[str, Any] | list[Any] | None = None,
     direction_fingerprint: dict[str, Any] | None = None,
+    direction_bundle_ref_report: dict[str, Any] | None = None,
     shared_memory_checked: bool = False,
 ) -> dict[str, Any]:
     """Score whether C2C S1 gathered enough evidence to enter S2."""
@@ -345,6 +347,8 @@ def build_s1_evidence_quality_score(
         failed_rules.append("implementation_surface_coverage")
     if novelty_score < thresholds["novelty_score"]:
         failed_rules.append("novelty_score")
+    if isinstance(direction_bundle_ref_report, dict) and direction_bundle_ref_report.get("status") not in {None, "pass"}:
+        failed_rules.append("direction_refs_not_in_retrieved_bundle")
     return {
         "schema_version": C2C_S1_EVIDENCE_QUALITY_SCHEMA_VERSION,
         "direction_id": str(direction.get("direction_id") or ""),
@@ -361,6 +365,7 @@ def build_s1_evidence_quality_score(
         "shared_memory_checked": bool(shared_memory_checked),
         "novelty_score": round(novelty_score, 4),
         "same_direction_similarity": round(same_direction_similarity, 4),
+        "direction_bundle_ref_report": direction_bundle_ref_report if isinstance(direction_bundle_ref_report, dict) else {},
         "thresholds": thresholds,
         "failed_rules": failed_rules,
         "coverage_contributors": {key: values[:20] for key, values in coverage_contributors.items()},
@@ -375,7 +380,24 @@ def build_s1_evidence_retrieval_trace(
     evidence_ref_report: dict[str, Any] | None = None,
     evidence_quality_score: dict[str, Any] | None = None,
     direction_fingerprint: dict[str, Any] | None = None,
+    deterministic_trace: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if isinstance(deterministic_trace, dict) and deterministic_trace.get("schema_version"):
+        trace = dict(deterministic_trace)
+        trace["direction_id"] = str(direction.get("direction_id") or trace.get("direction_id") or "")
+        score = evidence_quality_score if isinstance(evidence_quality_score, dict) else {}
+        trace["quality_gate"] = {
+            "gate": score.get("gate"),
+            "failed_rules": _as_list(score.get("failed_rules")),
+            "thresholds": score.get("thresholds") if isinstance(score.get("thresholds"), dict) else {},
+        }
+        trace["direction_fingerprint"] = {
+            "fingerprint": (direction_fingerprint or {}).get("fingerprint"),
+            "same_direction_similarity": (direction_fingerprint or {}).get("same_direction_similarity", 0.0),
+            "artifact": "literature/c2c/direction_fingerprint.json",
+        }
+        trace.setdefault("deterministic", True)
+        return trace
     payload = payload if isinstance(payload, dict) else {}
     evidence_ref_report = evidence_ref_report if isinstance(evidence_ref_report, dict) else {}
     score = evidence_quality_score if isinstance(evidence_quality_score, dict) else {}

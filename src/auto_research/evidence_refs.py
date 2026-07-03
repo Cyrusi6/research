@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .s1_retrieval import canonical_ref_key
 from .utils import read_json
 
 
@@ -68,6 +69,74 @@ def evidence_ref_errors_for_repair(report: dict[str, Any], *, limit: int = 12) -
     return errors
 
 
+def validate_direction_refs_subset_of_bundle(payload: dict[str, Any], evidence_bundle: dict[str, Any]) -> dict[str, Any]:
+    """Validate that S1c direction refs only use S1b retrieved evidence refs."""
+
+    bundle_items = [item for item in (evidence_bundle.get("items") if isinstance(evidence_bundle, dict) else []) or [] if isinstance(item, dict)]
+    bundle_refs: dict[str, dict[str, Any]] = {}
+    for item in bundle_items:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else item
+        key = canonical_ref_key(ref)
+        if key:
+            bundle_refs[key] = item
+    errors: list[dict[str, Any]] = []
+    checked_refs = 0
+    expected_files = _direction_expected_files(payload)
+    code_ref_targets: list[str] = []
+    for kind, ref, owner in _iter_direction_output_refs(payload):
+        checked_refs += 1
+        key = canonical_ref_key(ref)
+        item = bundle_refs.get(key)
+        if not item:
+            errors.append({"kind": kind, "owner": owner, "ref": _compact_ref(ref), "reason": "direction_ref_not_in_retrieved_bundle"})
+            continue
+        source_type = str(ref.get("source_type") or item.get("source_type") or "").lower()
+        if kind == "code_refs" and source_type != "code":
+            errors.append({"kind": kind, "owner": owner, "ref": _compact_ref(ref), "reason": "code_ref_not_code_source"})
+        if kind == "counterevidence_refs" and not _bundle_item_supports_counterevidence(item, ref):
+            errors.append({"kind": kind, "owner": owner, "ref": _compact_ref(ref), "reason": "counterevidence_ref_not_counterevidence_source"})
+        if kind == "code_refs":
+            code_ref_targets.extend(_ref_targets(ref))
+            code_ref_targets.extend(_ref_targets(item))
+    uncovered = []
+    for expected_file in expected_files:
+        normalized = _normalize_ref_target(expected_file)
+        if not normalized:
+            continue
+        if not any(target and (target == normalized or target.endswith("/" + normalized) or normalized.endswith("/" + target) or target in normalized or normalized in target) for target in code_ref_targets):
+            uncovered.append(expected_file)
+    for expected_file in uncovered:
+        errors.append({"kind": "expected_files", "owner": "direction.expected_files", "ref": {"source_label": expected_file}, "reason": "expected_file_not_covered_by_code_ref"})
+    return {
+        "schema_version": "s1_direction_bundle_ref_report_v1",
+        "status": "pass" if not errors else "fail",
+        "counts": {
+            "bundle_refs": len(bundle_refs),
+            "checked_direction_refs": checked_refs,
+            "errors": len(errors),
+            "expected_files": len(expected_files),
+            "uncovered_expected_files": len(uncovered),
+        },
+        "errors": errors,
+    }
+
+
+def direction_bundle_ref_errors_for_repair(report: dict[str, Any], *, limit: int = 12) -> list[str]:
+    errors = []
+    for item in report.get("errors") or []:
+        if not isinstance(item, dict):
+            continue
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        parts = [str(item.get("kind") or "ref"), str(item.get("owner") or "unknown_owner"), str(item.get("reason") or "invalid")]
+        for key in ["chunk_id", "source_path", "source_label"]:
+            if ref.get(key):
+                parts.append(f"{key}={ref.get(key)}")
+        errors.append(" | ".join(part for part in parts if part))
+        if len(errors) >= limit:
+            break
+    return errors
+
+
 def _iter_payload_refs(payload: dict[str, Any]):
     bundle = payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {}
     for idx, item in enumerate(bundle.get("items") or []):
@@ -81,6 +150,64 @@ def _iter_payload_refs(payload: dict[str, Any]):
             for idx, ref in enumerate(idea.get(field) or []):
                 if isinstance(ref, dict):
                     yield field, ref, f"{owner}.{field}[{idx}]"
+
+
+def _iter_direction_output_refs(payload: dict[str, Any]):
+    direction = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
+    for field in ["required_evidence_refs", "counterevidence_refs", "implementation_surface_refs"]:
+        for idx, ref in enumerate(direction.get(field) or []):
+            if isinstance(ref, dict):
+                kind = "evidence_refs" if field == "required_evidence_refs" else "code_refs" if field == "implementation_surface_refs" else "counterevidence_refs"
+                yield kind, ref, f"direction_decision.{field}[{idx}]"
+    for idea_idx, idea in enumerate(payload.get("selected_ideas") or []):
+        if not isinstance(idea, dict):
+            continue
+        owner = str(idea.get("id") or idea.get("title") or f"selected_ideas[{idea_idx}]")
+        for field in REF_FIELDS:
+            for idx, ref in enumerate(idea.get(field) or []):
+                if isinstance(ref, dict):
+                    yield field, ref, f"{owner}.{field}[{idx}]"
+
+
+def _direction_expected_files(payload: dict[str, Any]) -> list[str]:
+    values = []
+    direction = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
+    values.extend(str(item) for item in direction.get("expected_files") or [] if item)
+    for idea in payload.get("selected_ideas") or []:
+        if isinstance(idea, dict):
+            values.extend(str(item) for item in idea.get("expected_files") or [] if item)
+    seen = set()
+    result = []
+    for value in values:
+        key = _normalize_ref_target(value)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(value)
+    return result
+
+
+def _bundle_item_supports_counterevidence(item: dict[str, Any], ref: dict[str, Any]) -> bool:
+    source_type = str(ref.get("source_type") or item.get("source_type") or "").lower()
+    purpose = str(item.get("purpose") or "").lower()
+    if purpose == "counterevidence" or item.get("risks"):
+        return True
+    return source_type in {"rebuttal", "failure_feedback", "failure_memory", "feedback", "negative_memory", "counterevidence"}
+
+
+def _ref_targets(ref: dict[str, Any]) -> list[str]:
+    targets = []
+    for key in ["source_path", "path", "file", "source_label", "label", "chunk_id"]:
+        value = ref.get(key)
+        if value:
+            targets.append(_normalize_ref_target(str(value).removeprefix("code:")))
+    return [item for item in targets if item]
+
+
+def _normalize_ref_target(value: str) -> str:
+    text = str(value).strip().removeprefix("code:").split("#", 1)[0]
+    if "::" in text:
+        text = text.split("::", 1)[0]
+    return text.replace("\\", "/").removeprefix("./").lower()
 
 
 def _resolve_ref(project_root: Path, catalog: dict[str, set[str]], ref: dict[str, Any], *, kind: str, strict: bool) -> dict[str, str]:

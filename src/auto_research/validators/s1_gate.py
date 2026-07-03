@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from auto_research.evidence_refs import resolve_s1_evidence_refs
+from auto_research.evidence_refs import resolve_s1_evidence_refs, validate_direction_refs_subset_of_bundle
 
 from .base import StageGateValidator, load_schema, validate_min_schema
 
@@ -201,6 +201,7 @@ class S1GateValidator(StageGateValidator):
         else:
             self.pass_check("c2c_s1_evidence_bundle", details={"required_count": len(required)})
 
+        self._validate_c2c_two_phase_evidence_contract(ideas if isinstance(ideas, list) else [])
         self._validate_c2c_evidence_quality_gate()
 
         invalid_contracts = []
@@ -232,7 +233,7 @@ class S1GateValidator(StageGateValidator):
                 self.retry_check("c2c_debate_gpt_completion", "C2C debate contains fallback agent outputs", artifact="literature/idea_debate.json", details={"fallback_roles": fallback_roles})
             else:
                 self.pass_check("c2c_debate_gpt_completion", artifact="literature/idea_debate.json")
-            if debate.get("strategy") == "codex_resume_evidence_agent":
+            if debate.get("strategy") in {"codex_resume_evidence_agent", "codex_two_phase_evidence_direction"}:
                 self._validate_c2c_codex_evidence_agent_contract(debate)
 
     def _validate_c2c_codex_evidence_agent_contract(self, debate: dict) -> None:
@@ -289,6 +290,85 @@ class S1GateValidator(StageGateValidator):
         else:
             self.pass_check("c2c_s1_codex_evidence_agent_contract", artifact="literature/idea_debate.json")
 
+    def _validate_c2c_two_phase_evidence_contract(self, ideas: list[dict]) -> None:
+        request_plan_path = self.project_root / "literature/c2c/evidence_request_plan.json"
+        session = self._safe_json("literature/c2c/evidence_session.json")
+        debate = self._safe_json("literature/idea_debate.json")
+        two_phase_active = request_plan_path.exists() or (isinstance(session, dict) and session.get("schema_version") == "c2c_s1_two_phase_session_v1") or (isinstance(debate, dict) and debate.get("strategy") == "codex_two_phase_evidence_direction")
+        if not two_phase_active:
+            self.pass_check("c2c_s1_two_phase_contract", message="legacy C2C debate path; deterministic two-phase checks not active")
+            return
+        required = [
+            "literature/c2c/evidence_request_plan.json",
+            "literature/c2c/evidence_bundle.json",
+            "literature/c2c/direction_decision.json",
+            "literature/c2c/evidence_retrieval_trace.json",
+            "literature/c2c/evidence_session.json",
+        ]
+        missing = [rel for rel in required if not (self.project_root / rel).exists()]
+        if missing:
+            self.retry_check("c2c_s1_two_phase_artifacts", "C2C S1 two-phase artifacts missing", artifact="literature/c2c/evidence_request_plan.json", details={"missing": missing})
+            return
+        request_plan = self._safe_json("literature/c2c/evidence_request_plan.json")
+        bundle = self._safe_json("literature/c2c/evidence_bundle.json")
+        direction_decision = self._safe_json("literature/c2c/direction_decision.json")
+        trace = self._safe_json("literature/c2c/evidence_retrieval_trace.json")
+        schema_errors = {}
+        for rel, payload, schema_name in [
+            ("literature/c2c/evidence_request_plan.json", request_plan, "s1_evidence_request_plan.schema.json"),
+            ("literature/c2c/evidence_bundle.json", bundle, "s1_deterministic_evidence_bundle.schema.json"),
+            ("literature/c2c/evidence_retrieval_trace.json", trace, "s1_evidence_retrieval_trace.schema.json"),
+        ]:
+            errors = validate_min_schema(payload, load_schema(schema_name))
+            if not isinstance(payload, dict):
+                errors.append("payload must be an object")
+            if errors:
+                schema_errors[rel] = errors[:10]
+        if schema_errors:
+            self.retry_check("c2c_s1_two_phase_schema", "C2C S1 two-phase artifacts do not satisfy schema", artifact="literature/c2c/evidence_request_plan.json", details={"errors": schema_errors})
+            return
+        errors = []
+        if request_plan.get("schema_version") != "c2c_s1_evidence_request_plan_v1":
+            errors.append("evidence_request_plan.schema_version must be c2c_s1_evidence_request_plan_v1")
+        for forbidden in ["direction_decision", "selected_ideas", "evidence_bundle", "expected_files"]:
+            if forbidden in request_plan:
+                errors.append(f"evidence_request_plan must not include {forbidden}")
+        if bundle.get("producer") != "deterministic_retriever":
+            errors.append("evidence_bundle.producer must be deterministic_retriever")
+        if trace.get("schema_version") != "c2c_s1_deterministic_retrieval_trace_v1":
+            errors.append("evidence_retrieval_trace.schema_version must be c2c_s1_deterministic_retrieval_trace_v1")
+        if trace.get("deterministic") is not True:
+            errors.append("evidence_retrieval_trace.deterministic must be true")
+        if trace.get("unfilled_must_resolve_requests"):
+            errors.append("evidence_retrieval_trace.unfilled_must_resolve_requests must be empty")
+        ref_keys = []
+        for item in bundle.get("items") or []:
+            if isinstance(item, dict):
+                ref_keys.append(json.dumps(item.get("ref") if isinstance(item.get("ref"), dict) else {}, sort_keys=True, ensure_ascii=True))
+        if len(ref_keys) != len(set(ref_keys)):
+            errors.append("evidence_bundle.items[*].ref must be unique")
+        if isinstance(direction_decision, dict):
+            for forbidden in ["evidence_requests", "evidence_bundle"]:
+                if forbidden in direction_decision:
+                    errors.append(f"direction_decision must not include {forbidden}")
+        payload = {"direction_decision": direction_decision if isinstance(direction_decision, dict) else {}, "selected_ideas": ideas}
+        subset_report = validate_direction_refs_subset_of_bundle(payload, bundle if isinstance(bundle, dict) else {})
+        if subset_report.get("status") != "pass":
+            errors.append("direction_refs_subset_of_bundle_refs failed")
+        if errors:
+            self.retry_check(
+                "c2c_s1_two_phase_contract",
+                "C2C S1 two-phase evidence contract failed",
+                artifact="literature/c2c/evidence_request_plan.json",
+                details={"errors": errors, "direction_bundle_ref_report": subset_report},
+            )
+        else:
+            self.pass_check(
+                "c2c_s1_two_phase_contract",
+                artifact="literature/c2c/evidence_request_plan.json",
+                details={"request_count": len(request_plan.get("evidence_requests") or []), "bundle_items": len(bundle.get("items") or []), "trace_coverage": trace.get("coverage")},
+            )
+
     def _validate_c2c_evidence_quality_gate(self) -> None:
         required = {
             "literature/c2c/evidence_quality_score.json": "s1_evidence_quality.schema.json",
@@ -308,7 +388,7 @@ class S1GateValidator(StageGateValidator):
         schema_errors: dict[str, list[str]] = {}
         expected_versions = {
             "literature/c2c/evidence_quality_score.json": "c2c_s1_evidence_quality_v1",
-            "literature/c2c/evidence_retrieval_trace.json": "c2c_s1_evidence_retrieval_trace_v1",
+            "literature/c2c/evidence_retrieval_trace.json": "c2c_s1_deterministic_retrieval_trace_v1",
             "literature/c2c/direction_fingerprint.json": "c2c_s1_direction_fingerprint_v1",
         }
         for rel, schema_name in required.items():
@@ -405,4 +485,7 @@ def _c2c_quality_failed_rules(quality: dict) -> list[str]:
         failed.append("implementation_surface_coverage")
     if float(quality.get("novelty_score") or 0.0) < 0.6:
         failed.append("novelty_score")
+    ref_report = quality.get("direction_bundle_ref_report") if isinstance(quality.get("direction_bundle_ref_report"), dict) else {}
+    if ref_report and ref_report.get("status") not in {"pass", None}:
+        failed.append("direction_refs_not_in_retrieved_bundle")
     return failed

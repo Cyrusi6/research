@@ -55,6 +55,7 @@ def test_stage_contract_declares_c2c_s1_quality_outputs(tmp_path: Path) -> None:
 
     s1 = manager.stage_started("S1_literature", iteration=1, config=config)
 
+    assert "literature/c2c/evidence_request_plan.json" in s1["required_outputs"]
     assert "literature/c2c/evidence_quality_score.json" in s1["required_outputs"]
     assert "literature/c2c/evidence_retrieval_trace.json" in s1["required_outputs"]
     assert "literature/c2c/direction_fingerprint.json" in s1["required_outputs"]
