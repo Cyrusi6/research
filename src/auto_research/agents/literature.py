@@ -2431,6 +2431,7 @@ def _run_s1_c2c_direction_agent(
         attempts.append(_s1_codex_attempt_summary(call))
         payload = call.get("payload") if isinstance(call.get("payload"), dict) else None
         if call.get("status") == "ok" and payload is not None:
+            payload = _normalize_s1_c2c_direction_payload(payload, evidence_bundle=evidence_bundle)
             validation_errors = _validate_s1_c2c_direction_payload(payload, evidence_bundle=evidence_bundle)
             if not validation_errors:
                 novelty_payload = {**payload, "evidence_bundle": evidence_bundle}
@@ -2672,6 +2673,183 @@ def _validate_s1_c2c_direction_payload(payload: dict[str, Any], *, evidence_bund
         if report.get("status") != "pass":
             errors.extend(direction_bundle_ref_errors_for_repair(report))
     return errors
+
+
+def _normalize_s1_c2c_direction_payload(payload: dict[str, Any], *, evidence_bundle: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(payload, dict):
+        return payload
+    normalized = dict(payload)
+    decision = dict(normalized.get("direction_decision") if isinstance(normalized.get("direction_decision"), dict) else {})
+    ideas = [dict(item) if isinstance(item, dict) else item for item in (normalized.get("selected_ideas") or [])] if isinstance(normalized.get("selected_ideas"), list) else normalized.get("selected_ideas")
+    if decision.get("implementation_surface_refs"):
+        decision["implementation_surface_refs"] = _bundle_backed_s1_code_refs(decision.get("implementation_surface_refs"), evidence_bundle=evidence_bundle)
+    if isinstance(ideas, list):
+        for idea in ideas[:1]:
+            if isinstance(idea, dict) and idea.get("code_refs"):
+                idea["code_refs"] = _bundle_backed_s1_code_refs(idea.get("code_refs"), evidence_bundle=evidence_bundle)
+            if isinstance(idea, dict) and idea.get("implementation_surface_refs"):
+                idea["implementation_surface_refs"] = _bundle_backed_s1_code_refs(idea.get("implementation_surface_refs"), evidence_bundle=evidence_bundle)
+    normalized["direction_decision"] = decision
+    if isinstance(ideas, list):
+        normalized["selected_ideas"] = ideas
+    expected_files = _expected_files_from_s1_direction_payload(normalized, evidence_bundle=evidence_bundle)
+    if expected_files and decision.get("expected_files") in (None, "", []):
+        decision["expected_files"] = expected_files
+    if isinstance(ideas, list):
+        for idea in ideas[:1]:
+            if isinstance(idea, dict) and idea.get("expected_files") in (None, "", []):
+                idea["expected_files"] = list(decision.get("expected_files") or expected_files)
+        normalized["selected_ideas"] = ideas
+    normalized["direction_decision"] = decision
+    return normalized
+
+
+def _bundle_backed_s1_code_refs(refs: Any, *, evidence_bundle: dict[str, Any]) -> list[Any]:
+    code_items = [
+        item
+        for item in evidence_bundle.get("items") or []
+        if isinstance(item, dict) and _s1_ref_source_type(item).lower() in {"code", "implementation_surface"}
+    ]
+    normalized: list[Any] = []
+    for ref in refs or []:
+        matched = _matched_s1_code_items(ref, code_items)
+        if matched:
+            normalized.extend(_s1_bundle_ref(item) for item in matched)
+        else:
+            normalized.append(ref)
+    deduped: list[Any] = []
+    seen = set()
+    for ref in normalized:
+        key = json.dumps(ref, sort_keys=True, ensure_ascii=True, default=str) if isinstance(ref, dict) else str(ref)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ref)
+    return deduped
+
+
+def _s1_bundle_ref(item: dict[str, Any]) -> dict[str, Any]:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else item
+    return dict(ref)
+
+
+def _expected_files_from_s1_direction_payload(payload: dict[str, Any], *, evidence_bundle: dict[str, Any]) -> list[str]:
+    decision = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
+    refs: list[Any] = []
+    refs.extend(decision.get("expected_files") or [])
+    refs.extend(decision.get("implementation_surface_refs") or [])
+    for idea in payload.get("selected_ideas") or []:
+        if not isinstance(idea, dict):
+            continue
+        refs.extend(idea.get("expected_files") or [])
+        refs.extend(idea.get("code_refs") or [])
+        refs.extend(idea.get("implementation_surface_refs") or [])
+    code_items = [
+        item
+        for item in evidence_bundle.get("items") or []
+        if isinstance(item, dict) and _s1_ref_source_type(item).lower() in {"code", "implementation_surface"}
+    ]
+    files: list[str] = []
+    for ref in refs:
+        direct = _s1_ref_file_path(ref)
+        if direct:
+            files.append(direct)
+            continue
+        matched = _matched_s1_code_items(ref, code_items)
+        files.extend(_s1_ref_file_path(item) for item in matched)
+    if refs and not files:
+        files.extend(_s1_ref_file_path(item) for item in code_items)
+    result: list[str] = []
+    seen = set()
+    for file_path in files:
+        if not file_path or file_path in seen:
+            continue
+        seen.add(file_path)
+        result.append(file_path)
+    return result
+
+
+def _matched_s1_code_items(ref: Any, code_items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    ref_values = _s1_ref_match_values(ref)
+    if not ref_values:
+        return []
+    matches = []
+    for item in code_items:
+        item_values = _s1_ref_match_values(item)
+        if ref_values & item_values:
+            matches.append(item)
+    return matches
+
+
+def _s1_ref_match_values(ref: Any) -> set[str]:
+    values: set[str] = set()
+    records = []
+    if isinstance(ref, dict):
+        records.append(ref)
+        nested = ref.get("ref")
+        if isinstance(nested, dict):
+            records.append(nested)
+    elif isinstance(ref, str):
+        values.add(ref.strip())
+        normalized_file = _normalize_s1_expected_file(ref)
+        if normalized_file:
+            values.add(normalized_file)
+    for record in records:
+        for key in ["evidence_id", "chunk_id", "source_label", "label", "source_path", "path", "file", "locator"]:
+            value = record.get(key)
+            if value:
+                raw = str(value).strip()
+                values.add(raw)
+                normalized_file = _normalize_s1_expected_file(raw)
+                if normalized_file:
+                    values.add(normalized_file)
+    return {value for value in values if value}
+
+
+def _s1_ref_source_type(ref: dict[str, Any]) -> str:
+    nested = ref.get("ref") if isinstance(ref.get("ref"), dict) else {}
+    return str(ref.get("source_type") or nested.get("source_type") or "")
+
+
+def _s1_ref_file_path(ref: Any) -> str:
+    records = []
+    if isinstance(ref, dict):
+        records.append(ref)
+        nested = ref.get("ref")
+        if isinstance(nested, dict):
+            records.append(nested)
+    elif isinstance(ref, str):
+        records.append({"source_path": ref})
+    for record in records:
+        for key in ["source_path", "path", "file", "source_label", "chunk_id"]:
+            file_path = _normalize_s1_expected_file(record.get(key))
+            if file_path:
+                return file_path
+    return ""
+
+
+def _normalize_s1_expected_file(value: Any) -> str:
+    if not value:
+        return ""
+    text = str(value).strip().replace("\\", "/")
+    if not text:
+        return ""
+    for separator in ["::", "#"]:
+        if separator in text:
+            text = text.split(separator, 1)[0]
+    root_markers = ["/external/c2c_snapshot/", "/C2C/"]
+    for marker in root_markers:
+        if marker in text:
+            text = text.split(marker, 1)[1]
+            break
+    else:
+        for marker, prefix in [("/rosetta/", "rosetta"), ("/script/", "script"), ("/test/", "test"), ("/tests/", "tests")]:
+            if marker in text:
+                text = f"{prefix}/{text.split(marker, 1)[1]}"
+                break
+    if not ("/" in text or text.endswith(".py")):
+        return ""
+    return text.removeprefix("./")
 
 
 def _s1_c2c_json_repair_prompt(role: str, validation_errors: list[str], previous_output: str, previous_status: str) -> str:

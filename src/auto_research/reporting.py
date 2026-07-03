@@ -36,6 +36,7 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
     e2e_audit = read_json(project_root / "meta" / "c2c_artifact_audit_report.json", default={}) or {}
     e2e_manifest = read_json(project_root / "meta" / "c2c_e2e_run_manifest.json", default={}) or {}
     e2e_replay = read_json(project_root / "meta" / "c2c_replay_result.json", default={}) or {}
+    e2e_smoke = read_json(project_root / "meta" / "c2c_real_smoke_record.json", default={}) or {}
     selected_idea = _selected_idea(ideas)
     current_direction = _current_direction(selected_idea, direction_scorecard)
     attempts = _direction_attempts(direction_scorecard, main_results)
@@ -66,7 +67,7 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
         "s2_5_patch": _s2_5_patch_report(patch_gate),
         "s3_proxy": _s3_proxy_report(proxy_decision, worthiness),
         "attempt_ledger": _attempt_ledger_report(attempt_ledger, current_direction),
-        "e2e": _e2e_report(e2e_readiness, e2e_audit, e2e_manifest, e2e_replay),
+        "e2e": _e2e_report(e2e_readiness, e2e_audit, e2e_manifest, e2e_replay, e2e_smoke),
         "artifact_paths": {
             "direction": "literature/direction.json" if (project_root / "literature" / "direction.json").exists() else None,
             "ideas": "literature/ideas.json" if (project_root / "literature" / "ideas.json").exists() else None,
@@ -85,6 +86,7 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
             "c2c_artifact_audit": "meta/c2c_artifact_audit_report.json" if (project_root / "meta" / "c2c_artifact_audit_report.json").exists() else None,
             "c2c_e2e_run_manifest": "meta/c2c_e2e_run_manifest.json" if (project_root / "meta" / "c2c_e2e_run_manifest.json").exists() else None,
             "c2c_replay_result": "meta/c2c_replay_result.json" if (project_root / "meta" / "c2c_replay_result.json").exists() else None,
+            "c2c_real_smoke_record": "meta/c2c_real_smoke_record.json" if (project_root / "meta" / "c2c_real_smoke_record.json").exists() else None,
         },
     }
 
@@ -497,7 +499,13 @@ def _attempt_ledger_report(attempt_ledger: dict[str, Any], current_direction: di
     }
 
 
-def _e2e_report(readiness: dict[str, Any], audit: dict[str, Any], manifest: dict[str, Any], replay: dict[str, Any]) -> dict[str, Any]:
+def _e2e_report(
+    readiness: dict[str, Any],
+    audit: dict[str, Any],
+    manifest: dict[str, Any],
+    replay: dict[str, Any],
+    smoke: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     return {
         "readiness_gate": readiness.get("gate") if isinstance(readiness, dict) else None,
         "artifact_audit_gate": audit.get("gate") if isinstance(audit, dict) else None,
@@ -515,6 +523,26 @@ def _e2e_report(readiness: dict[str, Any], audit: dict[str, Any], manifest: dict
         }
         if isinstance(replay, dict) and replay
         else {},
+        "real_smoke_record": _real_smoke_report(smoke or {}),
+    }
+
+
+def _real_smoke_report(smoke: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(smoke, dict) or not smoke:
+        return {}
+    return {
+        "readiness_gate": smoke.get("readiness_gate"),
+        "run_manifest_final_status": smoke.get("run_manifest_final_status"),
+        "artifact_audit_gate": smoke.get("artifact_audit_gate"),
+        "replay_status": smoke.get("replay_status"),
+        "last_stage": smoke.get("last_stage"),
+        "s1_evidence_gate": smoke.get("s1_evidence_gate"),
+        "s2_planner_gate": smoke.get("s2_planner_gate"),
+        "s2_5_patch_gate": smoke.get("s2_5_patch_gate"),
+        "s3_proxy_decision": smoke.get("s3_proxy_decision"),
+        "route_decision": smoke.get("route_decision"),
+        "blocking_reasons": smoke.get("blocking_reasons") if isinstance(smoke.get("blocking_reasons"), list) else [],
+        "warnings": smoke.get("warnings") if isinstance(smoke.get("warnings"), list) else [],
     }
 
 

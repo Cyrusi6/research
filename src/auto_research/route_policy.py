@@ -266,6 +266,10 @@ def write_route_artifacts(
     write_json(meta_dir / "route_decision.json", route_decision)
     attempt_record = apply_route_decision_summary(project_root, route_context, route_decision)
     route_decision = {**route_decision, "attempt_record": attempt_record}
+    archive_rel = _route_decision_archive_rel(route_decision)
+    write_json(project_root / archive_rel, route_decision)
+    route_decision = {**route_decision, "archive_ref": archive_rel}
+    write_json(project_root / archive_rel, route_decision)
     write_json(meta_dir / "route_decision.json", route_decision)
     return {
         "route_context": route_context,
@@ -275,6 +279,14 @@ def write_route_artifacts(
         "route_decision_path": "meta/route_decision.json",
         "attempt_ledger_path": "meta/attempt_ledger.json",
     }
+
+
+def _route_decision_archive_rel(route_decision: dict[str, Any]) -> str:
+    created = str(route_decision.get("created_at") or now_utc())
+    stage = str(route_decision.get("trigger_stage") or "unknown")
+    stamp = "".join(ch if ch.isalnum() else "-" for ch in created).strip("-")
+    stage_slug = "".join(ch if ch.isalnum() else "_" for ch in stage).strip("_") or "unknown"
+    return f"meta/route_decisions/{stamp}_{stage_slug}.json"
 
 
 def _decision_core(context: dict[str, Any], config: dict[str, Any]) -> dict[str, Any]:

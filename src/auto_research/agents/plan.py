@@ -246,6 +246,7 @@ class PlanAgent:
         selected.setdefault("control_signal", s1_direction.get("control_signal"))
         if not _variant_expected_files(selected) and s1_direction.get("expected_files"):
             selected["expected_files"] = list(s1_direction.get("expected_files") or [])
+        _sanitize_c2c_variant_expected_files(selected, s1_direction, self.context.config)
         _ensure_c2c_s2_config_overrides(selected)
         if isinstance(selected.get("experiment_contract"), dict) and not selected["experiment_contract"].get("expected_files") and selected.get("expected_files"):
             selected["experiment_contract"]["expected_files"] = list(selected.get("expected_files") or [])
@@ -387,6 +388,14 @@ class PlanAgent:
         if isinstance(variant_selection.get("history_summary"), dict):
             history_fingerprints = [str(item) for item in variant_selection["history_summary"].get("fingerprints") or [] if item]
         pool_candidates = variant_selection.get("candidate_pool") if isinstance(variant_selection.get("candidate_pool"), list) else ideas
+        _sanitize_c2c_variant_expected_files(selected, s1_direction, self.context.config)
+        for item in ideas:
+            if isinstance(item, dict):
+                _sanitize_c2c_variant_expected_files(item, s1_direction, self.context.config)
+        if isinstance(pool_candidates, list):
+            for item in pool_candidates:
+                if isinstance(item, dict):
+                    _sanitize_c2c_variant_expected_files(item, s1_direction, self.context.config)
         candidate_pool = build_s2_candidate_pool(
             direction=s1_direction,
             candidates=[item for item in pool_candidates if isinstance(item, dict)],
@@ -437,6 +446,7 @@ class PlanAgent:
         selected.setdefault("expected_signature", s1_direction.get("expected_metric_signature"))
         if not _variant_expected_files(selected) and s1_direction.get("expected_files"):
             selected["expected_files"] = list(s1_direction.get("expected_files") or [])
+        _sanitize_c2c_variant_expected_files(selected, s1_direction, self.context.config)
         _ensure_c2c_s2_config_overrides(selected)
         if isinstance(selected.get("experiment_contract"), dict) and not selected["experiment_contract"].get("expected_files") and selected.get("expected_files"):
             selected["experiment_contract"]["expected_files"] = list(selected.get("expected_files") or [])
@@ -794,11 +804,12 @@ class PlanAgent:
         repair_files = [str(item) for item in repair_dispatch.get("changed_files") or [] if item] if isinstance(repair_dispatch, dict) else []
         if repair_files:
             selected_patch_idea["expected_files"] = repair_files
+            if isinstance(selected_patch_idea.get("experiment_contract"), dict):
+                selected_patch_idea["experiment_contract"]["expected_files"] = repair_files
         if not _variant_expected_files(selected_patch_idea) and s1_direction.get("expected_files"):
             selected_patch_idea["expected_files"] = list(s1_direction.get("expected_files") or [])
+        _sanitize_c2c_variant_expected_files(selected_patch_idea, s1_direction, self.context.config)
         _ensure_c2c_s2_config_overrides(selected_patch_idea)
-        if repair_files and isinstance(selected_patch_idea.get("experiment_contract"), dict):
-            selected_patch_idea["experiment_contract"]["expected_files"] = repair_files
         if isinstance(selected_patch_idea.get("experiment_contract"), dict) and not selected_patch_idea["experiment_contract"].get("expected_files") and selected_patch_idea.get("expected_files"):
             selected_patch_idea["experiment_contract"]["expected_files"] = list(selected_patch_idea.get("expected_files") or [])
         if not selected_patch_idea.get("variant_fingerprint"):
@@ -1193,6 +1204,7 @@ class PlanAgent:
             "expected_files": s1_direction.get("expected_files") or ["S2.5 repair target unavailable"],
             "expected_signature": s1_direction.get("expected_metric_signature") or {},
         }
+        _sanitize_c2c_variant_expected_files(repair_variant, s1_direction, self.context.config)
         planner_decision = build_planner_decision_artifact(
             direction=s1_direction,
             planner_summary="S2 planner skipped; implementation repair blocked before patch generation.",
@@ -2677,6 +2689,96 @@ def _variant_expected_files(variant: dict[str, Any]) -> list[str]:
     if isinstance(files, list):
         return [str(item) for item in files if item]
     return []
+
+
+def _sanitize_c2c_variant_expected_files(variant: dict[str, Any], direction: dict[str, Any], config: dict[str, Any]) -> None:
+    if not isinstance(variant, dict):
+        return
+    files = _filter_c2c_allowed_expected_files(_variant_expected_files(variant), config)
+    if not files:
+        files = _filter_c2c_allowed_expected_files(_direction_surface_files(direction), config)
+    if not files:
+        return
+    variant["expected_files"] = files
+    contract = variant.get("experiment_contract")
+    if not isinstance(contract, dict):
+        contract = {}
+        variant["experiment_contract"] = contract
+    contract["expected_files"] = files
+
+
+def _direction_surface_files(direction: dict[str, Any]) -> list[str]:
+    files: list[str] = []
+    for item in direction.get("expected_files") or []:
+        path = _surface_file_path(item)
+        if path:
+            files.append(path)
+    for item in direction.get("implementation_surface_refs") or []:
+        path = _surface_file_path(item)
+        if path:
+            files.append(path)
+    seen = set()
+    result = []
+    for path in files:
+        normalized = path.strip("/")
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    return result
+
+
+def _surface_file_path(value: Any) -> str:
+    if isinstance(value, dict):
+        for key in ["source_path", "path", "file", "source_label", "chunk_id"]:
+            if value.get(key):
+                return _normalize_surface_file(str(value.get(key)))
+        return ""
+    return _normalize_surface_file(str(value)) if value else ""
+
+
+def _normalize_surface_file(value: str) -> str:
+    text = str(value).strip().replace("\\", "/")
+    for separator in ["::", "#"]:
+        if separator in text:
+            text = text.split(separator, 1)[0]
+    for marker in ["/external/c2c_snapshot/", "/C2C/"]:
+        if marker in text:
+            text = text.split(marker, 1)[1]
+            break
+    else:
+        for marker, prefix in [("/rosetta/", "rosetta"), ("/script/", "script"), ("/test/", "test"), ("/tests/", "tests")]:
+            if marker in text:
+                text = f"{prefix}/{text.split(marker, 1)[1]}"
+                break
+    return text.removeprefix("./").strip("/")
+
+
+def _filter_c2c_allowed_expected_files(files: list[str], config: dict[str, Any]) -> list[str]:
+    c2c_cfg = config.get("c2c") if isinstance(config.get("c2c"), dict) else {}
+    allowed_files = {str(item).strip("/") for item in c2c_cfg.get("allowed_files") or [] if item}
+    allowed_prefixes = [str(item).strip("/") for item in c2c_cfg.get("allowed_prefixes") or [] if item]
+    if not allowed_files and not allowed_prefixes:
+        return _dedupe_paths([str(item).strip("/") for item in files if item])
+    kept = []
+    for item in files:
+        normalized = str(item).strip("/")
+        if not normalized:
+            continue
+        if normalized in allowed_files or any(normalized == prefix or normalized.startswith(prefix.rstrip("/") + "/") for prefix in allowed_prefixes):
+            kept.append(normalized)
+    return _dedupe_paths(kept)
+
+
+def _dedupe_paths(paths: list[str]) -> list[str]:
+    seen = set()
+    result = []
+    for path in paths:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        result.append(path)
+    return result
 
 
 def _flatten_variant_config_keys(value: Any, *, prefix: str = "") -> list[str]:

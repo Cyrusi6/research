@@ -80,3 +80,41 @@ def test_c2c_replay_detects_changed_proxy_decision(tmp_path: Path) -> None:
 
     assert result["status"] == "mismatch"
     assert any(item["kind"] == "input_hash_mismatch" for item in result["mismatches"])
+
+
+def test_c2c_replay_from_s3_uses_archived_route_when_latest_route_is_later_s2(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    config = _config()
+    _write_route_inputs(project)
+    _write_expected_route(project, config)
+
+    write_yaml(
+        project / "meta" / "registry.yaml",
+        {
+            "project_id": project.name,
+            "research_topic": "topic",
+            "current_stage": "S2_plan",
+            "iteration": 1,
+            "status": "failed",
+            "stages": {},
+        },
+    )
+    write_json(project / "plan" / "s2_planner" / "planner_gate_report.json", {"gate": "fail", "selected_variant_id": "variant_x"})
+    write_json(
+        project / "meta" / "attempt_ledger.json",
+        {
+            "schema_version": "c2c_attempt_ledger_v1",
+            "project_id": project.name,
+            "records": [],
+            "counters": {"by_direction": {"direction_x": {"proxy_failures": 2, "full_s3_failures": 0, "patch_repairs": 0, "resource_retries": 0}}},
+        },
+    )
+    context = build_route_context(project, {"project_id": project.name, "current_stage": "S2_plan", "iteration": 1}, config, trigger={"stage": "S2_plan", "source": "s2_gate", "status": "failed", "reason": "planner gate failed"})
+    write_route_artifacts(project, context, decide_next_route(context, config))
+
+    plan = build_c2c_replay_plan(project, replay_from="S3_experiment")
+    result = build_c2c_replay_result(project, plan, config)
+
+    assert plan["expected_decision_source"] == "route_decision_archive"
+    assert result["status"] == "match"
+    assert result["expected_decisions"]["failure_class"] == "proxy_negative"

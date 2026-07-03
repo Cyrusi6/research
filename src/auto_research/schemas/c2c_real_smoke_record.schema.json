@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CRealSmokeRecord",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "project_id",
+    "readiness_gate",
+    "run_manifest_final_status",
+    "artifact_audit_gate",
+    "replay_status",
+    "last_stage",
+    "s1_evidence_gate",
+    "s2_planner_gate",
+    "s2_5_patch_gate",
+    "s3_proxy_decision",
+    "route_decision",
+    "blocking_reasons",
+    "warnings"
+  ],
+  "properties": {
+    "schema_version": {"type": "string", "const": "c2c_real_smoke_record_v1"},
+    "created_at": {"type": "string"},
+    "project_id": {"type": "string"},
+    "readiness_gate": {"type": ["string", "null"], "enum": ["pass", "fail", "warn", null]},
+    "run_manifest_final_status": {"type": ["string", "null"]},
+    "artifact_audit_gate": {"type": ["string", "null"], "enum": ["pass", "fail", null]},
+    "replay_status": {"type": ["string", "null"], "enum": ["match", "mismatch", "blocked", null]},
+    "last_stage": {"type": ["string", "null"]},
+    "s1_evidence_gate": {"type": ["string", "null"]},
+    "s2_planner_gate": {"type": ["string", "null"]},
+    "s2_5_patch_gate": {"type": ["string", "null"]},
+    "s3_proxy_decision": {"type": ["string", "null"]},
+    "route_decision": {"type": ["string", "null"]},
+    "route_next_stage": {"type": ["string", "null"]},
+    "blocked_reason": {"type": ["string", "null"]},
+    "blocking_reasons": {"type": "array", "items": {"type": "string"}},
+    "warnings": {"type": "array", "items": {"type": "string"}},
+    "audit_summary": {"type": "object"},
+    "replay_mismatches": {"type": "array"}
+  },
+  "additionalProperties": true
+}

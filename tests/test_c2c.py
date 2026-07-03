@@ -566,6 +566,38 @@ def test_c2c_s1_evidence_quality_score_passes_with_required_coverage(tmp_path: P
     assert score["novelty_score"] >= 0.6
 
 
+def test_c2c_s1_evidence_quality_counts_distinct_code_refs_in_same_file(tmp_path: Path) -> None:
+    project_root = tmp_path / "p_quality_same_file_code_refs"
+    project_root.mkdir()
+    _write_minimal_s1_ref_catalog(project_root)
+    code_chunks_path = project_root / "intake" / "c2c" / "code_chunks.jsonl"
+    code_chunks_path.write_text(
+        code_chunks_path.read_text(encoding="utf-8")
+        + json.dumps({"chunk_id": "code:rosetta/model/wrapper.py:init", "path": "rosetta/model/wrapper.py", "symbol": "RosettaModel.__init__"})
+        + "\n"
+        + json.dumps({"chunk_id": "code:rosetta/model/wrapper.py:forward", "path": "rosetta/model/wrapper.py", "symbol": "RosettaModel.forward"})
+        + "\n",
+        encoding="utf-8",
+    )
+    payload = _s1_codex_direction_payload()
+    wrapper_code_refs = [
+        {"source_type": "code", "source_path": "rosetta/model/wrapper.py", "source_label": "rosetta/model/wrapper.py::RosettaModel.__init__", "claim": "wrapper init surface"},
+        {"source_type": "code", "source_path": "rosetta/model/wrapper.py", "source_label": "rosetta/model/wrapper.py::RosettaModel.forward", "claim": "wrapper forward surface"},
+    ]
+    payload["evidence_bundle"]["items"] = [
+        *[item for item in payload["evidence_bundle"]["items"] if item.get("source_type") != "code"],
+        *wrapper_code_refs,
+    ]
+    payload["direction_decision"]["expected_files"] = ["rosetta/model/wrapper.py"]
+    payload["selected_ideas"][0]["expected_files"] = ["rosetta/model/wrapper.py"]
+    payload["selected_ideas"][0]["code_refs"] = wrapper_code_refs
+
+    score = _quality_score_for_s1_payload(project_root, payload)
+
+    assert score["gate"] == "pass"
+    assert score["support_coverage"]["code"] == 2
+
+
 @pytest.mark.parametrize(
     ("case_name", "mutate", "expected_rule"),
     [

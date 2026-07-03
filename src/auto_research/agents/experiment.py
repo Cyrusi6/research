@@ -1207,8 +1207,30 @@ class ExperimentAgent:
             patch_gate_report=patch_gate_report,
             direction_fingerprint=direction_fingerprint,
         )
-        write_json(results_dir / "c2c_proxy_calibration_policy.json", calibration_policy)
-        write_json(results_dir / "c2c_effective_proxy_policy.json", effective_policy)
+        policy_sources = [
+            rel
+            for rel in [
+                "literature/c2c/direction_fingerprint.json",
+                "plan/s2_planner/variant_scorecard.json",
+                "plan/s2_planner/next_variant.json",
+                "plan/code_patches/patch_gate_report.json",
+            ]
+            if (self.context.project_root / rel).exists()
+        ]
+        self._write_c2c_experiment_json_artifact(
+            "results/c2c_proxy_calibration_policy.json",
+            calibration_policy,
+            artifact_type="c2c_proxy_calibration_policy",
+            summary="Deterministic C2C proxy calibration policy for S3 routing",
+            source_paths=policy_sources,
+        )
+        self._write_c2c_experiment_json_artifact(
+            "results/c2c_effective_proxy_policy.json",
+            effective_policy,
+            artifact_type="c2c_effective_proxy_policy",
+            summary="Effective C2C proxy policy after calibration adjustments",
+            source_paths=policy_sources + ["experiment/results/c2c_proxy_calibration_policy.json"],
+        )
         baseline_contracts = (
             self._write_c2c_proxy_baseline_contracts(
                 plan=plan,
@@ -1277,8 +1299,31 @@ class ExperimentAgent:
             baseline_cache_exists=baseline_cache_exists,
             require_cache_fingerprint_match=bool(fingerprint_cfg.get("require_cache_fingerprint_match", True)),
         )
-        write_json(fingerprint_path, fingerprint)
-        write_json(results_dir / "c2c_proxy_cache_report.json", cache_report)
+        baseline_sources = [
+            rel
+            for rel in [
+                "plan/plan.yaml",
+                "plan/s2_planner/variant_contract.json",
+                "plan/code_patches/patch_manifest.json",
+                "plan/code_patches/implementation_contract.json",
+                "plan/code_patches/selected_patch.json",
+            ]
+            if (self.context.project_root / rel).exists()
+        ]
+        self._write_c2c_experiment_json_artifact(
+            "results/c2c_proxy_baseline_fingerprint.json",
+            fingerprint,
+            artifact_type="c2c_proxy_baseline_fingerprint",
+            summary="Fingerprint used to decide whether the C2C paired proxy baseline cache is reusable",
+            source_paths=baseline_sources,
+        )
+        self._write_c2c_experiment_json_artifact(
+            "results/c2c_proxy_cache_report.json",
+            cache_report,
+            artifact_type="c2c_proxy_cache_report",
+            summary="C2C proxy baseline cache reuse, rerun, or invalidation decision",
+            source_paths=baseline_sources + ["experiment/results/c2c_proxy_baseline_fingerprint.json"],
+        )
         return {"baseline_fingerprint": fingerprint, "cache_report": cache_report}
 
     def _write_c2c_proxy_decision_contracts(
@@ -1316,7 +1361,22 @@ class ExperimentAgent:
                 config=config,
                 neutral_proxy_budget_remaining=True,
             )
-            write_json(results_dir / "c2c_full_s3_worthiness.json", worthiness)
+            self._write_c2c_experiment_json_artifact(
+                "results/c2c_full_s3_worthiness.json",
+                worthiness,
+                artifact_type="c2c_full_s3_worthiness",
+                summary="Deterministic worthiness score for spending full S3 budget on a neutral proxy",
+                source_paths=[
+                    rel
+                    for rel in [
+                        "experiment/results/c2c_effective_proxy_policy.json",
+                        "plan/s2_planner/variant_scorecard.json",
+                        "plan/code_patches/patch_gate_report.json",
+                        "literature/novelty_audit.json",
+                    ]
+                    if (self.context.project_root / rel).exists()
+                ],
+            )
         decision_report = build_c2c_proxy_decision_report(
             candidate=candidate,
             proxy_screen=proxy_screen,
@@ -1327,7 +1387,24 @@ class ExperimentAgent:
             variant_scorecard=variant_scorecard,
             full_s3_worthiness=worthiness,
         )
-        write_json(results_dir / "c2c_proxy_decision_report.json", decision_report)
+        self._write_c2c_experiment_json_artifact(
+            "results/c2c_proxy_decision_report.json",
+            decision_report,
+            artifact_type="c2c_proxy_decision_report",
+            summary="Source-of-truth C2C proxy routing decision for S3",
+            source_paths=[
+                rel
+                for rel in [
+                    "experiment/results/c2c_proxy_baseline_fingerprint.json",
+                    "experiment/results/c2c_effective_proxy_policy.json",
+                    "experiment/results/c2c_full_s3_worthiness.json",
+                    "plan/s2_planner/planner_gate_report.json",
+                    "plan/s2_planner/variant_scorecard.json",
+                    "plan/code_patches/patch_gate_report.json",
+                ]
+                if (self.context.project_root / rel).exists()
+            ],
+        )
         proxy_screen.setdefault("artifact_paths", {})
         proxy_screen["artifact_paths"].update(
             {
@@ -1354,6 +1431,24 @@ class ExperimentAgent:
         run_state["proxy_screen"] = proxy_screen
         run_state["proxy_decision_report"] = decision_report
         return decision_report
+
+    def _write_c2c_experiment_json_artifact(
+        self,
+        relative_path: str,
+        payload: Any,
+        *,
+        artifact_type: str,
+        summary: str,
+        source_paths: list[str] | None = None,
+    ) -> dict[str, Any]:
+        return self.context.artifacts.write_json(
+            self.stage_key,
+            relative_path,
+            payload,
+            artifact_type=artifact_type,
+            summary=summary,
+            source_paths=source_paths or [],
+        )
 
     @staticmethod
     def _snapshot_c2c_core_files(adapter: C2CAdapter) -> dict[str, str]:
@@ -1989,7 +2084,22 @@ class ExperimentAgent:
                                 "full_s3_readiness_report": "experiment/results/full_s3_readiness_report.json",
                             },
                         }
-                        write_json(self.context.project_root / "experiment" / "results" / "c2c_full_s3_decision.json", full_s3_decision)
+                        self._write_c2c_experiment_json_artifact(
+                            "results/c2c_full_s3_decision.json",
+                            full_s3_decision,
+                            artifact_type="c2c_full_s3_decision",
+                            summary="C2C decision to spend full S3 budget after proxy screening",
+                            source_paths=[
+                                rel
+                                for rel in [
+                                    "experiment/results/c2c_proxy_decision_report.json",
+                                    "experiment/results/c2c_effective_proxy_policy.json",
+                                    "experiment/results/c2c_full_s3_worthiness.json",
+                                    "experiment/results/full_s3_readiness_report.json",
+                                ]
+                                if (self.context.project_root / rel).exists()
+                            ],
+                        )
                         run_state["full_s3_decision"] = full_s3_decision
                     train_result = self.runner.run_step(
                         name="train",
@@ -2880,7 +2990,20 @@ class ExperimentAgent:
                     "rerun_status": "ok",
                     "post_rerun_fingerprint_hash": (post_run_contracts.get("baseline_fingerprint") or {}).get("fingerprint_hash"),
                 }
-                write_json(self.context.project_root / "experiment" / "results" / "c2c_proxy_cache_report.json", final_cache_report)
+                self._write_c2c_experiment_json_artifact(
+                    "results/c2c_proxy_cache_report.json",
+                    final_cache_report,
+                    artifact_type="c2c_proxy_cache_report",
+                    summary="C2C proxy baseline cache report after successful rerun",
+                    source_paths=[
+                        rel
+                        for rel in [
+                            "experiment/results/c2c_proxy_baseline_fingerprint.json",
+                            "experiment/results/c2c_proxy_baseline.json",
+                        ]
+                        if (self.context.project_root / rel).exists()
+                    ],
+                )
             return {
                 "enabled": True,
                 "status": "ok",

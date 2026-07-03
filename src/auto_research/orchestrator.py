@@ -14,6 +14,7 @@ from .c2c_e2e import (
     write_c2c_artifact_audit_report,
     write_c2c_e2e_readiness_report,
     write_c2c_e2e_run_manifest,
+    write_c2c_real_smoke_record,
     write_c2c_runtime_health_report,
     write_c2c_replay_plan,
     write_c2c_replay_result,
@@ -148,25 +149,29 @@ class Orchestrator:
         config = load_project_config(project_root)
         readiness = write_c2c_e2e_readiness_report(project_root, config)
         runtime = write_c2c_runtime_health_report(project_root, config)
+        smoke = write_c2c_real_smoke_record(project_root, config)
         self._log_session(project_root, action="doctor_c2c", details={"readiness_gate": readiness.get("gate")})
         return {
             "status": readiness.get("gate"),
             "project_id": project_id,
             "readiness_report": readiness,
             "runtime_health_report": runtime,
-            "artifacts": ["meta/c2c_e2e_readiness_report.json", "meta/c2c_runtime_health_report.json"],
+            "real_smoke_record": smoke,
+            "artifacts": ["meta/c2c_e2e_readiness_report.json", "meta/c2c_runtime_health_report.json", "meta/c2c_real_smoke_record.json"],
         }
 
     def audit_c2c(self, project_id: str) -> dict[str, Any]:
         project_root = self._project_root(project_id)
         config = load_project_config(project_root)
         audit = write_c2c_artifact_audit_report(project_root, config)
+        smoke = write_c2c_real_smoke_record(project_root, config)
         self._log_session(project_root, action="audit_c2c", details={"audit_gate": audit.get("gate")})
         return {
             "status": audit.get("gate"),
             "project_id": project_id,
             "artifact_audit_report": audit,
-            "artifacts": ["meta/c2c_artifact_audit_report.json"],
+            "real_smoke_record": smoke,
+            "artifacts": ["meta/c2c_artifact_audit_report.json", "meta/c2c_real_smoke_record.json"],
         }
 
     def replay_c2c(self, project_id: str, *, from_stage: str = "S3_experiment") -> dict[str, Any]:
@@ -174,13 +179,15 @@ class Orchestrator:
         config = load_project_config(project_root)
         plan = write_c2c_replay_plan(project_root, replay_from=from_stage)
         result = write_c2c_replay_result(project_root, config)
+        smoke = write_c2c_real_smoke_record(project_root, config)
         self._log_session(project_root, action="replay_c2c", details={"from_stage": from_stage, "status": result.get("status")})
         return {
             "status": result.get("status"),
             "project_id": project_id,
             "replay_plan": plan,
             "replay_result": result,
-            "artifacts": ["meta/c2c_replay_plan.json", "meta/c2c_replay_result.json"],
+            "real_smoke_record": smoke,
+            "artifacts": ["meta/c2c_replay_plan.json", "meta/c2c_replay_result.json", "meta/c2c_real_smoke_record.json"],
         }
 
     def enrich_s0(
@@ -816,6 +823,7 @@ class Orchestrator:
         write_c2c_e2e_run_manifest(project_root, config, final_status=status)
         if self._real_c2c_run(config) and self._c2c_e2e_enabled(config, "artifact_audit_enabled"):
             write_c2c_artifact_audit_report(project_root, config)
+        write_c2c_real_smoke_record(project_root, config)
 
     @staticmethod
     def _route_policy_enabled(config: dict[str, Any], project_root: Path) -> bool:

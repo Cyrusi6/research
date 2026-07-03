@@ -133,6 +133,25 @@ def test_project_report_summarizes_c2c_route(tmp_path, monkeypatch, capsys) -> N
     write_json(project / "meta" / "c2c_artifact_audit_report.json", {"gate": "fail", "summary": {"missing": 1}})
     write_json(project / "meta" / "c2c_e2e_run_manifest.json", {"mode": "real", "final_status": "blocked"})
     write_json(project / "meta" / "c2c_replay_result.json", {"status": "match", "mismatches": []})
+    write_json(
+        project / "meta" / "c2c_real_smoke_record.json",
+        {
+            "schema_version": "c2c_real_smoke_record_v1",
+            "project_id": "proj_report",
+            "readiness_gate": "pass",
+            "run_manifest_final_status": "blocked",
+            "artifact_audit_gate": "fail",
+            "replay_status": "match",
+            "last_stage": "S3_experiment",
+            "s1_evidence_gate": "pass",
+            "s2_planner_gate": "pass",
+            "s2_5_patch_gate": "pass",
+            "s3_proxy_decision": "proxy_rejected",
+            "route_decision": "route_to_s2",
+            "blocking_reasons": ["S3_experiment:missing:proxy"],
+            "warnings": [],
+        },
+    )
     (project / "plan" / "code_patches").mkdir()
     write_json(
         project / "plan" / "code_patches" / "patch_manifest.json",
@@ -169,6 +188,9 @@ def test_project_report_summarizes_c2c_route(tmp_path, monkeypatch, capsys) -> N
     assert report["e2e"]["artifact_audit_gate"] == "fail"
     assert report["e2e"]["real_run_manifest"]["mode"] == "real"
     assert report["e2e"]["replay"]["last_replay_status"] == "match"
+    assert report["e2e"]["real_smoke_record"]["last_stage"] == "S3_experiment"
+    assert report["e2e"]["real_smoke_record"]["route_decision"] == "route_to_s2"
+    assert report["artifact_paths"]["c2c_real_smoke_record"] == "meta/c2c_real_smoke_record.json"
     assert "S1 direction: utility_predicted_cache_routing" in text
     assert "Stage states:" in text
     assert "Next route: route_to_s2" in text

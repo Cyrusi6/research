@@ -104,3 +104,27 @@ def test_c2c_artifact_audit_reports_stale_route_invalidated_artifacts(tmp_path: 
     assert report["gate"] == "fail"
     assert report["summary"]["stale_artifacts"] == 1
     assert report["by_stage"]["orchestration"]["stale_artifacts"][0]["path"] == "plan/s2_planner/score_adjustment_report.json"
+
+
+def test_c2c_artifact_audit_allows_same_stage_failed_route_diagnostics(tmp_path: Path) -> None:
+    project = tmp_path / "proj"
+    _write_registered_required_artifacts(project)
+    stale = project / "plan" / "s2_planner" / "score_adjustment_report.json"
+    stale.write_text(json.dumps({"diagnostic": True}), encoding="utf-8")
+    time.sleep(0.01)
+    write_json(
+        project / "meta" / "route_decision.json",
+        {
+            "schema_version": "c2c_route_decision_v1",
+            "trigger_stage": "S2_plan",
+            "decision": "route_to_s2",
+            "artifact_effects": {
+                "invalidate_from": "S2_plan",
+                "invalidate_artifacts": ["plan/s2_planner/score_adjustment_report.json"],
+            },
+        },
+    )
+
+    report = build_c2c_artifact_audit_report(project, _audit_config())
+
+    assert report["by_stage"]["orchestration"]["stale_artifacts"] == []

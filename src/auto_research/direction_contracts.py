@@ -738,13 +738,19 @@ def _coverage_ref_identity(entry: dict[str, Any]) -> str:
     source_path = str(ref.get("source_path") or ref.get("path") or ref.get("file") or "")
     source_label = str(ref.get("source_label") or ref.get("label") or ref.get("source") or "")
     if source_type.lower() == "code":
-        label = source_path or source_label or chunk_id.removeprefix("code:")
-        normalized = _normalize_surface_key(label)
+        label = chunk_id.removeprefix("code:") or source_label or source_path
+        normalized = _normalize_code_coverage_key(label)
     else:
         label = source_label or chunk_id or source_path
         normalized = label.strip().lower()
     text = "|".join(part for part in [source_type, normalized] if part)
     return text or _ref_identity(entry)
+
+
+def _normalize_code_coverage_key(value: str) -> str:
+    text = str(value).strip().removeprefix("code:").split("#", 1)[0]
+    text = text.replace("\\", "/").removeprefix("./")
+    return text.lower()
 
 
 def _compact_quality_ref(entry: dict[str, Any]) -> dict[str, Any]:

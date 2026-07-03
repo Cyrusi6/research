@@ -13,6 +13,7 @@ class C2CE2EGateValidator(StageGateValidator):
         self.validate_readiness_report(required=False)
         self.validate_artifact_audit_report(required=False)
         self.validate_replay_result(required=False)
+        self.validate_real_smoke_record(required=False)
         return self.finalize(default_reason="C2C E2E orchestration artifacts are valid.")
 
     def validate_readiness_report(self, *, required: bool = True) -> None:
@@ -36,6 +37,14 @@ class C2CE2EGateValidator(StageGateValidator):
             "meta/c2c_replay_result.json",
             "c2c_replay_result.schema.json",
             "c2c_replay_result",
+            required=required,
+        )
+
+    def validate_real_smoke_record(self, *, required: bool = True) -> None:
+        self._validate_json_artifact(
+            "meta/c2c_real_smoke_record.json",
+            "c2c_real_smoke_record.schema.json",
+            "c2c_real_smoke_record",
             required=required,
         )
 
@@ -75,3 +84,9 @@ def validate_replay_result(project_root, config=None):
     validator = C2CE2EGateValidator(project_root, config)
     validator.validate_replay_result(required=True)
     return validator.finalize(default_reason="C2C replay result is valid.")
+
+
+def validate_real_smoke_record(project_root, config=None):
+    validator = C2CE2EGateValidator(project_root, config)
+    validator.validate_real_smoke_record(required=True)
+    return validator.finalize(default_reason="C2C real smoke record is valid.")

@@ -2761,3 +2761,39 @@ uv run pytest -q tests/test_c2c_e2e_readiness.py tests/test_c2c_artifact_audit.p
 uv run pytest -q tests/test_c2c.py
 uv run pytest -q
 ```
+
+## 2026-07-04 C2C Real Smoke Record And Replay Hardening
+
+第一次真实 `c2c_real_smoke_001` smoke run 验证了真实 target repo、真实 ref paper/rebuttal、真实 env_python、真实 S1/S2/S2.5/S3 artifacts、route decision、audit 和 replay 链路。结果显示真实链路可走到 S3 proxy decision，但最终在 route 回 S2 后被 planner gate 阻断；这属于后续算法/variant repair 问题，不再是 artifact 生命周期或 replay harness 缺口。
+
+修复：
+
+- 新增 `meta/c2c_real_smoke_record.json` 聚合 artifact 和 schema，汇总 readiness、run manifest、artifact audit、replay、S1/S2/S2.5/S3 gate、route decision、blocking reasons 与 warnings。
+- `doctor-c2c`、`audit-c2c`、`replay-c2c` 和 run finalize 后都会刷新 real smoke record；`report --json` 新增 `e2e.real_smoke_record`。
+- C2C S1c direction payload normalizer 会把新 direction contract 的 `implementation_surface_refs` / `code_refs` 映射回 legacy `expected_files`，防止真实 S1c 因旧字段缺失被挡住。
+- S1 evidence quality scoring 修正同一文件内多个 code chunk 的 deterministic coverage 计数，避免只按 source path 折叠导致 code coverage 假阴性。
+- C2C S2/S2.5 expected files sanitizer 会把 planner/patch-only repair 的 expected files 限定到 S1 direction implementation surface，防止 S2 gate 因跨 surface 文件失败。
+- S3 proxy policy/fingerprint/cache/decision/full-S3 decision artifacts 改为通过 `ArtifactManager` 写入，保证 `experiment/stage_manifest.json` 登记和 audit hash 可追踪。
+- Route policy 写 `meta/route_decisions/*.json` 归档；replay-from-S3 会按 requested stage 选择 archived route 或 iteration trace expected，并隔离后续 S2/S2.5 gate 和 ledger counter 覆盖。
+- Artifact audit 的 stale invalidation 检测保留跨 stage route 污染检查，但允许同 stage 自身失败保留诊断 artifacts。
+
+真实 smoke 结果：
+
+```text
+doctor-c2c c2c_real_smoke_001: warn
+readiness blocking_reasons: []
+readiness warning: deepseek_api_key_missing_for_semantic_enrichment
+run-c2c --max-iterations 1 --stop-after-stage S3_experiment: failed at S2_plan after S3 proxy route_to_s2
+S1 evidence gate: pass
+S3 proxy decision: proxy_repairable, route_hint=return_s2
+artifact audit: pass, checked_artifacts=30, missing=0, schema_failures=0, hash_mismatches=0, stale_artifacts=0
+replay-c2c --from-stage S3_experiment: match
+real smoke record: readiness_gate=warn, artifact_audit_gate=pass, replay_status=match
+```
+
+验证：
+
+```text
+python -m py_compile src/auto_research/agents/experiment.py src/auto_research/agents/literature.py src/auto_research/agents/plan.py src/auto_research/c2c_e2e.py src/auto_research/reporting.py src/auto_research/route_policy.py src/auto_research/validators/c2c_e2e_gate.py
+uv run pytest -q tests/test_c2c_s3_artifact_registration.py tests/test_c2c_replay.py tests/test_c2c_artifact_audit.py tests/test_c2c_real_smoke_record.py tests/test_s1_c2c_direction_normalization.py tests/test_s2_c2c_expected_files.py tests/test_reporting.py tests/test_validators.py
+```

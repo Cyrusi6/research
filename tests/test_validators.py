@@ -1024,7 +1024,27 @@ def test_c2c_e2e_gate_validates_readiness_audit_and_replay_reports(tmp_path: Pat
             "mismatches": [],
         },
     )
+    write_json(
+        project / "meta" / "c2c_real_smoke_record.json",
+        {
+            "schema_version": "c2c_real_smoke_record_v1",
+            "project_id": "proj_e2e_gate",
+            "readiness_gate": "pass",
+            "run_manifest_final_status": "completed",
+            "artifact_audit_gate": "pass",
+            "replay_status": "match",
+            "last_stage": "S3_experiment",
+            "s1_evidence_gate": "pass",
+            "s2_planner_gate": "pass",
+            "s2_5_patch_gate": "pass",
+            "s3_proxy_decision": "proxy_pass",
+            "route_decision": "complete",
+            "blocking_reasons": [],
+            "warnings": [],
+        },
+    )
 
     report = C2CE2EGateValidator(project, {}).validate().to_dict()
 
     assert report["status"] == "PASS"
+    assert any(check["name"] == "c2c_real_smoke_record_schema" and check["status"] == "PASS" for check in report["checks"])
