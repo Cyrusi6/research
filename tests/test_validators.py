@@ -10,8 +10,8 @@ from auto_research.s2_planner_contracts import (
     build_s2_variant_scorecard,
 )
 from auto_research.s2_feedback_policy import build_s2_adaptive_policy, build_s2_feedback_context, build_s2_score_adjustment_report
-from auto_research.utils import sha256_file
-from auto_research.validators import run_stage_gate
+from auto_research.utils import sha256_file, write_json
+from auto_research.validators import C2CE2EGateValidator, run_stage_gate
 from auto_research.workspace import init_workspace
 
 
@@ -973,3 +973,58 @@ def test_s3_gate_fails_when_s2_5_artifact_lock_changes(tmp_path: Path) -> None:
     lock_check = next(check for check in report["checks"] if check["name"] == "s3_s2_5_artifact_lock_sha256")
     assert lock_check["status"] == "FAIL"
     assert lock_check["details"]["mismatches"][0]["name"] == "selected_patch"
+
+
+def test_c2c_e2e_gate_validates_readiness_audit_and_replay_reports(tmp_path: Path) -> None:
+    project = tmp_path / "proj_e2e_gate"
+    write_json(
+        project / "meta" / "c2c_e2e_readiness_report.json",
+        {
+            "schema_version": "c2c_e2e_readiness_report_v1",
+            "project_id": "proj_e2e_gate",
+            "mode": "real",
+            "gate": "pass",
+            "checks": {
+                "target_repo_exists": True,
+                "ref_paper_exists": True,
+                "ref_rebuttal_exists": True,
+                "env_python_executable": True,
+                "workspace_writable": True,
+                "worktree_root_writable": True,
+                "llm_config_ready": True,
+                "dataset_paths_ready": True,
+                "gpu_policy_ready": True,
+                "s0_cache_compatible": True,
+                "baseline_cache_valid_or_invalidated": True,
+            },
+            "warnings": [],
+            "blocking_reasons": [],
+            "recommended_action": "run_c2c",
+        },
+    )
+    write_json(
+        project / "meta" / "c2c_artifact_audit_report.json",
+        {
+            "schema_version": "c2c_artifact_audit_report_v1",
+            "project_id": "proj_e2e_gate",
+            "gate": "pass",
+            "summary": {"checked_artifacts": 1, "missing": 0, "schema_failures": 0, "hash_mismatches": 0, "stale_artifacts": 0},
+            "by_stage": {},
+            "blocking_reasons": [],
+        },
+    )
+    write_json(
+        project / "meta" / "c2c_replay_result.json",
+        {
+            "schema_version": "c2c_replay_result_v1",
+            "project_id": "proj_e2e_gate",
+            "status": "match",
+            "replayed_decisions": {},
+            "expected_decisions": {},
+            "mismatches": [],
+        },
+    )
+
+    report = C2CE2EGateValidator(project, {}).validate().to_dict()
+
+    assert report["status"] == "PASS"

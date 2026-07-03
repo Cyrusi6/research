@@ -334,6 +334,17 @@ def build_c2c_project_config(
         "orchestration": {
             "auto_mode": True,
             "stop_after_stage": "S3_experiment",
+            "c2c_e2e": {
+                "readiness_gate_enabled": True,
+                "artifact_audit_enabled": True,
+                "replay_enabled": True,
+                "block_real_run_on_readiness_fail": True,
+                "warn_on_missing_optional_artifacts": True,
+                "require_stage_manifest_entries": True,
+                "require_schema_validation": True,
+                "require_hash_validation": True,
+                "detect_stale_artifacts": True,
+            },
             "route_policy": {
                 "enabled": True,
                 "c2c_only": True,

@@ -71,6 +71,16 @@ def build_parser() -> argparse.ArgumentParser:
     report_parser.add_argument("--project-id", required=True)
     report_parser.add_argument("--json", action="store_true", help="Emit structured JSON instead of human-readable text")
 
+    doctor_c2c_parser = subparsers.add_parser("doctor-c2c", help="Run C2C real-run readiness and runtime health checks")
+    doctor_c2c_parser.add_argument("--project-id", required=True)
+
+    audit_c2c_parser = subparsers.add_parser("audit-c2c", help="Audit C2C E2E artifacts after a run")
+    audit_c2c_parser.add_argument("--project-id", required=True)
+
+    replay_c2c_parser = subparsers.add_parser("replay-c2c", help="Replay deterministic C2C route decisions from frozen artifacts")
+    replay_c2c_parser.add_argument("--project-id", required=True)
+    replay_c2c_parser.add_argument("--from-stage", default="S3_experiment")
+
     memory_parser = subparsers.add_parser("memory", help="Inspect shared method failure memory")
     memory_subparsers = memory_parser.add_subparsers(dest="memory_command", required=True)
     memory_report_parser = memory_subparsers.add_parser("report", help="Show shared method memory report")
@@ -146,6 +156,15 @@ def main(argv: list[str] | None = None) -> None:
             print(json.dumps(report, indent=2, ensure_ascii=False))
         else:
             print(format_project_report(report))
+        return
+    if args.command == "doctor-c2c":
+        print(json.dumps(orchestrator.doctor_c2c(args.project_id), indent=2, ensure_ascii=False))
+        return
+    if args.command == "audit-c2c":
+        print(json.dumps(orchestrator.audit_c2c(args.project_id), indent=2, ensure_ascii=False))
+        return
+    if args.command == "replay-c2c":
+        print(json.dumps(orchestrator.replay_c2c(args.project_id, from_stage=args.from_stage), indent=2, ensure_ascii=False))
         return
     if args.command == "memory":
         project_root = None

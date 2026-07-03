@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CE2ERunManifest",
+  "type": "object",
+  "required": ["schema_version", "project_id", "started_at", "mode", "command", "inputs", "stage_boundaries", "final_status"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "project_id": {"type": "string"},
+    "started_at": {"type": "string"},
+    "completed_at": {"type": "string"},
+    "mode": {"type": "string", "enum": ["real", "simulate"]},
+    "command": {"type": "object"},
+    "inputs": {
+      "type": "object",
+      "required": ["target_repo", "ref_paper", "ref_rebuttal", "env_python", "project_config_sha256", "root_config_sha256"]
+    },
+    "stage_boundaries": {"type": "object"},
+    "final_status": {"type": "string"}
+  }
+}

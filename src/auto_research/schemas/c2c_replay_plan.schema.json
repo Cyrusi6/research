@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CReplayPlan",
+  "type": "object",
+  "required": ["schema_version", "project_id", "replay_from", "frozen_inputs", "actions"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "project_id": {"type": "string"},
+    "replay_from": {"type": "string"},
+    "frozen_inputs": {"type": "array"},
+    "input_hashes": {"type": "object"},
+    "actions": {"type": "array"},
+    "expected_decision_hashes": {"type": "object"}
+  }
+}

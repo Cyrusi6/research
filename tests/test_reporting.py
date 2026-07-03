@@ -129,6 +129,10 @@ def test_project_report_summarizes_c2c_route(tmp_path, monkeypatch, capsys) -> N
     write_json(project / "plan" / "s2_planner" / "planner_gate_report.json", {"gate": "pass", "selected_variant_id": "utility_v2"})
     write_json(project / "plan" / "s2_planner" / "variant_scorecard.json", {"ranking": [{"variant_id": "utility_v2", "score": 0.72, "decision": "selected"}]})
     write_json(project / "experiment" / "results" / "c2c_proxy_decision_report.json", {"decision": "proxy_rejected", "route_hint": "return_s2", "failure_class": "proxy_negative"})
+    write_json(project / "meta" / "c2c_e2e_readiness_report.json", {"gate": "pass"})
+    write_json(project / "meta" / "c2c_artifact_audit_report.json", {"gate": "fail", "summary": {"missing": 1}})
+    write_json(project / "meta" / "c2c_e2e_run_manifest.json", {"mode": "real", "final_status": "blocked"})
+    write_json(project / "meta" / "c2c_replay_result.json", {"status": "match", "mismatches": []})
     (project / "plan" / "code_patches").mkdir()
     write_json(
         project / "plan" / "code_patches" / "patch_manifest.json",
@@ -161,10 +165,15 @@ def test_project_report_summarizes_c2c_route(tmp_path, monkeypatch, capsys) -> N
     assert report["s2_planner"]["selected_variant_score"] == 0.72
     assert report["s3_proxy"]["route_hint"] == "return_s2"
     assert report["attempt_ledger"]["same_direction_proxy_failures"] == 1
+    assert report["e2e"]["readiness_gate"] == "pass"
+    assert report["e2e"]["artifact_audit_gate"] == "fail"
+    assert report["e2e"]["real_run_manifest"]["mode"] == "real"
+    assert report["e2e"]["replay"]["last_replay_status"] == "match"
     assert "S1 direction: utility_predicted_cache_routing" in text
     assert "Stage states:" in text
     assert "Next route: route_to_s2" in text
     assert "Route decision: route_to_s2 -> S2_plan" in text
+    assert "C2C E2E: readiness=pass audit=fail replay=match" in text
 
     import auto_research.config as config_module
     import auto_research.orchestrator as orchestrator_module

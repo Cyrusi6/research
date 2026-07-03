@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CRuntimeHealthReport",
+  "type": "object",
+  "required": ["schema_version", "project_id", "python", "gpu", "filesystem"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "project_id": {"type": "string"},
+    "python": {"type": "object"},
+    "gpu": {"type": "object"},
+    "filesystem": {"type": "object"}
+  }
+}

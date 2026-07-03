@@ -10,6 +10,14 @@ import yaml
 
 from .artifacts import ArtifactManager
 from .c2c import build_c2c_project_config, snapshot_c2c_repo, write_c2c_project_config
+from .c2c_e2e import (
+    write_c2c_artifact_audit_report,
+    write_c2c_e2e_readiness_report,
+    write_c2c_e2e_run_manifest,
+    write_c2c_runtime_health_report,
+    write_c2c_replay_plan,
+    write_c2c_replay_result,
+)
 from .code_patch import is_retryable_patch_manifest
 from .config import apply_runtime_overrides, load_project_config, load_root_config
 from .direction_contracts import direction_to_legacy_idea
@@ -135,6 +143,46 @@ class Orchestrator:
         project_root = self._project_root(project_id)
         return build_project_report(project_root)
 
+    def doctor_c2c(self, project_id: str) -> dict[str, Any]:
+        project_root = self._project_root(project_id)
+        config = load_project_config(project_root)
+        readiness = write_c2c_e2e_readiness_report(project_root, config)
+        runtime = write_c2c_runtime_health_report(project_root, config)
+        self._log_session(project_root, action="doctor_c2c", details={"readiness_gate": readiness.get("gate")})
+        return {
+            "status": readiness.get("gate"),
+            "project_id": project_id,
+            "readiness_report": readiness,
+            "runtime_health_report": runtime,
+            "artifacts": ["meta/c2c_e2e_readiness_report.json", "meta/c2c_runtime_health_report.json"],
+        }
+
+    def audit_c2c(self, project_id: str) -> dict[str, Any]:
+        project_root = self._project_root(project_id)
+        config = load_project_config(project_root)
+        audit = write_c2c_artifact_audit_report(project_root, config)
+        self._log_session(project_root, action="audit_c2c", details={"audit_gate": audit.get("gate")})
+        return {
+            "status": audit.get("gate"),
+            "project_id": project_id,
+            "artifact_audit_report": audit,
+            "artifacts": ["meta/c2c_artifact_audit_report.json"],
+        }
+
+    def replay_c2c(self, project_id: str, *, from_stage: str = "S3_experiment") -> dict[str, Any]:
+        project_root = self._project_root(project_id)
+        config = load_project_config(project_root)
+        plan = write_c2c_replay_plan(project_root, replay_from=from_stage)
+        result = write_c2c_replay_result(project_root, config)
+        self._log_session(project_root, action="replay_c2c", details={"from_stage": from_stage, "status": result.get("status")})
+        return {
+            "status": result.get("status"),
+            "project_id": project_id,
+            "replay_plan": plan,
+            "replay_result": result,
+            "artifacts": ["meta/c2c_replay_plan.json", "meta/c2c_replay_result.json"],
+        }
+
     def enrich_s0(
         self,
         project_id: str,
@@ -232,6 +280,9 @@ class Orchestrator:
         hitl = HITLManager(project_root, config)
         self._log_session(project_root, action="start_run", details={"stage": registry["current_stage"], "iteration": iteration})
         state.run_started(registry)
+        e2e_block = self._prepare_c2c_e2e_run(project_root, config, registry_path, registry, state)
+        if e2e_block:
+            return e2e_block
 
         while registry["current_stage"] != "DONE":
             stage_key = registry["current_stage"]
@@ -239,6 +290,7 @@ class Orchestrator:
             save_registry(registry_path, registry)
             state.stage_started(registry, stage_key)
             contracts.stage_started(stage_key, iteration=registry.get("iteration"), config=config)
+            self._record_c2c_e2e_stage_event(project_root, config, stage_key, "started")
             if stage_key == "S0_intake":
                 result = IntakeAgent(context).run(topic)
                 if result.get("status") == "blocked":
@@ -246,6 +298,8 @@ class Orchestrator:
                     save_registry(registry_path, registry)
                     state.stage_blocked(registry, stage_key, registry["blocked_reason"])
                     contracts.stage_stopped(stage_key, status="blocked", reason=registry["blocked_reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                    self._record_c2c_e2e_stage_event(project_root, config, stage_key, "blocked", reason=registry["blocked_reason"])
+                    self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
                     self._log_session(project_root, action="blocked", details={"stage": stage_key, "reason": registry["blocked_reason"]})
                     return {"status": "blocked", "stage": stage_key, "reason": registry["blocked_reason"]}
                 gate_report = gate_s0(project_root, config)
@@ -256,6 +310,8 @@ class Orchestrator:
                     save_registry(registry_path, registry)
                     state.stage_blocked(registry, stage_key, registry["blocked_reason"])
                     contracts.stage_stopped(stage_key, status="blocked", reason=registry["blocked_reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                    self._record_c2c_e2e_stage_event(project_root, config, stage_key, "blocked", reason=registry["blocked_reason"])
+                    self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
                     self._log_session(project_root, action="blocked", details={"stage": stage_key, "reason": registry["blocked_reason"]})
                     return {"status": "blocked", "stage": stage_key, "reason": registry["blocked_reason"]}
                 gate_report = gate_s1(project_root, config)
@@ -291,6 +347,7 @@ class Orchestrator:
                         if policy_route.get("continue"):
                             context = self._context(project_root, load_project_config(project_root))
                             continue
+                        self._finalize_c2c_e2e_run(project_root, config, registry, final_status=str(policy_route["response"].get("status") or registry.get("status") or "blocked"))
                         return policy_route["response"]
                     resource_pause = self._s3_resource_retry_pause_details(project_root, result, result["blocked_reason"])
                     if resource_pause:
@@ -305,6 +362,8 @@ class Orchestrator:
                             config=config,
                             iteration=registry.get("iteration"),
                         )
+                        self._record_c2c_e2e_stage_event(project_root, config, stage_key, "retryable_paused", reason=resource_pause["reason"])
+                        self._finalize_c2c_e2e_run(project_root, config, registry, final_status="retryable_paused")
                         self._log_session(project_root, action="s3_resource_retry_paused", details=resource_pause)
                         return {
                             "status": "retryable_paused",
@@ -364,6 +423,8 @@ class Orchestrator:
                             continue
                         state.stage_blocked(registry, stage_key, routed["reason"])
                         contracts.stage_stopped(stage_key, status="blocked", reason=routed["reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                        self._record_c2c_e2e_stage_event(project_root, config, stage_key, "blocked", reason=routed["reason"])
+                        self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
                         return {"status": "blocked", "stage": stage_key, "reason": routed["reason"]}
                     if self._should_route_s3_proxy_rejected_to_s2(config, project_root, registry):
                         routed = self._route_s3_proxy_rejected_to_s2(project_root, registry, result, result["blocked_reason"], config=config)
@@ -399,11 +460,15 @@ class Orchestrator:
                             continue
                         state.stage_blocked(registry, stage_key, routed["reason"])
                         contracts.stage_stopped(stage_key, status="blocked", reason=routed["reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                        self._record_c2c_e2e_stage_event(project_root, config, stage_key, "blocked", reason=routed["reason"])
+                        self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
                         return {"status": "blocked", "stage": stage_key, "reason": routed["reason"]}
                     block_stage(registry, stage_key, result["blocked_reason"])
                     save_registry(registry_path, registry)
                     state.stage_blocked(registry, stage_key, result["blocked_reason"])
                     contracts.stage_stopped(stage_key, status="blocked", reason=result["blocked_reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                    self._record_c2c_e2e_stage_event(project_root, config, stage_key, "blocked", reason=result["blocked_reason"])
+                    self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
                     self._log_session(project_root, action="blocked", details={"stage": stage_key, "reason": result["blocked_reason"]})
                     return {"status": "blocked", "stage": stage_key, "reason": result["blocked_reason"]}
                 gate_report = gate_s3(project_root, config)
@@ -432,6 +497,7 @@ class Orchestrator:
                         if policy_route.get("continue"):
                             context = self._context(project_root, load_project_config(project_root))
                             continue
+                        self._finalize_c2c_e2e_run(project_root, config, registry, final_status=str(policy_route["response"].get("status") or registry.get("status") or "blocked"))
                         return policy_route["response"]
                 if not ok and self._should_route_s3_implementation_failure_to_s2(config, project_root, registry):
                     routed = self._route_s3_repairable_proxy_to_s2(project_root, registry, result, reason, config=config)
@@ -463,6 +529,8 @@ class Orchestrator:
                         continue
                     state.stage_blocked(registry, stage_key, routed["reason"])
                     contracts.stage_stopped(stage_key, status="blocked", reason=routed["reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                    self._record_c2c_e2e_stage_event(project_root, config, stage_key, "blocked", reason=routed["reason"])
+                    self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
                     return {"status": "blocked", "stage": stage_key, "reason": routed["reason"]}
                 if not ok and self._should_route_s3_proxy_rejected_to_s2(config, project_root, registry):
                     routed = self._route_s3_proxy_rejected_to_s2(project_root, registry, result, reason, config=config)
@@ -484,6 +552,8 @@ class Orchestrator:
                         continue
                     state.stage_blocked(registry, stage_key, routed["reason"])
                     contracts.stage_stopped(stage_key, status="blocked", reason=routed["reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                    self._record_c2c_e2e_stage_event(project_root, config, stage_key, "blocked", reason=routed["reason"])
+                    self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
                     return {"status": "blocked", "stage": stage_key, "reason": routed["reason"]}
                 if not ok and self._should_route_s3_failure_to_s1(config, project_root, result):
                     routed = self._route_s3_failure_to_s1(project_root, registry, result, reason, config=config)
@@ -496,6 +566,8 @@ class Orchestrator:
                         continue
                     state.stage_blocked(registry, stage_key, routed["reason"])
                     contracts.stage_stopped(stage_key, status="blocked", reason=routed["reason"], artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                    self._record_c2c_e2e_stage_event(project_root, config, stage_key, "blocked", reason=routed["reason"])
+                    self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
                     return {"status": "blocked", "stage": stage_key, "reason": routed["reason"]}
             elif stage_key == "S4_writing":
                 LiteratureAgent(context).run(topic, phase="related_work_audit")
@@ -510,6 +582,8 @@ class Orchestrator:
                 save_registry(registry_path, registry)
                 state.stage_failed(registry, stage_key, f"Unknown stage {stage_key}")
                 contracts.stage_stopped(stage_key, status="failed", reason=f"Unknown stage {stage_key}", config=config, iteration=registry.get("iteration"))
+                self._record_c2c_e2e_stage_event(project_root, config, stage_key, "failed", reason=f"Unknown stage {stage_key}")
+                self._finalize_c2c_e2e_run(project_root, config, registry, final_status="failed")
                 return {"status": "failed", "stage": stage_key}
 
             if stage_key != "S3_experiment":
@@ -532,6 +606,8 @@ class Orchestrator:
                         save_registry(registry_path, registry)
                         state.stage_blocked(registry, stage_key, f"Rejected by human: {hitl_decision.guidance}")
                         contracts.stage_stopped(stage_key, status="blocked", reason=f"Rejected by human: {hitl_decision.guidance}", artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                        self._record_c2c_e2e_stage_event(project_root, config, stage_key, "blocked", reason=f"Rejected by human: {hitl_decision.guidance}")
+                        self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
                         self._log_session(project_root, action="hitl_rejected", details={"stage": stage_key, "guidance": hitl_decision.guidance})
                         return {"status": "blocked", "stage": stage_key, "reason": f"Rejected by human: {hitl_decision.guidance}"}
                     if hitl_decision.action == "guide":
@@ -548,6 +624,7 @@ class Orchestrator:
                 save_registry(registry_path, registry)
                 state.stage_completed(registry, stage_key, artifacts=result.get("artifacts", []))
                 contracts.stage_completed(stage_key, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                self._record_c2c_e2e_stage_event(project_root, config, stage_key, "completed")
                 self._log_session(project_root, action="stage_completed", details={"stage": stage_key})
                 stop_after = config.get("orchestration", {}).get("stop_after_stage")
                 if stop_after == stage_key:
@@ -583,6 +660,8 @@ class Orchestrator:
                     config=config,
                     iteration=registry.get("iteration"),
                 )
+                self._record_c2c_e2e_stage_event(project_root, config, stage_key, "retryable_paused", reason=retryable_pause["reason"])
+                self._finalize_c2c_e2e_run(project_root, config, registry, final_status="retryable_paused")
                 self._log_session(project_root, action="retryable_paused", details=retryable_pause)
                 return {
                     "status": "retryable_paused",
@@ -608,6 +687,7 @@ class Orchestrator:
                 if s2_5_policy_route.get("continue"):
                     context = self._context(project_root, load_project_config(project_root))
                     continue
+                self._finalize_c2c_e2e_run(project_root, config, registry, final_status=str(s2_5_policy_route["response"].get("status") or registry.get("status") or "blocked"))
                 return s2_5_policy_route["response"]
 
             s2_5_implementation_repair = self._route_s2_5_validation_failure_to_repair(
@@ -644,10 +724,98 @@ class Orchestrator:
             save_registry(registry_path, registry)
             state.stage_failed(registry, stage_key, reason)
             contracts.stage_stopped(stage_key, status="failed", reason=reason, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+            self._record_c2c_e2e_stage_event(project_root, config, stage_key, "failed", reason=reason)
+            self._finalize_c2c_e2e_run(project_root, config, registry, final_status="failed")
             self._log_session(project_root, action="stage_failed", details={"stage": stage_key, "reason": reason})
             return {"status": "failed", "stage": stage_key, "reason": reason}
         state.mark_completed(registry)
+        self._finalize_c2c_e2e_run(project_root, config, registry)
         return {"status": registry["status"], "project_id": registry["project_id"]}
+
+    def _prepare_c2c_e2e_run(
+        self,
+        project_root: Path,
+        config: dict[str, Any],
+        registry_path: Path,
+        registry: dict[str, Any],
+        state: OrchestrationStateManager,
+    ) -> dict[str, Any] | None:
+        if not self._c2c_e2e_enabled(config, "readiness_gate_enabled"):
+            return None
+        write_c2c_e2e_run_manifest(
+            project_root,
+            config,
+            command={
+                "name": "start",
+                "simulate": bool((config.get("experiment") or {}).get("simulate")),
+                "stop_after_stage": (config.get("orchestration") or {}).get("stop_after_stage"),
+                "max_iterations": registry.get("max_iterations") or (config.get("review") or {}).get("max_iterations"),
+            },
+        )
+        write_c2c_runtime_health_report(project_root, config)
+        if not self._real_c2c_run(config):
+            return None
+        readiness = write_c2c_e2e_readiness_report(project_root, config)
+        e2e_cfg = ((config.get("orchestration") or {}).get("c2c_e2e") or {}) if isinstance(config.get("orchestration"), dict) else {}
+        if readiness.get("gate") == "fail" and e2e_cfg.get("block_real_run_on_readiness_fail", True):
+            reason = "C2C real-run readiness failed: " + ", ".join(readiness.get("blocking_reasons") or [])
+            stage_key = registry.get("current_stage") or "S0_intake"
+            block_stage(registry, stage_key, reason)
+            save_registry(registry_path, registry)
+            state.stage_blocked(registry, stage_key, reason)
+            self._record_c2c_e2e_stage_event(project_root, config, str(stage_key), "blocked", reason=reason)
+            self._finalize_c2c_e2e_run(project_root, config, registry, final_status="blocked")
+            self._log_session(project_root, action="c2c_e2e_readiness_blocked", details=readiness)
+            return {
+                "status": "blocked",
+                "stage": stage_key,
+                "reason": reason,
+                "readiness_report_path": "meta/c2c_e2e_readiness_report.json",
+            }
+        return None
+
+    @staticmethod
+    def _c2c_e2e_enabled(config: dict[str, Any], key: str) -> bool:
+        if not bool(((config or {}).get("c2c") or {}).get("enabled")):
+            return False
+        cfg = ((config.get("orchestration") or {}).get("c2c_e2e") or {}) if isinstance(config.get("orchestration"), dict) else {}
+        return bool(cfg.get(key, False))
+
+    @staticmethod
+    def _real_c2c_run(config: dict[str, Any]) -> bool:
+        return bool(((config or {}).get("c2c") or {}).get("enabled")) and not bool(((config or {}).get("experiment") or {}).get("simulate"))
+
+    def _record_c2c_e2e_stage_event(
+        self,
+        project_root: Path,
+        config: dict[str, Any],
+        stage_key: str,
+        status: str,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        if not self._c2c_e2e_enabled(config, "readiness_gate_enabled"):
+            return
+        write_c2c_e2e_run_manifest(
+            project_root,
+            config,
+            stage_event={"stage": stage_key, "status": status, "reason": reason, "timestamp": now_utc()},
+        )
+
+    def _finalize_c2c_e2e_run(
+        self,
+        project_root: Path,
+        config: dict[str, Any],
+        registry: dict[str, Any],
+        *,
+        final_status: str | None = None,
+    ) -> None:
+        if not self._c2c_e2e_enabled(config, "readiness_gate_enabled"):
+            return
+        status = final_status or str(registry.get("status") or "completed")
+        write_c2c_e2e_run_manifest(project_root, config, final_status=status)
+        if self._real_c2c_run(config) and self._c2c_e2e_enabled(config, "artifact_audit_enabled"):
+            write_c2c_artifact_audit_report(project_root, config)
 
     @staticmethod
     def _route_policy_enabled(config: dict[str, Any], project_root: Path) -> bool:

@@ -32,6 +32,10 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
     patch_gate = read_json(project_root / "plan" / "code_patches" / "patch_gate_report.json", default={}) or {}
     proxy_decision = read_json(project_root / "experiment" / "results" / "c2c_proxy_decision_report.json", default={}) or {}
     worthiness = read_json(project_root / "experiment" / "results" / "c2c_full_s3_worthiness.json", default={}) or {}
+    e2e_readiness = read_json(project_root / "meta" / "c2c_e2e_readiness_report.json", default={}) or {}
+    e2e_audit = read_json(project_root / "meta" / "c2c_artifact_audit_report.json", default={}) or {}
+    e2e_manifest = read_json(project_root / "meta" / "c2c_e2e_run_manifest.json", default={}) or {}
+    e2e_replay = read_json(project_root / "meta" / "c2c_replay_result.json", default={}) or {}
     selected_idea = _selected_idea(ideas)
     current_direction = _current_direction(selected_idea, direction_scorecard)
     attempts = _direction_attempts(direction_scorecard, main_results)
@@ -62,6 +66,7 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
         "s2_5_patch": _s2_5_patch_report(patch_gate),
         "s3_proxy": _s3_proxy_report(proxy_decision, worthiness),
         "attempt_ledger": _attempt_ledger_report(attempt_ledger, current_direction),
+        "e2e": _e2e_report(e2e_readiness, e2e_audit, e2e_manifest, e2e_replay),
         "artifact_paths": {
             "direction": "literature/direction.json" if (project_root / "literature" / "direction.json").exists() else None,
             "ideas": "literature/ideas.json" if (project_root / "literature" / "ideas.json").exists() else None,
@@ -76,6 +81,10 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
             "planner_gate": "plan/s2_planner/planner_gate_report.json" if (project_root / "plan" / "s2_planner" / "planner_gate_report.json").exists() else None,
             "patch_gate": "plan/code_patches/patch_gate_report.json" if (project_root / "plan" / "code_patches" / "patch_gate_report.json").exists() else None,
             "proxy_decision": "experiment/results/c2c_proxy_decision_report.json" if (project_root / "experiment" / "results" / "c2c_proxy_decision_report.json").exists() else None,
+            "c2c_e2e_readiness": "meta/c2c_e2e_readiness_report.json" if (project_root / "meta" / "c2c_e2e_readiness_report.json").exists() else None,
+            "c2c_artifact_audit": "meta/c2c_artifact_audit_report.json" if (project_root / "meta" / "c2c_artifact_audit_report.json").exists() else None,
+            "c2c_e2e_run_manifest": "meta/c2c_e2e_run_manifest.json" if (project_root / "meta" / "c2c_e2e_run_manifest.json").exists() else None,
+            "c2c_replay_result": "meta/c2c_replay_result.json" if (project_root / "meta" / "c2c_replay_result.json").exists() else None,
         },
     }
 
@@ -88,6 +97,7 @@ def format_project_report(report: dict[str, Any]) -> str:
     failure = report.get("latest_failure") if isinstance(report.get("latest_failure"), dict) else {}
     route = report.get("next_route") if isinstance(report.get("next_route"), dict) else {}
     route_report = report.get("route") if isinstance(report.get("route"), dict) else {}
+    e2e = report.get("e2e") if isinstance(report.get("e2e"), dict) else {}
     lines = [
         f"Project: {report.get('project_id')}",
         f"Status: {report.get('status')} | Stage: {report.get('current_stage')} | Iteration: {report.get('iteration')}",
@@ -118,6 +128,7 @@ def format_project_report(report: dict[str, Any]) -> str:
             f"Recent failure: {failure.get('reason') or 'none'}",
             f"Next route: {route.get('action') or states.get('next_route_hint') or 'unknown'} ({route.get('reason') or states.get('next_route_hint') or 'no reason recorded'})",
             f"Route decision: {route_report.get('last_decision') or 'none'} -> {route_report.get('next_stage') or 'n/a'}",
+            f"C2C E2E: readiness={e2e.get('readiness_gate') or 'n/a'} audit={e2e.get('artifact_audit_gate') or 'n/a'} replay={e2e.get('replay', {}).get('last_replay_status') if isinstance(e2e.get('replay'), dict) else 'n/a'}",
         ]
     )
     if report.get("status") == "retryable_paused":
@@ -483,6 +494,27 @@ def _attempt_ledger_report(attempt_ledger: dict[str, Any], current_direction: di
         "patch_repairs": counters.get("patch_repairs", 0),
         "resource_retries": counters.get("resource_retries", 0),
         "record_count": len(records),
+    }
+
+
+def _e2e_report(readiness: dict[str, Any], audit: dict[str, Any], manifest: dict[str, Any], replay: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "readiness_gate": readiness.get("gate") if isinstance(readiness, dict) else None,
+        "artifact_audit_gate": audit.get("gate") if isinstance(audit, dict) else None,
+        "real_run_manifest": {
+            "mode": manifest.get("mode"),
+            "final_status": manifest.get("final_status"),
+            "stage_boundaries": manifest.get("stage_boundaries") if isinstance(manifest.get("stage_boundaries"), dict) else {},
+        }
+        if isinstance(manifest, dict) and manifest
+        else {},
+        "artifact_audit_summary": audit.get("summary") if isinstance(audit, dict) and isinstance(audit.get("summary"), dict) else {},
+        "replay": {
+            "last_replay_status": replay.get("status"),
+            "mismatches": replay.get("mismatches") if isinstance(replay.get("mismatches"), list) else [],
+        }
+        if isinstance(replay, dict) and replay
+        else {},
     }
 
 

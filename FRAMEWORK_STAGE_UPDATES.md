@@ -2736,3 +2736,28 @@ uv run pytest -q tests/test_s2_feedback_policy.py tests/test_s2_adaptive_scoreca
 uv run pytest -q tests/test_c2c.py
 uv run pytest -q
 ```
+
+## 2026-07-03 C2C Real E2E Readiness / Audit / Replay
+
+C2C 真实端到端运行新增 orchestration-level guardrail：真实 run-c2c 前先做 deterministic readiness check，运行过程中记录 E2E manifest，运行后可 audit artifact 完整性和 hash，失败后可从固定 artifact replay route policy，不需要重跑 S1/S2 LLM。
+
+修复：
+
+- 新增 `c2c_e2e.py`，提供 `build_c2c_e2e_readiness_report()`、`build_c2c_e2e_run_manifest()`、`build_c2c_artifact_audit_report()`、`build_c2c_replay_plan()`、`build_c2c_replay_result()` 和 `build_c2c_runtime_health_report()`。
+- 新增 E2E artifacts：`meta/c2c_e2e_readiness_report.json`、`meta/c2c_e2e_run_manifest.json`、`meta/c2c_artifact_audit_report.json`、`meta/c2c_runtime_health_report.json`、`meta/c2c_replay_plan.json` 和 `meta/c2c_replay_result.json`。
+- `doctor-c2c` 在真实运行前检查 target repo、ref paper/rebuttal、env python、workspace/worktree 写权限、LLM key/provider、dataset root、GPU policy、S0 cache fingerprint 和 baseline cache 状态。
+- `audit-c2c` 检查 C2C S1/S2/S2.5/S3/route 关键 artifacts 是否存在、schema 是否最小通过、stage_manifest 是否登记、sha256 是否一致，并检测 route invalidation 后仍残留的旧 adaptive artifacts。
+- `replay-c2c` 冻结 S2 scorecard、S2.5 patch gate、S3 proxy decision、worthiness、calibration policy、attempt ledger 和 route decision，复算 route policy 并比对 frozen input hash 与 route decision hash。
+- Orchestrator 只在真实 C2C run 且 `orchestration.c2c_e2e.readiness_gate_enabled=true` 时自动阻断 readiness fail；simulate C2C 项目继续由各 stage gate 自己暴露问题。
+- Orchestrator 记录 stage boundary 到 `c2c_e2e_run_manifest.json`，真实 C2C run 完成、失败、暂停或阻塞时写 final status，并在配置启用时写 artifact audit。
+- `reporting.py` 新增 `e2e` 区块，展示 readiness gate、artifact audit gate、real-run manifest final status 和 replay status。
+- 新增 `C2CE2EGateValidator` 与 6 个 E2E schema；C2C 默认项目配置新增 `orchestration.c2c_e2e`。
+
+验证：
+
+```text
+python -m py_compile src/auto_research/c2c_e2e.py src/auto_research/orchestrator.py src/auto_research/cli.py src/auto_research/reporting.py src/auto_research/validators/c2c_e2e_gate.py src/auto_research/c2c.py
+uv run pytest -q tests/test_c2c_e2e_readiness.py tests/test_c2c_artifact_audit.py tests/test_c2c_replay.py tests/test_reporting.py tests/test_validators.py tests/test_pipeline.py
+uv run pytest -q tests/test_c2c.py
+uv run pytest -q
+```

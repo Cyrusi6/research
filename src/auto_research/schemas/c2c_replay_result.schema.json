@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CReplayResult",
+  "type": "object",
+  "required": ["schema_version", "project_id", "status", "replayed_decisions", "expected_decisions", "mismatches"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "project_id": {"type": "string"},
+    "status": {"type": "string", "enum": ["match", "mismatch", "blocked"]},
+    "replayed_decisions": {"type": "object"},
+    "expected_decisions": {"type": "object"},
+    "mismatches": {"type": "array"}
+  }
+}

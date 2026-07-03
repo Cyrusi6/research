@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CE2EReadinessReport",
+  "type": "object",
+  "required": ["schema_version", "project_id", "mode", "gate", "checks", "warnings", "blocking_reasons", "recommended_action"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "created_at": {"type": "string"},
+    "project_id": {"type": "string"},
+    "mode": {"type": "string", "enum": ["real", "simulate"]},
+    "gate": {"type": "string", "enum": ["pass", "fail", "warn"]},
+    "checks": {
+      "type": "object",
+      "required": [
+        "target_repo_exists",
+        "ref_paper_exists",
+        "ref_rebuttal_exists",
+        "env_python_executable",
+        "workspace_writable",
+        "worktree_root_writable",
+        "llm_config_ready",
+        "dataset_paths_ready",
+        "gpu_policy_ready",
+        "s0_cache_compatible",
+        "baseline_cache_valid_or_invalidated"
+      ]
+    },
+    "warnings": {"type": "array"},
+    "blocking_reasons": {"type": "array"},
+    "recommended_action": {"type": "string"}
+  }
+}

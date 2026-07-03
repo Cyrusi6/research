@@ -10,7 +10,7 @@ import auto_research.agents.literature as literature_module
 import auto_research.orchestrator as orchestrator_module
 from auto_research.adapters.literature import LiteratureProvider
 from auto_research.orchestrator import Orchestrator
-from auto_research.registry import block_stage
+from auto_research.registry import block_stage, default_registry
 from auto_research.s2_feedback_policy import build_s2_adaptive_policy, build_s2_feedback_context, build_s2_score_adjustment_report
 from auto_research.s2_planner_contracts import build_s2_candidate_pool, build_s2_planner_gate_report, build_s2_variant_scorecard
 from auto_research.utils import write_json, write_yaml
@@ -329,6 +329,42 @@ def test_real_mode_blocks_at_experiment_stage(monkeypatch, tmp_path: Path) -> No
     s3_contract = json.loads((tmp_path / project_id / "orchestration" / "stage_contracts" / "S3_experiment.json").read_text(encoding="utf-8"))
     assert s3_contract["status"] == "blocked"
     assert s3_contract["reason"]
+
+
+def test_c2c_real_run_readiness_blocks_before_s0(monkeypatch, tmp_path: Path) -> None:
+    project_root = tmp_path / "proj_c2c_readiness_block"
+    config = _test_config(tmp_path, simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "target_repo": str(tmp_path / "missing_repo"),
+        "snapshot_path": "external/c2c_snapshot",
+        "ref_paper": str(tmp_path / "missing_paper.md"),
+        "ref_rebuttal": str(tmp_path / "missing_rebuttal.md"),
+        "env_python": str(tmp_path / "missing_python"),
+        "dataset_root": str(tmp_path / "missing_datasets"),
+        "small_loop": {"strict_dataset_cache": True},
+    }
+    config["orchestration"]["c2c_e2e"] = {
+        "readiness_gate_enabled": True,
+        "artifact_audit_enabled": True,
+        "block_real_run_on_readiness_fail": True,
+    }
+    project_root.mkdir(parents=True)
+    (project_root / "meta").mkdir()
+    write_yaml(project_root / "meta" / "project_config.yaml", config)
+    write_yaml(project_root / "meta" / "registry.yaml", default_registry(project_id=project_root.name, topic="topic", config=config))
+    monkeypatch.setattr(config_module, "load_root_config", lambda: config)
+    monkeypatch.setattr(orchestrator_module, "load_root_config", lambda: config)
+
+    result = Orchestrator().start(project_root.name)
+
+    assert result["status"] == "blocked"
+    assert result["stage"] == "S0_intake"
+    assert "C2C real-run readiness failed" in result["reason"]
+    readiness = json.loads((project_root / "meta" / "c2c_e2e_readiness_report.json").read_text(encoding="utf-8"))
+    assert readiness["gate"] == "fail"
+    manifest = json.loads((project_root / "meta" / "c2c_e2e_run_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["final_status"] == "blocked"
 
 
 def test_generic_s1_codex_repairs_invalid_json(monkeypatch, tmp_path: Path) -> None:
