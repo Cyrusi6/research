@@ -2640,3 +2640,26 @@ python -m py_compile src/auto_research/s1_retrieval.py src/auto_research/evidenc
 uv run pytest -q tests/test_s1_retrieval.py tests/test_validators.py tests/test_stage_contracts.py
 uv run pytest -q tests/test_c2c.py
 ```
+
+## 2026-07-03 C2C S2 Planner / S2.5 Patch Contract Split
+
+C2C S2 进一步拆成 planner-only、deterministic selector、planner gate 和 S2.5 patch gate，避免低质量 variant 规划直接进入 CodePatchAgent，也让后续 S3 feedback 能区分“variant 规划失败”和“patch 实现失败”。
+
+修复：
+
+- 新增 `s2_planner_contracts.py`，提供 `candidate_pool`、deterministic `variant_scorecard`、`planner_gate_report`、S2.5 `implementation_contract` 和 `patch_gate_report` builder。
+- C2C regular S2 路径先写 `plan/s2_planner/candidate_pool.json`、`variant_scorecard.json`、`next_variant.json`、`planner_gate_report.json`；只有 planner gate pass 才调用 `CodePatchAgent.run_selected_variant()`。
+- S2.5 patch-only repair 也复用 locked selected variant 生成 planner artifacts，并按 repair dispatch 的 changed files 收窄 implementation surface，避免重新跑 S2 planner。
+- `CodePatchAgent` 新增 selected-variant wrapper，写出 top-level `plan/code_patches/implementation_contract.json` 和 `patch_gate_report.json`。
+- `S2GateValidator` 增加 planner gate 和 patch gate 硬校验：selected variant 必须来自 pool、fingerprint/direction 匹配、expected files 在 allowed surface、ablation switch 存在；patch manifest 存在时必须有 implementation/patch gate，并分类 no executable、forbidden files、activation switch、runtime resource retry 等失败。
+- `stage_contracts.py` 增加 C2C S2 planner outputs 和 code_patch-enabled S2.5 artifacts，并修复 `code_patch.enabled == true` 条件匹配。
+- C2C/pipeline 测试 helper 升级为同时写 legacy compatibility artifacts 和 `plan/s2_planner/*` 新 source-of-truth artifacts。
+
+验证：
+
+```text
+python -m py_compile src/auto_research/s2_planner_contracts.py src/auto_research/agents/plan.py src/auto_research/code_patch.py src/auto_research/validators/s2_gate.py src/auto_research/stage_contracts.py
+uv run pytest -q tests/test_s2_planner_contracts.py tests/test_stage_contracts.py tests/test_validators.py
+uv run pytest -q tests/test_c2c.py
+uv run pytest -q tests/test_stage_contracts.py tests/test_pipeline.py tests/test_validators.py tests/test_s2_planner_contracts.py
+```

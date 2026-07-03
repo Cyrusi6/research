@@ -61,6 +61,26 @@ def test_stage_contract_declares_c2c_s1_quality_outputs(tmp_path: Path) -> None:
     assert "literature/c2c/direction_fingerprint.json" in s1["required_outputs"]
 
 
+def test_stage_contract_declares_c2c_s2_planner_outputs(tmp_path: Path) -> None:
+    config = {
+        "project": {"workspace_root": str(tmp_path)},
+        "review": {"max_iterations": 2},
+        "c2c": {"enabled": True},
+        "code_patch": {"enabled": True},
+    }
+    paths = init_workspace(config, "topic", project_id="proj_c2c_s2_outputs", simulate=True)
+    manager = StageContractManager(paths.root)
+
+    s2 = manager.stage_started("S2_plan", iteration=1, config=config)
+
+    assert "plan/s2_planner/candidate_pool.json" in s2["required_outputs"]
+    assert "plan/s2_planner/variant_scorecard.json" in s2["required_outputs"]
+    assert "plan/s2_planner/next_variant.json" in s2["required_outputs"]
+    assert "plan/s2_planner/planner_gate_report.json" in s2["required_outputs"]
+    assert "plan/code_patches/implementation_contract.json" in s2["required_outputs"]
+    assert "plan/code_patches/patch_gate_report.json" in s2["required_outputs"]
+
+
 def test_stage_contract_activates_c2c_small_loop_inputs(tmp_path: Path) -> None:
     config = {
         "project": {"workspace_root": str(tmp_path)},

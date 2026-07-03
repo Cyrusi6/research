@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS25PatchGateReport",
+  "type": "object",
+  "required": ["schema_version", "gate", "variant_id", "variant_fingerprint", "patch_manifest_status", "checks", "repairable"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "gate": {"type": "string", "enum": ["pass", "fail", "retry"]},
+    "variant_id": {"type": "string"},
+    "variant_fingerprint": {"type": "string"},
+    "patch_manifest_status": {"type": "string"},
+    "checks": {"type": "object"},
+    "changed_files": {"type": "array"},
+    "failure_class": {"type": ["string", "null"]},
+    "repairable": {"type": "boolean"}
+  }
+}

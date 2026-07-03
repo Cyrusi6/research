@@ -29,6 +29,7 @@ from auto_research.c2c import C2CAdapter, C2CPatchGuard, DEFAULT_C2C_PROXY_SCREE
 from auto_research.direction_contracts import build_direction_contract, build_s1_direction_fingerprint, build_s1_evidence_quality_score
 from auto_research.evidence_refs import resolve_s1_evidence_refs
 from auto_research.judges import gate_s0
+from auto_research.s2_planner_contracts import build_s2_candidate_pool, build_s2_planner_gate_report, build_s2_variant_scorecard
 from auto_research.validators.s2_gate import S2GateValidator
 from auto_research.code_patch import (
     CodePatchAgent,
@@ -319,11 +320,18 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
     variant = {
         "id": "wrapper_utility_variant",
         "title": "Wrapper utility variant",
+        "direction_id": direction_id,
+        "s1_direction_id": direction_id,
         "variant_fingerprint": "fp_wrapper_utility",
         "mechanism_axis": "routing",
         "integration_point": "wrapper",
         "control_signal": "utility",
         "expected_files": ["rosetta/model/wrapper.py"],
+        "ablation_switch": "disable_wrapper_utility",
+        "experiment_contract": {
+            "expected_files": ["rosetta/model/wrapper.py"],
+            "ablation_switch": "disable_wrapper_utility",
+        },
     }
     (project / "literature" / "direction.json").write_text(json.dumps(direction), encoding="utf-8")
     (project / "plan" / "planner_decision.json").write_text(
@@ -386,6 +394,34 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
         ),
         encoding="utf-8",
     )
+    contract = json.loads((project / "plan" / "variant_contract.json").read_text(encoding="utf-8"))
+    fingerprint = json.loads((project / "plan" / "variant_fingerprint.json").read_text(encoding="utf-8"))
+    candidate_pool = build_s2_candidate_pool(direction=direction, candidates=[variant], source="test_fixture")
+    scorecard = build_s2_variant_scorecard(
+        direction=direction,
+        candidate_pool=candidate_pool,
+        selected_variant=variant,
+        evidence_quality={"support_coverage": {"paper": 2, "code": 2}},
+        variant_fingerprint=fingerprint,
+        planner_memory={"entries": []},
+        feedback=[],
+        config={},
+    )
+    planner_gate = build_s2_planner_gate_report(
+        direction=direction,
+        candidate_pool=candidate_pool,
+        scorecard=scorecard,
+        next_variant=variant,
+        variant_contract=contract,
+        variant_fingerprint=fingerprint,
+        config={},
+    )
+    (project / "plan" / "s2_planner").mkdir(parents=True, exist_ok=True)
+    (project / "plan" / "next_variant.json").write_text((project / "plan" / "planner_decision.json").read_text(encoding="utf-8"), encoding="utf-8")
+    (project / "plan" / "s2_planner" / "candidate_pool.json").write_text(json.dumps(candidate_pool), encoding="utf-8")
+    (project / "plan" / "s2_planner" / "variant_scorecard.json").write_text(json.dumps(scorecard), encoding="utf-8")
+    (project / "plan" / "s2_planner" / "next_variant.json").write_text(json.dumps(variant), encoding="utf-8")
+    (project / "plan" / "s2_planner" / "planner_gate_report.json").write_text(json.dumps(planner_gate), encoding="utf-8")
 
 
 def _write_minimal_s1_ref_catalog(project_root: Path) -> None:
@@ -5945,7 +5981,7 @@ def test_c2c_s2_directional_planner_falls_back_without_real_llm(tmp_path: Path) 
         "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
         "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
         "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
-        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py", "test/test_aligner_span_overlap.py"],
+        "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py", "test/test_aligner_span_overlap.py"],
     }
     config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
     config["code_patch"] = {"enabled": False}
@@ -5960,6 +5996,11 @@ def test_c2c_s2_directional_planner_falls_back_without_real_llm(tmp_path: Path) 
     planned = result["plan"]["candidate_ideas"]
     assert planned[0]["id"] == "utility_predicted_cache_routing"
     assert result["plan"]["directional_planning"]["status"] == "fallback_no_real_llm"
+    assert (paths.root / "plan" / "s2_planner" / "candidate_pool.json").exists()
+    assert (paths.root / "plan" / "s2_planner" / "variant_scorecard.json").exists()
+    assert (paths.root / "plan" / "s2_planner" / "next_variant.json").exists()
+    planner_gate = json.loads((paths.root / "plan" / "s2_planner" / "planner_gate_report.json").read_text(encoding="utf-8"))
+    assert planner_gate["gate"] == "pass"
 
 
 def test_c2c_s2_planner_current_direction_fallback_gets_execution_contract(tmp_path: Path) -> None:
@@ -6246,6 +6287,10 @@ def test_c2c_implementation_failure_reruns_only_s2_5_patch_repair(monkeypatch, t
     manifest = json.loads((paths.root / "plan" / "code_patches" / "patch_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "ok"
     assert manifest["selected_candidate_id"] == existing_candidate["id"]
+    assert (paths.root / "plan" / "code_patches" / "implementation_contract.json").exists()
+    patch_gate = json.loads((paths.root / "plan" / "code_patches" / "patch_gate_report.json").read_text(encoding="utf-8"))
+    assert patch_gate["gate"] == "pass"
+    assert patch_gate["variant_id"] == existing_candidate["id"]
     patch_only_record = json.loads((paths.root / "plan" / "s2_5_patch_only_repair.json").read_text(encoding="utf-8"))
     assert patch_only_record["repair_lane"] == "s2_5_only_implementation_repair"
     assert patch_only_record["patch_eligible_for_s3"] is True
@@ -6321,6 +6366,10 @@ def test_c2c_implementation_failure_missing_candidate_blocks_without_s2_planner(
     manifest = json.loads((paths.root / "plan" / "code_patches" / "patch_manifest.json").read_text(encoding="utf-8"))
     assert manifest["status"] == "no_valid_patch"
     assert manifest["implementation_blocked"] is True
+    assert (paths.root / "plan" / "s2_planner" / "planner_gate_report.json").exists()
+    patch_gate = json.loads((paths.root / "plan" / "code_patches" / "patch_gate_report.json").read_text(encoding="utf-8"))
+    assert patch_gate["gate"] == "fail"
+    assert patch_gate["repairable"] is True
 
 
 def test_c2c_s2_variant_scorer_prefers_diverse_failure_targeted_variant(tmp_path: Path) -> None:

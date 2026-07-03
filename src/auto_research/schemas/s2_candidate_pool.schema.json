@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS2CandidatePool",
+  "type": "object",
+  "required": ["schema_version", "direction_id", "source", "candidate_count", "candidates"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "source": {"type": "string"},
+    "candidate_count": {"type": "integer"},
+    "used_shared_memory_refs": {"type": "array"},
+    "candidates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "variant_fingerprint", "mechanism_axis", "integration_point", "control_signal", "expected_files", "ablation_switch"],
+        "properties": {
+          "id": {"type": "string"},
+          "title": {"type": "string"},
+          "direction_id": {"type": "string"},
+          "variant_fingerprint": {"type": "string"},
+          "mechanism_axis": {"type": "string"},
+          "integration_point": {"type": "string"},
+          "control_signal": {"type": "string"},
+          "expected_files": {"type": "array"},
+          "ablation_switch": {"type": "string"},
+          "experiment_contract": {"type": "object"},
+          "implementation_plan": {"type": "object"},
+          "failure_feedback_refs": {"type": "array"},
+          "used_shared_memory_refs": {"type": "array"},
+          "variant_score": {"type": "object"},
+          "risk_budget": {"type": "object"},
+          "selected_for_s2_5": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}

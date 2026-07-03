@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS2PlannerGateReport",
+  "type": "object",
+  "required": ["schema_version", "direction_id", "gate", "selected_variant_id", "selected_variant_fingerprint", "selected_variant", "checks", "errors"],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "gate": {"type": "string", "enum": ["pass", "fail"]},
+    "selected_variant_id": {"type": "string"},
+    "selected_variant_fingerprint": {"type": "string"},
+    "selected_variant_score": {"type": "number"},
+    "selected_variant": {"type": "object"},
+    "checks": {"type": "object"},
+    "errors": {"type": "array"},
+    "return_to": {"type": ["string", "null"]}
+  }
+}

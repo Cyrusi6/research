@@ -2,6 +2,13 @@ import json
 from pathlib import Path
 
 from auto_research.c2c import default_c2c_ideas
+from auto_research.s2_planner_contracts import (
+    build_s2_5_patch_gate_report,
+    build_s2_candidate_pool,
+    build_s2_implementation_contract,
+    build_s2_planner_gate_report,
+    build_s2_variant_scorecard,
+)
 from auto_research.utils import sha256_file
 from auto_research.validators import run_stage_gate
 from auto_research.workspace import init_workspace
@@ -258,17 +265,37 @@ def _write_c2c_s1_gate_context(paths, *, quality_gate: str = "pass", mutate_qual
     )
 
 
-def _write_s2_contracts(paths, *, direction_id: str = "utility_predicted_cache_routing", mutate_contract=None, mutate_fingerprint=None) -> None:
+def _write_s2_contracts(
+    paths,
+    *,
+    direction_id: str = "utility_predicted_cache_routing",
+    mutate_contract=None,
+    mutate_fingerprint=None,
+    mutate_next_variant=None,
+    mutate_scorecard=None,
+    mutate_planner_gate=None,
+) -> None:
     plan_dir = paths.root / "plan"
+    planner_dir = plan_dir / "s2_planner"
+    planner_dir.mkdir(parents=True, exist_ok=True)
     direction = _direction_payload(direction_id)
     next_variant = {
         "id": "wrapper_utility_variant",
         "title": "Wrapper utility variant",
+        "direction_id": direction_id,
+        "s1_direction_id": direction_id,
         "variant_fingerprint": "fp_wrapper_utility",
         "mechanism_axis": "routing",
         "integration_point": "wrapper",
         "control_signal": "utility",
         "expected_files": ["rosetta/model/wrapper.py"],
+        "ablation_switch": "disable_wrapper_utility",
+        "experiment_contract": {
+            "expected_files": ["rosetta/model/wrapper.py"],
+            "ablation_switch": "disable_wrapper_utility",
+        },
+        "implementation_plan": {"scope": "small", "integration_points": ["wrapper"]},
+        "failure_feedback_refs": [],
     }
     planner = {
         "schema_version": "auto_research_planner_decision_v1",
@@ -319,11 +346,102 @@ def _write_s2_contracts(paths, *, direction_id: str = "utility_predicted_cache_r
         mutate_contract(contract)
     if mutate_fingerprint:
         mutate_fingerprint(fingerprint)
+    if mutate_next_variant:
+        mutate_next_variant(next_variant)
+    candidate_pool = build_s2_candidate_pool(direction=direction, candidates=[next_variant], source="test_fixture")
+    scorecard = build_s2_variant_scorecard(
+        direction=direction,
+        candidate_pool=candidate_pool,
+        selected_variant=next_variant,
+        evidence_quality={"support_coverage": {"paper": 2, "code": 2}},
+        variant_fingerprint=fingerprint,
+        planner_memory={"entries": []},
+        feedback=[],
+        config={},
+    )
+    if mutate_scorecard:
+        mutate_scorecard(scorecard)
+    planner_gate = build_s2_planner_gate_report(
+        direction=direction,
+        candidate_pool=candidate_pool,
+        scorecard=scorecard,
+        next_variant=next_variant,
+        variant_contract=contract,
+        variant_fingerprint=fingerprint,
+        config={},
+    )
+    if mutate_planner_gate:
+        mutate_planner_gate(planner_gate)
     (paths.root / "literature").mkdir(parents=True, exist_ok=True)
     (paths.root / "literature" / "direction.json").write_text(json.dumps(direction), encoding="utf-8")
+    (plan_dir / "next_variant.json").write_text(json.dumps(planner), encoding="utf-8")
     (plan_dir / "planner_decision.json").write_text(json.dumps(planner), encoding="utf-8")
     (plan_dir / "variant_contract.json").write_text(json.dumps(contract), encoding="utf-8")
     (plan_dir / "variant_fingerprint.json").write_text(json.dumps(fingerprint), encoding="utf-8")
+    (planner_dir / "candidate_pool.json").write_text(json.dumps(candidate_pool), encoding="utf-8")
+    (planner_dir / "variant_scorecard.json").write_text(json.dumps(scorecard), encoding="utf-8")
+    (planner_dir / "next_variant.json").write_text(json.dumps(next_variant), encoding="utf-8")
+    (planner_dir / "planner_gate_report.json").write_text(json.dumps(planner_gate), encoding="utf-8")
+
+
+def _write_s2_patch_gate_artifacts(
+    paths,
+    *,
+    status: str = "ok",
+    selected_candidate_id: str = "wrapper_utility_variant",
+    changed_files: list[str] | None = None,
+    has_executable_change: bool = True,
+    mutate_patch_gate=None,
+) -> None:
+    plan_dir = paths.root / "plan"
+    patch_dir = plan_dir / "code_patches"
+    patch_dir.mkdir(parents=True, exist_ok=True)
+    direction = json.loads((paths.root / "literature" / "direction.json").read_text(encoding="utf-8"))
+    next_variant = json.loads((plan_dir / "s2_planner" / "next_variant.json").read_text(encoding="utf-8"))
+    variant_contract = json.loads((plan_dir / "variant_contract.json").read_text(encoding="utf-8"))
+    variant_fingerprint = json.loads((plan_dir / "variant_fingerprint.json").read_text(encoding="utf-8"))
+    planner_gate = json.loads((plan_dir / "s2_planner" / "planner_gate_report.json").read_text(encoding="utf-8"))
+    implementation_contract = build_s2_implementation_contract(
+        direction=direction,
+        selected_variant=next_variant,
+        variant_contract=variant_contract,
+        planner_gate_report=planner_gate,
+        config={},
+    )
+    changed_files = changed_files if changed_files is not None else ["rosetta/model/wrapper.py"]
+    entry = {
+        "candidate_id": selected_candidate_id,
+        "status": "ok" if status == "ok" else "failed",
+        "changed_files": changed_files,
+        "has_executable_change": has_executable_change,
+        "validation": {
+            "status": "ok" if status == "ok" else "validation_failed",
+            "activation_check": {"status": "ok"},
+            "risk_check": {"status": "ok"},
+            "mechanism_review": {"status": "ok"},
+        },
+    }
+    manifest = {
+        "status": status,
+        "selected_candidate_id": selected_candidate_id,
+        "valid_patch_count": 1 if status == "ok" else 0,
+        "valid_patch_ids": [selected_candidate_id] if status == "ok" else [],
+        "candidates": [entry],
+        "patches": [entry],
+        "selected_patch": {"candidate_id": selected_candidate_id},
+    }
+    patch_gate = build_s2_5_patch_gate_report(
+        patch_manifest=manifest,
+        implementation_contract=implementation_contract,
+        planner_gate_report=planner_gate,
+        variant_fingerprint=variant_fingerprint,
+        config={},
+    )
+    if mutate_patch_gate:
+        mutate_patch_gate(patch_gate)
+    (patch_dir / "patch_manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+    (patch_dir / "implementation_contract.json").write_text(json.dumps(implementation_contract), encoding="utf-8")
+    (patch_dir / "patch_gate_report.json").write_text(json.dumps(patch_gate), encoding="utf-8")
 
 
 def _write_minimal_c2c_plan(paths) -> None:
@@ -475,6 +593,7 @@ reviewer_risk_controls:
     assert any(check["name"] == "c2c_runtime_resource_selection_deferred" for check in report["checks"])
     assert any(check["name"] == "c2c_mechanism_novelty_gate" and check["status"] == "PASS" for check in report["checks"])
     assert any(check["name"] == "c2c_implementation_scope_gate" and check["status"] == "PASS" for check in report["checks"])
+    assert any(check["name"] == "s2_planner_gate_contract" and check["status"] == "PASS" for check in report["checks"])
 
 
 def test_s2_gate_retries_missing_variant_contract(tmp_path: Path) -> None:
@@ -488,6 +607,54 @@ def test_s2_gate_retries_missing_variant_contract(tmp_path: Path) -> None:
 
     assert report["status"] == "NEEDS_RETRY"
     assert any(check["name"] == "variant_contract_json_exists" for check in report["checks"])
+
+
+def test_s2_gate_retries_missing_s2_candidate_pool(tmp_path: Path) -> None:
+    paths = init_workspace(_config(tmp_path), "topic", project_id="proj_gate_missing_s2_pool", simulate=True)
+    _write_s1_contract(paths)
+    _write_minimal_c2c_plan(paths)
+    _write_s2_contracts(paths)
+    (paths.root / "plan" / "s2_planner" / "candidate_pool.json").unlink()
+
+    report = run_stage_gate("S2_plan", paths.root, _config(tmp_path)).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    assert any(check["name"] == "s2_candidate_pool_json_exists" for check in report["checks"])
+
+
+def test_s2_gate_retries_s2_next_variant_direction_mismatch(tmp_path: Path) -> None:
+    paths = init_workspace(_config(tmp_path), "topic", project_id="proj_gate_s2_next_direction_mismatch", simulate=True)
+    _write_s1_contract(paths)
+    _write_minimal_c2c_plan(paths)
+    _write_s2_contracts(paths, mutate_next_variant=lambda variant: variant.update({"direction_id": "other_direction"}))
+
+    report = run_stage_gate("S2_plan", paths.root, _config(tmp_path)).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    planner_gate = next(check for check in report["checks"] if check["name"] == "s2_planner_gate_contract")
+    assert "next_variant.direction_id must match literature/direction.json direction_id" in planner_gate["details"]["errors"]
+
+
+def test_s2_gate_retries_s2_next_variant_missing_ablation_switch(tmp_path: Path) -> None:
+    paths = init_workspace(_config(tmp_path), "topic", project_id="proj_gate_s2_next_missing_ablation", simulate=True)
+    _write_s1_contract(paths)
+    _write_minimal_c2c_plan(paths)
+
+    def remove_ablation(variant: dict) -> None:
+        variant.pop("ablation_switch", None)
+        variant["experiment_contract"].pop("ablation_switch", None)
+
+    _write_s2_contracts(
+        paths,
+        mutate_next_variant=remove_ablation,
+        mutate_contract=lambda contract: contract["ablation"].pop("switch"),
+    )
+
+    report = run_stage_gate("S2_plan", paths.root, _config(tmp_path)).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    planner_gate = next(check for check in report["checks"] if check["name"] == "s2_planner_gate_contract")
+    assert "next_variant.ablation_switch must be present" in planner_gate["details"]["planner_gate_errors"]
 
 
 def test_s2_gate_retries_direction_mismatch(tmp_path: Path) -> None:
@@ -543,6 +710,36 @@ def test_s2_gate_retries_repeated_variant_fingerprint(tmp_path: Path) -> None:
     assert report["status"] == "NEEDS_RETRY"
     handoff = next(check for check in report["checks"] if check["name"] == "s2_variant_handoff_contract")
     assert "variant_fingerprint repeats a previous same-direction variant" in handoff["details"]["errors"]
+
+
+def test_s2_gate_retries_missing_patch_gate_when_manifest_exists(tmp_path: Path) -> None:
+    paths = init_workspace(_config(tmp_path), "topic", project_id="proj_gate_missing_patch_gate", simulate=True)
+    _write_s1_contract(paths)
+    _write_minimal_c2c_plan(paths)
+    _write_s2_contracts(paths)
+    _write_s2_patch_gate_artifacts(paths)
+    (paths.root / "plan" / "code_patches" / "patch_gate_report.json").unlink()
+
+    report = run_stage_gate("S2_plan", paths.root, _config(tmp_path)).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    assert any(check["name"] == "s2_5_patch_gate_report_json_exists" for check in report["checks"])
+
+
+def test_s2_gate_retries_patch_gate_no_executable_change(tmp_path: Path) -> None:
+    paths = init_workspace(_config(tmp_path), "topic", project_id="proj_gate_patch_no_exec", simulate=True)
+    _write_s1_contract(paths)
+    _write_minimal_c2c_plan(paths)
+    _write_s2_contracts(paths)
+    _write_s2_patch_gate_artifacts(paths, status="no_valid_patch", has_executable_change=False, changed_files=[])
+
+    report = run_stage_gate("S2_plan", paths.root, _config(tmp_path)).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    patch_gate = next(check for check in report["checks"] if check["name"] == "s2_5_patch_gate_contract")
+    assert patch_gate["status"] == "NEEDS_RETRY"
+    patch_status = next(check for check in report["checks"] if check["name"] == "s2_5_patch_manifest_status")
+    assert patch_status["status"] == "NEEDS_RETRY"
 
 
 def test_s2_gate_retries_c2c_local_tuning_idea(tmp_path: Path) -> None:

@@ -172,10 +172,22 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
         ],
         "conditional_outputs": [
             {
-                "when": "execution.collector == c2c_small_loop",
+                "when": "project.mode == c2c",
                 "paths": [
                     "plan/candidate_ideas.json",
                     "plan/short_loop_plan.yaml",
+                    "plan/s2_planner/candidate_pool.json",
+                    "plan/s2_planner/variant_scorecard.json",
+                    "plan/s2_planner/next_variant.json",
+                    "plan/s2_planner/planner_gate_report.json",
+                ],
+            },
+            {
+                "when": "code_patch.enabled == true",
+                "paths": [
+                    "plan/code_patches/implementation_contract.json",
+                    "plan/code_patches/patch_gate_report.json",
+                    "plan/code_patches/patch_manifest.json",
                 ],
             }
         ],
@@ -505,6 +517,7 @@ def _condition_context(project_root: Path, config: dict[str, Any], iteration: in
         "project.mode": "c2c" if c2c_enabled else "generic",
         "iteration": int(iteration or 1),
         "execution.collector": collector,
+        "code_patch.enabled": bool((config.get("code_patch") or {}).get("enabled")) if isinstance(config.get("code_patch"), dict) else False,
     }
 
 
@@ -528,7 +541,10 @@ def _condition_matches(condition: str, context: dict[str, Any]) -> bool:
     if "==" in condition:
         left, right = [part.strip() for part in condition.split("==", 1)]
         right = right.strip("'\"")
-        return str(context.get(left, "")) == right
+        value = context.get(left, "")
+        if isinstance(value, bool):
+            return value is (right.lower() == "true")
+        return str(value) == right
     if ">" in condition:
         left, right = [part.strip() for part in condition.split(">", 1)]
         try:

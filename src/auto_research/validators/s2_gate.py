@@ -47,6 +47,7 @@ class S2GateValidator(StageGateValidator):
             self._validate_variant_handoff(plan, planner, variant_contract, variant_fingerprint)
 
         if plan.get("execution", {}).get("collector") == "c2c_small_loop":
+            self._validate_s2_planner_gate_artifacts(variant_fingerprint if isinstance(variant_fingerprint, dict) else {})
             self._validate_c2c_plan(plan)
         return self.finalize()
 
@@ -228,7 +229,9 @@ class S2GateValidator(StageGateValidator):
 
         patch_manifest_path = self.project_root / "plan" / "code_patches" / "patch_manifest.json"
         if patch_manifest_path.exists():
+            self._validate_s2_5_patch_gate()
             patch_manifest = self.read_json_artifact("plan/code_patches/patch_manifest.json") or {}
+            patch_gate = self.read_json_artifact("plan/code_patches/patch_gate_report.json") or {}
             status = patch_manifest.get("status")
             if status in {"ok", "partial", "disabled"}:
                 self.pass_check("s2_5_patch_manifest_status", artifact="plan/code_patches/patch_manifest.json", details={"status": status})
@@ -246,20 +249,156 @@ class S2GateValidator(StageGateValidator):
                         "resource_retry": _patch_manifest_has_resource_retry(patch_manifest),
                     },
                 )
+            elif isinstance(patch_gate, dict) and patch_gate.get("gate") == "fail" and patch_gate.get("repairable") is True:
+                self.retry_check(
+                    "s2_5_patch_manifest_status",
+                    "S2.5 patch failed its implementation contract and should route to patch-only repair",
+                    artifact="plan/code_patches/patch_manifest.json",
+                    details={
+                        "status": status,
+                        "patch_gate": patch_gate.get("gate"),
+                        "failure_class": patch_gate.get("failure_class"),
+                    },
+                )
             else:
                 self.fail_check("s2_5_patch_manifest_status", f"S2.5 patch manifest status is {status}", artifact="plan/code_patches/patch_manifest.json")
             entries = patch_manifest.get("patches") or patch_manifest.get("candidates") or []
             executable = any(_patch_has_executable_change(entry) for entry in entries if isinstance(entry, dict))
-            if status != "disabled" and entries and not executable and not is_retryable_patch_manifest(patch_manifest):
+            patch_gate_repairable = isinstance(patch_gate, dict) and patch_gate.get("gate") == "fail" and patch_gate.get("repairable") is True
+            if status != "disabled" and entries and not executable and not is_retryable_patch_manifest(patch_manifest) and not patch_gate_repairable:
                 self.fail_check("s2_5_executable_patch", "S2.5 produced no executable code change", artifact="plan/code_patches/patch_manifest.json")
             elif status != "disabled" and entries and not executable:
                 self.retry_check(
                     "s2_5_executable_patch",
-                    "S2.5 produced no executable code change because patch generation is retryable",
+                    "S2.5 produced no executable code change and should route to retry/patch-only repair",
                     artifact="plan/code_patches/patch_manifest.json",
                 )
             elif entries:
                 self.pass_check("s2_5_executable_patch", artifact="plan/code_patches/patch_manifest.json")
+
+    def _validate_s2_planner_gate_artifacts(self, variant_fingerprint: dict) -> None:
+        candidate_pool = self._read_required_json_with_schema(
+            "plan/s2_planner/candidate_pool.json",
+            "s2_candidate_pool_json_exists",
+            "s2_candidate_pool_schema",
+            "s2_candidate_pool.schema.json",
+        )
+        scorecard = self._read_required_json_with_schema(
+            "plan/s2_planner/variant_scorecard.json",
+            "s2_variant_scorecard_json_exists",
+            "s2_variant_scorecard_schema",
+            "s2_variant_scorecard.schema.json",
+        )
+        next_variant_path = self.require_file("plan/s2_planner/next_variant.json", check_name="s2_next_variant_json_exists")
+        next_variant = self.read_json_artifact("plan/s2_planner/next_variant.json") if next_variant_path else None
+        if isinstance(next_variant, dict):
+            self.pass_check("s2_next_variant_schema", artifact="plan/s2_planner/next_variant.json")
+        elif next_variant_path:
+            self.retry_check("s2_next_variant_schema", "plan/s2_planner/next_variant.json must be an object", artifact="plan/s2_planner/next_variant.json")
+        planner_gate = self._read_required_json_with_schema(
+            "plan/s2_planner/planner_gate_report.json",
+            "s2_planner_gate_report_json_exists",
+            "s2_planner_gate_report_schema",
+            "s2_planner_gate_report.schema.json",
+        )
+        if not all(isinstance(item, dict) for item in [candidate_pool, scorecard, next_variant, planner_gate]):
+            return
+        errors: list[str] = []
+        direction = self._safe_json("literature/direction.json")
+        direction_id = str(direction.get("direction_id") or "") if isinstance(direction, dict) else ""
+        candidates = [item for item in candidate_pool.get("candidates") or [] if isinstance(item, dict)]
+        candidate_ids = {str(item.get("id") or "") for item in candidates}
+        candidate_fps = {str(item.get("variant_fingerprint") or "") for item in candidates}
+        selected_id = str(planner_gate.get("selected_variant_id") or next_variant.get("id") or "")
+        selected_fp = str(planner_gate.get("selected_variant_fingerprint") or next_variant.get("variant_fingerprint") or "")
+        expected_fp = str(variant_fingerprint.get("variant_fingerprint") or "")
+        if planner_gate.get("gate") != "pass":
+            errors.append("planner_gate_report.gate must be pass")
+        next_direction = str(next_variant.get("direction_id") or next_variant.get("s1_direction_id") or "")
+        if direction_id and next_direction != direction_id:
+            errors.append("next_variant.direction_id must match literature/direction.json direction_id")
+        if direction_id and str(planner_gate.get("direction_id") or "") != direction_id:
+            errors.append("planner_gate_report.direction_id must match literature/direction.json direction_id")
+        if selected_id not in candidate_ids:
+            errors.append("selected next_variant.id must exist in candidate_pool")
+        if selected_fp and selected_fp not in candidate_fps:
+            errors.append("selected next_variant.variant_fingerprint must exist in candidate_pool")
+        if selected_fp and expected_fp and selected_fp != expected_fp:
+            errors.append("selected next_variant.variant_fingerprint must match variant_fingerprint.json")
+        if str(scorecard.get("selected_variant_id") or "") != selected_id:
+            errors.append("variant_scorecard.selected_variant_id must match planner_gate_report.selected_variant_id")
+        ranking = [item for item in scorecard.get("ranking") or [] if isinstance(item, dict)]
+        selected_rows = [item for item in ranking if item.get("decision") == "selected"]
+        if len(selected_rows) != 1:
+            errors.append("variant_scorecard.ranking must contain exactly one selected row")
+        expected_files = [str(item) for item in next_variant.get("expected_files") or [] if item]
+        if not expected_files:
+            errors.append("next_variant.expected_files must be non-empty")
+        disallowed = self._disallowed_c2c_expected_files({"expected_files": expected_files})
+        if disallowed:
+            errors.append(f"next_variant expected_files outside allowed C2C edit surface: {disallowed[:5]}")
+        ablation_switch = str(next_variant.get("ablation_switch") or ((next_variant.get("experiment_contract") or {}).get("ablation_switch") if isinstance(next_variant.get("experiment_contract"), dict) else "") or "")
+        if not ablation_switch:
+            errors.append("next_variant.ablation_switch must be present")
+        rejected = scorecard.get("rejected_variants") if isinstance(scorecard.get("rejected_variants"), list) else []
+        if len(candidates) > 1 and not all(isinstance(item, dict) and item.get("reasons") for item in rejected):
+            errors.append("variant_scorecard.rejected_variants must include structured rejection reasons")
+        if errors:
+            self.retry_check(
+                "s2_planner_gate_contract",
+                "S2 planner gate did not produce a patch-ready selected variant",
+                artifact="plan/s2_planner/planner_gate_report.json",
+                details={"errors": errors[:12], "planner_gate_errors": planner_gate.get("errors") or []},
+            )
+        else:
+            self.pass_check("s2_planner_gate_contract", artifact="plan/s2_planner/planner_gate_report.json")
+
+    def _validate_s2_5_patch_gate(self) -> None:
+        implementation_contract = self._read_required_json_with_schema(
+            "plan/code_patches/implementation_contract.json",
+            "s2_5_implementation_contract_json_exists",
+            "s2_5_implementation_contract_schema",
+            "s2_5_implementation_contract.schema.json",
+        )
+        patch_gate = self._read_required_json_with_schema(
+            "plan/code_patches/patch_gate_report.json",
+            "s2_5_patch_gate_report_json_exists",
+            "s2_5_patch_gate_report_schema",
+            "s2_5_patch_gate_report.schema.json",
+        )
+        patch_manifest = self.read_json_artifact("plan/code_patches/patch_manifest.json") or {}
+        planner_gate = self.read_json_artifact("plan/s2_planner/planner_gate_report.json") or {}
+        variant_fingerprint = self.read_json_artifact("plan/variant_fingerprint.json") or {}
+        if not isinstance(implementation_contract, dict) or not isinstance(patch_gate, dict):
+            return
+        errors: list[str] = []
+        if str(patch_gate.get("variant_id") or "") != str(planner_gate.get("selected_variant_id") or implementation_contract.get("variant_id") or ""):
+            errors.append("patch_gate_report.variant_id must match planner_gate selected_variant_id")
+        expected_fp = str(variant_fingerprint.get("variant_fingerprint") or implementation_contract.get("variant_fingerprint") or "")
+        if str(patch_gate.get("variant_fingerprint") or "") != expected_fp:
+            errors.append("patch_gate_report.variant_fingerprint must match variant_fingerprint.json")
+        if patch_gate.get("gate") == "pass" and patch_manifest.get("status") != "ok":
+            errors.append("patch_gate_report.gate pass requires patch_manifest.status ok")
+        checks = patch_gate.get("checks") if isinstance(patch_gate.get("checks"), dict) else {}
+        required_true = [
+            "has_executable_change",
+            "forbidden_files_untouched",
+            "ablation_switch_present",
+        ]
+        for key in required_true:
+            if checks.get(key) is not True:
+                errors.append(f"patch_gate_report.checks.{key} must be true")
+        if checks.get("selected_variant_matches_planner") is not True:
+            errors.append("patch_gate_report.checks.selected_variant_matches_planner must be true")
+        if errors:
+            self.retry_check(
+                "s2_5_patch_gate_contract",
+                "S2.5 patch gate did not satisfy selected variant implementation contract",
+                artifact="plan/code_patches/patch_gate_report.json",
+                details={"errors": errors[:12], "failure_class": patch_gate.get("failure_class"), "repairable": patch_gate.get("repairable")},
+            )
+        else:
+            self.pass_check("s2_5_patch_gate_contract", artifact="plan/code_patches/patch_gate_report.json")
 
     def _quality_or_retry(
         self,

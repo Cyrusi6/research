@@ -22,6 +22,7 @@ from .adapters.runner import ExperimentRunner, GpuSelection
 from .artifacts import ArtifactManager
 from .c2c import C2CAdapter, c2c_candidate_config_overrides, c2c_idea_novelty_report, repo_snapshot_manifest
 from .llm import codex_subprocess_env
+from .s2_planner_contracts import build_s2_5_patch_gate_report
 from .utils import ensure_dir, now_utc, read_json, read_yaml, repo_root, sanitize_filename, sha256_file, write_json, write_yaml
 
 
@@ -543,6 +544,58 @@ class CodePatchAgent:
         self.config = config
         self.artifacts = artifacts
         self.backend = backend or _default_code_patch_backend(config, project_root)
+
+    def run_selected_variant(
+        self,
+        plan: dict[str, Any],
+        selected_variant: dict[str, Any],
+        implementation_contract: dict[str, Any],
+        planner_gate_report: dict[str, Any],
+        variant_fingerprint: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        code_patch_config = _code_patch_config(self.config)
+        if not code_patch_config.get("enabled", False):
+            return {"status": "disabled", "candidates": [], "artifacts": []}
+        candidate = dict(selected_variant)
+        candidate["selected"] = True
+        candidate["id"] = str(candidate.get("id") or implementation_contract.get("variant_id") or "selected_variant")
+        candidate["variant_fingerprint"] = str(candidate.get("variant_fingerprint") or implementation_contract.get("variant_fingerprint") or "")
+        plan = dict(plan)
+        plan["selected_idea"] = candidate
+        plan["candidate_ideas"] = [candidate]
+        plan["next_variant"] = candidate
+        plan["selected_variant_candidates"] = [{"id": candidate.get("id"), "variant_fingerprint": candidate.get("variant_fingerprint")}]
+        contract_record = self.artifacts.write_json(
+            self.stage_key,
+            "code_patches/implementation_contract.json",
+            implementation_contract,
+            artifact_type="c2c_s2_5_implementation_contract",
+            summary="S2.5 implementation contract generated after planner gate pass",
+            source_paths=["plan/s2_planner/planner_gate_report.json", "plan/s2_planner/next_variant.json", "plan/variant_contract.json"],
+        )
+        manifest = self.run(plan, [candidate])
+        patch_gate_report = build_s2_5_patch_gate_report(
+            patch_manifest=manifest,
+            implementation_contract=implementation_contract,
+            planner_gate_report=planner_gate_report,
+            variant_fingerprint=variant_fingerprint,
+            config=self.config,
+        )
+        patch_gate_record = self.artifacts.write_json(
+            self.stage_key,
+            "code_patches/patch_gate_report.json",
+            patch_gate_report,
+            artifact_type="c2c_s2_5_patch_gate_report",
+            summary="S2.5 patch gate report against selected planner variant",
+            source_paths=["plan/code_patches/implementation_contract.json", "plan/code_patches/patch_manifest.json"],
+        )
+        artifacts = list(manifest.get("artifacts") or [])
+        artifacts.extend([contract_record["path"], patch_gate_record["path"]])
+        manifest["artifacts"] = artifacts
+        manifest["implementation_contract_path"] = contract_record["path"]
+        manifest["patch_gate_report_path"] = patch_gate_record["path"]
+        manifest["patch_gate"] = patch_gate_report.get("gate")
+        return manifest
 
     def run(self, plan: dict[str, Any], candidate_ideas: list[dict[str, Any]]) -> dict[str, Any]:
         code_patch_config = _code_patch_config(self.config)

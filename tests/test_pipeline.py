@@ -11,6 +11,7 @@ import auto_research.orchestrator as orchestrator_module
 from auto_research.adapters.literature import LiteratureProvider
 from auto_research.orchestrator import Orchestrator
 from auto_research.registry import block_stage
+from auto_research.s2_planner_contracts import build_s2_candidate_pool, build_s2_planner_gate_report, build_s2_variant_scorecard
 from auto_research.utils import write_json, write_yaml
 
 
@@ -116,10 +117,18 @@ def _write_direction_and_variant_contracts(project_root: Path) -> list[str]:
     variant = {
         "id": "utility_predicted_cache_routing",
         "title": "Utility-predicted cache routing",
+        "direction_id": direction["direction_id"],
+        "s1_direction_id": direction["direction_id"],
         "variant_fingerprint": "fp_utility_router",
         "mechanism_axis": "routing",
         "integration_point": "projector",
         "control_signal": "utility",
+        "expected_files": ["rosetta/model/projector.py"],
+        "ablation_switch": "disable_utility_router",
+        "experiment_contract": {
+            "expected_files": ["rosetta/model/projector.py"],
+            "ablation_switch": "disable_utility_router",
+        },
     }
     write_json(project_root / "literature" / "direction.json", direction)
     write_json(
@@ -133,9 +142,7 @@ def _write_direction_and_variant_contracts(project_root: Path) -> list[str]:
             "next_variant": variant,
         },
     )
-    write_json(
-        project_root / "plan" / "variant_contract.json",
-        {
+    contract = {
             "schema_version": "auto_research_variant_contract_v1",
             "direction_id": direction["direction_id"],
             "variant_id": variant["id"],
@@ -159,11 +166,9 @@ def _write_direction_and_variant_contracts(project_root: Path) -> list[str]:
                 "return_to_s1_conditions": ["budget exhausted"],
             },
             "used_shared_memory_refs": [],
-        },
-    )
-    write_json(
-        project_root / "plan" / "variant_fingerprint.json",
-        {
+    }
+    write_json(project_root / "plan" / "variant_contract.json", contract)
+    fingerprint = {
             "schema_version": "auto_research_variant_fingerprint_v1",
             "direction_id": direction["direction_id"],
             "variant_id": variant["id"],
@@ -174,9 +179,42 @@ def _write_direction_and_variant_contracts(project_root: Path) -> list[str]:
             "history_fingerprints": [],
             "is_repeat": False,
             "mode": "regular",
-        },
+    }
+    write_json(project_root / "plan" / "variant_fingerprint.json", fingerprint)
+    candidate_pool = build_s2_candidate_pool(direction=direction, candidates=[variant], source="test_fixture")
+    scorecard = build_s2_variant_scorecard(
+        direction=direction,
+        candidate_pool=candidate_pool,
+        selected_variant=variant,
+        evidence_quality={"support_coverage": {"paper": 2, "code": 2}},
+        variant_fingerprint=fingerprint,
+        planner_memory={"entries": []},
+        feedback=[],
+        config={},
     )
-    return ["plan/planner_decision.json", "plan/variant_contract.json", "plan/variant_fingerprint.json"]
+    planner_gate = build_s2_planner_gate_report(
+        direction=direction,
+        candidate_pool=candidate_pool,
+        scorecard=scorecard,
+        next_variant=variant,
+        variant_contract=contract,
+        variant_fingerprint=fingerprint,
+        config={},
+    )
+    write_json(project_root / "plan" / "next_variant.json", {"schema_version": "auto_research_planner_decision_v1", "direction_id": direction["direction_id"], "planner_summary": "Mocked S2 planner decision.", "planning_mode": "same_direction_variant", "used_shared_memory_refs": [], "next_variant": variant})
+    write_json(project_root / "plan" / "s2_planner" / "candidate_pool.json", candidate_pool)
+    write_json(project_root / "plan" / "s2_planner" / "variant_scorecard.json", scorecard)
+    write_json(project_root / "plan" / "s2_planner" / "next_variant.json", variant)
+    write_json(project_root / "plan" / "s2_planner" / "planner_gate_report.json", planner_gate)
+    return [
+        "plan/planner_decision.json",
+        "plan/variant_contract.json",
+        "plan/variant_fingerprint.json",
+        "plan/s2_planner/candidate_pool.json",
+        "plan/s2_planner/variant_scorecard.json",
+        "plan/s2_planner/next_variant.json",
+        "plan/s2_planner/planner_gate_report.json",
+    ]
 
 
 def _mock_generic_s1_codex(monkeypatch):
