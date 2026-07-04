@@ -545,7 +545,7 @@ def _budget_snapshot(
     full_s3_failures = int(by_direction.get("full_s3_failures") or 0)
     return {
         "same_direction_proxy_failures": proxy_failures,
-        "max_same_direction_proxy_failures": int(budgets_cfg.get("same_direction_proxy_failures") or feedback_cfg.get("max_same_direction_proxy_failures") or feedback_cfg.get("max_same_direction_proxy_iterations") or feedback_cfg.get("max_proxy_rejected_routes_per_iteration") or 2),
+        "max_same_direction_proxy_failures": int(budgets_cfg.get("same_direction_proxy_failures") or feedback_cfg.get("max_same_direction_proxy_failures") or feedback_cfg.get("max_same_direction_proxy_iterations") or feedback_cfg.get("max_proxy_rejected_routes_per_iteration") or 5),
         "same_direction_full_s3_failures": full_s3_failures,
         "max_same_direction_full_s3_failures": int(budgets_cfg.get("same_direction_full_s3_failures") or 1),
         "patch_repair_attempts": patch_repairs,

@@ -354,7 +354,7 @@ def build_c2c_project_config(
                 "require_route_decision_for_s3_feedback": True,
                 "budgets": {
                     "patch_repair_attempts_per_variant": 2,
-                    "same_direction_proxy_failures": 2,
+                    "same_direction_proxy_failures": 5,
                     "same_direction_full_s3_failures": 1,
                     "resource_retries_per_stage": 3,
                 },

@@ -64,6 +64,18 @@ def test_proxy_rejected_routes_to_s2_with_budget_remaining(tmp_path: Path) -> No
     assert "same_direction_budget_remaining" in decision["reason_codes"]
 
 
+def test_route_context_defaults_same_direction_proxy_budget_to_five(tmp_path: Path) -> None:
+    _base_contracts(tmp_path)
+    context = build_route_context(
+        tmp_path,
+        _registry(),
+        {"c2c": {"enabled": True}, "orchestration": {"route_policy": {"enabled": True}}},
+        trigger={"stage": "S3_experiment", "source": "s3_gate", "status": "failed", "reason": "proxy rejected"},
+    )
+
+    assert context["budgets"]["max_same_direction_proxy_failures"] == 5
+
+
 def test_proxy_rejected_routes_to_s1_when_same_direction_budget_exhausted(tmp_path: Path) -> None:
     _base_contracts(tmp_path)
     write_json(tmp_path / "experiment" / "results" / "c2c_proxy_decision_report.json", {"decision": "proxy_rejected", "route_hint": "return_s2", "failure_class": "proxy_negative", "variant_id": "variant_x"})

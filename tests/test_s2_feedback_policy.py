@@ -57,6 +57,16 @@ def test_feedback_context_no_history_writes_insufficient_policy(tmp_path: Path) 
     assert policy["policy_hash"]
 
 
+def test_feedback_context_defaults_same_direction_proxy_budget_to_five(tmp_path: Path) -> None:
+    context = build_s2_feedback_context(
+        project_root=tmp_path,
+        direction=_direction(),
+        config={"c2c": {"enabled": True}, "orchestration": {"route_policy": {"enabled": True}}},
+    )
+
+    assert context["attempt_counters"]["max_same_direction_proxy_failures"] == 5
+
+
 def test_proxy_failure_penalizes_same_mechanism_and_integration() -> None:
     context = {
         "recent_failures": [

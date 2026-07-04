@@ -166,7 +166,7 @@ def build_s2_adaptive_policy(feedback_context: dict[str, Any], config: dict[str,
     history_sufficient = history_count >= int(cfg.get("min_history_for_penalty") or 1)
     proxy_failures = int(counters.get("same_direction_proxy_failures") or 0)
     full_failures = int(counters.get("same_direction_full_s3_failures") or 0)
-    max_proxy = int(counters.get("max_same_direction_proxy_failures") or _route_budget(config or {}, "same_direction_proxy_failures", 2))
+    max_proxy = int(counters.get("max_same_direction_proxy_failures") or _route_budget(config or {}, "same_direction_proxy_failures", 5))
     max_full = int(counters.get("max_same_direction_full_s3_failures") or _route_budget(config or {}, "same_direction_full_s3_failures", 1))
     force_new_integration = history_sufficient and proxy_failures >= int(cfg.get("force_new_integration_after_proxy_failures") or 2)
     force_new_direction = history_sufficient and full_failures >= int(cfg.get("force_new_direction_after_full_s3_failures") or 1)
@@ -628,7 +628,7 @@ def _attempt_counters(ledger: dict[str, Any], direction_id: str) -> dict[str, in
 
 def _budget_limits(config: dict[str, Any]) -> dict[str, int]:
     return {
-        "same_direction_proxy_failures": _route_budget(config, "same_direction_proxy_failures", 2),
+        "same_direction_proxy_failures": _route_budget(config, "same_direction_proxy_failures", 5),
         "same_direction_full_s3_failures": _route_budget(config, "same_direction_full_s3_failures", 1),
         "patch_repair_attempts_per_variant": _route_budget(config, "patch_repair_attempts_per_variant", 2),
         "resource_retries_per_stage": _route_budget(config, "resource_retries_per_stage", 3),

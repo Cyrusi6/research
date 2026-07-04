@@ -2809,6 +2809,7 @@ uv run pytest -q tests/test_c2c_s3_artifact_registration.py tests/test_c2c_repla
 - `s2_feedback_policy.py` 将 repairable proxy markers 规范化为 `implementation_failure`，只触发 patch-surface prior，不触发 mechanism/integration method penalty。
 - S2 feedback context 优先从 attempt records 复算 counters，并跨 `route_decision`、`proxy_decision`、`main_results`、`performance_feedback`、`attempt_ledger` 去重同一 failure event。
 - `build_s2_planner_gate_report()` 对 `implementation_repair` mode 放宽 force-new-integration / force-new-direction 约束，允许同一 variant/fingerprint 进入 S2.5 修补。
+- C2C route policy 默认 `same_direction_proxy_failures` 预算从 2 统一改为 5；`route_policy.py` 和 `s2_feedback_policy.py` 的无配置 fallback 也同步为 5。
 
 验证：
 
