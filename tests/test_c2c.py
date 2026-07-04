@@ -4893,6 +4893,61 @@ def test_c2c_s0_semantic_enrichment_missing_key_fails_open(monkeypatch, tmp_path
     assert gate_s0(paths.root, config).passed is True
 
 
+def test_c2c_s0_semantic_enrichment_rebuilds_code_indexes(monkeypatch, tmp_path: Path) -> None:
+    source_repo = _fake_c2c_repo(tmp_path)
+    ref_paper = tmp_path / "paper.txt"
+    ref_rebuttal = tmp_path / "rebuttal.md"
+    ref_paper.write_text("paper method text", encoding="utf-8")
+    ref_rebuttal.write_text("review concern text", encoding="utf-8")
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["intake"] = {"semantic_enrichment": {"enabled": True, "provider": "deepseek", "model": "deepseek-v4-flash"}}
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(source_repo),
+        "ref_paper": str(ref_paper),
+        "ref_rebuttal": str(ref_rebuttal),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "allowed_files": ["rosetta/model/aligner.py"],
+    }
+    paths = init_workspace(config, "topic", project_id="proj_c2c_s0_enrich_indexes", simulate=False)
+
+    def enrich_with_code_semantics(self, **kwargs):
+        code_chunks = []
+        for chunk in kwargs["code_chunks"]:
+            item = dict(chunk)
+            if item.get("path") == "rosetta/model/aligner.py":
+                item["semantic_summary"] = "Aligner handles valid_mask routing for cache transfer."
+                item["mechanism_tags"] = ["alignment_core", "cache_routing"]
+                item["retrieval_keywords"] = ["alignment", "valid_mask", "routing"]
+                item["semantic_enrichment"] = {"schema_version": "s0_semantic_enrichment_sample_v1", "cache_status": "test"}
+            code_chunks.append(item)
+        return {
+            "paper_chunks": kwargs["paper_chunks"],
+            "rebuttal_chunks": kwargs["rebuttal_chunks"],
+            "code_chunks": code_chunks,
+            "report": {"enabled": True, "status": "ok", "records": []},
+            "artifacts": [],
+        }
+
+    monkeypatch.setattr(DeepSeekS0SemanticEnricher, "enrich_c2c_chunks", enrich_with_code_semantics)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+
+    result = IntakeAgent(context).run("topic")
+
+    assert result["status"] == "ok"
+    bundle = json.loads((paths.root / "intake/c2c/static_bundle.json").read_text(encoding="utf-8"))
+    aligner_chunk = next(chunk for chunk in bundle["code_chunks"] if chunk.get("path") == "rosetta/model/aligner.py")
+    assert aligner_chunk["retrieval_keywords"] == ["alignment", "valid_mask", "routing"]
+    alignment_surface = bundle["implementation_surface_map"]["surfaces"]["alignment_core"]
+    assert any(item.get("semantic_summary") == "Aligner handles valid_mask routing for cache transfer." for item in alignment_surface)
+    alignment_query = bundle["code_retrieval_index"]["default_queries"][0]
+    aligner_result = next(item for item in alignment_query["results"] if item.get("path") == "rosetta/model/aligner.py")
+    assert "retrieval_keywords:valid_mask" in aligner_result["match_reasons"]
+    assert aligner_result["semantic_summary"] == "Aligner handles valid_mask routing for cache transfer."
+    assert gate_s0(paths.root, config).passed is True
+
+
 def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Path) -> None:
     source_repo = _fake_c2c_repo(tmp_path)
     ref_paper = tmp_path / "paper.txt"

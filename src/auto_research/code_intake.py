@@ -174,6 +174,9 @@ def retrieve_code_chunks(
                 "match_reasons": reasons[:10],
                 "text_preview": chunk.get("text_preview", ""),
                 "keywords": chunk.get("keywords", [])[:20],
+                "retrieval_keywords": chunk.get("retrieval_keywords", [])[:20],
+                "mechanism_tags": chunk.get("mechanism_tags", [])[:20],
+                "semantic_summary": chunk.get("semantic_summary", ""),
             }
         )
     return sorted(ranked, key=lambda item: (-float(item.get("score") or 0.0), str(item.get("path") or ""), str(item.get("symbol") or "")))[:top_k]
@@ -1167,6 +1170,9 @@ def _surface_item_from_chunk(chunk: dict[str, Any]) -> dict[str, Any]:
         "risk_tags": chunk.get("risk_tags", []),
         "config_keys": chunk.get("config_keys", [])[:20],
         "calls": chunk.get("calls", [])[:20],
+        "mechanism_tags": chunk.get("mechanism_tags", [])[:20],
+        "retrieval_keywords": chunk.get("retrieval_keywords", [])[:20],
+        "semantic_summary": chunk.get("semantic_summary", ""),
         "text_preview": chunk.get("text_preview", ""),
     }
 
@@ -1216,6 +1222,24 @@ def _build_code_retrieval_index(
     }
 
 
+def rebuild_code_intake_indexes(
+    *,
+    symbols: list[dict[str, Any]],
+    chunks: list[dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Rebuild semantic-dependent code indexes after chunk enrichment."""
+
+    surface_map = _build_implementation_surface_map(symbols=symbols, chunks=chunks, edges=edges)
+    retrieval_index = _build_code_retrieval_index(
+        chunks=chunks,
+        symbols=symbols,
+        edges=edges,
+        surface_map=surface_map,
+    )
+    return surface_map, retrieval_index
+
+
 def _query_terms(query: str) -> list[str]:
     raw = re.split(r"[^A-Za-z0-9_\\-]+", query.lower())
     stop = {"the", "and", "for", "with", "from", "into", "this", "that", "candidate", "idea", "patch"}
@@ -1237,6 +1261,9 @@ def _score_code_chunk(
         "config_keys": " ".join(str(item) for item in chunk.get("config_keys") or []).lower(),
         "calls": " ".join(str(item) for item in chunk.get("calls") or []).lower(),
         "references": " ".join(str(item) for item in chunk.get("references") or []).lower(),
+        "retrieval_keywords": " ".join(str(item) for item in chunk.get("retrieval_keywords") or []).lower(),
+        "mechanism_tags": " ".join(str(item) for item in chunk.get("mechanism_tags") or []).lower(),
+        "semantic_summary": str(chunk.get("semantic_summary") or "").lower(),
         "text_preview": str(chunk.get("text_preview") or "").lower(),
     }
     weights = {
@@ -1247,6 +1274,9 @@ def _score_code_chunk(
         "config_keys": 3.0,
         "calls": 2.0,
         "references": 1.5,
+        "retrieval_keywords": 3.5,
+        "mechanism_tags": 3.0,
+        "semantic_summary": 2.0,
         "text_preview": 1.0,
     }
     score = 0.0

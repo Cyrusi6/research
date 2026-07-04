@@ -1,5 +1,12 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-04 C2C S0 Semantic Enrichment Index Rebuild
+
+- Fixed S0 C2C semantic enrichment ordering: enriched `code_chunks` now rebuild `implementation_surface_map` and `code_retrieval_index` before artifacts/static bundle are written.
+- `retrieve_code_chunks()` now scores `retrieval_keywords`, `mechanism_tags`, and `semantic_summary`, so semantic enrichment affects precomputed retrieval results.
+- Code retrieval results and implementation surface items now carry semantic fields forward for S1/S2 consumers.
+- Added regression coverage proving enriched code semantics appear in static bundle, surface map, retrieval index match reasons, and S0 gate still passes.
+
 ## 2026-07-04 C2C S1 Discriminating Evidence And Direction Scorecard
 
 - Upgraded S1a evidence request plans with competing `candidate_direction_hypotheses`, `uncertainty_axes`, `discriminating_evidence_requests`, and `must_have_before_direction`.

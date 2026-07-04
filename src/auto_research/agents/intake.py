@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from ..c2c import C2CAdapter, is_c2c_project
+from ..code_intake import rebuild_code_intake_indexes
 from ..method_memory import load_shared_method_memory, shared_method_memory_query_context
 from ..s0_enrichment import DeepSeekS0SemanticEnricher, S0SemanticEnrichmentError, semantic_enrichment_enabled
 from ..utils import read_json
@@ -132,6 +133,8 @@ class IntakeAgent:
         code_cards = adapter.build_code_cards(repo_manifest)
         code_intake = adapter.build_code_intake()
         code_chunks = code_intake.chunks
+        implementation_surface_map = code_intake.surface_map
+        code_retrieval_index = code_intake.retrieval_index
         semantic_enrichment_result: dict[str, Any] | None = None
         if semantic_enrichment_enabled(self.context.config):
             try:
@@ -143,6 +146,11 @@ class IntakeAgent:
                 paper_chunks = semantic_enrichment_result["paper_chunks"]
                 rebuttal_chunks = semantic_enrichment_result["rebuttal_chunks"]
                 code_chunks = semantic_enrichment_result["code_chunks"]
+                implementation_surface_map, code_retrieval_index = rebuild_code_intake_indexes(
+                    symbols=code_intake.symbols,
+                    chunks=code_chunks,
+                    edges=code_intake.edges,
+                )
             except S0SemanticEnrichmentError as exc:
                 semantic_enrichment_result = {
                     "report": {
@@ -240,8 +248,8 @@ class IntakeAgent:
             "code_edges": code_intake.edges,
             "code_repo_map": code_intake.repo_map,
             "code_intake_report": code_intake.report,
-            "implementation_surface_map": code_intake.surface_map,
-            "code_retrieval_index": code_intake.retrieval_index,
+            "implementation_surface_map": implementation_surface_map,
+            "code_retrieval_index": code_retrieval_index,
             "cache_summary": cache_summary,
             "semantic_enrichment": (semantic_enrichment_result or {}).get("report") or {"enabled": False},
             "chunk_index": chunk_index,
@@ -275,8 +283,8 @@ class IntakeAgent:
         records.append(self.context.artifacts.write_text(self.stage_key, "c2c/code_repo_map.md", code_intake.repo_map_md, artifact_type="c2c_code_repo_map_markdown", summary="Readable tree-sitter repository map"))
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/code_intake_report.json", code_intake.report, artifact_type="c2c_code_intake_report", summary="Code intake coverage and quality diagnostics"))
         records.append(self.context.artifacts.write_text(self.stage_key, "c2c/code_intake_report.md", code_intake.report_md, artifact_type="c2c_code_intake_report_markdown", summary="Readable code intake coverage report"))
-        records.append(self.context.artifacts.write_json(self.stage_key, "c2c/implementation_surface_map.json", code_intake.surface_map, artifact_type="c2c_implementation_surface_map", summary="Editable mechanism surfaces for S2.5 patches"))
-        records.append(self.context.artifacts.write_json(self.stage_key, "c2c/code_retrieval_index.json", code_intake.retrieval_index, artifact_type="c2c_code_retrieval_index", summary="Precomputed code retrieval entry points for S1/S2"))
+        records.append(self.context.artifacts.write_json(self.stage_key, "c2c/implementation_surface_map.json", implementation_surface_map, artifact_type="c2c_implementation_surface_map", summary="Editable mechanism surfaces for S2.5 patches"))
+        records.append(self.context.artifacts.write_json(self.stage_key, "c2c/code_retrieval_index.json", code_retrieval_index, artifact_type="c2c_code_retrieval_index", summary="Precomputed code retrieval entry points for S1/S2"))
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/cache_summary.json", cache_summary, artifact_type="c2c_static_cache_summary", summary="S0 cache hit/miss summary for MinerU and code intake"))
         if semantic_enrichment_result:
             records.extend({"path": path} for path in semantic_enrichment_result.get("artifacts", []))

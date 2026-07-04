@@ -65,6 +65,18 @@
 - S1 gate / stage contract / C2C artifact audit 已把该 scorecard 纳入 C2C S1 required artifact 和 schema 校验。
 - 新增/更新测试覆盖 request-plan 区分性字段、code-neighborhood expansion、C2C S1 follow-up loop、C2C pipeline 新 artifact、stage contracts 和 validators。
 
+## 2026-07-04 C2C S0 Semantic Enrichment 索引重算
+
+修复 S0 C2C 语义增强的顺序问题：此前 `agents/intake.py` 在 `adapter.build_code_intake()` 后只替换了增强后的 `code_chunks`，但继续写出增强前的 `implementation_surface_map` 和 `code_retrieval_index`，导致 DeepSeek 产出的 `mechanism_tags`、`retrieval_keywords`、`semantic_summary` 对预计算代码检索结果没有作用。
+
+调整：
+
+- 新增 `rebuild_code_intake_indexes()`，在语义增强成功后用增强后的 `code_chunks` 重算 implementation surface map 和 code retrieval index。
+- `static_bundle.json`、`intake/c2c/implementation_surface_map.json`、`intake/c2c/code_retrieval_index.json` 现在都使用重算后的对象。
+- `retrieve_code_chunks()` 将 `retrieval_keywords`、`mechanism_tags`、`semantic_summary` 纳入打分，并把这些字段写入 retrieval result。
+- surface map item 也保留语义增强字段，方便 S1/S2 读取实现面时看到增强后的机制摘要。
+- 新增测试覆盖增强后的 code chunk 能进入 static bundle、surface map、retrieval index match reasons，并通过 S0 gate。
+
 ## 2026-06-26 External S2.5 Worktree Storage
 
 真实 C2C 迭代积累后发现 `workspace/<project_id>/plan/code_worktrees/<idea>/vN/repo` 会把完整 Git worktree 放进当前 VS Code workspace。打开项目根目录时 VS Code 会递归 watch 历史 artifact 和 worktree repo，当前本地 `workspace/` 已达到 109G、15 万以上文件，触发 20 万量级 watcher。
