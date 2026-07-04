@@ -5136,6 +5136,7 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert evidence_session["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     assert len(evidence_session["attempts"]) == 3
     assert "resume" in s1_codex_commands[1]
+    assert "resume" in s1_codex_commands[2]
     assert "Validation errors" in s1_codex_prompts[1]
 
 

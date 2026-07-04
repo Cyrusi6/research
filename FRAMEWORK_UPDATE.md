@@ -1,5 +1,12 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-04 C2C S1 Shared Evidence/Direction Session
+
+- Changed C2C S1 two-phase defaults so `evidence_request_agent` and `direction_agent` share one Codex resume session by default.
+- S1b remains deterministic and non-GPT: it inserts the retrieved evidence bundle between the two Codex turns.
+- Updated the S1c prompt to explicitly continue the same evidence-on-demand session while still forbidding refs outside the deterministic bundle.
+- Added regression coverage that the S1c direction-agent call uses `codex resume` after S1a.
+
 ## 2026-07-04 C2C Real Smoke Record And Replay Hardening
 
 - Added `meta/c2c_real_smoke_record.json` plus schema/report/validator coverage.

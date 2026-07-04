@@ -2627,6 +2627,7 @@ C2C S1 的 evidence-on-demand 路径进一步拆成三段硬合同：S1a 只产�
   - S1a 禁止输出 `direction_decision / selected_ideas / evidence_bundle / expected_files`；
   - S1b 写出 `literature/c2c/evidence_request_plan.json`、deterministic `evidence_bundle.json` 和真实 retrieval trace；
   - S1c prompt 只暴露 `allowed_refs`，并要求 direction/idea refs 必须来自 bundle。
+- S1a 和 S1c 默认复用同一个 Codex resume session：S1a 先提出证据需求，S1b deterministic retriever 把证据卡片回填为 bundle，S1c 在同一会话上下文中切换为 direction_agent，但仍只能消费 bundle refs。
 - 新增 `validate_direction_refs_subset_of_bundle()`，校验 required evidence、counterevidence、code refs 都是 S1b bundle 子集，并检查 expected files 被 code refs 覆盖。
 - `build_s1_evidence_quality_score()` 纳入 direction-vs-bundle subset report；C2C S1 quality gate 在原有 paper/code/counterevidence/novelty/surface 规则之外，也会硬拦截 direction refs 不来自 bundle 的输出。
 - `S1GateValidator` 新增 two-phase contract gate，要求 request plan、deterministic bundle、direction decision、deterministic retrieval trace、evidence session 同时存在且 producer/schema/subset/coverage 合法。

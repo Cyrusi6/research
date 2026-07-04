@@ -1938,11 +1938,14 @@ def _c2c_s1_two_phase_config(config: dict[str, Any]) -> dict[str, Any]:
     request_raw = raw.get("request_agent") if isinstance(raw.get("request_agent"), dict) else {}
     direction_raw = raw.get("direction_agent") if isinstance(raw.get("direction_agent"), dict) else {}
     retriever_raw = raw.get("retriever") if isinstance(raw.get("retriever"), dict) else {}
+    shared_session_key = str(raw.get("session_key") or "s1:c2c_evidence_direction")
+    request_session_key = str(request_raw.get("session_key") or direction_raw.get("session_key") or shared_session_key)
+    direction_session_key = str(direction_raw.get("session_key") or request_session_key)
     return {
         "enabled": bool(raw.get("enabled", True)),
         "max_request_revision_rounds": int(raw.get("max_request_revision_rounds") or 1),
         "request_agent": {
-            "session_key": request_raw.get("session_key") or "s1:c2c_evidence_request",
+            "session_key": request_session_key,
             "max_json_repairs": int(request_raw.get("max_json_repairs") or ((_s1_codex_agent_config(config, mode="c2c").get("max_json_repairs") or 2))),
             "timeout_seconds": int(request_raw.get("timeout_seconds") or llm_timeout),
             "resume_enabled": bool(request_raw.get("resume_enabled", True)),
@@ -1958,7 +1961,7 @@ def _c2c_s1_two_phase_config(config: dict[str, Any]) -> dict[str, Any]:
             "require_deterministic_bundle": bool(retriever_raw.get("require_deterministic_bundle", True)),
         },
         "direction_agent": {
-            "session_key": direction_raw.get("session_key") or "s1:c2c_direction_decision",
+            "session_key": direction_session_key,
             "max_json_repairs": int(direction_raw.get("max_json_repairs") or ((_s1_codex_agent_config(config, mode="c2c").get("max_json_repairs") or 2))),
             "timeout_seconds": int(direction_raw.get("timeout_seconds") or llm_timeout),
             "resume_enabled": bool(direction_raw.get("resume_enabled", True)),
@@ -2621,6 +2624,7 @@ def _s1_c2c_direction_prompt(
     return "\n\n".join(
         [
             "You are S1c direction_agent.",
+            "You are continuing the same S1 evidence-on-demand session after S1a requested evidence and S1b deterministic retrieval returned the evidence bundle.",
             "You can only choose a high-level research direction from the supplied deterministic evidence_bundle.",
             "You must not output evidence_requests or evidence_bundle.",
             "You must not invent refs, papers, code facts, rebuttal facts, or failure memories outside evidence_bundle.items.",
