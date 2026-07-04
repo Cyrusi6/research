@@ -5140,6 +5140,158 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert "Validation errors" in s1_codex_prompts[1]
 
 
+def test_c2c_s1_direction_agent_can_request_followup_cards_in_same_session(monkeypatch, tmp_path: Path) -> None:
+    config = _base_config(tmp_path / "workspace", simulate=True)
+    config["ideation"] = {
+        "c2c_s1_two_phase": {"max_direction_followup_rounds": 1},
+        "c2c": {"novelty_auditor": {"enabled": False}},
+    }
+    project_root = tmp_path / "project"
+    project_root.mkdir()
+    context = AgentContext(project_root, config, ArtifactManager(project_root), ModelClient(config, project_root=project_root))
+    agent = literature_module.LiteratureAgent(context)
+    monkeypatch.setattr(literature_module.shutil, "which", lambda name: "/usr/bin/codex" if name == "codex" else None)
+    original_subprocess_run = literature_module.subprocess.run
+    commands = []
+    direction_calls = 0
+
+    def prompt_context(prompt: str) -> dict:
+        return json.loads(prompt.split("Context JSON:", 1)[1].split("Required JSON shape:", 1)[0])
+
+    def final_direction(prompt: str) -> dict:
+        context_payload = prompt_context(prompt)
+        refs = [ref for ref in context_payload["allowed_refs"] if isinstance(ref, dict)]
+        paper_refs = [ref for ref in refs if ref.get("source_type") == "paper"][:2]
+        code_refs = [ref for ref in refs if ref.get("source_type") == "code"][:2]
+        counter_refs = [ref for ref in refs if ref.get("source_type") == "rebuttal"][:1]
+        return {
+            "schema_version": "c2c_s1_direction_agent_v1",
+            "status": "ok",
+            "direction_decision": {
+                "direction_id": "followup_wrapper_routing",
+                "mechanism_direction": "Follow-up wrapper routing",
+                "mechanism_type": "routing",
+                "mechanism_axis": "routing",
+                "integration_point": "wrapper",
+                "control_signal": "utility",
+                "core_hypothesis": "Use utility-aware wrapper routing after inspecting both initial and follow-up code cards.",
+                "why_baseline_fails": "The baseline lacks a utility control signal.",
+                "why_this_direction": "The merged deterministic bundle contains paper, counterevidence, and two code surfaces.",
+                "expected_metric_signature": {"primary_metric": "three_dataset_mean", "expected_direction": "increase", "diagnostics": []},
+                "required_evidence_refs": paper_refs,
+                "counterevidence_refs": counter_refs,
+                "implementation_surface_refs": code_refs,
+                "expected_files": [ref["source_path"] for ref in code_refs],
+                "allowed_variants": ["wrapper utility routing"],
+                "forbidden_patterns": ["hard gate"],
+                "failure_routing_hints": ["return to S1 after repeated method failures"],
+                "s2_affordance": "S2 can instantiate wrapper utility routing.",
+                "verification_commands": ["py_compile"],
+                "target_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+                "failure_focus": ["coverage"],
+            },
+            "selected_ideas": [
+                {
+                    "id": "followup_wrapper_routing",
+                    "title": "Follow-up wrapper routing",
+                    "selected": True,
+                    "hypothesis": "Use utility-aware wrapper routing.",
+                    "novelty_score": 7,
+                    "feasibility_score": 7,
+                    "mechanism_type": "routing",
+                    "description": "High-level direction selected after follow-up evidence.",
+                    "motivation": "Merged deterministic evidence supports wrapper routing.",
+                    "reviewer_risk_response": "Track coverage and avoid hard gates.",
+                    "expected_files": [ref["source_path"] for ref in code_refs],
+                    "verification_commands": ["py_compile"],
+                    "evidence_refs": paper_refs,
+                    "counterevidence_refs": counter_refs,
+                    "code_refs": code_refs,
+                    "s1_allowed_variants": ["wrapper utility routing"],
+                    "s1_forbidden_patterns": ["hard gate"],
+                }
+            ],
+            "negative_constraints": {"forbidden_patterns": ["hard gate"]},
+            "decision_chain": {"evidence": ["paper", "code"], "counterevidence": ["rebuttal"], "conclusion": "select wrapper routing"},
+        }
+
+    def fake_codex_run(command, **kwargs):
+        nonlocal direction_calls
+        if not command or command[0] != "codex":
+            return original_subprocess_run(command, **kwargs)
+        commands.append(command)
+        prompt = kwargs.get("input") or ""
+        output_path = Path(command[command.index("--output-last-message") + 1])
+        if "evidence_request_agent" in prompt:
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "c2c_s1_evidence_request_plan_v1",
+                        "request_plan_id": "initial_plan",
+                        "evidence_requests": [
+                            {"request_id": "paper_support", "source_type": "paper", "query": "cache transfer support", "keywords": ["cache", "transfer"], "purpose": "support", "top_k": 2, "must_resolve": True},
+                            {"request_id": "code_aligner", "source_type": "code", "query": "aligner wrapper cache", "keywords": ["aligner", "wrapper"], "purpose": "implementation_surface", "top_k": 2, "must_resolve": True},
+                            {"request_id": "counter", "source_type": "rebuttal", "query": "coverage risk", "keywords": ["coverage", "risk"], "purpose": "counterevidence", "top_k": 1, "must_resolve": True},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return SimpleNamespace(returncode=0, stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174099"}\n', stderr="")
+        direction_calls += 1
+        if direction_calls == 1:
+            output_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "c2c_s1_direction_agent_v1",
+                        "status": "needs_more_evidence",
+                        "reason": "Need wrapper implementation surface before choosing.",
+                        "followup_evidence_request_plan": {
+                            "evidence_requests": [
+                                {"request_id": "code_wrapper_followup", "source_type": "code", "query": "wrapper forward utility routing", "keywords": ["wrapper", "forward", "utility"], "purpose": "implementation_surface", "top_k": 1, "must_resolve": True}
+                            ],
+                            "request_rationale": "The first bundle only covered aligner code.",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+        else:
+            output_path.write_text(json.dumps(final_direction(prompt)), encoding="utf-8")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(literature_module.subprocess, "run", fake_codex_run)
+    result = agent._run_c2c_evidence_on_demand_direction(
+        topic="cross tokenizer cache",
+        evidence_brief={},
+        chunk_index={},
+        paper_chunks=[
+            {"chunk_id": "paper_1", "text": "cache transfer support mechanism", "source_path": "paper.md"},
+            {"chunk_id": "paper_2", "text": "transfer utility support evidence", "source_path": "paper.md"},
+        ],
+        rebuttal_chunks=[{"chunk_id": "reb_1", "text": "coverage risk and regression counterevidence", "source_path": "rebuttal.md"}],
+        code_chunks=[
+            {"chunk_id": "code_aligner", "text": "aligner cache bridge", "source_path": "rosetta/model/aligner.py"},
+            {"chunk_id": "code_wrapper", "text": "wrapper forward utility routing", "source_path": "rosetta/model/wrapper.py"},
+        ],
+        code_edges=[],
+        code_intake_report={},
+        implementation_surface_map={"surfaces": {"rosetta/model/aligner.py": {"status": "allowed"}, "rosetta/model/wrapper.py": {"status": "allowed"}}},
+        code_retrieval_index={},
+        baseline={},
+        negative_memory={},
+        rebuttal_matrix={},
+        feedback=[],
+    )
+
+    assert result["status"] == "ok"
+    assert direction_calls == 2
+    assert "resume" in commands[1]
+    assert "resume" in commands[2]
+    assert result["evidence_quality_score"]["support_coverage"]["code"] >= 2
+    assert result["evidence_retrieval_trace"]["followup_rounds"][0]["selected_ref_count"] >= 1
+
+
 def test_gpu_selector_auto_limits_to_six(monkeypatch) -> None:
     snapshot = [
         {"index": idx, "memory_total_mb": 80000, "memory_free_mb": 10000 + idx * 1000, "memory_used_mb": 0, "utilization_gpu": idx}

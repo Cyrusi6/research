@@ -5,7 +5,8 @@
 - Changed C2C S1 two-phase defaults so `evidence_request_agent` and `direction_agent` share one Codex resume session by default.
 - S1b remains deterministic and non-GPT: it inserts the retrieved evidence bundle between the two Codex turns.
 - Updated the S1c prompt to explicitly continue the same evidence-on-demand session while still forbidding refs outside the deterministic bundle.
-- Added regression coverage that the S1c direction-agent call uses `codex resume` after S1a.
+- Added a same-session S1c follow-up evidence loop: when S1c returns `status=needs_more_evidence`, the system runs deterministic retrieval for the requested extra cards, merges them into the bundle, and resumes S1c again.
+- Added regression coverage that the S1c direction-agent call uses `codex resume` after S1a and after a follow-up retrieval.
 
 ## 2026-07-04 C2C Real Smoke Record And Replay Hardening
 

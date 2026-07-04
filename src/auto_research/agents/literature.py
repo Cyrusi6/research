@@ -1119,6 +1119,7 @@ class LiteratureAgent:
         )
         retrieval_feedback: list[str] = []
         request_result: dict[str, Any] = {}
+        request_plans: list[dict[str, Any]] = []
         evidence_bundle: dict[str, Any] = {}
         deterministic_trace: dict[str, Any] = {}
         max_request_rounds = int(two_phase_cfg.get("max_request_revision_rounds") or 1)
@@ -1145,6 +1146,7 @@ class LiteratureAgent:
                     phases=[request_result],
                 )
             request_plan = request_result.get("evidence_request_plan") if isinstance(request_result.get("evidence_request_plan"), dict) else default_c2c_evidence_request_plan(topic=topic)
+            request_plans = [request_plan]
             evidence_bundle, deterministic_trace = retrieve_s1_c2c_requested_evidence(
                 request_plan,
                 chunk_index=chunk_index,
@@ -1176,24 +1178,53 @@ class LiteratureAgent:
                     ],
                 )
 
-        direction_result = _run_s1_c2c_direction_agent(
-            project_root=self.context.project_root,
-            config=self.context.config,
-            topic=topic,
-            baseline=baseline,
-            negative_memory=negative_memory,
-            feedback=feedback,
-            evidence_bundle=evidence_bundle,
-            retrieval_trace=deterministic_trace,
-            shared_memory=shared_memory,
-        )
+        direction_phases: list[dict[str, Any]] = []
+        max_direction_followups = int(two_phase_cfg.get("max_direction_followup_rounds") or 1)
+        direction_result: dict[str, Any] = {}
+        for direction_round in range(max_direction_followups + 1):
+            direction_result = _run_s1_c2c_direction_agent(
+                project_root=self.context.project_root,
+                config=self.context.config,
+                topic=topic,
+                baseline=baseline,
+                negative_memory=negative_memory,
+                feedback=feedback,
+                evidence_bundle=evidence_bundle,
+                retrieval_trace=deterministic_trace,
+                shared_memory=shared_memory,
+            )
+            direction_phases.append(direction_result)
+            if direction_result.get("status") == "ok":
+                break
+            if direction_result.get("status") != "needs_more_evidence" or direction_round >= max_direction_followups:
+                break
+            followup_plan = direction_result.get("followup_evidence_request_plan") if isinstance(direction_result.get("followup_evidence_request_plan"), dict) else {}
+            followup_bundle, followup_trace = retrieve_s1_c2c_requested_evidence(
+                followup_plan,
+                chunk_index=chunk_index,
+                paper_chunks=paper_chunks,
+                rebuttal_chunks=rebuttal_chunks,
+                code_chunks=code_chunks,
+                code_edges=code_edges,
+                code_retrieval_index=code_retrieval_index,
+                implementation_surface_map=implementation_surface_map,
+                negative_memory=negative_memory,
+                feedback=feedback,
+                shared_memory=shared_memory,
+                config=self.context.config,
+            )
+            request_plans.append(followup_plan)
+            evidence_bundle = _merge_s1_c2c_evidence_bundles(evidence_bundle, followup_bundle)
+            deterministic_trace = _merge_s1_c2c_retrieval_traces(deterministic_trace, followup_trace, followup_round=direction_round + 1)
         if direction_result.get("status") != "ok":
             return _blocked_c2c_two_phase_result(
                 reason=direction_result.get("reason") or "S1c direction agent did not return valid direction JSON.",
-                phases=[request_result, {"phase": "deterministic_retriever", "status": "ok", "retrieval_trace": deterministic_trace}, direction_result],
+                phases=[request_result, {"phase": "deterministic_retriever", "status": "ok", "retrieval_trace": deterministic_trace}, *direction_phases],
             )
         payload = direction_result.get("payload") if isinstance(direction_result.get("payload"), dict) else {}
-        evidence_requests = (request_result.get("evidence_request_plan") or {}).get("evidence_requests") if isinstance(request_result.get("evidence_request_plan"), dict) else []
+        evidence_requests: list[dict[str, Any]] = []
+        for plan in request_plans:
+            evidence_requests.extend(item for item in (plan.get("evidence_requests") or []) if isinstance(item, dict))
         payload = dict(payload)
         payload["evidence_requests"] = evidence_requests
         payload["evidence_bundle"] = evidence_bundle
@@ -1944,6 +1975,7 @@ def _c2c_s1_two_phase_config(config: dict[str, Any]) -> dict[str, Any]:
     return {
         "enabled": bool(raw.get("enabled", True)),
         "max_request_revision_rounds": int(raw.get("max_request_revision_rounds") or 1),
+        "max_direction_followup_rounds": int(raw.get("max_direction_followup_rounds") or 1),
         "request_agent": {
             "session_key": request_session_key,
             "max_json_repairs": int(request_raw.get("max_json_repairs") or ((_s1_codex_agent_config(config, mode="c2c").get("max_json_repairs") or 2))),
@@ -2434,6 +2466,25 @@ def _run_s1_c2c_direction_agent(
         attempts.append(_s1_codex_attempt_summary(call))
         payload = call.get("payload") if isinstance(call.get("payload"), dict) else None
         if call.get("status") == "ok" and payload is not None:
+            status = str(payload.get("status") or "ok").lower()
+            if status in {"needs_more_evidence", "insufficient_evidence"}:
+                followup_plan = _s1c_followup_evidence_request_plan(payload, topic=topic)
+                validation_errors = _validate_s1c_followup_evidence_request_plan(followup_plan)
+                if not validation_errors:
+                    return {
+                        "status": "needs_more_evidence",
+                        "phase": "direction_agent",
+                        "reason": str(payload.get("reason") or payload.get("request_rationale") or "S1c requested more deterministic evidence before choosing a direction."),
+                        "followup_evidence_request_plan": followup_plan,
+                        "session_key": session_key,
+                        "session_id": session_id,
+                        "repair_count": attempt_idx,
+                        "attempts": attempts,
+                        "novelty_audits": novelty_audits,
+                    }
+                previous_status = "followup_request_invalid"
+                previous_output = json.dumps(payload, ensure_ascii=False)[-4000:]
+                continue
             payload = _normalize_s1_c2c_direction_payload(payload, evidence_bundle=evidence_bundle)
             validation_errors = _validate_s1_c2c_direction_payload(payload, evidence_bundle=evidence_bundle)
             if not validation_errors:
@@ -2608,7 +2659,27 @@ def _s1_c2c_direction_prompt(
             }
         ],
         "negative_constraints": {"forbidden_idea_ids": [], "forbidden_patterns": [], "failure_feedback_rules": []},
-        "decision_chain": {"evidence": ["evidence_id values"], "counterevidence": ["evidence_id values"], "conclusion": "one sentence"},
+            "decision_chain": {"evidence": ["evidence_id values"], "counterevidence": ["evidence_id values"], "conclusion": "one sentence"},
+    }
+    followup_contract = {
+        "schema_version": "c2c_s1_direction_agent_v1",
+        "status": "needs_more_evidence",
+        "reason": "why the current deterministic bundle is insufficient",
+        "followup_evidence_request_plan": {
+            "evidence_requests": [
+                {
+                    "request_id": "specific_missing_card",
+                    "source_type": "paper|rebuttal|code|failure_memory|feedback",
+                    "query": "specific query for missing evidence",
+                    "keywords": ["specific", "terms"],
+                    "purpose": "support|counterevidence|implementation_surface|failure_memory",
+                    "top_k": 2,
+                    "filters": {},
+                    "must_resolve": True,
+                }
+            ],
+            "request_rationale": "why these cards are needed before selecting a direction",
+        },
     }
     context_payload = {
         "schema_version": "c2c_s1c_direction_context_v1",
@@ -2626,18 +2697,133 @@ def _s1_c2c_direction_prompt(
             "You are S1c direction_agent.",
             "You are continuing the same S1 evidence-on-demand session after S1a requested evidence and S1b deterministic retrieval returned the evidence bundle.",
             "You can only choose a high-level research direction from the supplied deterministic evidence_bundle.",
-            "You must not output evidence_requests or evidence_bundle.",
+            "If the supplied bundle is not enough to choose responsibly, return status=needs_more_evidence with followup_evidence_request_plan; do not choose a direction in that response.",
+            "When status=ok, you must not output evidence_requests, followup_evidence_request_plan, or evidence_bundle.",
             "You must not invent refs, papers, code facts, rebuttal facts, or failure memories outside evidence_bundle.items.",
             "All evidence_refs, counterevidence_refs, and code_refs must be copied exactly from allowed_refs.",
-            "If evidence is insufficient, return status=insufficient_evidence with no selected_ideas instead of inventing evidence.",
+            "If evidence is insufficient, return status=needs_more_evidence with no selected_ideas instead of inventing evidence.",
             "expected_files must be covered by code_refs from evidence_bundle.",
             "Return only one valid JSON object.",
             "Context JSON:",
             json.dumps(context_payload, ensure_ascii=False, indent=2),
             "Required JSON shape:",
             json.dumps(output_contract, ensure_ascii=False, indent=2),
+            "Alternative JSON shape only when the bundle is insufficient:",
+            json.dumps(followup_contract, ensure_ascii=False, indent=2),
         ]
     )
+
+
+def _s1c_followup_evidence_request_plan(payload: dict[str, Any], *, topic: str) -> dict[str, Any]:
+    raw = payload.get("followup_evidence_request_plan") if isinstance(payload.get("followup_evidence_request_plan"), dict) else {}
+    raw_requests = raw.get("evidence_requests") if isinstance(raw.get("evidence_requests"), list) else payload.get("followup_evidence_requests") if isinstance(payload.get("followup_evidence_requests"), list) else []
+    requests: list[dict[str, Any]] = []
+    for idx, request in enumerate(raw_requests):
+        if not isinstance(request, dict):
+            continue
+        source_type = str(request.get("source_type") or "paper").strip() or "paper"
+        requests.append(
+            {
+                "request_id": str(request.get("request_id") or f"s1c_followup_{idx + 1}_{source_type}"),
+                "source_type": source_type,
+                "query": str(request.get("query") or " ".join(str(item) for item in request.get("keywords") or []) or topic),
+                "keywords": [str(item) for item in request.get("keywords") or [] if item],
+                "purpose": str(request.get("purpose") or "support"),
+                "top_k": max(1, int(request.get("top_k") or 2)),
+                "filters": request.get("filters") if isinstance(request.get("filters"), dict) else {},
+                "must_resolve": bool(request.get("must_resolve", True)),
+            }
+        )
+    return {
+        "schema_version": "c2c_s1_evidence_request_plan_v1",
+        "request_plan_id": str(raw.get("request_plan_id") or _short_s1_hash({"topic": topic, "requests": requests})),
+        "evidence_requests": requests,
+        "required_source_coverage": raw.get("required_source_coverage") if isinstance(raw.get("required_source_coverage"), dict) else {},
+        "retrieval_budget": raw.get("retrieval_budget") if isinstance(raw.get("retrieval_budget"), dict) else {"top_k_per_request": 2, "max_total_items": 12, "min_score": 0.0},
+        "forbidden_outputs": ["direction_decision", "selected_ideas", "evidence_bundle", "expected_files"],
+        "request_rationale": str(raw.get("request_rationale") or payload.get("reason") or payload.get("request_rationale") or "S1c requested additional deterministic evidence."),
+    }
+
+
+def _validate_s1c_followup_evidence_request_plan(plan: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    allowed_sources = {"paper", "rebuttal", "code", "failure_memory", "feedback"}
+    requests = plan.get("evidence_requests") if isinstance(plan, dict) else None
+    if not isinstance(requests, list) or not requests:
+        return ["followup_evidence_request_plan.evidence_requests must be a non-empty list"]
+    seen = set()
+    for idx, request in enumerate(requests):
+        if not isinstance(request, dict):
+            errors.append(f"followup_evidence_request_plan.evidence_requests[{idx}] must be an object")
+            continue
+        request_id = str(request.get("request_id") or "")
+        if not request_id:
+            errors.append(f"followup_evidence_request_plan.evidence_requests[{idx}].request_id missing")
+        elif request_id in seen:
+            errors.append(f"duplicate followup request_id: {request_id}")
+        seen.add(request_id)
+        if str(request.get("source_type") or "") not in allowed_sources:
+            errors.append(f"followup_evidence_request_plan.evidence_requests[{idx}].source_type must be one of {sorted(allowed_sources)}")
+        if not str(request.get("query") or "").strip():
+            errors.append(f"followup_evidence_request_plan.evidence_requests[{idx}].query missing")
+        if int(request.get("top_k") or 0) <= 0:
+            errors.append(f"followup_evidence_request_plan.evidence_requests[{idx}].top_k must be positive")
+    return errors
+
+
+def _short_s1_hash(payload: dict[str, Any]) -> str:
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8")).hexdigest()[:12]
+
+
+def _merge_s1_c2c_evidence_bundles(primary: dict[str, Any], followup: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(primary if isinstance(primary, dict) else {})
+    items: list[dict[str, Any]] = []
+    seen = set()
+    for bundle in [primary, followup]:
+        for item in (bundle.get("items") if isinstance(bundle, dict) else []) or []:
+            if not isinstance(item, dict):
+                continue
+            key = _s1_evidence_item_key(item)
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+    merged["schema_version"] = str(merged.get("schema_version") or (followup or {}).get("schema_version") or "c2c_s1_deterministic_evidence_bundle_v1")
+    merged["producer"] = "deterministic_retriever"
+    merged["retriever_version"] = str(merged.get("retriever_version") or (followup or {}).get("retriever_version") or "")
+    merged["items"] = items
+    merged["merged_followup_bundle_count"] = int(merged.get("merged_followup_bundle_count") or 0) + 1
+    return merged
+
+
+def _merge_s1_c2c_retrieval_traces(primary: dict[str, Any], followup: dict[str, Any], *, followup_round: int) -> dict[str, Any]:
+    merged = dict(primary if isinstance(primary, dict) else {})
+    for key in ["requests", "evidence_requests", "selected_refs", "resolved_refs", "unfilled_requests", "unfilled_must_resolve_requests", "rejected_top_candidates"]:
+        merged[key] = _dedupe_trace_values([*((primary or {}).get(key) or []), *((followup or {}).get(key) or [])])
+    merged["resolved_ref_count"] = len(merged.get("resolved_refs") or merged.get("selected_refs") or [])
+    merged["unresolved_ref_count"] = int((primary or {}).get("unresolved_ref_count") or 0) + int((followup or {}).get("unresolved_ref_count") or 0)
+    merged["deterministic"] = True
+    merged["followup_rounds"] = [*((primary or {}).get("followup_rounds") or []), {"round": followup_round, "request_plan_id": (followup or {}).get("request_plan_id"), "selected_ref_count": len((followup or {}).get("selected_refs") or [])}]
+    return merged
+
+
+def _s1_evidence_item_key(item: dict[str, Any]) -> str:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else None
+    if ref:
+        return json.dumps(ref, sort_keys=True, ensure_ascii=True, default=str)
+    return str(item.get("evidence_id") or item.get("chunk_id") or item.get("source_path") or json.dumps(item, sort_keys=True, ensure_ascii=True, default=str))
+
+
+def _dedupe_trace_values(values: list[Any]) -> list[Any]:
+    result = []
+    seen = set()
+    for value in values:
+        key = json.dumps(value, sort_keys=True, ensure_ascii=True, default=str) if isinstance(value, (dict, list)) else str(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(value)
+    return result
 
 
 def _validate_s1_c2c_direction_payload(payload: dict[str, Any], *, evidence_bundle: dict[str, Any]) -> list[str]:
@@ -2647,6 +2833,8 @@ def _validate_s1_c2c_direction_payload(payload: dict[str, Any], *, evidence_bund
     for field in ["evidence_requests", "evidence_bundle"]:
         if field in payload:
             errors.append(f"direction_agent must not output {field}")
+    if payload.get("followup_evidence_request_plan"):
+        errors.append("direction_agent status=ok must not output followup_evidence_request_plan")
     if str(payload.get("status") or "ok").lower() not in {"ok", "direction_selected"}:
         errors.append("status must be ok or direction_selected")
     decision = payload.get("direction_decision")
