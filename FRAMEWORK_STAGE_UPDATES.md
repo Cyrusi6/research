@@ -2797,3 +2797,22 @@ real smoke record: readiness_gate=warn, artifact_audit_gate=pass, replay_status=
 python -m py_compile src/auto_research/agents/experiment.py src/auto_research/agents/literature.py src/auto_research/agents/plan.py src/auto_research/c2c_e2e.py src/auto_research/reporting.py src/auto_research/route_policy.py src/auto_research/validators/c2c_e2e_gate.py
 uv run pytest -q tests/test_c2c_s3_artifact_registration.py tests/test_c2c_replay.py tests/test_c2c_artifact_audit.py tests/test_c2c_real_smoke_record.py tests/test_s1_c2c_direction_normalization.py tests/test_s2_c2c_expected_files.py tests/test_reporting.py tests/test_validators.py
 ```
+
+## 2026-07-04 C2C Proxy Repair Routing / S2 Adaptive Guard
+
+真实 `c2c_real_smoke_001` 暴露的剩余问题是：S3 `proxy_repairable` 被 legacy `route_hint=return_s2` 带回 S2 后，attempt ledger 将其累计为 same-direction proxy failure；S2 adaptive selector 随后把同一 repairable incident 从多个 artifact 重复扣分，导致唯一候选分数降到负数并被 planner gate 阻断。该问题本质上是 repair lane 和 method-failure lane 的语义混淆。
+
+修复：
+
+- `route_policy.py` 在 route_hint 分支前识别 `proxy_repairable`、`effect_first_proxy_repair`、`repairable_proxy`、patch-gate repair 等上下文，并强制路由到 `route_to_s2_5` patch-only repair。
+- Attempt ledger 只把 method-level proxy/full-S3 failure 计入 same-direction counters；repairable proxy / implementation repair 不再污染 proxy failure budget。
+- `s2_feedback_policy.py` 将 repairable proxy markers 规范化为 `implementation_failure`，只触发 patch-surface prior，不触发 mechanism/integration method penalty。
+- S2 feedback context 优先从 attempt records 复算 counters，并跨 `route_decision`、`proxy_decision`、`main_results`、`performance_feedback`、`attempt_ledger` 去重同一 failure event。
+- `build_s2_planner_gate_report()` 对 `implementation_repair` mode 放宽 force-new-integration / force-new-direction 约束，允许同一 variant/fingerprint 进入 S2.5 修补。
+
+验证：
+
+```text
+uv run pytest -q tests/test_route_policy.py tests/test_attempt_ledger.py tests/test_s2_feedback_policy.py tests/test_s2_adaptive_scorecard.py
+uv run pytest -q tests/test_validators.py tests/test_c2c.py tests/test_pipeline.py tests/test_stage_contracts.py
+```

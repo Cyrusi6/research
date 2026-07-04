@@ -53,6 +53,16 @@ IMPLEMENTATION_FAILURE_MARKERS = {
     "patch_gate_not_passed",
 }
 
+REPAIRABLE_PROXY_FAILURE_MARKERS = {
+    "proxy_repairable",
+    "effect_first_proxy_repair",
+    "repairable_proxy",
+    "repairable_proxy_risk_before_full_training",
+    "patch_repair",
+    "patch_only_repair",
+    "proxy_timeout",
+}
+
 
 def build_s2_feedback_context(
     *,
@@ -480,12 +490,22 @@ def _collect_recent_failures(
     deduped = []
     seen = set()
     for row in rows:
-        key = (row.get("source"), row.get("variant_id"), row.get("failure_class"), row.get("route_decision"))
+        key = _failure_dedupe_key(row)
         if key in seen or not row.get("failure_class"):
             continue
         seen.add(key)
         deduped.append(row)
     return deduped
+
+
+def _failure_dedupe_key(row: dict[str, Any]) -> tuple[str, str]:
+    identity = str(row.get("variant_fingerprint") or row.get("variant_id") or "").strip()
+    if not identity:
+        identity = "|".join(
+            str(row.get(key) or "")
+            for key in ["mechanism_axis", "integration_point", "control_signal"]
+        )
+    return (identity, str(row.get("failure_class") or ""))
 
 
 def _candidate_failure_payload(candidate: dict[str, Any], defaults: dict[str, Any]) -> dict[str, Any]:
@@ -527,6 +547,8 @@ def _failure_row(payload: dict[str, Any], *, source: str) -> dict[str, Any]:
 def _normalized_failure_class(value: Any) -> str:
     text = str(value or "").strip()
     lowered = text.lower()
+    if lowered in REPAIRABLE_PROXY_FAILURE_MARKERS or any(marker in lowered for marker in ["effect_first_proxy_repair", "repairable_proxy", "patch_repair"]):
+        return "implementation_failure"
     if lowered in {"proxy_rejected", "rejected", "cheap_proxy_rejected_before_full_training"}:
         return "proxy_negative"
     if lowered in {"proxy_pass_full_fail", "acceptance_failed"}:
@@ -573,6 +595,25 @@ def _dataset_risks(calibration_policy: dict[str, Any], dragging: list[str]) -> d
 
 
 def _attempt_counters(ledger: dict[str, Any], direction_id: str) -> dict[str, int]:
+    records = [item for item in ledger.get("records") or [] if isinstance(item, dict)] if isinstance(ledger, dict) else []
+    if records:
+        counters = {"proxy_failures": 0, "full_s3_failures": 0, "patch_repairs": 0, "resource_retries": 0}
+        for record in records:
+            record_direction = str(record.get("direction_id") or "")
+            if direction_id and record_direction and record_direction != direction_id:
+                continue
+            failure_class = _normalized_failure_class(record.get("failure_class"))
+            if record.get("consumes_patch_repair_attempt"):
+                counters["patch_repairs"] += 1
+            if record.get("consumes_resource_retry"):
+                counters["resource_retries"] += 1
+            if not record.get("consumes_same_direction_attempt"):
+                continue
+            if failure_class == "full_s3_method_failure" or "full_s3" in failure_class:
+                counters["full_s3_failures"] += 1
+            elif _is_method_failure(failure_class):
+                counters["proxy_failures"] += 1
+        return counters
     by_direction = ((ledger.get("counters") or {}).get("by_direction") or {}) if isinstance(ledger, dict) else {}
     counters = by_direction.get(direction_id)
     if not isinstance(counters, dict):
@@ -661,14 +702,16 @@ def _expected_files(candidate: dict[str, Any]) -> list[str]:
 
 def _is_method_failure(value: Any) -> bool:
     text = str(value or "").lower()
-    if "resource" in text:
+    if "resource" in text or _is_implementation_failure(text):
+        return False
+    if any(marker in text for marker in REPAIRABLE_PROXY_FAILURE_MARKERS):
         return False
     return any(marker in text for marker in ["proxy", "full_s3", "method"]) or text in METHOD_FAILURE_CLASSES
 
 
 def _is_implementation_failure(value: Any) -> bool:
     text = str(value or "").lower()
-    return any(marker in text for marker in IMPLEMENTATION_FAILURE_MARKERS)
+    return any(marker in text for marker in IMPLEMENTATION_FAILURE_MARKERS) or any(marker in text for marker in REPAIRABLE_PROXY_FAILURE_MARKERS)
 
 
 def _prior_result(

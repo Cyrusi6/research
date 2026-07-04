@@ -225,9 +225,10 @@ def apply_route_decision_summary(
     )
     failure_class = str(route_decision.get("failure_class") or "")
     reason_text = " ".join(str(item) for item in route_decision.get("reason_codes") or [])
-    if record["consumes_same_direction_attempt"] and "full_s3" in failure_class:
+    failure_bucket = _same_direction_failure_bucket(failure_class, reason_text)
+    if record["consumes_same_direction_attempt"] and failure_bucket == "full_s3":
         counters["full_s3_failures"] = int(counters.get("full_s3_failures") or 0) + 1
-    elif record["consumes_same_direction_attempt"] and ("proxy" in failure_class or "proxy" in reason_text):
+    elif record["consumes_same_direction_attempt"] and failure_bucket == "proxy":
         counters["proxy_failures"] = int(counters.get("proxy_failures") or 0) + 1
     if record["consumes_patch_repair_attempt"]:
         counters["patch_repairs"] = int(counters.get("patch_repairs") or 0) + 1
@@ -312,6 +313,8 @@ def _decision_core(context: dict[str, Any], config: dict[str, Any]) -> dict[str,
     route_hint = str(s3.get("route_hint") or "")
     proxy_decision = str(s3.get("proxy_decision") or "")
     s3_failure_class = str(s3.get("failure_class") or s3.get("candidate_failure_class") or "")
+    if _is_repairable_proxy_context(s3):
+        return _route_to_s2_5("proxy_repairable_patch_only_repair", failure_class=s3_failure_class or "implementation_failure")
     if route_hint == "repair_s2_5":
         return _route_to_s2_5("proxy_decision_report_route_hint_repair_s2_5", failure_class=s3_failure_class or "implementation_failure")
     if route_hint == "return_s1":
@@ -564,6 +567,45 @@ def _same_direction_budget_exhausted(budgets: dict[str, Any]) -> bool:
 
 def _same_direction_full_s3_budget_exhausted(budgets: dict[str, Any]) -> bool:
     return int(budgets.get("same_direction_full_s3_failures") or 0) + 1 > int(budgets.get("max_same_direction_full_s3_failures") or 1)
+
+
+def _is_repairable_proxy_context(s3: dict[str, Any]) -> bool:
+    proxy_decision = str(s3.get("proxy_decision") or "").lower()
+    route_hint = str(s3.get("route_hint") or "").lower()
+    failure_class = str(s3.get("failure_class") or s3.get("candidate_failure_class") or "").lower()
+    if proxy_decision == "proxy_repairable":
+        return True
+    haystack = " ".join(item for item in [route_hint, failure_class] if item)
+    repair_markers = [
+        "effect_first_proxy_repair",
+        "repairable_proxy",
+        "proxy_repairable",
+        "patch_gate_not_passed",
+        "static_patch_gate_failed",
+        "patch_repair",
+        "implementation_failure",
+    ]
+    return any(marker in haystack for marker in repair_markers)
+
+
+def _same_direction_failure_bucket(failure_class: str, reason_text: str) -> str | None:
+    haystack = f"{failure_class} {reason_text}".lower()
+    if any(
+        marker in haystack
+        for marker in [
+            "repairable_proxy",
+            "proxy_repairable",
+            "effect_first_proxy_repair",
+            "patch_repair",
+            "implementation_failure",
+        ]
+    ):
+        return None
+    if "full_s3" in haystack:
+        return "full_s3"
+    if "proxy" in haystack or "method" in haystack:
+        return "proxy"
+    return None
 
 
 def _sum_registry_repair_routes(registry: dict[str, Any], variant_id: str) -> int:

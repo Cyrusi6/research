@@ -180,11 +180,11 @@ def build_s2_planner_gate_report(
     if selected_rows and float(selected_rows[0].get("adjusted_score", selected_rows[0].get("score") or 0.0) or 0.0) != selected_score:
         errors.append("selected_variant_score must use adjusted score")
     route_constraints = adaptive_policy.get("route_constraints") if isinstance(adaptive_policy.get("route_constraints"), dict) else {}
-    if route_constraints.get("force_new_integration_point"):
+    if route_constraints.get("force_new_integration_point") and not implementation_repair_mode:
         failed_points = {str(item) for item in route_constraints.get("failed_integration_points") or [] if item}
         if str(next_variant.get("integration_point") or "") in failed_points:
             errors.append("adaptive_policy.force_new_integration_point requires a new integration_point")
-    if route_constraints.get("force_new_direction"):
+    if route_constraints.get("force_new_direction") and not implementation_repair_mode:
         errors.append("adaptive_policy.force_new_direction requires route_to_s1 instead of selecting another S2 variant")
     gate_cfg = ((config.get("c2c") or {}).get("s2_planner_gate") or {}) if isinstance(config.get("c2c"), dict) else {}
     min_score = float(gate_cfg.get("min_selected_variant_score", 0.0) or 0.0)
@@ -213,11 +213,11 @@ def build_s2_planner_gate_report(
             "scorecard_selected": bool(selected_rows),
             "adaptive_policy_hash_matches": not policy_hash or str(scorecard.get("policy_hash") or "") == policy_hash,
             "score_adjustment_selected_matches": not score_adjustment_report or str(score_adjustment_report.get("selected_variant_id") or "") == selected_id,
-            "force_new_integration_point_satisfied": not route_constraints.get("force_new_integration_point") or str(next_variant.get("integration_point") or "") not in {str(item) for item in route_constraints.get("failed_integration_points") or [] if item},
-            "force_new_direction": bool(route_constraints.get("force_new_direction")),
+            "force_new_integration_point_satisfied": implementation_repair_mode or not route_constraints.get("force_new_integration_point") or str(next_variant.get("integration_point") or "") not in {str(item) for item in route_constraints.get("failed_integration_points") or [] if item},
+            "force_new_direction": bool(route_constraints.get("force_new_direction") and not implementation_repair_mode),
         },
         "errors": errors,
-        "return_to": "S1_literature" if route_constraints.get("force_new_direction") else "S2_planner" if errors else None,
+        "return_to": "S1_literature" if route_constraints.get("force_new_direction") and not implementation_repair_mode else "S2_planner" if errors else None,
     }
 
 

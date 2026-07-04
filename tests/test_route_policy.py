@@ -95,6 +95,26 @@ def test_implementation_failure_routes_to_s2_5_without_method_memory(tmp_path: P
     assert decision["memory_effects"]["write_shared_method_memory"] is False
 
 
+def test_proxy_repairable_return_s2_hint_is_reclassified_to_patch_repair(tmp_path: Path) -> None:
+    _base_contracts(tmp_path)
+    write_json(
+        tmp_path / "experiment" / "results" / "c2c_proxy_decision_report.json",
+        {
+            "decision": "proxy_repairable",
+            "route_hint": "return_s2",
+            "failure_class": "effect_first_proxy_repair",
+            "variant_id": "variant_x",
+        },
+    )
+
+    decision = _decision(tmp_path)
+
+    assert decision["decision"] == "route_to_s2_5"
+    assert decision["budget_effects"]["consumes_same_direction_attempt"] is False
+    assert decision["budget_effects"]["consumes_patch_repair_attempt"] is True
+    assert decision["memory_effects"]["write_shared_method_memory"] is False
+
+
 def test_resource_retry_pauses_without_attempt_consumption(tmp_path: Path) -> None:
     _base_contracts(tmp_path)
     write_json(tmp_path / "experiment" / "results" / "c2c_proxy_decision_report.json", {"decision": "blocked", "route_hint": "block_resource", "failure_class": "resource_retry", "variant_id": "variant_x"})

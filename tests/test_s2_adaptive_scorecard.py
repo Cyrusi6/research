@@ -211,3 +211,55 @@ def test_force_new_direction_makes_planner_gate_fail_to_s1() -> None:
     assert policy["route_constraints"]["force_new_direction"] is True
     assert gate["gate"] == "fail"
     assert gate["return_to"] == "S1_literature"
+
+
+def test_implementation_repair_mode_can_reuse_failed_integration_point() -> None:
+    direction = _direction()
+    variant = _variant("old_point", "projector")
+    pool = build_s2_candidate_pool(direction=direction, candidates=[variant], source="unit")
+    context = {
+        "direction_id": "direction_x",
+        "recent_failures": [{"mechanism_axis": "routing", "integration_point": "projector", "failure_class": "proxy_negative"}],
+        "attempt_counters": {"same_direction_proxy_failures": 2, "max_same_direction_proxy_failures": 2},
+        "dragging_datasets": [],
+    }
+    policy = build_s2_adaptive_policy(context, _config())
+    scorecard = build_s2_variant_scorecard(
+        direction=direction,
+        candidate_pool=pool,
+        selected_variant=variant,
+        evidence_quality={"support_coverage": {"paper": 2, "code": 2}},
+        variant_fingerprint={"variant_fingerprint": "fp_old_point", "is_repeat": True, "mode": "implementation_repair"},
+        planner_memory={"entries": []},
+        feedback=[],
+        feedback_context=context,
+        adaptive_policy=policy,
+        config=_config(),
+    )
+    report = build_s2_score_adjustment_report(direction=direction, candidate_pool=pool, scorecard=scorecard, adaptive_policy=policy, feedback_context=context)
+    gate = build_s2_planner_gate_report(
+        direction=direction,
+        candidate_pool=pool,
+        scorecard=scorecard,
+        next_variant=variant,
+        variant_contract={
+            "direction_id": "direction_x",
+            "variant_id": "old_point",
+            "variant_fingerprint": "fp_old_point",
+            "mechanism_axis": "routing",
+            "integration_point": "projector",
+            "control_signal": "utility",
+            "expected_files": ["rosetta/model/projector.py"],
+            "resource_budget": {},
+            "expected_metric_signature": {"primary_metric": "three_dataset_mean"},
+            "ablation": {"switch": "disable_old_point", "control": "off"},
+        },
+        variant_fingerprint={"variant_fingerprint": "fp_old_point", "is_repeat": True, "mode": "implementation_repair"},
+        adaptive_policy=policy,
+        score_adjustment_report=report,
+        config=_config(),
+    )
+
+    assert policy["route_constraints"]["force_new_integration_point"] is True
+    assert gate["gate"] == "pass"
+    assert gate["checks"]["force_new_integration_point_satisfied"] is True
