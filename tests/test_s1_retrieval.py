@@ -32,6 +32,17 @@ def test_evidence_request_plan_rejects_direction_fields() -> None:
     assert "evidence_request_plan must not include direction_decision" in errors
 
 
+def test_evidence_request_plan_requires_discriminating_uncertainty_contract() -> None:
+    plan = default_c2c_evidence_request_plan(topic="cache")
+    plan.pop("candidate_direction_hypotheses")
+    plan["discriminating_evidence_requests"] = []
+
+    errors = validate_c2c_evidence_request_plan(plan)
+
+    assert "candidate_direction_hypotheses must contain at least two competing hypotheses" in errors
+    assert "discriminating_evidence_requests must be a non-empty list" in errors
+
+
 def test_deterministic_retriever_returns_stable_bundle_and_coverage() -> None:
     chunk_index, paper_chunks, rebuttal_chunks, code_chunks = _chunks()
     plan = default_c2c_evidence_request_plan(topic="cache")
@@ -120,6 +131,51 @@ def test_deterministic_retriever_prefers_allowed_code_surface_over_docs() -> Non
     selected_paths = [item["source_path"] for item in bundle["items"]]
     assert selected_paths == ["rosetta/model/aligner.py", "rosetta/model/wrapper.py"]
     assert trace["coverage"]["code"] == 2
+
+
+def test_deterministic_retriever_expands_code_neighborhood_from_edges() -> None:
+    plan = default_c2c_evidence_request_plan(topic="cache")
+    plan["evidence_requests"] = [
+        {
+            "request_id": "code_surface",
+            "source_type": "code",
+            "query": "wrapper cache routing",
+            "keywords": ["wrapper", "cache"],
+            "purpose": "implementation_surface",
+            "top_k": 1,
+            "filters": {},
+            "must_resolve": True,
+        }
+    ]
+    code = [
+        {
+            "chunk_id": "wrapper_chunk",
+            "source_type": "code",
+            "path": "rosetta/model/wrapper.py",
+            "text": "wrapper cache routing implementation",
+            "keywords": ["wrapper", "cache"],
+        },
+        {
+            "chunk_id": "router_chunk",
+            "source_type": "code",
+            "path": "rosetta/model/router.py",
+            "text": "router applies utility control signal",
+            "keywords": ["router", "utility"],
+        },
+    ]
+
+    bundle, trace = retrieve_s1_c2c_requested_evidence(
+        plan,
+        chunk_index={"entries": code},
+        code_chunks=code,
+        code_edges=[{"edge_type": "resolved_call", "src": "wrapper_chunk", "dst": "router_chunk", "confidence": "test"}],
+        implementation_surface_map={"surfaces": {"rosetta/model/wrapper.py": {"edit_surface": "allowed"}, "rosetta/model/router.py": {"edit_surface": "allowed"}}},
+    )
+
+    selected_paths = [item["source_path"] for item in bundle["items"]]
+    assert selected_paths == ["rosetta/model/wrapper.py", "rosetta/model/router.py"]
+    assert trace["code_neighborhood_expansions"][0]["reason"] == "callgraph_edge"
+    assert "code_neighborhood" in trace["coverage_contributors"]
 
 
 def test_deterministic_retriever_reports_unfilled_must_resolve() -> None:

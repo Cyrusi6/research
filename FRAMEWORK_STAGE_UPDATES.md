@@ -47,6 +47,24 @@
 - legacy C2C debate 路径也写同样的 deterministic artifact；S1 gate 在检测到 C2C 项目时要求并 schema-check 三个 artifact，并用 `s1_evidence_quality_gate` 返回 `NEEDS_RETRY`。
 - `stage_contracts.py` 将三个新 artifact 作为 C2C S1 conditional outputs，方便 manifest、orchestrator 和报告路径追踪。
 
+## 2026-07-04 C2C S1 区分性证据检索与方向候选 Scorecard
+
+本次继续加固 S1a/S1b/S1c 三段式 C2C S1 流程，目标是让“证据驱动选方向”不只覆盖证据厚度，还覆盖候选方向之间的区分性：
+
+- S1a `evidence_request_plan` 新增：
+  - `candidate_direction_hypotheses`
+  - `uncertainty_axes`
+  - `discriminating_evidence_requests`
+  - `must_have_before_direction`
+- S1a 仍然只提出证据请求，不能输出 `direction_decision`、`selected_ideas`、`evidence_bundle` 或 expected files；新字段只用于让 S1b 的 deterministic retrieval 更有针对性。
+- S1b 在命中 code implementation surface 后，会从 parsed `code_edges` 和真实 code chunks 做 deterministic code-neighborhood expansion，并在 trace 中记录：
+  - `code_neighborhood_expansions`
+  - `coverage_contributors`
+  - 传递给 S1c 的候选方向假设、不确定性轴和区分性请求。
+- S1c 新增 `candidate_direction_scorecard` 合同，落盘为 `literature/c2c/direction_candidate_scorecard.json`，记录候选方向、分数、证据 refs、反证 refs、实现面 refs、selected direction，以及未选方向的 `why_not_selected`。
+- S1 gate / stage contract / C2C artifact audit 已把该 scorecard 纳入 C2C S1 required artifact 和 schema 校验。
+- 新增/更新测试覆盖 request-plan 区分性字段、code-neighborhood expansion、C2C S1 follow-up loop、C2C pipeline 新 artifact、stage contracts 和 validators。
+
 ## 2026-06-26 External S2.5 Worktree Storage
 
 真实 C2C 迭代积累后发现 `workspace/<project_id>/plan/code_worktrees/<idea>/vN/repo` 会把完整 Git worktree 放进当前 VS Code workspace。打开项目根目录时 VS Code 会递归 watch 历史 artifact 和 worktree repo，当前本地 `workspace/` 已达到 109G、15 万以上文件，触发 20 万量级 watcher。

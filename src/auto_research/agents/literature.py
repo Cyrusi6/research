@@ -45,6 +45,8 @@ from ..s0_enrichment import (
     S0_SEMANTIC_ENRICHMENT_SCHEMA_VERSION,
 )
 from ..s1_retrieval import (
+    bundle_ref_set,
+    canonical_ref_key,
     default_c2c_evidence_request_plan,
     normalize_c2c_evidence_request_plan,
     retrieve_s1_c2c_requested_evidence,
@@ -574,6 +576,7 @@ class LiteratureAgent:
         direction_record = None
         evidence_session_record = None
         evidence_ref_report_record = None
+        direction_candidate_scorecard_record = None
         novelty_record = None
         evidence_quality_record = None
         evidence_retrieval_trace_record = None
@@ -630,6 +633,15 @@ class LiteratureAgent:
                     }
             ideas = debate["selected_ideas"]
             if debate.get("strategy") in {"codex_resume_evidence_agent", "codex_two_phase_evidence_direction"}:
+                c2c_direction_candidate_scorecard = _s1_direction_candidate_scorecard(
+                    {
+                        "direction_decision": debate.get("direction_decision") if isinstance(debate.get("direction_decision"), dict) else {},
+                        "selected_ideas": ideas[:1] if isinstance(ideas, list) else [],
+                    },
+                    evidence_bundle=debate.get("evidence_bundle") if isinstance(debate.get("evidence_bundle"), dict) else _evidence_bundle_from_selected_ideas(ideas),
+                    raw_scorecard=debate.get("direction_candidate_scorecard") if isinstance(debate.get("direction_candidate_scorecard"), dict) else {},
+                )
+                debate["direction_candidate_scorecard"] = c2c_direction_candidate_scorecard
                 if isinstance(debate.get("evidence_request_plan"), dict):
                     evidence_request_plan_record = self.context.artifacts.write_json(
                         self.stage_key,
@@ -662,6 +674,14 @@ class LiteratureAgent:
                     artifact_type="c2c_s1_direction_decision",
                     summary="S1 selected mechanism direction after evidence retrieval",
                     source_paths=[evidence_bundle_record["path"], negative_record["path"], baseline_record["path"]],
+                )
+                direction_candidate_scorecard_record = self.context.artifacts.write_json(
+                    self.stage_key,
+                    "c2c/direction_candidate_scorecard.json",
+                    c2c_direction_candidate_scorecard,
+                    artifact_type="c2c_s1_direction_candidate_scorecard",
+                    summary="S1c scored candidate high-level directions and recorded why alternatives were not selected",
+                    source_paths=[direction_record["path"], evidence_bundle_record["path"], evidence_request_plan_record["path"] if evidence_request_plan_record else evidence_requests_record["path"]],
                 )
                 evidence_session_record = self.context.artifacts.write_json(
                     self.stage_key,
@@ -721,11 +741,12 @@ class LiteratureAgent:
                             *( [evidence_request_plan_record["path"]] if evidence_request_plan_record else [] ),
                             evidence_bundle_record["path"],
                             direction_record["path"],
+                            direction_candidate_scorecard_record["path"],
                             evidence_session_record["path"],
                             evidence_ref_report_record["path"],
                             *( [novelty_record["path"]] if novelty_record else [] ),
                         ]
-                        if evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record and evidence_ref_report_record
+                        if evidence_requests_record and evidence_bundle_record and direction_record and direction_candidate_scorecard_record and evidence_session_record and evidence_ref_report_record
                         else []
                     ),
                 ],
@@ -772,6 +793,11 @@ class LiteratureAgent:
             evidence_bundle=root_evidence_bundle,
             novelty_audit=root_novelty_audit,
         )
+        root_direction_candidate_scorecard = _s1_direction_candidate_scorecard(
+            root_direction_payload,
+            evidence_bundle=root_evidence_bundle,
+            raw_scorecard=debate.get("direction_candidate_scorecard") if isinstance(debate.get("direction_candidate_scorecard"), dict) else {},
+        )
         root_evidence_bundle_record = self.context.artifacts.write_json(
             self.stage_key,
             "evidence_bundle.json",
@@ -804,6 +830,15 @@ class LiteratureAgent:
             summary="Root C2C S1 direction readiness scorecard",
             source_paths=[root_direction_record["path"], root_novelty_record["path"], root_evidence_bundle_record["path"]],
         )
+        if direction_candidate_scorecard_record is None:
+            direction_candidate_scorecard_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "c2c/direction_candidate_scorecard.json",
+                root_direction_candidate_scorecard,
+                artifact_type="c2c_s1_direction_candidate_scorecard",
+                summary="S1c scored candidate high-level directions and recorded why alternatives were not selected",
+                source_paths=[root_direction_record["path"], root_evidence_bundle_record["path"], root_scorecard_record["path"]],
+            )
         root_evidence_ref_report = debate.get("evidence_ref_report") if isinstance(debate.get("evidence_ref_report"), dict) else resolve_s1_evidence_refs(self.context.project_root, root_direction_payload, mode="c2c")
         root_direction_bundle_ref_report = (
             debate.get("direction_bundle_ref_report")
@@ -898,6 +933,7 @@ class LiteratureAgent:
                 root_direction_record["path"],
                 root_novelty_record["path"],
                 root_scorecard_record["path"],
+                direction_candidate_scorecard_record["path"],
                 direction_fingerprint_record["path"],
                 evidence_quality_record["path"],
                 evidence_retrieval_trace_record["path"],
@@ -907,13 +943,14 @@ class LiteratureAgent:
                         *( [evidence_request_plan_record["path"]] if evidence_request_plan_record else [] ),
                         evidence_bundle_record["path"],
                         direction_record["path"],
+                        direction_candidate_scorecard_record["path"],
                         evidence_session_record["path"],
                         evidence_ref_report_record["path"],
                         debate_record["path"],
                         debate_md_record["path"],
                         constraints_record["path"],
                     ]
-                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record and evidence_ref_report_record
+                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and direction_candidate_scorecard_record and evidence_session_record and evidence_ref_report_record
                     else []
                 ),
             ],
@@ -961,6 +998,7 @@ class LiteratureAgent:
                 root_direction_record["path"],
                 root_novelty_record["path"],
                 root_scorecard_record["path"],
+                direction_candidate_scorecard_record["path"],
                 direction_fingerprint_record["path"],
                 evidence_quality_record["path"],
                 evidence_retrieval_trace_record["path"],
@@ -970,13 +1008,14 @@ class LiteratureAgent:
                         *( [evidence_request_plan_record["path"]] if evidence_request_plan_record else [] ),
                         evidence_bundle_record["path"],
                         direction_record["path"],
+                        direction_candidate_scorecard_record["path"],
                         evidence_session_record["path"],
                         evidence_ref_report_record["path"],
                         debate_record["path"],
                         debate_md_record["path"],
                         constraints_record["path"],
                     ]
-                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and evidence_session_record and evidence_ref_report_record
+                    if debate_record and debate_md_record and constraints_record and evidence_requests_record and evidence_bundle_record and direction_record and direction_candidate_scorecard_record and evidence_session_record and evidence_ref_report_record
                     else []
                 ),
                 survey_record["path"],
@@ -1250,6 +1289,7 @@ class LiteratureAgent:
         direction_payload["selected_ideas"] = selected_ideas
         direction_payload["negative_constraints"] = negative_constraints
         direction = build_direction_contract(direction_payload, mode="c2c", used_shared_memory_refs=used_shared_memory_refs)
+        direction_candidate_scorecard = _s1_direction_candidate_scorecard(direction_payload, evidence_bundle=evidence_bundle)
         novelty_audit = normalize_novelty_audit(direction_result.get("novelty_audits", []), direction_id=str(direction.get("direction_id") or ""))
         quality_artifacts = _build_c2c_s1_quality_artifacts(
             project_root=self.context.project_root,
@@ -1286,6 +1326,7 @@ class LiteratureAgent:
             "direction_decision": direction_decision,
             "direction": direction,
             "direction_scorecard": build_direction_scorecard(direction, evidence_bundle=evidence_bundle, novelty_audit=novelty_audit),
+            "direction_candidate_scorecard": direction_candidate_scorecard,
             "novelty_audits": direction_result.get("novelty_audits", []),
             "novelty_audit": novelty_audit,
             "selected_ideas": selected_ideas,
@@ -2576,6 +2617,7 @@ def _s1_c2c_evidence_request_prompt(
             "You must only produce an evidence request plan.",
             "Do not output direction_decision, selected_ideas, evidence_bundle, expected_files, or any research direction.",
             "Requests should cover paper support, code implementation surface, counterevidence, and failure memory when available.",
+            "You must include competing candidate_direction_hypotheses, uncertainty_axes, discriminating_evidence_requests, and must_have_before_direction so S1b can retrieve evidence that separates plausible directions.",
             "Return only one valid JSON object.",
             "Context JSON:",
             json.dumps(context_payload, ensure_ascii=False, indent=2),
@@ -2658,6 +2700,26 @@ def _s1_c2c_direction_prompt(
                 "used_shared_memory_refs": ["memory ids if used, or []"],
             }
         ],
+        "candidate_direction_scorecard": {
+            "schema_version": "c2c_s1_direction_candidate_scorecard_v1",
+            "selected_direction_id": "same as direction_decision.direction_id",
+            "candidates": [
+                {
+                    "direction_id": "stable candidate id",
+                    "mechanism_axis": "routing|alignment|normalization|training_signal|scoring",
+                    "integration_point": "wrapper|aligner|projector|train_loss|recipe",
+                    "control_signal": "signal S2 would manipulate",
+                    "score": 0.0,
+                    "selected": False,
+                    "evidence_refs": ["refs copied exactly from allowed_refs"],
+                    "counterevidence_refs": ["refs copied exactly from allowed_refs when relevant"],
+                    "implementation_surface_refs": ["code refs copied exactly from allowed_refs when relevant"],
+                    "why_selected": "required for selected candidate only",
+                    "why_not_selected": ["required for non-selected candidates"],
+                }
+            ],
+            "comparison_axes": ["evidence support", "counterevidence resolution", "implementation surface", "negative memory"],
+        },
         "negative_constraints": {"forbidden_idea_ids": [], "forbidden_patterns": [], "failure_feedback_rules": []},
             "decision_chain": {"evidence": ["evidence_id values"], "counterevidence": ["evidence_id values"], "conclusion": "one sentence"},
     }
@@ -2689,7 +2751,23 @@ def _s1_c2c_direction_prompt(
         "feedback_summary": _compact_json_value(feedback[:8], max_chars=4500),
         "shared_method_memory_summary": _compact_json_value(shared_memory, max_chars=4500),
         "evidence_bundle": {"producer": evidence_bundle.get("producer"), "retriever_version": evidence_bundle.get("retriever_version"), "items": evidence_items},
-        "retrieval_trace_coverage": _compact_json_value({key: retrieval_trace.get(key) for key in ["coverage", "candidate_counts", "unfilled_must_resolve_requests", "request_plan_id"]}, max_chars=4500),
+        "retrieval_trace_coverage": _compact_json_value(
+            {
+                key: retrieval_trace.get(key)
+                for key in [
+                    "coverage",
+                    "candidate_counts",
+                    "unfilled_must_resolve_requests",
+                    "request_plan_id",
+                    "candidate_direction_hypotheses",
+                    "uncertainty_axes",
+                    "discriminating_evidence_requests",
+                    "must_have_before_direction",
+                    "code_neighborhood_expansions",
+                ]
+            },
+            max_chars=6500,
+        ),
         "allowed_refs": allowed_refs,
     }
     return "\n\n".join(
@@ -2798,12 +2876,39 @@ def _merge_s1_c2c_evidence_bundles(primary: dict[str, Any], followup: dict[str, 
 
 def _merge_s1_c2c_retrieval_traces(primary: dict[str, Any], followup: dict[str, Any], *, followup_round: int) -> dict[str, Any]:
     merged = dict(primary if isinstance(primary, dict) else {})
-    for key in ["requests", "evidence_requests", "selected_refs", "resolved_refs", "unfilled_requests", "unfilled_must_resolve_requests", "rejected_top_candidates"]:
+    for key in [
+        "requests",
+        "evidence_requests",
+        "selected_refs",
+        "resolved_refs",
+        "unfilled_requests",
+        "unfilled_must_resolve_requests",
+        "rejected_top_candidates",
+        "code_neighborhood_expansions",
+        "candidate_direction_hypotheses",
+        "uncertainty_axes",
+        "discriminating_evidence_requests",
+        "must_have_before_direction",
+    ]:
         merged[key] = _dedupe_trace_values([*((primary or {}).get(key) or []), *((followup or {}).get(key) or [])])
+    merged["coverage_contributors"] = _merge_s1_trace_contributors((primary or {}).get("coverage_contributors"), (followup or {}).get("coverage_contributors"))
     merged["resolved_ref_count"] = len(merged.get("resolved_refs") or merged.get("selected_refs") or [])
     merged["unresolved_ref_count"] = int((primary or {}).get("unresolved_ref_count") or 0) + int((followup or {}).get("unresolved_ref_count") or 0)
     merged["deterministic"] = True
     merged["followup_rounds"] = [*((primary or {}).get("followup_rounds") or []), {"round": followup_round, "request_plan_id": (followup or {}).get("request_plan_id"), "selected_ref_count": len((followup or {}).get("selected_refs") or [])}]
+    return merged
+
+
+def _merge_s1_trace_contributors(primary: Any, followup: Any) -> dict[str, Any]:
+    merged: dict[str, Any] = {}
+    for payload in [primary, followup]:
+        if not isinstance(payload, dict):
+            continue
+        for key, values in payload.items():
+            if isinstance(values, list):
+                merged[key] = _dedupe_trace_values([*(merged.get(key) or []), *values])
+            elif values:
+                merged[key] = values
     return merged
 
 
@@ -2860,6 +2965,8 @@ def _validate_s1_c2c_direction_payload(payload: dict[str, Any], *, evidence_bund
                     errors.append(f"selected_ideas[0] missing {field}")
     if not isinstance(payload.get("negative_constraints"), dict):
         errors.append("negative_constraints must be an object")
+    scorecard_errors = _validate_s1_direction_candidate_scorecard(payload.get("candidate_direction_scorecard"), evidence_bundle=evidence_bundle)
+    errors.extend(scorecard_errors)
     if not errors:
         report = validate_direction_refs_subset_of_bundle(payload, evidence_bundle)
         if report.get("status") != "pass":
@@ -2893,7 +3000,141 @@ def _normalize_s1_c2c_direction_payload(payload: dict[str, Any], *, evidence_bun
                 idea["expected_files"] = list(decision.get("expected_files") or expected_files)
         normalized["selected_ideas"] = ideas
     normalized["direction_decision"] = decision
+    normalized["candidate_direction_scorecard"] = _s1_direction_candidate_scorecard(normalized, evidence_bundle=evidence_bundle)
     return normalized
+
+
+def _s1_direction_candidate_scorecard(
+    payload: dict[str, Any],
+    *,
+    evidence_bundle: dict[str, Any],
+    raw_scorecard: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    raw = raw_scorecard if isinstance(raw_scorecard, dict) else payload.get("candidate_direction_scorecard") if isinstance(payload.get("candidate_direction_scorecard"), dict) else {}
+    decision = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
+    selected_ideas = payload.get("selected_ideas") if isinstance(payload.get("selected_ideas"), list) else []
+    selected_idea = next((item for item in selected_ideas if isinstance(item, dict)), {})
+    selected_direction_id = str(raw.get("selected_direction_id") or decision.get("direction_id") or selected_idea.get("id") or "selected_direction")
+    raw_candidates = raw.get("candidates") if isinstance(raw.get("candidates"), list) else []
+    candidates = [_normalize_s1_direction_candidate(item, selected_direction_id=selected_direction_id, decision=decision, selected_idea=selected_idea) for item in raw_candidates if isinstance(item, dict)]
+    candidates = [item for item in candidates if item.get("direction_id")]
+    if not any(item.get("selected") for item in candidates):
+        candidates.insert(0, _selected_s1_direction_candidate(selected_direction_id, decision=decision, selected_idea=selected_idea))
+    candidates = _dedupe_s1_direction_candidates(candidates, selected_direction_id=selected_direction_id)
+    return {
+        "schema_version": "c2c_s1_direction_candidate_scorecard_v1",
+        "direction_id": selected_direction_id,
+        "selected_direction_id": selected_direction_id,
+        "candidates": candidates,
+        "comparison_axes": raw.get("comparison_axes") if isinstance(raw.get("comparison_axes"), list) and raw.get("comparison_axes") else ["evidence_support", "counterevidence_resolution", "implementation_surface", "negative_memory"],
+        "coverage": {
+            "candidate_count": len(candidates),
+            "non_selected_count": len([item for item in candidates if not item.get("selected")]),
+            "bundle_ref_count": len(bundle_ref_set(evidence_bundle)),
+        },
+    }
+
+
+def _normalize_s1_direction_candidate(
+    item: dict[str, Any],
+    *,
+    selected_direction_id: str,
+    decision: dict[str, Any],
+    selected_idea: dict[str, Any],
+) -> dict[str, Any]:
+    direction_id = str(item.get("direction_id") or item.get("id") or "").strip()
+    selected = bool(item.get("selected") or (direction_id and direction_id == selected_direction_id))
+    candidate = {
+        "direction_id": direction_id,
+        "mechanism_axis": str(item.get("mechanism_axis") or (decision.get("mechanism_axis") if selected else "") or "unknown"),
+        "integration_point": str(item.get("integration_point") or (decision.get("integration_point") if selected else "") or "unknown"),
+        "control_signal": str(item.get("control_signal") or (decision.get("control_signal") if selected else "") or "unknown"),
+        "score": float(item.get("score") if item.get("score") is not None else (1.0 if selected else 0.0)),
+        "selected": selected,
+        "evidence_refs": _as_ref_list(item.get("evidence_refs") or (decision.get("required_evidence_refs") if selected else [])),
+        "counterevidence_refs": _as_ref_list(item.get("counterevidence_refs") or (decision.get("counterevidence_refs") if selected else [])),
+        "implementation_surface_refs": _as_ref_list(item.get("implementation_surface_refs") or item.get("code_refs") or (decision.get("implementation_surface_refs") if selected else [])),
+        "why_selected": str(item.get("why_selected") or item.get("rationale") or (decision.get("why_this_direction") if selected else "")),
+        "why_not_selected": [str(reason) for reason in item.get("why_not_selected") or ([] if selected else ["Lower deterministic evidence support than the selected direction."]) if reason],
+    }
+    if selected and not candidate["why_not_selected"]:
+        candidate["why_not_selected"] = []
+    if selected and not candidate["why_selected"]:
+        candidate["why_selected"] = str(selected_idea.get("motivation") or selected_idea.get("description") or "Selected as the strongest bundle-grounded S1 direction.")
+    return candidate
+
+
+def _selected_s1_direction_candidate(selected_direction_id: str, *, decision: dict[str, Any], selected_idea: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "direction_id": selected_direction_id,
+        "mechanism_axis": str(decision.get("mechanism_axis") or "unknown"),
+        "integration_point": str(decision.get("integration_point") or "unknown"),
+        "control_signal": str(decision.get("control_signal") or "unknown"),
+        "score": 1.0,
+        "selected": True,
+        "evidence_refs": _as_ref_list(decision.get("required_evidence_refs") or selected_idea.get("evidence_refs") or []),
+        "counterevidence_refs": _as_ref_list(decision.get("counterevidence_refs") or selected_idea.get("counterevidence_refs") or []),
+        "implementation_surface_refs": _as_ref_list(decision.get("implementation_surface_refs") or selected_idea.get("code_refs") or []),
+        "why_selected": str(decision.get("why_this_direction") or selected_idea.get("motivation") or "Selected as the strongest bundle-grounded S1 direction."),
+        "why_not_selected": [],
+    }
+
+
+def _dedupe_s1_direction_candidates(candidates: list[dict[str, Any]], *, selected_direction_id: str) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen = set()
+    for candidate in sorted(candidates, key=lambda item: (not item.get("selected"), -float(item.get("score") or 0.0), str(item.get("direction_id") or ""))):
+        direction_id = str(candidate.get("direction_id") or "")
+        if not direction_id or direction_id in seen:
+            continue
+        seen.add(direction_id)
+        if direction_id == selected_direction_id:
+            candidate["selected"] = True
+            candidate["why_not_selected"] = []
+        deduped.append(candidate)
+    return deduped
+
+
+def _validate_s1_direction_candidate_scorecard(scorecard: Any, *, evidence_bundle: dict[str, Any]) -> list[str]:
+    if not isinstance(scorecard, dict):
+        return ["candidate_direction_scorecard must be an object"]
+    errors: list[str] = []
+    if scorecard.get("schema_version") != "c2c_s1_direction_candidate_scorecard_v1":
+        errors.append("candidate_direction_scorecard.schema_version must be c2c_s1_direction_candidate_scorecard_v1")
+    selected_direction_id = str(scorecard.get("selected_direction_id") or "")
+    candidates = scorecard.get("candidates")
+    if not selected_direction_id:
+        errors.append("candidate_direction_scorecard.selected_direction_id missing")
+    if not isinstance(candidates, list) or not candidates:
+        errors.append("candidate_direction_scorecard.candidates must be a non-empty list")
+        return errors
+    selected_count = 0
+    allowed_refs = bundle_ref_set(evidence_bundle)
+    for idx, candidate in enumerate(candidates):
+        if not isinstance(candidate, dict):
+            errors.append(f"candidate_direction_scorecard.candidates[{idx}] must be an object")
+            continue
+        for field in ["direction_id", "mechanism_axis", "integration_point", "control_signal"]:
+            if candidate.get(field) in (None, "", []):
+                errors.append(f"candidate_direction_scorecard.candidates[{idx}] missing {field}")
+        if candidate.get("selected") is True:
+            selected_count += 1
+            if not candidate.get("why_selected"):
+                errors.append(f"candidate_direction_scorecard.candidates[{idx}] selected candidate missing why_selected")
+        elif not candidate.get("why_not_selected"):
+            errors.append(f"candidate_direction_scorecard.candidates[{idx}] missing why_not_selected")
+        for ref_field in ["evidence_refs", "counterevidence_refs", "implementation_surface_refs"]:
+            for ref in candidate.get(ref_field) or []:
+                if isinstance(ref, dict) and canonical_ref_key(ref) not in allowed_refs:
+                    errors.append(f"candidate_direction_scorecard.candidates[{idx}].{ref_field} contains ref outside evidence_bundle")
+                    break
+    if selected_count != 1:
+        errors.append("candidate_direction_scorecard must contain exactly one selected candidate")
+    return errors
+
+
+def _as_ref_list(value: Any) -> list[Any]:
+    return [item for item in value if item] if isinstance(value, list) else []
 
 
 def _bundle_backed_s1_code_refs(refs: Any, *, evidence_bundle: dict[str, Any]) -> list[Any]:

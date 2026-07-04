@@ -123,6 +123,7 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
                     "literature/c2c/cache_summary.json",
                     "literature/c2c/chunk_index.json",
                     "literature/c2c/evidence_request_plan.json",
+                    "literature/c2c/direction_candidate_scorecard.json",
                     "literature/c2c/evidence_quality_score.json",
                     "literature/c2c/evidence_retrieval_trace.json",
                     "literature/c2c/direction_fingerprint.json",

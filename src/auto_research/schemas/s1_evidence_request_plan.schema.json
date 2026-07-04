@@ -6,6 +6,10 @@
     "schema_version",
     "request_plan_id",
     "evidence_requests",
+    "candidate_direction_hypotheses",
+    "uncertainty_axes",
+    "discriminating_evidence_requests",
+    "must_have_before_direction",
     "required_source_coverage",
     "retrieval_budget",
     "forbidden_outputs",
@@ -29,6 +33,62 @@
           "top_k": {"type": "integer"},
           "filters": {"type": "object"},
           "must_resolve": {"type": "boolean"}
+        }
+      }
+    },
+    "candidate_direction_hypotheses": {
+      "type": "array",
+      "minItems": 2,
+      "items": {
+        "type": "object",
+        "required": ["hypothesis_id", "mechanism_axis", "integration_point", "control_signal", "why_plausible"],
+        "properties": {
+          "hypothesis_id": {"type": "string"},
+          "mechanism_axis": {"type": "string"},
+          "integration_point": {"type": "string"},
+          "control_signal": {"type": "string"},
+          "why_plausible": {"type": "string"},
+          "uncertainty_axes": {"type": "array"}
+        }
+      }
+    },
+    "uncertainty_axes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["axis_id", "question"],
+        "properties": {
+          "axis_id": {"type": "string"},
+          "question": {"type": "string"},
+          "needed_sources": {"type": "array"}
+        }
+      }
+    },
+    "discriminating_evidence_requests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["request_id", "distinguishes", "decision_if_supported", "decision_if_refuted"],
+        "properties": {
+          "request_id": {"type": "string"},
+          "distinguishes": {"type": "array"},
+          "decision_if_supported": {"type": "string"},
+          "decision_if_refuted": {"type": "string"}
+        }
+      }
+    },
+    "must_have_before_direction": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["source_type", "purpose", "minimum"],
+        "properties": {
+          "source_type": {"type": "string"},
+          "purpose": {"type": "string"},
+          "minimum": {"type": "integer"}
         }
       }
     },

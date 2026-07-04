@@ -191,6 +191,7 @@ class S1GateValidator(StageGateValidator):
             "literature/negative_constraints.json",
             "literature/c2c/baseline_evidence.json",
             "literature/c2c/rebuttal_concern_matrix.json",
+            "literature/c2c/direction_candidate_scorecard.json",
             "literature/c2c/evidence_quality_score.json",
             "literature/c2c/evidence_retrieval_trace.json",
             "literature/c2c/direction_fingerprint.json",
@@ -243,6 +244,7 @@ class S1GateValidator(StageGateValidator):
             "literature/c2c/evidence_requests.json",
             "literature/c2c/evidence_bundle.json",
             "literature/c2c/direction_decision.json",
+            "literature/c2c/direction_candidate_scorecard.json",
             "literature/c2c/evidence_session.json",
             "literature/c2c/evidence_ref_report.json",
         ]
@@ -302,6 +304,7 @@ class S1GateValidator(StageGateValidator):
             "literature/c2c/evidence_request_plan.json",
             "literature/c2c/evidence_bundle.json",
             "literature/c2c/direction_decision.json",
+            "literature/c2c/direction_candidate_scorecard.json",
             "literature/c2c/evidence_retrieval_trace.json",
             "literature/c2c/evidence_session.json",
         ]
@@ -312,11 +315,13 @@ class S1GateValidator(StageGateValidator):
         request_plan = self._safe_json("literature/c2c/evidence_request_plan.json")
         bundle = self._safe_json("literature/c2c/evidence_bundle.json")
         direction_decision = self._safe_json("literature/c2c/direction_decision.json")
+        direction_candidate_scorecard = self._safe_json("literature/c2c/direction_candidate_scorecard.json")
         trace = self._safe_json("literature/c2c/evidence_retrieval_trace.json")
         schema_errors = {}
         for rel, payload, schema_name in [
             ("literature/c2c/evidence_request_plan.json", request_plan, "s1_evidence_request_plan.schema.json"),
             ("literature/c2c/evidence_bundle.json", bundle, "s1_deterministic_evidence_bundle.schema.json"),
+            ("literature/c2c/direction_candidate_scorecard.json", direction_candidate_scorecard, "s1_direction_candidate_scorecard.schema.json"),
             ("literature/c2c/evidence_retrieval_trace.json", trace, "s1_evidence_retrieval_trace.schema.json"),
         ]:
             errors = validate_min_schema(payload, load_schema(schema_name))
@@ -341,6 +346,14 @@ class S1GateValidator(StageGateValidator):
             errors.append("evidence_retrieval_trace.deterministic must be true")
         if trace.get("unfilled_must_resolve_requests"):
             errors.append("evidence_retrieval_trace.unfilled_must_resolve_requests must be empty")
+        if isinstance(direction_decision, dict) and isinstance(direction_candidate_scorecard, dict):
+            if direction_candidate_scorecard.get("selected_direction_id") != direction_decision.get("direction_id"):
+                errors.append("direction_candidate_scorecard.selected_direction_id must match direction_decision.direction_id")
+            selected_candidates = [item for item in direction_candidate_scorecard.get("candidates") or [] if isinstance(item, dict) and item.get("selected") is True]
+            if len(selected_candidates) != 1:
+                errors.append("direction_candidate_scorecard must contain exactly one selected candidate")
+            elif selected_candidates[0].get("direction_id") != direction_decision.get("direction_id"):
+                errors.append("direction_candidate_scorecard selected candidate must match direction_decision.direction_id")
         ref_keys = []
         for item in bundle.get("items") or []:
             if isinstance(item, dict):

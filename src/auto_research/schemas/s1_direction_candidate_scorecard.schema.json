@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "C2CS1DirectionCandidateScorecard",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "direction_id",
+    "selected_direction_id",
+    "candidates"
+  ],
+  "properties": {
+    "schema_version": {"type": "string"},
+    "direction_id": {"type": "string"},
+    "selected_direction_id": {"type": "string"},
+    "candidates": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "direction_id",
+          "mechanism_axis",
+          "integration_point",
+          "control_signal",
+          "score",
+          "selected",
+          "evidence_refs",
+          "counterevidence_refs",
+          "why_not_selected"
+        ],
+        "properties": {
+          "direction_id": {"type": "string"},
+          "mechanism_axis": {"type": "string"},
+          "integration_point": {"type": "string"},
+          "control_signal": {"type": "string"},
+          "score": {"type": "number"},
+          "selected": {"type": "boolean"},
+          "evidence_refs": {"type": "array"},
+          "counterevidence_refs": {"type": "array"},
+          "implementation_surface_refs": {"type": "array"},
+          "why_selected": {"type": "string"},
+          "why_not_selected": {"type": "array"}
+        }
+      }
+    },
+    "comparison_axes": {"type": "array"},
+    "coverage": {"type": "object"}
+  }
+}

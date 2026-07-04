@@ -30,6 +30,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("literature/direction.json", "direction.schema.json"),
         ("literature/c2c/evidence_request_plan.json", "s1_evidence_request_plan.schema.json"),
         ("literature/c2c/evidence_bundle.json", "s1_deterministic_evidence_bundle.schema.json"),
+        ("literature/c2c/direction_candidate_scorecard.json", "s1_direction_candidate_scorecard.schema.json"),
         ("literature/c2c/evidence_retrieval_trace.json", "s1_evidence_retrieval_trace.schema.json"),
         ("literature/c2c/evidence_quality_score.json", "s1_evidence_quality.schema.json"),
         ("literature/c2c/direction_fingerprint.json", "s1_direction_fingerprint.schema.json"),

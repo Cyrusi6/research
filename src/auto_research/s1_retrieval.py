@@ -61,6 +61,55 @@ def default_c2c_evidence_request_plan(*, topic: str = "c2c") -> dict[str, Any]:
                 "must_resolve": False,
             },
         ],
+        "candidate_direction_hypotheses": [
+            {
+                "hypothesis_id": "routing_control_signal",
+                "mechanism_axis": "routing",
+                "integration_point": "wrapper",
+                "control_signal": "utility",
+                "why_plausible": "C2C cache transfer may need an explicit runtime signal to route useful cache states.",
+                "uncertainty_axes": ["paper_support", "code_surface", "counterevidence"],
+            },
+            {
+                "hypothesis_id": "alignment_surface_signal",
+                "mechanism_axis": "alignment",
+                "integration_point": "aligner",
+                "control_signal": "representation_match",
+                "why_plausible": "Transfer quality may fail when the aligner/projector surface does not preserve compatible representations.",
+                "uncertainty_axes": ["paper_support", "implementation_surface", "failure_memory"],
+            },
+        ],
+        "uncertainty_axes": [
+            {
+                "axis_id": "mechanism_axis",
+                "question": "Which high-level mechanism axis has the strongest support and least unresolved counterevidence?",
+                "needed_sources": ["paper", "rebuttal", "failure_memory"],
+            },
+            {
+                "axis_id": "implementation_surface",
+                "question": "Which code entry point can S2 realistically edit without touching evaluation code?",
+                "needed_sources": ["code"],
+            },
+        ],
+        "discriminating_evidence_requests": [
+            {
+                "request_id": "paper_support",
+                "distinguishes": ["routing_control_signal", "alignment_surface_signal"],
+                "decision_if_supported": "Prefer the mechanism axis whose support evidence explains the baseline failure.",
+                "decision_if_refuted": "Ask for additional paper/rebuttal evidence before choosing the direction.",
+            },
+            {
+                "request_id": "code_surface",
+                "distinguishes": ["wrapper", "aligner", "projector"],
+                "decision_if_supported": "Prefer the integration point with direct editable code evidence and adjacent callgraph support.",
+                "decision_if_refuted": "Do not advance to S2 until implementation-surface cards resolve.",
+            },
+        ],
+        "must_have_before_direction": [
+            {"source_type": "paper", "purpose": "support", "minimum": 2},
+            {"source_type": "code", "purpose": "implementation_surface", "minimum": 2},
+            {"source_type": "rebuttal", "purpose": "counterevidence", "minimum": 1},
+        ],
         "required_source_coverage": {"paper": 2, "code": 2, "counterevidence": 1, "failure_memory": 0},
         "retrieval_budget": {"top_k_per_request": 2, "max_total_items": 12, "min_score": 0.0},
         "forbidden_outputs": ["direction_decision", "selected_ideas", "evidence_bundle", "expected_files"],
@@ -94,6 +143,20 @@ def normalize_c2c_evidence_request_plan(plan: dict[str, Any], *, topic: str = "c
             }
         )
     normalized["evidence_requests"] = requests or fallback["evidence_requests"]
+    normalized["candidate_direction_hypotheses"] = _normalize_candidate_direction_hypotheses(
+        normalized.get("candidate_direction_hypotheses"),
+        fallback=fallback["candidate_direction_hypotheses"],
+    )
+    normalized["uncertainty_axes"] = _normalize_uncertainty_axes(normalized.get("uncertainty_axes"), fallback=fallback["uncertainty_axes"])
+    normalized["discriminating_evidence_requests"] = _normalize_discriminating_evidence_requests(
+        normalized.get("discriminating_evidence_requests"),
+        fallback=fallback["discriminating_evidence_requests"],
+    )
+    normalized["discriminating_evidence_requests"] = _align_discriminating_request_ids(normalized["discriminating_evidence_requests"], normalized["evidence_requests"])
+    normalized["must_have_before_direction"] = _normalize_must_have_before_direction(
+        normalized.get("must_have_before_direction"),
+        fallback=fallback["must_have_before_direction"],
+    )
     normalized.setdefault("required_source_coverage", fallback["required_source_coverage"])
     normalized.setdefault("retrieval_budget", fallback["retrieval_budget"])
     normalized["forbidden_outputs"] = ["direction_decision", "selected_ideas", "evidence_bundle", "expected_files"]
@@ -142,7 +205,163 @@ def validate_c2c_evidence_request_plan(plan: dict[str, Any]) -> list[str]:
         errors.append("evidence_requests must include code source coverage")
     if "counterevidence" not in purposes and not (source_types & {"rebuttal", "failure_memory", "feedback"}):
         errors.append("evidence_requests must include counterevidence request coverage")
+    hypotheses = plan.get("candidate_direction_hypotheses")
+    if not isinstance(hypotheses, list) or len([item for item in hypotheses if isinstance(item, dict)]) < 2:
+        errors.append("candidate_direction_hypotheses must contain at least two competing hypotheses")
+    axes = plan.get("uncertainty_axes")
+    if not isinstance(axes, list) or not axes:
+        errors.append("uncertainty_axes must be a non-empty list")
+    discriminators = plan.get("discriminating_evidence_requests")
+    if not isinstance(discriminators, list) or not discriminators:
+        errors.append("discriminating_evidence_requests must be a non-empty list")
+    else:
+        known_request_ids = {str(item.get("request_id") or "") for item in plan.get("evidence_requests") or [] if isinstance(item, dict)}
+        for idx, item in enumerate(discriminators):
+            if not isinstance(item, dict):
+                errors.append(f"discriminating_evidence_requests[{idx}] must be an object")
+                continue
+            request_id = str(item.get("request_id") or "")
+            if not request_id:
+                errors.append(f"discriminating_evidence_requests[{idx}].request_id missing")
+            elif request_id not in known_request_ids:
+                errors.append(f"discriminating_evidence_requests[{idx}].request_id must reference evidence_requests")
+            if not item.get("distinguishes"):
+                errors.append(f"discriminating_evidence_requests[{idx}].distinguishes must be non-empty")
+    must_have = plan.get("must_have_before_direction")
+    if not isinstance(must_have, list) or not must_have:
+        errors.append("must_have_before_direction must be a non-empty list")
     return errors
+
+
+def _normalize_candidate_direction_hypotheses(value: Any, *, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    raw_items = value if isinstance(value, list) else []
+    normalized: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            continue
+        hypothesis_id = str(item.get("hypothesis_id") or item.get("id") or f"hypothesis_{idx + 1}").strip()
+        if not hypothesis_id:
+            continue
+        normalized.append(
+            {
+                "hypothesis_id": hypothesis_id,
+                "mechanism_axis": str(item.get("mechanism_axis") or item.get("axis") or "unknown"),
+                "integration_point": str(item.get("integration_point") or item.get("surface") or "unknown"),
+                "control_signal": str(item.get("control_signal") or item.get("signal") or "unknown"),
+                "why_plausible": str(item.get("why_plausible") or item.get("rationale") or "Requires deterministic evidence before direction selection."),
+                "uncertainty_axes": _dedupe([str(axis) for axis in item.get("uncertainty_axes") or [] if axis]),
+            }
+        )
+    return normalized if len(normalized) >= 2 else [dict(item) for item in fallback]
+
+
+def _normalize_uncertainty_axes(value: Any, *, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    raw_items = value if isinstance(value, list) else []
+    normalized: list[dict[str, Any]] = []
+    for idx, item in enumerate(raw_items):
+        if isinstance(item, str):
+            axis_id = item.strip()
+            if axis_id:
+                normalized.append({"axis_id": axis_id, "question": f"Resolve uncertainty around {axis_id}.", "needed_sources": []})
+            continue
+        if not isinstance(item, dict):
+            continue
+        axis_id = str(item.get("axis_id") or item.get("id") or item.get("axis") or f"axis_{idx + 1}").strip()
+        if not axis_id:
+            continue
+        normalized.append(
+            {
+                "axis_id": axis_id,
+                "question": str(item.get("question") or item.get("rationale") or f"Resolve uncertainty around {axis_id}."),
+                "needed_sources": _dedupe([_normalize_request_source_type(source) for source in item.get("needed_sources") or item.get("source_types") or [] if source]),
+            }
+        )
+    return normalized or [dict(item) for item in fallback]
+
+
+def _normalize_discriminating_evidence_requests(value: Any, *, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    raw_items = value if isinstance(value, list) else []
+    normalized: list[dict[str, Any]] = []
+    for item in raw_items:
+        if isinstance(item, str):
+            request_id = item.strip()
+            if request_id:
+                normalized.append(
+                    {
+                        "request_id": request_id,
+                        "distinguishes": [],
+                        "decision_if_supported": "Prefer directions supported by this evidence.",
+                        "decision_if_refuted": "Request more evidence before selecting a direction.",
+                    }
+                )
+            continue
+        if not isinstance(item, dict):
+            continue
+        request_id = str(item.get("request_id") or item.get("evidence_request_id") or "").strip()
+        if not request_id:
+            continue
+        normalized.append(
+            {
+                "request_id": request_id,
+                "distinguishes": _dedupe([str(value) for value in item.get("distinguishes") or item.get("compares") or [] if value]),
+                "decision_if_supported": str(item.get("decision_if_supported") or item.get("if_supported") or "Prefer the direction supported by this evidence."),
+                "decision_if_refuted": str(item.get("decision_if_refuted") or item.get("if_refuted") or "Request more evidence before selecting a direction."),
+            }
+        )
+    return normalized or [dict(item) for item in fallback]
+
+
+def _align_discriminating_request_ids(discriminators: list[dict[str, Any]], requests: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    known_request_ids = {str(item.get("request_id") or "") for item in requests if isinstance(item, dict)}
+    aligned: list[dict[str, Any]] = []
+    for item in discriminators:
+        if not isinstance(item, dict):
+            continue
+        entry = dict(item)
+        request_id = str(entry.get("request_id") or "")
+        if request_id not in known_request_ids:
+            replacement = _replacement_discriminator_request_id(request_id, requests)
+            if replacement:
+                entry["request_id"] = replacement
+        if str(entry.get("request_id") or "") in known_request_ids:
+            aligned.append(entry)
+    return aligned
+
+
+def _replacement_discriminator_request_id(request_id: str, requests: list[dict[str, Any]]) -> str:
+    request_id = request_id.lower()
+    preferred_source = "code" if "code" in request_id or "surface" in request_id else "paper" if "paper" in request_id or "support" in request_id else ""
+    preferred_purpose = "counterevidence" if "counter" in request_id or "risk" in request_id else "implementation_surface" if "surface" in request_id or "code" in request_id else ""
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        if preferred_purpose and str(request.get("purpose") or "") == preferred_purpose:
+            return str(request.get("request_id") or "")
+    for request in requests:
+        if not isinstance(request, dict):
+            continue
+        if preferred_source and str(request.get("source_type") or "") == preferred_source:
+            return str(request.get("request_id") or "")
+    return str((requests[0] or {}).get("request_id") or "") if requests else ""
+
+
+def _normalize_must_have_before_direction(value: Any, *, fallback: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    raw_items = value if isinstance(value, list) else []
+    normalized: list[dict[str, Any]] = []
+    for item in raw_items:
+        if isinstance(item, str):
+            normalized.append({"source_type": _normalize_request_source_type(item), "purpose": item, "minimum": 1})
+            continue
+        if not isinstance(item, dict):
+            continue
+        normalized.append(
+            {
+                "source_type": _normalize_request_source_type(item.get("source_type") or item.get("source")),
+                "purpose": str(item.get("purpose") or item.get("evidence_type") or "support"),
+                "minimum": max(0, int(item.get("minimum") or item.get("min_count") or 1)),
+            }
+        )
+    return normalized or [dict(item) for item in fallback]
 
 
 def retrieve_s1_c2c_requested_evidence(
@@ -182,6 +401,9 @@ def retrieve_s1_c2c_requested_evidence(
     request_results = []
     rejected_top_candidates = []
     unfilled_requests = []
+    code_neighborhood_expansions: list[dict[str, Any]] = []
+    code_neighborhood_enabled = bool(retriever_cfg.get("enable_code_neighborhood_expansion", True))
+    code_neighborhood_max = int(retriever_cfg.get("code_neighborhood_max_per_request", 2) or 2)
     for request in plan["evidence_requests"]:
         scored = [_score_candidate(request, candidate, implementation_surface_map or {}) for candidate in candidates]
         scored = [item for item in scored if item["score"] >= min_score and _request_source_matches(request, item["candidate"])]
@@ -199,6 +421,20 @@ def retrieve_s1_c2c_requested_evidence(
             request_selected.append(evidence_item)
             if len(request_selected) >= int(request.get("top_k") or 1) or len(selected) >= max_total_items:
                 break
+        if code_neighborhood_enabled and len(selected) < max_total_items:
+            added_items, expansions = _expand_code_neighborhood(
+                request,
+                request_selected=request_selected,
+                candidates=candidates,
+                code_edges=code_edges or [],
+                selected_keys=selected_keys,
+                implementation_surface_map=implementation_surface_map or {},
+                max_neighbors=code_neighborhood_max,
+                remaining=max(0, max_total_items - len(selected)),
+            )
+            selected.extend(added_items)
+            request_selected.extend(added_items)
+            code_neighborhood_expansions.extend(expansions)
         if request.get("must_resolve") and not request_selected:
             unfilled_requests.append({"request_id": request.get("request_id"), "source_type": request.get("source_type"), "purpose": request.get("purpose"), "reason": "no_candidate_above_threshold"})
         request_results.append(
@@ -237,7 +473,12 @@ def retrieve_s1_c2c_requested_evidence(
         "unfilled_requests": unfilled_requests,
         "unfilled_must_resolve_requests": [item for item in unfilled_requests],
         "coverage": coverage,
-        "coverage_contributors": {},
+        "coverage_contributors": _coverage_contributors(selected),
+        "code_neighborhood_expansions": code_neighborhood_expansions,
+        "candidate_direction_hypotheses": plan.get("candidate_direction_hypotheses") or [],
+        "uncertainty_axes": plan.get("uncertainty_axes") or [],
+        "discriminating_evidence_requests": plan.get("discriminating_evidence_requests") or [],
+        "must_have_before_direction": plan.get("must_have_before_direction") or [],
         "rejected_top_candidates": rejected_top_candidates[:40],
         "deterministic": True,
         "retrieval_inputs_hash": _short_hash(
@@ -247,6 +488,9 @@ def retrieve_s1_c2c_requested_evidence(
                 "paper_chunks": _compact_for_hash(paper_chunks or []),
                 "rebuttal_chunks": _compact_for_hash(rebuttal_chunks or []),
                 "code_chunks": _compact_for_hash(code_chunks or []),
+                "code_edges": _compact_for_hash(code_edges or []),
+                "code_retrieval_index": _compact_for_hash(code_retrieval_index or {}),
+                "implementation_surface_map": _compact_for_hash(implementation_surface_map or {}),
                 "negative_memory": _compact_for_hash(negative_memory or {}),
                 "feedback": _compact_for_hash(feedback or []),
             }
@@ -405,6 +649,134 @@ def _candidate_to_evidence_item(candidate: dict[str, Any], request: dict[str, An
     return {key: value for key, value in item.items() if value not in (None, "", [], {})}
 
 
+def _expand_code_neighborhood(
+    request: dict[str, Any],
+    *,
+    request_selected: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    code_edges: list[dict[str, Any]],
+    selected_keys: set[str],
+    implementation_surface_map: dict[str, Any],
+    max_neighbors: int,
+    remaining: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if remaining <= 0 or max_neighbors <= 0 or not request_selected:
+        return [], []
+    if str(request.get("source_type") or "") != "code" and str(request.get("purpose") or "") != "implementation_surface":
+        return [], []
+    edge_neighbor_ids = _edge_neighbor_ids(request_selected, code_edges)
+    seed_paths = {str(item.get("source_path") or "") for item in request_selected if item.get("source_path")}
+    scored_neighbors = []
+    for candidate in candidates:
+        if candidate.get("source_type") != "code" or _candidate_is_doc_like(candidate):
+            continue
+        if not candidate.get("chunk_id") and str(candidate.get("source_path") or "") in seed_paths:
+            continue
+        key = _candidate_key(candidate)
+        if key in selected_keys:
+            continue
+        reason, seed_ref = _code_neighbor_reason(candidate, request_selected, edge_neighbor_ids=edge_neighbor_ids, seed_paths=seed_paths)
+        if not reason:
+            continue
+        score_item = _score_candidate(request, candidate, implementation_surface_map)
+        score_item["score"] = float(score_item.get("score") or 0.0) + 0.8
+        score_item.setdefault("components", {})["code_neighborhood_boost"] = 0.8
+        priority = 0 if reason in {"callgraph_edge", "same_file_neighbor_edge"} else 1
+        scored_neighbors.append((priority, -float(score_item["score"]), str(candidate.get("source_path") or ""), str(candidate.get("locator") or ""), candidate, score_item, reason, seed_ref))
+    scored_neighbors.sort(key=lambda item: item[:4])
+    added: list[dict[str, Any]] = []
+    expansions: list[dict[str, Any]] = []
+    for _, _, _, _, candidate, score_item, reason, seed_ref in scored_neighbors[: min(max_neighbors, remaining)]:
+        key = _candidate_key(candidate)
+        if key in selected_keys:
+            continue
+        neighbor_request = dict(request)
+        neighbor_request["request_id"] = f"{request.get('request_id')}:code_neighborhood"
+        neighbor_request["purpose"] = "implementation_surface_neighbor"
+        evidence_item = _candidate_to_evidence_item(candidate, neighbor_request, score_item)
+        supports = list(evidence_item.get("supports") or [])
+        supports.append("code_neighborhood")
+        evidence_item["supports"] = _dedupe(supports)
+        evidence_item["why_selected"] = f"Added deterministic code-neighborhood evidence via {reason} from {seed_ref}."
+        selected_keys.add(key)
+        added.append(evidence_item)
+        expansions.append(
+            {
+                "request_id": request.get("request_id"),
+                "seed_ref": seed_ref,
+                "added_ref": evidence_item.get("ref"),
+                "reason": reason,
+            }
+        )
+    return added, expansions
+
+
+def _edge_neighbor_ids(selected_items: list[dict[str, Any]], code_edges: list[dict[str, Any]]) -> dict[str, dict[str, str]]:
+    seed_ids: set[str] = set()
+    for item in selected_items:
+        seed_ids.update(_code_item_ids(item))
+    neighbors: dict[str, str] = {}
+    for edge in code_edges:
+        if not isinstance(edge, dict):
+            continue
+        src = str(edge.get("src") or "")
+        dst = str(edge.get("dst") or "")
+        if not src or not dst:
+            continue
+        edge_type = str(edge.get("edge_type") or "code_edge")
+        if src in seed_ids:
+            neighbors[dst] = {"edge_type": edge_type, "seed_id": src}
+        if dst in seed_ids:
+            neighbors[src] = {"edge_type": edge_type, "seed_id": dst}
+    return neighbors
+
+
+def _code_neighbor_reason(
+    candidate: dict[str, Any],
+    selected_items: list[dict[str, Any]],
+    *,
+    edge_neighbor_ids: dict[str, dict[str, str]],
+    seed_paths: set[str],
+) -> tuple[str, str]:
+    candidate_ids = _candidate_code_ids(candidate)
+    for candidate_id in candidate_ids:
+        if candidate_id in edge_neighbor_ids:
+            edge = edge_neighbor_ids[candidate_id]
+            return _edge_type_reason(edge.get("edge_type") or ""), str(edge.get("seed_id") or "")
+    candidate_path = str(candidate.get("source_path") or "")
+    if candidate.get("chunk_id") and candidate_path and candidate_path in seed_paths:
+        seed = next((item for item in selected_items if str(item.get("source_path") or "") == candidate_path), {})
+        return "same_file_neighbor", str(seed.get("chunk_id") or seed.get("source_label") or candidate_path)
+    return "", ""
+
+
+def _code_item_ids(item: dict[str, Any]) -> set[str]:
+    ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+    values = [
+        item.get("chunk_id"),
+        item.get("locator"),
+        item.get("source_label"),
+        item.get("source_path"),
+        ref.get("chunk_id"),
+        ref.get("source_label"),
+        ref.get("source_path"),
+    ]
+    return {str(value) for value in values if value}
+
+
+def _candidate_code_ids(candidate: dict[str, Any]) -> set[str]:
+    values = [candidate.get("chunk_id"), candidate.get("locator"), candidate.get("source_label"), candidate.get("source_path"), candidate.get("symbol")]
+    return {str(value) for value in values if value}
+
+
+def _edge_type_reason(edge_type: str) -> str:
+    if edge_type == "same_file_neighbor":
+        return "same_file_neighbor_edge"
+    if edge_type in {"resolved_call", "calls", "tested_by", "tests_symbol", "config_key_defined_in"}:
+        return "callgraph_edge"
+    return "code_edge"
+
+
 def _score_candidate(request: dict[str, Any], candidate: dict[str, Any], implementation_surface_map: dict[str, Any]) -> dict[str, Any]:
     query_tokens = _tokens(str(request.get("query") or ""))
     keyword_tokens = set().union(*(_tokens(str(item)) for item in request.get("keywords") or [])) if request.get("keywords") else set()
@@ -537,6 +909,22 @@ def _coverage(items: list[dict[str, Any]]) -> dict[str, Any]:
         if item.get("risks"):
             seen_by_type["counterevidence"].add(key)
     return {key: len(value) for key, value in seen_by_type.items()}
+
+
+def _coverage_contributors(items: list[dict[str, Any]]) -> dict[str, Any]:
+    contributors: dict[str, list[dict[str, Any]]] = {}
+    for item in items:
+        ref = item.get("ref") if isinstance(item.get("ref"), dict) else {}
+        if not ref:
+            continue
+        source_type = str(item.get("source_type") or ref.get("source_type") or "unknown")
+        if source_type == "failure_feedback":
+            source_type = "failure_memory"
+        for key in [source_type, *[str(value) for value in item.get("supports") or [] if value], *[str(value) for value in item.get("risks") or [] if value]]:
+            contributors.setdefault(key, [])
+            if canonical_ref_key(ref) not in {canonical_ref_key(existing) for existing in contributors[key]}:
+                contributors[key].append(ref)
+    return contributors
 
 
 def _candidate_counts(candidates: list[dict[str, Any]]) -> dict[str, int]:

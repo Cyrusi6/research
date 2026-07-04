@@ -5005,6 +5005,39 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
                     "used_shared_memory_refs": ["mem_s1_avoid_hard_gate"],
                 }
             ],
+            "candidate_direction_scorecard": {
+                "schema_version": "c2c_s1_direction_candidate_scorecard_v1",
+                "selected_direction_id": "utility_predicted_cache_routing",
+                "candidates": [
+                    {
+                        "direction_id": "utility_predicted_cache_routing",
+                        "mechanism_axis": "routing",
+                        "integration_point": "wrapper",
+                        "control_signal": "utility",
+                        "score": 0.86,
+                        "selected": True,
+                        "evidence_refs": paper_refs,
+                        "counterevidence_refs": counter_refs,
+                        "implementation_surface_refs": code_refs,
+                        "why_selected": "It has paper support, editable wrapper/code refs, and known hard-gate counterevidence.",
+                        "why_not_selected": [],
+                    },
+                    {
+                        "direction_id": "alignment_surface_signal",
+                        "mechanism_axis": "alignment",
+                        "integration_point": "aligner",
+                        "control_signal": "representation_match",
+                        "score": 0.51,
+                        "selected": False,
+                        "evidence_refs": paper_refs[:1],
+                        "counterevidence_refs": counter_refs,
+                        "implementation_surface_refs": code_refs[:1],
+                        "why_selected": "",
+                        "why_not_selected": ["Less direct evidence that alignment alone explains the baseline failure."],
+                    },
+                ],
+                "comparison_axes": ["evidence_support", "counterevidence_resolution", "implementation_surface"],
+            },
             "negative_constraints": {
                 "reviewer_concerns": ["failure_modes_ood", "coverage collapse"],
                 "forbidden_idea_ids": ["hard_gate_stack"],
@@ -5074,6 +5107,7 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert (root / "literature/c2c/evidence_requests.json").exists()
     assert (root / "literature/c2c/evidence_bundle.json").exists()
     assert (root / "literature/c2c/direction_decision.json").exists()
+    assert (root / "literature/c2c/direction_candidate_scorecard.json").exists()
     assert (root / "literature/c2c/evidence_session.json").exists()
     assert (root / "literature/c2c/evidence_quality_score.json").exists()
     assert (root / "literature/c2c/evidence_retrieval_trace.json").exists()
@@ -5120,6 +5154,9 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     direction = json.loads((root / "literature/c2c/direction_decision.json").read_text(encoding="utf-8"))
     assert direction["direction_id"] == "utility_predicted_cache_routing"
     assert direction["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
+    direction_candidate_scorecard = json.loads((root / "literature/c2c/direction_candidate_scorecard.json").read_text(encoding="utf-8"))
+    assert direction_candidate_scorecard["selected_direction_id"] == "utility_predicted_cache_routing"
+    assert any(candidate["why_not_selected"] for candidate in direction_candidate_scorecard["candidates"] if not candidate["selected"])
     root_direction = json.loads((root / "literature/direction.json").read_text(encoding="utf-8"))
     assert root_direction["direction_id"] == "utility_predicted_cache_routing"
     assert root_direction["mechanism_axis"]

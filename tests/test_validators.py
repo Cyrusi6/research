@@ -144,6 +144,20 @@ def _write_c2c_s1_gate_context(paths, *, quality_gate: str = "pass", mutate_qual
             {"request_id": "code_surface", "source_type": "code", "query": "code surface", "keywords": ["wrapper"], "purpose": "implementation_surface", "top_k": 2, "filters": {}, "must_resolve": True},
             {"request_id": "counter", "source_type": "failure_memory", "query": "risk", "keywords": ["risk"], "purpose": "counterevidence", "top_k": 1, "filters": {}, "must_resolve": True},
         ],
+        "candidate_direction_hypotheses": [
+            {"hypothesis_id": "routing_control_signal", "mechanism_axis": "routing", "integration_point": "wrapper", "control_signal": "utility", "why_plausible": "paper and code refs support wrapper routing", "uncertainty_axes": ["mechanism_axis"]},
+            {"hypothesis_id": "alignment_surface_signal", "mechanism_axis": "alignment", "integration_point": "aligner", "control_signal": "representation_match", "why_plausible": "aligner code refs may support an alternate surface", "uncertainty_axes": ["implementation_surface"]},
+        ],
+        "uncertainty_axes": [{"axis_id": "mechanism_axis", "question": "which mechanism is best supported", "needed_sources": ["paper", "code"]}],
+        "discriminating_evidence_requests": [
+            {"request_id": "paper_support", "distinguishes": ["routing_control_signal", "alignment_surface_signal"], "decision_if_supported": "prefer supported mechanism", "decision_if_refuted": "request more evidence"},
+            {"request_id": "code_surface", "distinguishes": ["wrapper", "aligner"], "decision_if_supported": "prefer editable surface", "decision_if_refuted": "block S2 handoff"},
+        ],
+        "must_have_before_direction": [
+            {"source_type": "paper", "purpose": "support", "minimum": 2},
+            {"source_type": "code", "purpose": "implementation_surface", "minimum": 2},
+            {"source_type": "failure_memory", "purpose": "counterevidence", "minimum": 1},
+        ],
         "required_source_coverage": {"paper": 2, "code": 2, "counterevidence": 1},
         "retrieval_budget": {"top_k_per_request": 2, "max_total_items": 8, "min_score": 0.0},
         "forbidden_outputs": ["direction_decision", "selected_ideas", "evidence_bundle", "expected_files"],
@@ -202,6 +216,46 @@ def _write_c2c_s1_gate_context(paths, *, quality_gate: str = "pass", mutate_qual
     (c2c_literature / "evidence_requests.json").write_text(json.dumps(request_plan["evidence_requests"]), encoding="utf-8")
     (c2c_literature / "evidence_bundle.json").write_text(json.dumps(bundle), encoding="utf-8")
     (c2c_literature / "direction_decision.json").write_text(json.dumps(direction_decision), encoding="utf-8")
+    (c2c_literature / "direction_candidate_scorecard.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "c2c_s1_direction_candidate_scorecard_v1",
+                "direction_id": "utility_predicted_cache_routing",
+                "selected_direction_id": "utility_predicted_cache_routing",
+                "candidates": [
+                    {
+                        "direction_id": "utility_predicted_cache_routing",
+                        "mechanism_axis": "routing",
+                        "integration_point": "wrapper",
+                        "control_signal": "utility",
+                        "score": 1.0,
+                        "selected": True,
+                        "evidence_refs": [paper_ref, paper_ref2],
+                        "counterevidence_refs": [counter_ref],
+                        "implementation_surface_refs": [code_ref, code_ref2],
+                        "why_selected": "best supported by deterministic refs",
+                        "why_not_selected": [],
+                    },
+                    {
+                        "direction_id": "alignment_surface_signal",
+                        "mechanism_axis": "alignment",
+                        "integration_point": "aligner",
+                        "control_signal": "representation_match",
+                        "score": 0.42,
+                        "selected": False,
+                        "evidence_refs": [paper_ref],
+                        "counterevidence_refs": [counter_ref],
+                        "implementation_surface_refs": [code_ref2],
+                        "why_selected": "",
+                        "why_not_selected": ["less direct wrapper evidence"],
+                    },
+                ],
+                "comparison_axes": ["evidence_support", "implementation_surface"],
+                "coverage": {"candidate_count": 2, "non_selected_count": 1, "bundle_ref_count": 5},
+            }
+        ),
+        encoding="utf-8",
+    )
     (c2c_literature / "evidence_session.json").write_text(json.dumps({"schema_version": "c2c_s1_two_phase_session_v1", "status": "ok", "phases": []}), encoding="utf-8")
     (c2c_literature / "evidence_ref_report.json").write_text(json.dumps({"schema_version": "s1_evidence_ref_report_v1", "status": "pass", "counts": {"resolved": 5, "unresolved": 0}, "resolved": [], "errors": []}), encoding="utf-8")
     quality = {

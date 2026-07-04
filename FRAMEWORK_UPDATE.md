@@ -1,5 +1,14 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-04 C2C S1 Discriminating Evidence And Direction Scorecard
+
+- Upgraded S1a evidence request plans with competing `candidate_direction_hypotheses`, `uncertainty_axes`, `discriminating_evidence_requests`, and `must_have_before_direction`.
+- S1a still cannot choose a direction or emit evidence bundles; the new fields only make deterministic S1b retrieval ask sharper, direction-separating questions.
+- Added deterministic S1b code-neighborhood expansion from parsed code edges/same-file chunks, with `code_neighborhood_expansions` and coverage contributors recorded in the retrieval trace.
+- Added `literature/c2c/direction_candidate_scorecard.json` so S1c records candidate directions, selected direction, scores, evidence/counterevidence refs, and `why_not_selected` for alternatives.
+- S1 gate, stage contracts, and C2C artifact audit now require/schema-check the new direction candidate scorecard.
+- Added regression coverage for discriminating request validation, code-neighborhood expansion, C2C S1 follow-up, C2C pipeline artifact creation, stage contracts, and validators.
+
 ## 2026-07-04 C2C S1 Shared Evidence/Direction Session
 
 - Changed C2C S1 two-phase defaults so `evidence_request_agent` and `direction_agent` share one Codex resume session by default.
