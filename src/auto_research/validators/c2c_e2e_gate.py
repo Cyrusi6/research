@@ -11,6 +11,7 @@ class C2CE2EGateValidator(StageGateValidator):
 
     def validate(self):
         self.validate_readiness_report(required=False)
+        self.validate_execution_hooks_report(required=False)
         self.validate_artifact_audit_report(required=False)
         self.validate_replay_result(required=False)
         self.validate_real_smoke_record(required=False)
@@ -21,6 +22,14 @@ class C2CE2EGateValidator(StageGateValidator):
             "meta/c2c_e2e_readiness_report.json",
             "c2c_e2e_readiness_report.schema.json",
             "c2c_e2e_readiness_report",
+            required=required,
+        )
+
+    def validate_execution_hooks_report(self, *, required: bool = True) -> None:
+        self._validate_json_artifact(
+            "meta/c2c_execution_hooks_report.json",
+            "c2c_execution_hooks_report.schema.json",
+            "c2c_execution_hooks_report",
             required=required,
         )
 

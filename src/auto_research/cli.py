@@ -77,6 +77,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     audit_c2c_parser = subparsers.add_parser("audit-c2c", help="Audit C2C E2E artifacts after a run")
     audit_c2c_parser.add_argument("--project-id", required=True)
+    audit_c2c_parser.add_argument("--scope", choices=["completed", "up-to-current", "full"], default="completed")
 
     replay_c2c_parser = subparsers.add_parser("replay-c2c", help="Replay deterministic C2C route decisions from frozen artifacts")
     replay_c2c_parser.add_argument("--project-id", required=True)
@@ -84,7 +85,18 @@ def build_parser() -> argparse.ArgumentParser:
 
     smoke_c2c_parser = subparsers.add_parser("smoke-c2c", help="Run the one-command C2C real smoke regression sequence")
     smoke_c2c_parser.add_argument("--project-id", required=True)
+    smoke_c2c_parser.add_argument("--topic", default="cross tokenizer cache communication")
+    smoke_c2c_parser.add_argument("--target-repo", default=None)
+    smoke_c2c_parser.add_argument("--ref-paper", default=None)
+    smoke_c2c_parser.add_argument("--ref-rebuttal", default=None)
+    smoke_c2c_parser.add_argument("--env-python", default=DEFAULT_C2C_ENV_PYTHON)
     smoke_c2c_parser.add_argument("--from-stage", default="S3_experiment", help="Replay route decision from this stage")
+    smoke_c2c_parser.add_argument("--audit-scope", choices=["completed", "up-to-current", "full"], default="completed")
+    smoke_c2c_parser.add_argument("--no-s0-cache", action="store_true", help="Do not restore a compatible S0 static bundle")
+    smoke_c2c_parser.add_argument("--s0-cache-project", help="Restore S0 static bundle from a specific previous project id")
+    smoke_c2c_parser.add_argument("--s0-cache-path", help="Restore S0 static bundle from an explicit JSON path")
+    smoke_c2c_parser.add_argument("--s0-force-refresh", action="store_true", help="Force S0 to regenerate instead of using any local or restored bundle")
+    smoke_c2c_parser.add_argument("--prepare-only", action="store_true", help="Prepare/bootstrap and run doctor checks, but do not start the C2C pipeline")
 
     memory_parser = subparsers.add_parser("memory", help="Inspect shared method failure memory")
     memory_subparsers = memory_parser.add_subparsers(dest="memory_command", required=True)
@@ -166,7 +178,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(orchestrator.doctor_c2c(args.project_id), indent=2, ensure_ascii=False))
         return
     if args.command == "audit-c2c":
-        print(json.dumps(orchestrator.audit_c2c(args.project_id), indent=2, ensure_ascii=False))
+        print(json.dumps(orchestrator.audit_c2c(args.project_id, scope=args.scope), indent=2, ensure_ascii=False))
         return
     if args.command == "replay-c2c":
         print(json.dumps(orchestrator.replay_c2c(args.project_id, from_stage=args.from_stage), indent=2, ensure_ascii=False))
@@ -311,6 +323,9 @@ def _smoke_c2c_command(args: argparse.Namespace, orchestrator: Orchestrator) -> 
     project_id = args.project_id
     from_stage = getattr(args, "from_stage", "S3_experiment")
     steps: list[dict[str, object]] = []
+    if not _c2c_project_exists(project_id, orchestrator):
+        prepare = _run_c2c_command(_smoke_run_args(args, prepare_only=True), orchestrator)
+        steps.append(_smoke_step("prepare-c2c", prepare))
 
     doctor = orchestrator.doctor_c2c(project_id)
     steps.append(_smoke_step("doctor-c2c", doctor))
@@ -321,32 +336,32 @@ def _smoke_c2c_command(args: argparse.Namespace, orchestrator: Orchestrator) -> 
             "project_id": project_id,
             "steps": steps,
             "readiness_report": doctor.get("readiness_report"),
+            "execution_hooks_report": doctor.get("execution_hooks_report"),
             "real_smoke_record": smoke,
-            "artifacts": ["meta/c2c_e2e_readiness_report.json", "meta/c2c_runtime_health_report.json", "meta/c2c_real_smoke_record.json"],
+            "artifacts": [
+                "meta/c2c_e2e_readiness_report.json",
+                "meta/c2c_runtime_health_report.json",
+                "meta/c2c_execution_hooks_report.json",
+                "meta/c2c_real_smoke_record.json",
+            ],
             "next_action": "fix_environment",
         }
+    if getattr(args, "prepare_only", False):
+        smoke = _write_final_c2c_smoke_record(orchestrator, project_id)
+        return {
+            "status": "prepared",
+            "project_id": project_id,
+            "steps": steps,
+            "readiness_report": doctor.get("readiness_report"),
+            "execution_hooks_report": doctor.get("execution_hooks_report"),
+            "real_smoke_record": smoke,
+            "artifacts": ["meta/c2c_real_smoke_record.json"],
+        }
 
-    run_args = argparse.Namespace(
-        topic="cross tokenizer cache communication",
-        project_id=project_id,
-        target_repo=None,
-        ref_paper=None,
-        ref_rebuttal=None,
-        env_python=DEFAULT_C2C_ENV_PYTHON,
-        max_iterations=1,
-        stop_after_stage="S3_experiment",
-        simulate=False,
-        hitl=False,
-        no_s0_cache=False,
-        s0_cache_project=None,
-        s0_cache_path=None,
-        s0_force_refresh=False,
-        prepare_only=False,
-    )
-    run = _run_c2c_command(run_args, orchestrator)
+    run = _run_c2c_command(_smoke_run_args(args, prepare_only=False), orchestrator)
     steps.append(_smoke_step("run-c2c", run))
 
-    audit = orchestrator.audit_c2c(project_id)
+    audit = orchestrator.audit_c2c(project_id, scope=getattr(args, "audit_scope", "completed"))
     steps.append(_smoke_step("audit-c2c", audit))
 
     replay = orchestrator.replay_c2c(project_id, from_stage=from_stage)
@@ -361,12 +376,43 @@ def _smoke_c2c_command(args: argparse.Namespace, orchestrator: Orchestrator) -> 
         "project_id": project_id,
         "steps": steps,
         "run": run,
+        "readiness_report": doctor.get("readiness_report"),
+        "execution_hooks_report": doctor.get("execution_hooks_report"),
         "artifact_audit_report": audit.get("artifact_audit_report"),
         "replay_result": replay.get("replay_result"),
         "report": report,
         "real_smoke_record": smoke,
         "artifacts": ["meta/c2c_real_smoke_record.json"],
     }
+
+
+def _smoke_run_args(args: argparse.Namespace, *, prepare_only: bool) -> argparse.Namespace:
+    return argparse.Namespace(
+        topic=getattr(args, "topic", "cross tokenizer cache communication"),
+        project_id=args.project_id,
+        target_repo=getattr(args, "target_repo", None),
+        ref_paper=getattr(args, "ref_paper", None),
+        ref_rebuttal=getattr(args, "ref_rebuttal", None),
+        env_python=getattr(args, "env_python", DEFAULT_C2C_ENV_PYTHON),
+        max_iterations=1,
+        stop_after_stage="S3_experiment",
+        simulate=False,
+        hitl=False,
+        no_s0_cache=bool(getattr(args, "no_s0_cache", False)),
+        s0_cache_project=getattr(args, "s0_cache_project", None),
+        s0_cache_path=getattr(args, "s0_cache_path", None),
+        s0_force_refresh=bool(getattr(args, "s0_force_refresh", False)),
+        prepare_only=prepare_only,
+    )
+
+
+def _c2c_project_exists(project_id: str, orchestrator: Orchestrator) -> bool:
+    try:
+        return orchestrator._project_root(project_id).exists()
+    except Exception:
+        root_config = load_root_config()
+        workspace_root = Path(root_config["project"]["workspace_root"])
+        return (workspace_root / project_id).exists()
 
 
 def _smoke_step(name: str, result: dict[str, object]) -> dict[str, object]:

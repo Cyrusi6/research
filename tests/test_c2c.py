@@ -947,7 +947,7 @@ def test_smoke_c2c_command_runs_real_smoke_sequence(monkeypatch, tmp_path: Path)
             write_json(project / "meta" / "c2c_e2e_readiness_report.json", readiness)
             return {"status": "pass", "readiness_report": readiness}
 
-        def audit_c2c(self, project_id: str) -> dict:
+        def audit_c2c(self, project_id: str, *, scope: str | None = None) -> dict:
             self.calls.append("audit-c2c")
             audit = _smoke_audit(project, gate="pass")
             write_json(project / "meta" / "c2c_artifact_audit_report.json", audit)
@@ -1010,7 +1010,7 @@ def _smoke_readiness(project: Path, *, gate: str, blocking: list[str]) -> dict:
         "project_id": project.name,
         "mode": "real",
         "gate": gate,
-        "checks": {"env_python_executable": gate != "fail"},
+        "checks": {"env_python_executable": gate != "fail", "real_execution_hooks_ready": gate != "fail"},
         "warnings": [],
         "blocking_reasons": blocking,
         "recommended_action": "run_c2c" if gate != "fail" else "fix_environment",
@@ -1033,7 +1033,10 @@ def _smoke_audit(project: Path, *, gate: str) -> dict:
         "schema_version": "c2c_artifact_audit_report_v1",
         "project_id": project.name,
         "gate": gate,
-        "summary": {"checked_artifacts": 1, "missing": 0, "schema_failures": 0, "hash_mismatches": 0, "stale_artifacts": 0},
+        "audit_scope": "completed",
+        "expected_stages": [],
+        "skipped_stages": [],
+        "summary": {"checked_artifacts": 1, "missing": 0, "schema_failures": 0, "missing_manifest_hash": 0, "hash_mismatches": 0, "stale_artifacts": 0},
         "by_stage": {},
         "blocking_reasons": [],
     }

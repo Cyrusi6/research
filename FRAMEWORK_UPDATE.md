@@ -1,5 +1,14 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-05 C2C Smoke Audit And Execution Probe Hardening
+
+- Added stage-aware `audit-c2c --scope completed|up-to-current|full`; default `completed` now skips unreached stages and records `expected_stages` / `skipped_stages`.
+- Hardened artifact manifest validation so enabled hash validation fails on missing manifest entries, missing manifest `sha256`, and hash mismatches.
+- Added `meta/c2c_execution_hooks_report.json` with cheap real-run probes for env python, target repo importability, eval entrypoint/help, dataset sample readability, output writability, and timeout configuration.
+- `doctor-c2c` and real C2C preflight now write execution hooks before readiness; readiness consumes the hooks gate and smoke records expose `execution_hooks_gate`.
+- Expanded `smoke-c2c` with bootstrap/override flags for topic, target repo, ref paper/rebuttal, env python, S0 cache behavior, audit scope, and prepare-only mode.
+- Added regression tests for audit scope, strict manifest hash, execution hooks, and smoke CLI overrides.
+
 ## 2026-07-05 C2C Real Smoke CLI Entry
 
 - Added `auto-research smoke-c2c --project-id <id>` as a one-command real C2C smoke regression entrypoint.

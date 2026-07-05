@@ -55,7 +55,7 @@ def test_c2c_artifact_audit_reports_missing_contract_artifacts(tmp_path: Path) -
     project = tmp_path / "proj"
     project.mkdir()
 
-    report = build_c2c_artifact_audit_report(project, _audit_config())
+    report = build_c2c_artifact_audit_report(project, _audit_config(), scope="full")
 
     assert report["gate"] == "fail"
     assert report["summary"]["missing"] > 0
@@ -67,7 +67,7 @@ def test_c2c_artifact_audit_reports_missing_stage_manifest_entry(tmp_path: Path)
     _write_registered_required_artifacts(project, skip="plan/s2_planner/adaptive_policy.json")
     write_json(project / "plan" / "s2_planner" / "adaptive_policy.json", {"schema_version": "test"})
 
-    report = build_c2c_artifact_audit_report(project, _audit_config())
+    report = build_c2c_artifact_audit_report(project, _audit_config(), scope="full")
 
     assert report["gate"] == "fail"
     assert any(item["path"] == "plan/s2_planner/adaptive_policy.json" for item in report["by_stage"]["S2_plan"]["manifest_missing"])
@@ -78,7 +78,7 @@ def test_c2c_artifact_audit_reports_hash_mismatch(tmp_path: Path) -> None:
     _write_registered_required_artifacts(project)
     (project / "plan" / "s2_planner" / "variant_scorecard.json").write_text(json.dumps({"changed": True}), encoding="utf-8")
 
-    report = build_c2c_artifact_audit_report(project, _audit_config())
+    report = build_c2c_artifact_audit_report(project, _audit_config(), scope="full")
 
     assert report["gate"] == "fail"
     assert any(item["path"] == "plan/s2_planner/variant_scorecard.json" for item in report["by_stage"]["S2_plan"]["hash_mismatches"])
@@ -99,7 +99,7 @@ def test_c2c_artifact_audit_reports_stale_route_invalidated_artifacts(tmp_path: 
         },
     )
 
-    report = build_c2c_artifact_audit_report(project, _audit_config())
+    report = build_c2c_artifact_audit_report(project, _audit_config(), scope="full")
 
     assert report["gate"] == "fail"
     assert report["summary"]["stale_artifacts"] == 1
@@ -125,6 +125,6 @@ def test_c2c_artifact_audit_allows_same_stage_failed_route_diagnostics(tmp_path:
         },
     )
 
-    report = build_c2c_artifact_audit_report(project, _audit_config())
+    report = build_c2c_artifact_audit_report(project, _audit_config(), scope="full")
 
     assert report["by_stage"]["orchestration"]["stale_artifacts"] == []

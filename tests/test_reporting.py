@@ -139,6 +139,7 @@ def test_project_report_summarizes_c2c_route(tmp_path, monkeypatch, capsys) -> N
             "schema_version": "c2c_real_smoke_record_v1",
             "project_id": "proj_report",
             "readiness_gate": "pass",
+            "execution_hooks_gate": "pass",
             "run_manifest_final_status": "blocked",
             "artifact_audit_gate": "fail",
             "replay_status": "match",

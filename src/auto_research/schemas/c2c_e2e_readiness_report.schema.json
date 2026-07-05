@@ -22,11 +22,14 @@
         "dataset_paths_ready",
         "gpu_policy_ready",
         "s0_cache_compatible",
-        "baseline_cache_valid_or_invalidated"
+        "baseline_cache_valid_or_invalidated",
+        "real_execution_hooks_ready"
       ]
     },
     "warnings": {"type": "array"},
     "blocking_reasons": {"type": "array"},
-    "recommended_action": {"type": "string"}
+    "recommended_action": {"type": "string"},
+    "execution_hooks_gate": {"type": ["string", "null"], "enum": ["pass", "fail", null]},
+    "execution_hooks_report": {"type": ["string", "null"]}
   }
 }

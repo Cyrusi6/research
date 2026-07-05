@@ -14,6 +14,7 @@ from .c2c_e2e import (
     write_c2c_artifact_audit_report,
     write_c2c_e2e_readiness_report,
     write_c2c_e2e_run_manifest,
+    write_c2c_execution_hooks_report,
     write_c2c_real_smoke_record,
     write_c2c_runtime_health_report,
     write_c2c_replay_plan,
@@ -147,8 +148,9 @@ class Orchestrator:
     def doctor_c2c(self, project_id: str) -> dict[str, Any]:
         project_root = self._project_root(project_id)
         config = load_project_config(project_root)
-        readiness = write_c2c_e2e_readiness_report(project_root, config)
         runtime = write_c2c_runtime_health_report(project_root, config)
+        execution_hooks = write_c2c_execution_hooks_report(project_root, config)
+        readiness = write_c2c_e2e_readiness_report(project_root, config)
         smoke = write_c2c_real_smoke_record(project_root, config)
         self._log_session(project_root, action="doctor_c2c", details={"readiness_gate": readiness.get("gate")})
         return {
@@ -156,16 +158,22 @@ class Orchestrator:
             "project_id": project_id,
             "readiness_report": readiness,
             "runtime_health_report": runtime,
+            "execution_hooks_report": execution_hooks,
             "real_smoke_record": smoke,
-            "artifacts": ["meta/c2c_e2e_readiness_report.json", "meta/c2c_runtime_health_report.json", "meta/c2c_real_smoke_record.json"],
+            "artifacts": [
+                "meta/c2c_e2e_readiness_report.json",
+                "meta/c2c_runtime_health_report.json",
+                "meta/c2c_execution_hooks_report.json",
+                "meta/c2c_real_smoke_record.json",
+            ],
         }
 
-    def audit_c2c(self, project_id: str) -> dict[str, Any]:
+    def audit_c2c(self, project_id: str, *, scope: str | None = None) -> dict[str, Any]:
         project_root = self._project_root(project_id)
         config = load_project_config(project_root)
-        audit = write_c2c_artifact_audit_report(project_root, config)
+        audit = write_c2c_artifact_audit_report(project_root, config, scope=scope)
         smoke = write_c2c_real_smoke_record(project_root, config)
-        self._log_session(project_root, action="audit_c2c", details={"audit_gate": audit.get("gate")})
+        self._log_session(project_root, action="audit_c2c", details={"audit_gate": audit.get("gate"), "scope": audit.get("audit_scope")})
         return {
             "status": audit.get("gate"),
             "project_id": project_id,
@@ -762,6 +770,7 @@ class Orchestrator:
         write_c2c_runtime_health_report(project_root, config)
         if not self._real_c2c_run(config):
             return None
+        write_c2c_execution_hooks_report(project_root, config)
         readiness = write_c2c_e2e_readiness_report(project_root, config)
         e2e_cfg = ((config.get("orchestration") or {}).get("c2c_e2e") or {}) if isinstance(config.get("orchestration"), dict) else {}
         if readiness.get("gate") == "fail" and e2e_cfg.get("block_real_run_on_readiness_fail", True):

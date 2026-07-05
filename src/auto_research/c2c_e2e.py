@@ -8,6 +8,7 @@ import os
 import platform
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ C2C_E2E_READINESS_SCHEMA_VERSION = "c2c_e2e_readiness_report_v1"
 C2C_E2E_RUN_MANIFEST_SCHEMA_VERSION = "c2c_e2e_run_manifest_v1"
 C2C_ARTIFACT_AUDIT_SCHEMA_VERSION = "c2c_artifact_audit_report_v1"
 C2C_RUNTIME_HEALTH_SCHEMA_VERSION = "c2c_runtime_health_report_v1"
+C2C_EXECUTION_HOOKS_SCHEMA_VERSION = "c2c_execution_hooks_report_v1"
 C2C_REPLAY_PLAN_SCHEMA_VERSION = "c2c_replay_plan_v1"
 C2C_REPLAY_RESULT_SCHEMA_VERSION = "c2c_replay_result_v1"
 C2C_REAL_SMOKE_RECORD_SCHEMA_VERSION = "c2c_real_smoke_record_v1"
@@ -70,6 +72,8 @@ STAGE_MANIFESTS = {
     "experiment": "experiment/stage_manifest.json",
 }
 
+AUDIT_STAGE_ORDER = ["S1_literature", "S2_plan", "S2_5_patch", "S3_experiment", "orchestration"]
+
 
 def build_c2c_e2e_readiness_report(project_root: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Build the pre-real-run C2C readiness report without calling any model."""
@@ -102,7 +106,14 @@ def build_c2c_e2e_readiness_report(project_root: Path, config: dict[str, Any] | 
     checks["dataset_paths_ready"] = _dataset_paths_ready(c2c, mode=mode, warnings=warnings)
     checks["gpu_policy_ready"] = _gpu_policy_ready(config, mode=mode, warnings=warnings)
     checks["baseline_cache_valid_or_invalidated"] = _baseline_cache_ready(project_root, warnings=warnings)
-    checks["real_execution_hooks_ready"] = mode == "simulate" or bool(c2c.get("env_python") and c2c.get("snapshot_path"))
+    hooks_report = read_json(project_root / "meta" / "c2c_execution_hooks_report.json", default={}) or {}
+    if mode == "simulate":
+        checks["real_execution_hooks_ready"] = True
+    elif isinstance(hooks_report, dict) and hooks_report:
+        checks["real_execution_hooks_ready"] = hooks_report.get("gate") == "pass"
+    else:
+        checks["real_execution_hooks_ready"] = bool(c2c.get("env_python") and c2c.get("snapshot_path"))
+        warnings.append("execution_hooks_report_missing")
 
     hard_checks = [
         "target_repo_exists",
@@ -149,6 +160,8 @@ def build_c2c_e2e_readiness_report(project_root: Path, config: dict[str, Any] | 
             "env_python": str(env_python) if env_python else None,
             "snapshot_path": str(snapshot_path),
         },
+        "execution_hooks_gate": hooks_report.get("gate") if isinstance(hooks_report, dict) else None,
+        "execution_hooks_report": "meta/c2c_execution_hooks_report.json" if hooks_report else None,
     }
 
 
@@ -181,6 +194,88 @@ def build_c2c_runtime_health_report(project_root: Path, config: dict[str, Any] |
         "filesystem": {
             "project_root_writable": _writable(project_root),
             "workspace_writable": _writable(project_root.parent),
+        },
+    }
+
+
+def build_c2c_execution_hooks_report(project_root: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Run cheap probes that prove the configured C2C repo can execute basic hooks."""
+
+    config = config if isinstance(config, dict) else {}
+    c2c = config.get("c2c") if isinstance(config.get("c2c"), dict) else {}
+    e2e_cfg = ((config.get("orchestration") or {}).get("c2c_e2e") or {}) if isinstance(config.get("orchestration"), dict) else {}
+    env_python = _path(c2c.get("env_python"))
+    snapshot_path = project_root / str(c2c.get("snapshot_path") or "external/c2c_snapshot")
+    target_repo = snapshot_path if snapshot_path.exists() else _path(c2c.get("target_repo"))
+    try:
+        timeout_seconds = int(e2e_cfg.get("execution_hook_timeout_seconds") or 30)
+    except (TypeError, ValueError):
+        timeout_seconds = 30
+    commands: list[dict[str, Any]] = []
+
+    version = _run_hook_command("env_python_version", [str(env_python), "--version"] if env_python else [], timeout_seconds=timeout_seconds)
+    commands.append(version)
+    executable = _run_hook_command(
+        "env_python_executable",
+        [str(env_python), "-c", "import sys; print(sys.executable)"] if env_python else [],
+        timeout_seconds=timeout_seconds,
+    )
+    commands.append(executable)
+
+    importable = _run_hook_command(
+        "target_repo_importable",
+        [
+            str(env_python),
+            "-c",
+            (
+                "import importlib.util, pathlib, sys; "
+                "repo=pathlib.Path(sys.argv[1]).resolve(); "
+                "sys.path.insert(0, str(repo)); "
+                "ok=importlib.util.find_spec('rosetta') is not None; "
+                "print(ok); raise SystemExit(0 if ok else 1)"
+            ),
+            str(target_repo or ""),
+        ]
+        if env_python and target_repo
+        else [],
+        timeout_seconds=timeout_seconds,
+        cwd=target_repo,
+    )
+    commands.append(importable)
+
+    eval_entrypoint = (target_repo / "script" / "evaluation" / "unified_evaluator.py") if target_repo else None
+    eval_help = _run_hook_command(
+        "eval_help",
+        [str(env_python), str(eval_entrypoint), "--help"] if env_python and eval_entrypoint and eval_entrypoint.exists() else [],
+        timeout_seconds=timeout_seconds,
+        cwd=target_repo,
+    )
+    commands.append(eval_help)
+
+    checks = {
+        "env_python_runs": version.get("returncode") == 0 and executable.get("returncode") == 0,
+        "target_repo_importable": importable.get("returncode") == 0,
+        "eval_entrypoint_exists": bool(eval_entrypoint and eval_entrypoint.exists()),
+        "eval_help_command_passed": eval_help.get("returncode") == 0,
+        "dataset_one_example_loadable": _dataset_one_example_loadable(_path(c2c.get("dataset_root"))),
+        "output_dir_writable": _writable((target_repo / "local" / "auto_research_runs") if target_repo else project_root / "experiment" / "results"),
+        "command_timeout_configured": _command_timeout_configured(c2c),
+    }
+    blocking = [key for key, ok in checks.items() if not ok]
+    return {
+        "schema_version": C2C_EXECUTION_HOOKS_SCHEMA_VERSION,
+        "created_at": now_utc(),
+        "project_id": project_root.name,
+        "gate": "fail" if blocking else "pass",
+        "checks": checks,
+        "commands": commands,
+        "blocking_reasons": blocking,
+        "warnings": [],
+        "paths": {
+            "env_python": str(env_python) if env_python else None,
+            "target_repo": str(target_repo) if target_repo else None,
+            "eval_entrypoint": str(eval_entrypoint) if eval_entrypoint else None,
+            "dataset_root": c2c.get("dataset_root"),
         },
     }
 
@@ -233,25 +328,41 @@ def build_c2c_e2e_run_manifest(
     return manifest
 
 
-def build_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
+def build_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any] | None = None, *, scope: str | None = None) -> dict[str, Any]:
     """Audit C2C run artifacts, schemas, stage manifests, hashes, and stale outputs."""
 
     config = config if isinstance(config, dict) else {}
     e2e_cfg = ((config.get("orchestration") or {}).get("c2c_e2e") or {}) if isinstance(config.get("orchestration"), dict) else {}
+    audit_scope = str(scope or e2e_cfg.get("audit_scope") or "completed")
+    if audit_scope not in {"completed", "up-to-current", "full"}:
+        audit_scope = "completed"
     require_manifest = bool(e2e_cfg.get("require_stage_manifest_entries", True))
     require_schema = bool(e2e_cfg.get("require_schema_validation", True))
     require_hash = bool(e2e_cfg.get("require_hash_validation", True))
     detect_stale = bool(e2e_cfg.get("detect_stale_artifacts", True))
+    registry = read_yaml(project_root / "meta" / "registry.yaml", default={}) or {}
+    run_manifest = read_json(project_root / "meta" / "c2c_e2e_run_manifest.json", default={}) or {}
+    expected_stages, skipped_stages = _expected_audit_stages(project_root, registry, run_manifest, audit_scope, config)
     by_stage: dict[str, dict[str, Any]] = {}
     checked_artifacts = 0
     missing_count = 0
     schema_failure_count = 0
+    missing_manifest_hash_count = 0
     hash_mismatch_count = 0
     stale_count = 0
     blocking: list[str] = []
 
-    for stage, requirements in STAGE_ARTIFACT_REQUIREMENTS.items():
-        stage_report = {"gate": "pass", "missing": [], "schema_failures": [], "hash_mismatches": [], "manifest_missing": [], "stale_artifacts": []}
+    for stage in expected_stages:
+        requirements = STAGE_ARTIFACT_REQUIREMENTS.get(stage, [])
+        stage_report = {
+            "gate": "pass",
+            "missing": [],
+            "schema_failures": [],
+            "hash_mismatches": [],
+            "manifest_missing": [],
+            "missing_manifest_hash": [],
+            "stale_artifacts": [],
+        }
         for rel_path, schema_name in requirements:
             path = project_root / rel_path
             checked_artifacts += 1
@@ -270,11 +381,12 @@ def build_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any] |
                     if manifest_error.get("kind") == "hash_mismatch":
                         hash_mismatch_count += 1
                         stage_report["hash_mismatches"].append(manifest_error)
+                    elif manifest_error.get("kind") == "missing_manifest_hash":
+                        missing_manifest_hash_count += 1
+                        stage_report["missing_manifest_hash"].append(manifest_error)
                     else:
                         stage_report["manifest_missing"].append(manifest_error)
-            if require_hash and path.is_file() and rel_path.endswith(".json"):
-                pass
-        if any(stage_report[key] for key in ["missing", "schema_failures", "hash_mismatches", "manifest_missing", "stale_artifacts"]):
+        if any(stage_report[key] for key in ["missing", "schema_failures", "hash_mismatches", "manifest_missing", "missing_manifest_hash", "stale_artifacts"]):
             stage_report["gate"] = "fail"
         by_stage[stage] = stage_report
 
@@ -283,7 +395,10 @@ def build_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any] |
         checked_artifacts += 1
         if item.get("schema_errors"):
             schema_failure_count += 1
-            by_stage.setdefault(item["stage"], {"gate": "pass", "missing": [], "schema_failures": [], "hash_mismatches": [], "manifest_missing": [], "stale_artifacts": []})
+            by_stage.setdefault(
+                item["stage"],
+                {"gate": "pass", "missing": [], "schema_failures": [], "hash_mismatches": [], "manifest_missing": [], "missing_manifest_hash": [], "stale_artifacts": []},
+            )
             by_stage[item["stage"]]["schema_failures"].append({"path": item["path"], "errors": item["schema_errors"]})
             by_stage[item["stage"]]["gate"] = "fail"
 
@@ -291,7 +406,10 @@ def build_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any] |
         stale = _stale_artifacts_after_route(project_root)
         stale_count = len(stale)
         if stale:
-            by_stage.setdefault("orchestration", {"gate": "pass", "missing": [], "schema_failures": [], "hash_mismatches": [], "manifest_missing": [], "stale_artifacts": []})
+            by_stage.setdefault(
+                "orchestration",
+                {"gate": "pass", "missing": [], "schema_failures": [], "hash_mismatches": [], "manifest_missing": [], "missing_manifest_hash": [], "stale_artifacts": []},
+            )
             by_stage["orchestration"]["stale_artifacts"].extend(stale)
             by_stage["orchestration"]["gate"] = "fail"
 
@@ -305,6 +423,8 @@ def build_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any] |
                 blocking.append(f"{stage}:hash_mismatch")
             if report.get("manifest_missing"):
                 blocking.append(f"{stage}:manifest_missing")
+            if report.get("missing_manifest_hash"):
+                blocking.append(f"{stage}:missing_manifest_hash")
             if report.get("stale_artifacts"):
                 blocking.append(f"{stage}:stale_artifact")
     gate = "fail" if blocking else "pass"
@@ -313,10 +433,14 @@ def build_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any] |
         "created_at": now_utc(),
         "project_id": project_root.name,
         "gate": gate,
+        "audit_scope": audit_scope,
+        "expected_stages": expected_stages,
+        "skipped_stages": skipped_stages,
         "summary": {
             "checked_artifacts": checked_artifacts,
             "missing": missing_count,
             "schema_failures": schema_failure_count,
+            "missing_manifest_hash": missing_manifest_hash_count,
             "hash_mismatches": hash_mismatch_count,
             "stale_artifacts": stale_count,
         },
@@ -430,6 +554,7 @@ def build_c2c_real_smoke_record(project_root: Path, config: dict[str, Any] | Non
     del config  # Reserved for future policy switches without changing the public builder.
     registry = read_yaml(project_root / "meta" / "registry.yaml", default={}) or {}
     readiness = read_json(project_root / "meta" / "c2c_e2e_readiness_report.json", default={}) or {}
+    execution_hooks = read_json(project_root / "meta" / "c2c_execution_hooks_report.json", default={}) or {}
     manifest = read_json(project_root / "meta" / "c2c_e2e_run_manifest.json", default={}) or {}
     audit = read_json(project_root / "meta" / "c2c_artifact_audit_report.json", default={}) or {}
     replay = read_json(project_root / "meta" / "c2c_replay_result.json", default={}) or {}
@@ -439,12 +564,13 @@ def build_c2c_real_smoke_record(project_root: Path, config: dict[str, Any] | Non
     proxy_decision = read_json(project_root / "experiment" / "results" / "c2c_proxy_decision_report.json", default={}) or {}
     route_decision = read_json(project_root / "meta" / "route_decision.json", default={}) or {}
 
-    blocking_reasons = _smoke_blocking_reasons(registry, readiness, audit, replay)
+    blocking_reasons = _smoke_blocking_reasons(registry, readiness, execution_hooks, audit, replay)
     return {
         "schema_version": C2C_REAL_SMOKE_RECORD_SCHEMA_VERSION,
         "created_at": now_utc(),
         "project_id": project_root.name,
         "readiness_gate": readiness.get("gate") if isinstance(readiness, dict) else None,
+        "execution_hooks_gate": execution_hooks.get("gate") if isinstance(execution_hooks, dict) else None,
         "run_manifest_final_status": manifest.get("final_status") if isinstance(manifest, dict) else None,
         "artifact_audit_gate": audit.get("gate") if isinstance(audit, dict) else None,
         "replay_status": replay.get("status") if isinstance(replay, dict) else None,
@@ -475,6 +601,12 @@ def write_c2c_runtime_health_report(project_root: Path, config: dict[str, Any]) 
     return report
 
 
+def write_c2c_execution_hooks_report(project_root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    report = build_c2c_execution_hooks_report(project_root, config)
+    write_json(project_root / "meta" / "c2c_execution_hooks_report.json", report)
+    return report
+
+
 def write_c2c_e2e_run_manifest(
     project_root: Path,
     config: dict[str, Any],
@@ -490,8 +622,8 @@ def write_c2c_e2e_run_manifest(
     return manifest
 
 
-def write_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any]) -> dict[str, Any]:
-    report = build_c2c_artifact_audit_report(project_root, config)
+def write_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any], *, scope: str | None = None) -> dict[str, Any]:
+    report = build_c2c_artifact_audit_report(project_root, config, scope=scope)
     write_json(project_root / "meta" / "c2c_artifact_audit_report.json", report)
     return report
 
@@ -612,6 +744,121 @@ def _baseline_cache_ready(project_root: Path, *, warnings: list[str]) -> bool:
     return True
 
 
+def _run_hook_command(
+    name: str,
+    command: list[str],
+    *,
+    timeout_seconds: int,
+    cwd: Path | None = None,
+) -> dict[str, Any]:
+    started = time.monotonic()
+    if not command:
+        return {
+            "name": name,
+            "command": "",
+            "returncode": None,
+            "duration_sec": 0.0,
+            "status": "skipped",
+            "reason": "command_not_configured",
+        }
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=max(1, timeout_seconds),
+            check=False,
+        )
+        status = "ok" if result.returncode == 0 else "failed"
+        return {
+            "name": name,
+            "command": " ".join(command),
+            "returncode": result.returncode,
+            "duration_sec": round(time.monotonic() - started, 3),
+            "status": status,
+            "stdout": (result.stdout or "").strip()[:1000],
+            "stderr": (result.stderr or "").strip()[:1000],
+        }
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "name": name,
+            "command": " ".join(command),
+            "returncode": None,
+            "duration_sec": round(time.monotonic() - started, 3),
+            "status": "timeout",
+            "stderr": str(exc)[:1000],
+        }
+    except Exception as exc:
+        return {
+            "name": name,
+            "command": " ".join(command),
+            "returncode": None,
+            "duration_sec": round(time.monotonic() - started, 3),
+            "status": "failed",
+            "stderr": str(exc)[:1000],
+        }
+
+
+def _dataset_one_example_loadable(dataset_root: Path | None) -> bool:
+    if not dataset_root or not dataset_root.exists():
+        return False
+    if dataset_root.is_file():
+        return _load_one_dataset_example(dataset_root)
+    checked = 0
+    for path in sorted(dataset_root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in {".jsonl", ".json", ".csv", ".txt"}:
+            continue
+        checked += 1
+        if _load_one_dataset_example(path):
+            return True
+        if checked >= 25:
+            break
+    return False
+
+
+def _load_one_dataset_example(path: Path) -> bool:
+    try:
+        suffix = path.suffix.lower()
+        if suffix == ".jsonl":
+            for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if not line.strip():
+                    continue
+                json.loads(line)
+                return True
+            return False
+        if suffix == ".json":
+            payload = json.loads(path.read_text(encoding="utf-8", errors="ignore"))
+            if isinstance(payload, list):
+                return bool(payload)
+            if isinstance(payload, dict):
+                for key in ["data", "examples", "train", "validation", "test"]:
+                    value = payload.get(key)
+                    if isinstance(value, list) and value:
+                        return True
+                return bool(payload)
+            return payload is not None
+        if suffix == ".csv":
+            return bool(path.read_text(encoding="utf-8", errors="ignore").splitlines())
+        if suffix == ".txt":
+            return bool(path.read_text(encoding="utf-8", errors="ignore").strip())
+    except Exception:
+        return False
+    return False
+
+
+def _command_timeout_configured(c2c: dict[str, Any]) -> bool:
+    small_loop = c2c.get("small_loop") if isinstance(c2c.get("small_loop"), dict) else {}
+    proxy_screen = small_loop.get("proxy_screen") if isinstance(small_loop.get("proxy_screen"), dict) else {}
+    for key in ["command_timeout_seconds", "train_timeout_seconds", "eval_timeout_seconds", "preflight_timeout_seconds"]:
+        try:
+            if int(proxy_screen.get(key) or small_loop.get(key) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
+
+
 def _s0_cache_compatible(project_root: Path, snapshot_path: Path) -> bool:
     bundle = read_json(project_root / "intake" / "c2c" / "static_bundle.json", default={}) or {}
     if not isinstance(bundle, dict) or not bundle:
@@ -631,6 +878,78 @@ def _s0_cache_compatible(project_root: Path, snapshot_path: Path) -> bool:
         if not path.exists() or sha256_file(path) != expected:
             return False
     return True
+
+
+def _expected_audit_stages(
+    project_root: Path,
+    registry: dict[str, Any],
+    run_manifest: dict[str, Any],
+    scope: str,
+    config: dict[str, Any],
+) -> tuple[list[str], list[dict[str, str]]]:
+    del config
+    if scope == "full":
+        return list(AUDIT_STAGE_ORDER), []
+
+    boundaries = run_manifest.get("stage_boundaries") if isinstance(run_manifest, dict) else {}
+    boundaries = boundaries if isinstance(boundaries, dict) else {}
+    completed = {
+        stage
+        for stage, payload in boundaries.items()
+        if isinstance(payload, dict) and payload.get("status") == "completed"
+    }
+    expected: list[str] = []
+    current_stage = str(registry.get("current_stage") or "")
+    current_index = None
+    if scope == "up-to-current":
+        current_index = _audit_stage_index(current_stage, completed)
+        if current_index is None:
+            indexes = [_audit_stage_index(stage, completed) for stage in completed]
+            current_index = max((idx for idx in indexes if idx is not None), default=-1)
+        expected = [stage for idx, stage in enumerate(AUDIT_STAGE_ORDER) if idx <= current_index and stage != "orchestration"]
+    else:
+        expected = [stage for stage in AUDIT_STAGE_ORDER if stage in completed and stage != "orchestration"]
+
+    s2_5_index = AUDIT_STAGE_ORDER.index("S2_5_patch")
+    if scope == "completed" and "S2_plan" in expected:
+        expected.append("S2_5_patch")
+    if scope == "up-to-current" and ((current_index is not None and current_index >= s2_5_index) or "S2_plan" in completed):
+        expected.append("S2_5_patch")
+    if "S3_experiment" in expected and "S2_5_patch" not in expected:
+        expected.append("S2_5_patch")
+    expected = [stage for stage in AUDIT_STAGE_ORDER if stage in set(expected)]
+
+    if _orchestration_required_artifacts_present(project_root):
+        expected.append("orchestration")
+
+    skipped = []
+    expected_set = set(expected)
+    for stage in AUDIT_STAGE_ORDER:
+        if stage in expected_set:
+            continue
+        reason = "not_reached"
+        payload = boundaries.get(stage) if isinstance(boundaries.get(stage), dict) else {}
+        if scope == "completed" and payload and payload.get("status") != "completed":
+            reason = "not_completed"
+        if stage == "orchestration" and not _orchestration_required_artifacts_present(project_root):
+            reason = "not_reached"
+        skipped.append({"stage": stage, "reason": reason})
+    return expected, skipped
+
+
+def _audit_stage_index(current_stage: str, completed: set[str]) -> int | None:
+    if current_stage == "DONE":
+        indexes = [AUDIT_STAGE_ORDER.index(stage) for stage in completed if stage in AUDIT_STAGE_ORDER]
+        return max(indexes) if indexes else None
+    if current_stage == "S2_5_patch":
+        return AUDIT_STAGE_ORDER.index("S2_5_patch")
+    if current_stage in AUDIT_STAGE_ORDER:
+        return AUDIT_STAGE_ORDER.index(current_stage)
+    return None
+
+
+def _orchestration_required_artifacts_present(project_root: Path) -> bool:
+    return any((project_root / rel_path).exists() for rel_path, _schema in STAGE_ARTIFACT_REQUIREMENTS.get("orchestration", []))
 
 
 def _run_manifest_inputs(project_root: Path, config: dict[str, Any], c2c: dict[str, Any]) -> dict[str, Any]:
@@ -688,8 +1007,13 @@ def _manifest_error(project_root: Path, rel_path: str, *, require_hash: bool) ->
     entry = next((item for item in artifacts or [] if isinstance(item, dict) and item.get("path") == rel_path), None)
     if not entry:
         return {"kind": "missing_manifest_entry", "path": rel_path, "manifest": manifest_rel}
-    if require_hash and entry.get("sha256") and sha256_file(project_root / rel_path) != entry.get("sha256"):
-        return {"kind": "hash_mismatch", "path": rel_path, "manifest": manifest_rel, "expected": entry.get("sha256"), "actual": sha256_file(project_root / rel_path)}
+    if require_hash:
+        expected = entry.get("sha256")
+        if not expected:
+            return {"kind": "missing_manifest_hash", "path": rel_path, "manifest": manifest_rel}
+        actual = sha256_file(project_root / rel_path)
+        if actual != expected:
+            return {"kind": "hash_mismatch", "path": rel_path, "manifest": manifest_rel, "expected": expected, "actual": actual}
     return None
 
 
@@ -710,6 +1034,7 @@ def _optional_artifact_checks(project_root: Path, *, require_schema: bool) -> li
         ("experiment/results/c2c_full_s3_worthiness.json", "c2c_full_s3_worthiness.schema.json", "S3_experiment"),
         ("meta/c2c_e2e_readiness_report.json", "c2c_e2e_readiness_report.schema.json", "orchestration"),
         ("meta/c2c_e2e_run_manifest.json", "c2c_e2e_run_manifest.schema.json", "orchestration"),
+        ("meta/c2c_execution_hooks_report.json", "c2c_execution_hooks_report.schema.json", "orchestration"),
         ("meta/c2c_replay_plan.json", "c2c_replay_plan.schema.json", "orchestration"),
         ("meta/c2c_replay_result.json", "c2c_replay_result.schema.json", "orchestration"),
         ("meta/c2c_real_smoke_record.json", "c2c_real_smoke_record.schema.json", "orchestration"),
@@ -876,6 +1201,7 @@ def _smoke_last_stage(registry: dict[str, Any], manifest: dict[str, Any]) -> str
 def _smoke_blocking_reasons(
     registry: dict[str, Any],
     readiness: dict[str, Any],
+    execution_hooks: dict[str, Any],
     audit: dict[str, Any],
     replay: dict[str, Any],
 ) -> list[str]:
@@ -884,6 +1210,8 @@ def _smoke_blocking_reasons(
         reasons.append(str(registry.get("blocked_reason")))
     if isinstance(readiness, dict):
         reasons.extend(_string_list(readiness.get("blocking_reasons")))
+    if isinstance(execution_hooks, dict):
+        reasons.extend(f"execution_hooks:{item}" for item in _string_list(execution_hooks.get("blocking_reasons")))
     if isinstance(audit, dict):
         reasons.extend(_string_list(audit.get("blocking_reasons")))
     if isinstance(replay, dict):

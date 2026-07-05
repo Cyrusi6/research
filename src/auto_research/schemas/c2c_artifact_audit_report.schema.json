@@ -2,15 +2,18 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "C2CArtifactAuditReport",
   "type": "object",
-  "required": ["schema_version", "project_id", "gate", "summary", "by_stage", "blocking_reasons"],
+  "required": ["schema_version", "project_id", "gate", "audit_scope", "expected_stages", "skipped_stages", "summary", "by_stage", "blocking_reasons"],
   "properties": {
     "schema_version": {"type": "string"},
     "created_at": {"type": "string"},
     "project_id": {"type": "string"},
     "gate": {"type": "string", "enum": ["pass", "fail"]},
+    "audit_scope": {"type": "string", "enum": ["completed", "up-to-current", "full"]},
+    "expected_stages": {"type": "array", "items": {"type": "string"}},
+    "skipped_stages": {"type": "array"},
     "summary": {
       "type": "object",
-      "required": ["checked_artifacts", "missing", "schema_failures", "hash_mismatches", "stale_artifacts"]
+      "required": ["checked_artifacts", "missing", "schema_failures", "missing_manifest_hash", "hash_mismatches", "stale_artifacts"]
     },
     "by_stage": {"type": "object"},
     "blocking_reasons": {"type": "array"}
