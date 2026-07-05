@@ -20,7 +20,7 @@ import auto_research.orchestrator as orchestrator_module
 from auto_research.adapters.runner import ExperimentRunner
 from auto_research.agents.debate import MultiAgentReasoningService
 from auto_research.agents.experiment import ExperimentAgent
-from auto_research.agents.intake import IntakeAgent
+from auto_research.agents.intake import IntakeAgent, _c2c_evidence_brief, _c2c_static_bundle_validity
 from auto_research.agents.plan import PlanAgent
 from auto_research.agents.base import AgentContext
 from auto_research.failure_log import build_c2c_feedback_bundle, load_c2c_feedback_bundle
@@ -4794,7 +4794,10 @@ def test_c2c_s0_reuses_cached_static_bundle_and_restores_sidecars(monkeypatch, t
         "repo_manifest": {"files": []},
         "historical_results": {"results": []},
         "baseline": config["c2c"]["baseline"],
-        "repo_card": {"allowed_surface": ["rosetta/model/aligner.py"], "constraints": []},
+        "repo_card": {
+            "editable_surface": {"allowed_files": ["rosetta/model/aligner.py"], "allowed_prefixes": []},
+            "protocol_constraints": ["Keep protocol fixed."],
+        },
         "paper_cards": [{"paper_id": "cached", "title": "Cached Paper", "kind": "ref_paper", "text": "Method text."}],
         "paper_chunks": [paper_chunk],
         "bibliography_cards": [],
@@ -4813,10 +4816,26 @@ def test_c2c_s0_reuses_cached_static_bundle_and_restores_sidecars(monkeypatch, t
         "chunk_index": chunk_index,
         "result_ledger_csv": "id,mean\n",
         "negative_memory": {"blocked_idea_patterns": []},
-        "retrieval_plan": {"primary_questions": []},
-        "followup_bundle": {"cross_source_targets": []},
+        "retrieval_plan": {
+            "questions": [
+                {
+                    "question_id": "mechanism",
+                    "question": "Which code paths implement cache routing?",
+                    "priority_terms": ["cache", "aligner"],
+                }
+            ]
+        },
+        "followup_bundle": {
+            "questions": [
+                {
+                    "question_id": "mechanism",
+                    "cross_source_targets": [{"source_type": "code", "source_path": "rosetta/model/aligner.py"}],
+                }
+            ]
+        },
         "evidence_brief": {"schema_version": "c2c_evidence_brief_v1", "topic": "topic"},
     }
+    bundle["validity"] = _c2c_static_bundle_validity(project_root, config)
     write_json(project_root / "intake" / "c2c" / "static_bundle.json", bundle)
 
     def fail_import(self):
@@ -4836,6 +4855,7 @@ def test_c2c_s0_reuses_cached_static_bundle_and_restores_sidecars(monkeypatch, t
     shared_snapshot = json.loads((project_root / "intake/shared_method_failure_memory.json").read_text(encoding="utf-8"))
     negative_memory = json.loads((project_root / "intake/c2c/negative_result_memory.json").read_text(encoding="utf-8"))
     evidence_brief = json.loads((project_root / "intake/c2c/evidence_brief.json").read_text(encoding="utf-8"))
+    refreshed_bundle = json.loads((project_root / "intake/c2c/static_bundle.json").read_text(encoding="utf-8"))
     assert shared_snapshot["entry_count"] == 1
     assert "old_bad_method" in shared_snapshot["entries"][0]["summary"]["failed_idea_ids"]
     assert shared_snapshot["retrieval_policy"]["mode"] == "quality_weighted_top_k_retrieval"
@@ -4849,12 +4869,121 @@ def test_c2c_s0_reuses_cached_static_bundle_and_restores_sidecars(monkeypatch, t
     assert "dataset_regression" in negative_memory["shared_method_memory"]["quality_summary"]["signal_counts"]
     assert "shared-mmlu-regression" in evidence_brief["shared_method_memory"]["high_quality_memory_ids"]
     assert evidence_brief["shared_method_memory"]["memory_catalog"][0]["memory_id"] == "shared-mmlu-regression"
+    assert refreshed_bundle["shared_method_memory"]["entry_count"] == 1
+    assert refreshed_bundle["negative_memory"]["shared_method_memory"]["entry_count"] == 1
+    assert refreshed_bundle["evidence_brief"]["shared_method_memory"]["entry_count"] == 1
+    assert refreshed_bundle["validity"]["fingerprint"] == _c2c_static_bundle_validity(project_root, config)["fingerprint"]
     assert "Do not repeat old_bad_method" in negative_memory["blocked_idea_patterns"][0]
     manifest = json.loads((project_root / "intake/stage_manifest.json").read_text(encoding="utf-8"))
     artifact_paths = {item["path"] for item in manifest["artifacts"]}
     assert "intake/c2c/static_bundle.json" in artifact_paths
     assert "intake/c2c/chunk_index.jsonl" in artifact_paths
     assert gate_s0(project_root, config).passed is True
+
+
+def test_c2c_s0_rejects_stale_cached_static_bundle(tmp_path: Path) -> None:
+    source_repo = _fake_c2c_repo(tmp_path)
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "snapshot_path": str(source_repo),
+        "env_python": "/usr/bin/python3",
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "allowed_files": ["rosetta/model/aligner.py"],
+    }
+    paths = init_workspace(config, "topic", project_id="proj_c2c_stale_s0", simulate=False)
+    project_root = paths.root
+    code_chunk = {
+        "chunk_id": "code:align",
+        "source_type": "code",
+        "source_path": "rosetta/model/aligner.py",
+        "path": "rosetta/model/aligner.py",
+        "node_type": "function_definition",
+        "symbol": "align",
+        "start_line": 1,
+        "end_line": 2,
+        "edit_surface": "allowed",
+        "text": "def align(): pass\n",
+        "keywords": ["align"],
+        "section": "align",
+        "text_preview": "def align(): pass",
+    }
+    paper_chunk = {"chunk_id": "paper:1", "source_type": "paper", "source_path": "paper.md", "section": "Method", "keywords": ["cache"], "text_preview": "paper", "text": "paper"}
+    rebuttal_chunk = {"chunk_id": "rebuttal:1", "source_type": "rebuttal", "source_path": "rebuttal.md", "section": "Review", "keywords": ["risk"], "text_preview": "risk", "text": "risk"}
+    bundle = {
+        "schema_version": "c2c_static_intake_bundle_v1",
+        "paper_chunks": [paper_chunk],
+        "rebuttal_chunks": [rebuttal_chunk],
+        "code_file_manifest": {"files": [{"path": "rosetta/model/aligner.py"}]},
+        "code_symbols": [{"path": "rosetta/model/aligner.py", "symbol": "align"}],
+        "code_chunks": [code_chunk],
+        "code_edges": [],
+        "code_repo_map": {"counts": {"chunks": 1}},
+        "code_intake_report": {"counts": {"chunks": 1}},
+        "implementation_surface_map": {"surfaces": {"rosetta/model/aligner.py": {}}},
+        "code_retrieval_index": {"default_queries": [{"query": "align"}]},
+        "cache_summary": {},
+        "paper_full_manifest": [],
+        "evidence_brief": {"schema_version": "c2c_evidence_brief_v1"},
+        "baseline": config["c2c"]["baseline"],
+        "repo_card": {"editable_surface": {"allowed_files": ["rosetta/model/aligner.py"], "allowed_prefixes": []}},
+        "paper_cards": [{"paper_id": "p1", "title": "Paper", "kind": "ref_paper", "text": "paper"}],
+        "rebuttal_matrix": {"top_concerns": []},
+        "code_cards": [{"path": "rosetta/model/aligner.py", "summary": "Aligner"}],
+        "negative_memory": {"blocked_idea_patterns": []},
+        "retrieval_plan": {"questions": [{"question_id": "mechanism", "question": "code?", "priority_terms": ["align"]}]},
+        "followup_bundle": {"questions": [{"question_id": "mechanism", "cross_source_targets": [{"source_type": "code", "source_path": "rosetta/model/aligner.py"}]}]},
+        "chunk_index": {"counts": {"paper": 1, "rebuttal": 1, "code": 1, "total": 3}, "entries": [paper_chunk, rebuttal_chunk, code_chunk]},
+        "validity": _c2c_static_bundle_validity(project_root, config),
+    }
+    write_json(project_root / "intake" / "c2c" / "static_bundle.json", bundle)
+
+    context = AgentContext(project_root, config, ArtifactManager(project_root), ModelClient(config, project_root=project_root))
+    assert IntakeAgent(context)._load_reusable_c2c_static_bundle(_c2c_static_bundle_validity(project_root, config)) is not None
+
+    (source_repo / "rosetta/model/aligner.py").write_text("VALUE = 'changed'\n", encoding="utf-8")
+
+    assert IntakeAgent(context)._load_reusable_c2c_static_bundle(_c2c_static_bundle_validity(project_root, config)) is None
+
+
+def test_c2c_evidence_brief_uses_current_repo_and_retrieval_fields() -> None:
+    brief = _c2c_evidence_brief(
+        topic="cache routing",
+        baseline={"name": "base", "mean": 50.0},
+        repo_card={
+            "editable_surface": {"allowed_files": ["rosetta/model/aligner.py"], "allowed_prefixes": ["rosetta/model"]},
+            "protocol_constraints": ["Keep receiver/sharer fixed."],
+        },
+        paper_cards=[{"paper_id": "p1", "title": "Paper", "kind": "ref_paper", "text": "Method text."}],
+        rebuttal_matrix={"top_concerns": ["baseline fairness"], "structured_concerns": [{"concern": "baseline"}]},
+        code_cards=[{"path": "rosetta/model/aligner.py", "summary": "Aligner", "symbols": ["align"]}],
+        negative_memory={"blocked_idea_patterns": ["hard gate"]},
+        retrieval_plan={
+            "questions": [
+                {
+                    "question_id": "mechanism",
+                    "question": "Which code paths implement cache routing?",
+                    "priority_terms": ["cache", "aligner"],
+                }
+            ]
+        },
+        followup_bundle={
+            "questions": [
+                {
+                    "question_id": "mechanism",
+                    "cross_source_targets": [
+                        {"source_type": "paper", "source_path": "paper.md"},
+                        {"source_type": "code", "source_path": "rosetta/model/aligner.py"},
+                    ],
+                }
+            ]
+        },
+    )
+
+    assert brief["repo_summary"]["editable_surface"]["allowed_files"] == ["rosetta/model/aligner.py"]
+    assert brief["repo_summary"]["protocol_constraints"] == ["Keep receiver/sharer fixed."]
+    assert brief["retrieval_targets"]["questions"][0]["question_id"] == "mechanism"
+    assert {item["source_type"] for item in brief["retrieval_targets"]["cross_source_targets"]} == {"paper", "code"}
 
 
 def test_c2c_s0_semantic_enrichment_missing_key_fails_open(monkeypatch, tmp_path: Path) -> None:

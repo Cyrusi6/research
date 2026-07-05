@@ -1,5 +1,14 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-05 C2C S0 Cache Validity And Evidence Brief Hardening
+
+- Added a validity fingerprint to C2C S0 `static_bundle.json` covering reference inputs, editable repo surface, allowed edit policy, baseline/datasets, PDF ingest config, and semantic enrichment config.
+- S0 cached bundle reuse now rejects stale bundles when the current input/config fingerprint differs from the saved bundle fingerprint.
+- Cached S0 reuse now refreshes and rewrites `static_bundle.json` after merging shared method failure memory, so S1 reads the same updated context as the sidecar artifacts.
+- Rebuilt C2C `evidence_brief` on cache reuse and fixed field mapping to preserve `editable_surface`, `protocol_constraints`, retrieval `questions`, and nested follow-up `cross_source_targets`.
+- Strengthened the S0 gate so `evidence_brief.json` must contain compact repo surface and retrieval-target context, not just exist.
+- Added regression coverage for stale cache rejection, shared-memory writeback into cached bundles, and current evidence brief field mapping.
+
 ## 2026-07-04 C2C S0 Semantic Enrichment Index Rebuild
 
 - Fixed S0 C2C semantic enrichment ordering: enriched `code_chunks` now rebuild `implementation_surface_map` and `code_retrieval_index` before artifacts/static bundle are written.

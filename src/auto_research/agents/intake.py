@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+from pathlib import Path
 from typing import Any
 
 from ..c2c import C2CAdapter, is_c2c_project
 from ..code_intake import rebuild_code_intake_indexes
 from ..method_memory import load_shared_method_memory, shared_method_memory_query_context
 from ..s0_enrichment import DeepSeekS0SemanticEnricher, S0SemanticEnrichmentError, semantic_enrichment_enabled
-from ..utils import read_json
+from ..utils import read_json, sha256_file
 from .base import AgentContext
 
 
@@ -44,7 +46,8 @@ class IntakeAgent:
             (self.context.config.get("intake", {}) or {}).get("force_refresh")
             or (self.context.config.get("c2c", {}) or {}).get("s0_force_refresh")
         )
-        cached = None if force_refresh else self._load_reusable_c2c_static_bundle()
+        expected_validity = _c2c_static_bundle_validity(self.context.project_root, self.context.config)
+        cached = None if force_refresh else self._load_reusable_c2c_static_bundle(expected_validity)
         if cached:
             shared_memory = load_shared_method_memory(
                 self.context.config,
@@ -57,8 +60,36 @@ class IntakeAgent:
             )
             _merge_shared_method_memory_into_negative_memory(cached.setdefault("negative_memory", {}), shared_memory)
             cached["shared_method_memory"] = shared_memory
-            cached["evidence_brief"] = _evidence_brief_with_shared_method_memory(cached.get("evidence_brief") or {}, shared_memory)
-            records = self._register_or_restore_cached_c2c_artifacts(cached)
+            cached["evidence_brief"] = _evidence_brief_with_shared_method_memory(
+                _c2c_evidence_brief(
+                    topic=topic,
+                    baseline=cached.get("baseline") if isinstance(cached.get("baseline"), dict) else {},
+                    repo_card=cached.get("repo_card") if isinstance(cached.get("repo_card"), dict) else {},
+                    paper_cards=cached.get("paper_cards") if isinstance(cached.get("paper_cards"), list) else [],
+                    rebuttal_matrix=cached.get("rebuttal_matrix") if isinstance(cached.get("rebuttal_matrix"), dict) else {},
+                    code_cards=cached.get("code_cards") if isinstance(cached.get("code_cards"), list) else [],
+                    negative_memory=cached.get("negative_memory") if isinstance(cached.get("negative_memory"), dict) else {},
+                    retrieval_plan=cached.get("retrieval_plan") if isinstance(cached.get("retrieval_plan"), dict) else {},
+                    followup_bundle=cached.get("followup_bundle") if isinstance(cached.get("followup_bundle"), dict) else {},
+                ),
+                shared_memory,
+            )
+            cached["validity"] = expected_validity
+            static_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "c2c/static_bundle.json",
+                cached,
+                artifact_type="c2c_static_bundle",
+                summary="Reused C2C static bundle refreshed with shared method memory",
+                source_paths=[shared_memory.get("path")] if shared_memory.get("path") else [],
+                metadata={"cache_status": "reused_refreshed", "validity_fingerprint": expected_validity.get("fingerprint")},
+            )
+            records = [static_record]
+            records.extend(
+                record
+                for record in self._register_or_restore_cached_c2c_artifacts(cached)
+                if record.get("path") != static_record["path"]
+            )
             records.append(
                 self.context.artifacts.write_json(
                     self.stage_key,
@@ -259,6 +290,7 @@ class IntakeAgent:
             "retrieval_plan": retrieval_plan,
             "followup_bundle": followup_bundle,
             "evidence_brief": evidence_brief,
+            "validity": expected_validity,
         }
         records = []
         records.append(self.context.artifacts.write_json(self.stage_key, "papers/metadata.json", metadata, artifact_type="metadata", summary="C2C configured reference materials"))
@@ -297,7 +329,7 @@ class IntakeAgent:
         records.append(self.context.artifacts.write_json(self.stage_key, "c2c/evidence_brief.json", evidence_brief, artifact_type="c2c_evidence_brief", summary="Compact static evidence brief for S1 direction selection"))
         return {"artifacts": [record["path"] for record in records], "status": "ok", "static_bundle": static_bundle}
 
-    def _load_reusable_c2c_static_bundle(self) -> dict[str, Any] | None:
+    def _load_reusable_c2c_static_bundle(self, expected_validity: dict[str, Any] | None = None) -> dict[str, Any] | None:
         bundle_path = self.context.project_root / "intake" / "c2c" / "static_bundle.json"
         if not bundle_path.exists():
             return None
@@ -305,6 +337,9 @@ class IntakeAgent:
         if not isinstance(bundle, dict):
             return None
         if bundle.get("schema_version") != "c2c_static_intake_bundle_v1":
+            return None
+        validity = bundle.get("validity") if isinstance(bundle.get("validity"), dict) else {}
+        if expected_validity and validity.get("fingerprint") != expected_validity.get("fingerprint"):
             return None
         chunk_index = bundle.get("chunk_index")
         if not _valid_chunk_index(chunk_index):
@@ -323,6 +358,14 @@ class IntakeAgent:
             "cache_summary",
             "paper_full_manifest",
             "evidence_brief",
+            "baseline",
+            "repo_card",
+            "paper_cards",
+            "rebuttal_matrix",
+            "code_cards",
+            "negative_memory",
+            "retrieval_plan",
+            "followup_bundle",
         ]:
             if key not in bundle:
                 return None
@@ -572,6 +615,133 @@ def _code_intake_report_markdown_from_cached(report: Any) -> str:
     return "\n".join(lines).rstrip() + "\n"
 
 
+def _c2c_static_bundle_validity(project_root: Path, config: dict[str, Any]) -> dict[str, Any]:
+    raw_c2c_cfg = config.get("c2c", {}) if isinstance(config.get("c2c"), dict) else {}
+    intake_cfg = config.get("intake", {}) if isinstance(config.get("intake"), dict) else {}
+    adapter = C2CAdapter(project_root, {**config, "c2c": raw_c2c_cfg})
+    allowed_files = sorted(str(item).strip("/") for item in adapter.allowed_files if item)
+    allowed_prefixes = sorted(str(item).strip("/") for item in adapter.allowed_prefixes if item)
+    payload = {
+        "schema_version": "c2c_static_bundle_validity_v1",
+        "ref_paper": _path_fingerprint(_resolve_config_path(project_root, raw_c2c_cfg.get("ref_paper"))),
+        "ref_rebuttal": _path_fingerprint(_resolve_config_path(project_root, raw_c2c_cfg.get("ref_rebuttal"))),
+        "repo_edit_surface": _c2c_repo_edit_surface_fingerprint(adapter.repo_root, allowed_files, allowed_prefixes),
+        "allowed_files": allowed_files,
+        "allowed_prefixes": allowed_prefixes,
+        "baseline": adapter.baseline,
+        "datasets": raw_c2c_cfg.get("datasets") or [],
+        "pdf_ingest_hash": _stable_hash(adapter.pdf_ingest_config),
+        "semantic_enrichment_hash": _stable_hash((intake_cfg.get("semantic_enrichment") or {}) if isinstance(intake_cfg, dict) else {}),
+    }
+    payload["fingerprint"] = _stable_hash(payload)
+    return payload
+
+
+def _resolve_config_path(project_root: Path, value: Any) -> Path | None:
+    if not value:
+        return None
+    path = Path(str(value)).expanduser()
+    if path.is_absolute():
+        return path
+    return project_root / path
+
+
+def _c2c_repo_edit_surface_fingerprint(snapshot: Path, allowed_files: list[str], allowed_prefixes: list[str]) -> dict[str, Any]:
+    if not snapshot.exists():
+        return {"status": "missing", "path": str(snapshot)}
+    paths: list[Path] = []
+    for rel in allowed_files:
+        if not rel:
+            continue
+        paths.append(snapshot / str(rel).strip("/"))
+    for prefix in allowed_prefixes:
+        if not prefix:
+            continue
+        root = snapshot / str(prefix).strip("/")
+        if root.exists():
+            paths.extend(child for child in root.rglob("*") if child.is_file())
+    if not paths:
+        for rel in [
+            "rosetta/model/aligner.py",
+            "rosetta/model/projector.py",
+            "rosetta/model/wrapper.py",
+            "script/train/SFT_train.py",
+            "script/evaluation/unified_evaluator.py",
+            "recipe/train_recipe/C2C_0.6+0.5.json",
+            "recipe/eval_recipe/unified_eval.yaml",
+        ]:
+            paths.append(snapshot / rel)
+    return _file_collection_fingerprint(snapshot, paths)
+
+
+def _path_fingerprint(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {"status": "not_configured"}
+    if not path.exists():
+        return {"status": "missing", "path": str(path)}
+    if path.is_file():
+        return {
+            "status": "file",
+            "path": str(path),
+            "size_bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
+    files = [
+        child
+        for child in path.rglob("*")
+        if child.is_file() and child.suffix.lower() in {".pdf", ".md", ".txt", ".json", ".yaml", ".yml"}
+    ]
+    return _file_collection_fingerprint(path, files)
+
+
+def _file_collection_fingerprint(root: Path, files: list[Path]) -> dict[str, Any]:
+    seen: dict[str, Path] = {}
+    for path in files:
+        try:
+            rel = path.relative_to(root).as_posix()
+        except ValueError:
+            rel = str(path)
+        if _skip_fingerprint_path(rel):
+            continue
+        seen[rel] = path
+    records = []
+    for rel, path in sorted(seen.items()):
+        if not path.exists() or not path.is_file():
+            records.append({"path": rel, "exists": False})
+            continue
+        records.append({"path": rel, "exists": True, "size_bytes": path.stat().st_size, "sha256": sha256_file(path)})
+    return {
+        "status": "directory" if root.is_dir() else "collection",
+        "path": str(root),
+        "file_count": len(records),
+        "hash": _stable_hash(records),
+        "files": records[:200],
+    }
+
+
+def _skip_fingerprint_path(rel_path: str) -> bool:
+    normalized = rel_path.replace("\\", "/").strip("/")
+    excluded_prefixes = (
+        ".git/",
+        "wandb/",
+        "__pycache__/",
+        ".pytest_cache/",
+        "local/checkpoints/",
+        "local/snapshots/",
+        "local/final_results/",
+        "data/",
+        "datasets/",
+        "models/",
+    )
+    excluded_suffixes = (".pt", ".pth", ".safetensors", ".bin", ".ckpt", ".parquet", ".arrow")
+    return normalized.startswith(excluded_prefixes) or normalized.endswith(excluded_suffixes)
+
+
+def _stable_hash(value: Any) -> str:
+    text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _c2c_evidence_brief(
     *,
     topic: str,
@@ -584,14 +754,31 @@ def _c2c_evidence_brief(
     retrieval_plan: dict[str, Any],
     followup_bundle: dict[str, Any],
 ) -> dict[str, Any]:
+    editable_surface = repo_card.get("editable_surface") or {
+        "allowed_files": repo_card.get("allowed_files") or repo_card.get("allowed_surface") or [],
+        "allowed_prefixes": repo_card.get("allowed_prefixes") or [],
+    }
+    protocol_constraints = repo_card.get("protocol_constraints") or repo_card.get("constraints") or []
+    retrieval_questions = [
+        {
+            "question_id": item.get("question_id"),
+            "question": item.get("question"),
+            "priority_terms": (item.get("priority_terms") or [])[:12],
+        }
+        for item in (retrieval_plan.get("questions") or retrieval_plan.get("primary_questions") or [])[:8]
+        if isinstance(item, dict)
+    ]
+    cross_source_targets = _followup_cross_source_targets(followup_bundle)
     return {
         "schema_version": "c2c_evidence_brief_v1",
         "topic": topic,
         "baseline_to_beat": baseline,
         "repo_summary": {
-            "allowed_surface": repo_card.get("allowed_surface") or repo_card.get("allowed_files") or [],
+            "editable_surface": editable_surface,
+            "allowed_surface": editable_surface,
             "baseline_surface": repo_card.get("baseline_surface") or {},
-            "constraints": repo_card.get("constraints") or [],
+            "protocol_constraints": protocol_constraints,
+            "constraints": protocol_constraints,
         },
         "paper_brief": [
             {"paper_id": card.get("paper_id"), "title": card.get("title"), "kind": card.get("kind"), "snippet": (card.get("text") or "")[:900]}
@@ -607,8 +794,9 @@ def _c2c_evidence_brief(
         ],
         "negative_memory": negative_memory,
         "retrieval_targets": {
-            "primary_questions": (retrieval_plan.get("primary_questions") or [])[:8],
-            "cross_source_targets": (followup_bundle.get("cross_source_targets") or [])[:8],
+            "questions": retrieval_questions,
+            "primary_questions": retrieval_questions,
+            "cross_source_targets": cross_source_targets[:12],
         },
         "static_rules": [
             "Use S0 evidence as stable context; do not re-import papers, rebuttals, or repo cards in S1.",
@@ -616,6 +804,26 @@ def _c2c_evidence_brief(
             "Avoid pure threshold/top-k/fallback tuning and evaluator changes.",
         ],
     }
+
+
+def _followup_cross_source_targets(followup_bundle: dict[str, Any]) -> list[dict[str, Any]]:
+    direct = followup_bundle.get("cross_source_targets") if isinstance(followup_bundle, dict) else []
+    if isinstance(direct, list) and direct:
+        return [item for item in direct if isinstance(item, dict)]
+    targets: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for question in followup_bundle.get("questions") or []:
+        if not isinstance(question, dict):
+            continue
+        for item in question.get("cross_source_targets") or []:
+            if not isinstance(item, dict):
+                continue
+            key = json.dumps(item, ensure_ascii=False, sort_keys=True, default=str)
+            if key in seen:
+                continue
+            seen.add(key)
+            targets.append(item)
+    return targets
 
 
 def _c2c_cache_summary(paper_full_manifest: list[dict[str, Any]], code_intake_report: dict[str, Any], *, pdf_ingest_config: dict[str, Any] | None = None) -> dict[str, Any]:

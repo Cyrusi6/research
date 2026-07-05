@@ -93,8 +93,43 @@ class S0GateValidator(StageGateValidator):
         if isinstance(bundle, dict):
             self._validate_paper_full_manifest(bundle)
             self._validate_code_intake(bundle)
+            self._validate_evidence_brief(bundle)
 
         return self.finalize(default_reason="S0 static intake passed")
+
+    def _validate_evidence_brief(self, bundle: dict) -> None:
+        brief = bundle.get("evidence_brief") if isinstance(bundle.get("evidence_brief"), dict) else {}
+        if not brief:
+            self.retry_check("c2c_evidence_brief_nonempty", "S0 evidence_brief is empty", artifact="intake/c2c/evidence_brief.json")
+            return
+        repo_summary = brief.get("repo_summary") if isinstance(brief.get("repo_summary"), dict) else {}
+        editable_surface = repo_summary.get("editable_surface") or repo_summary.get("allowed_surface")
+        constraints = repo_summary.get("protocol_constraints") or repo_summary.get("constraints")
+        retrieval_targets = brief.get("retrieval_targets") if isinstance(brief.get("retrieval_targets"), dict) else {}
+        questions = retrieval_targets.get("questions") or retrieval_targets.get("primary_questions")
+        cross_source_targets = retrieval_targets.get("cross_source_targets")
+        missing = []
+        if not editable_surface:
+            missing.append("repo_summary.editable_surface")
+        if not constraints:
+            missing.append("repo_summary.protocol_constraints")
+        if not questions:
+            missing.append("retrieval_targets.questions")
+        if not cross_source_targets:
+            missing.append("retrieval_targets.cross_source_targets")
+        if missing:
+            self.retry_check(
+                "c2c_evidence_brief_content",
+                "S0 evidence_brief is missing compact S1 context fields",
+                artifact="intake/c2c/evidence_brief.json",
+                details={"missing": missing},
+            )
+        else:
+            self.pass_check(
+                "c2c_evidence_brief_content",
+                artifact="intake/c2c/evidence_brief.json",
+                details={"question_count": len(questions), "cross_source_target_count": len(cross_source_targets)},
+            )
 
     def _validate_paper_full_manifest(self, bundle: dict) -> None:
         cards = ((bundle.get("reference_result") or {}).get("cards") or [])
