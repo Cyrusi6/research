@@ -48,9 +48,9 @@ from auto_research.mineru import MinerUError, MinerUPdfClient
 from auto_research.code_intake import retrieve_code_chunks
 from auto_research.s0_enrichment import DeepSeekS0SemanticEnricher, S0SemanticEnrichmentError
 from auto_research.orchestrator import Orchestrator
-from auto_research.utils import sha256_file, write_json
+from auto_research.utils import sha256_file, write_json, write_yaml
 from auto_research.workspace import init_workspace
-from auto_research.cli import _run_c2c_command
+from auto_research.cli import _run_c2c_command, _smoke_c2c_command
 
 
 def _torch_available() -> bool:
@@ -890,6 +890,164 @@ def test_run_c2c_command_prepares_three_iteration_project_with_s0_cache(monkeypa
     assert result["s0_cache"]["status"] == "restored"
     assert result["s0_cache"]["sidecars"]["copied_count"] == 1
     assert (new_root / "references/c2c/ref_paper/demo/paper_full.md").exists()
+
+
+def test_smoke_c2c_command_stops_on_readiness_failure(monkeypatch, tmp_path: Path) -> None:
+    project = tmp_path / "workspace" / "proj_smoke_fail"
+    _write_smoke_registry(project, current_stage="S0_intake", status="initialized")
+    write_yaml(project / "meta" / "project_config.yaml", {"c2c": {"enabled": True}, "experiment": {"simulate": False}})
+    monkeypatch.setattr(cli_module, "load_project_config", lambda project_root: {"c2c": {"enabled": True}, "experiment": {"simulate": False}})
+
+    class FakeOrchestrator:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def _project_root(self, project_id: str) -> Path:
+            assert project_id == "proj_smoke_fail"
+            return project
+
+        def doctor_c2c(self, project_id: str) -> dict:
+            self.calls.append("doctor-c2c")
+            readiness = _smoke_readiness(project, gate="fail", blocking=["env_python_executable"])
+            write_json(project / "meta" / "c2c_e2e_readiness_report.json", readiness)
+            write_json(project / "meta" / "c2c_runtime_health_report.json", {"project_id": project.name})
+            return {"status": "fail", "readiness_report": readiness}
+
+    def unexpected_run(*args, **kwargs):
+        raise AssertionError("smoke-c2c must not start run-c2c when readiness fails")
+
+    monkeypatch.setattr(cli_module, "_run_c2c_command", unexpected_run)
+    result = _smoke_c2c_command(SimpleNamespace(project_id="proj_smoke_fail", from_stage="S3_experiment"), FakeOrchestrator())
+
+    assert result["status"] == "readiness_failed"
+    assert result["steps"] == [{"name": "doctor-c2c", "status": "fail"}]
+    record = json.loads((project / "meta/c2c_real_smoke_record.json").read_text(encoding="utf-8"))
+    assert record["readiness_gate"] == "fail"
+    assert "env_python_executable" in record["blocking_reasons"]
+
+
+def test_smoke_c2c_command_runs_real_smoke_sequence(monkeypatch, tmp_path: Path) -> None:
+    project = tmp_path / "workspace" / "proj_smoke"
+    _write_smoke_registry(project, current_stage="S3_experiment", status="completed")
+    write_yaml(project / "meta" / "project_config.yaml", {"c2c": {"enabled": True}, "experiment": {"simulate": False}})
+    monkeypatch.setattr(cli_module, "load_project_config", lambda project_root: {"c2c": {"enabled": True}, "experiment": {"simulate": False}})
+    run_args_seen: dict[str, object] = {}
+
+    class FakeOrchestrator:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def _project_root(self, project_id: str) -> Path:
+            assert project_id == "proj_smoke"
+            return project
+
+        def doctor_c2c(self, project_id: str) -> dict:
+            self.calls.append("doctor-c2c")
+            readiness = _smoke_readiness(project, gate="pass", blocking=[])
+            write_json(project / "meta" / "c2c_e2e_readiness_report.json", readiness)
+            return {"status": "pass", "readiness_report": readiness}
+
+        def audit_c2c(self, project_id: str) -> dict:
+            self.calls.append("audit-c2c")
+            audit = _smoke_audit(project, gate="pass")
+            write_json(project / "meta" / "c2c_artifact_audit_report.json", audit)
+            return {"status": "pass", "artifact_audit_report": audit}
+
+        def replay_c2c(self, project_id: str, *, from_stage: str = "S3_experiment") -> dict:
+            self.calls.append(f"replay-c2c:{from_stage}")
+            replay = _smoke_replay(project, status="match")
+            write_json(project / "meta" / "c2c_replay_result.json", replay)
+            return {"status": "match", "replay_result": replay}
+
+        def report(self, project_id: str) -> dict:
+            self.calls.append("report")
+            return {"project_id": project_id, "e2e": {"real_smoke_record": {"last_stage": "S3_experiment"}}}
+
+    orchestrator = FakeOrchestrator()
+
+    def fake_run_c2c(args, _orchestrator):
+        run_args_seen.update(vars(args))
+        write_json(project / "meta" / "c2c_e2e_run_manifest.json", _smoke_manifest(project, final_status="completed"))
+        return {"status": "completed", "project_id": args.project_id, "run_overrides": {"max_iterations": args.max_iterations}}
+
+    monkeypatch.setattr(cli_module, "_run_c2c_command", fake_run_c2c)
+
+    parsed = cli_module.build_parser().parse_args(["smoke-c2c", "--project-id", "proj_smoke"])
+    assert parsed.command == "smoke-c2c"
+    result = _smoke_c2c_command(SimpleNamespace(project_id="proj_smoke", from_stage="S3_experiment"), orchestrator)
+
+    assert result["status"] == "passed"
+    assert [step["name"] for step in result["steps"]] == ["doctor-c2c", "run-c2c", "audit-c2c", "replay-c2c", "report --json"]
+    assert orchestrator.calls == ["doctor-c2c", "audit-c2c", "replay-c2c:S3_experiment", "report"]
+    assert run_args_seen["max_iterations"] == 1
+    assert run_args_seen["stop_after_stage"] == "S3_experiment"
+    assert run_args_seen["simulate"] is False
+    assert run_args_seen["hitl"] is False
+    record = json.loads((project / "meta/c2c_real_smoke_record.json").read_text(encoding="utf-8"))
+    assert record["readiness_gate"] == "pass"
+    assert record["run_manifest_final_status"] == "completed"
+    assert record["artifact_audit_gate"] == "pass"
+    assert record["replay_status"] == "match"
+
+
+def _write_smoke_registry(project: Path, *, current_stage: str, status: str) -> None:
+    write_yaml(
+        project / "meta" / "registry.yaml",
+        {
+            "project_id": project.name,
+            "research_topic": "c2c smoke",
+            "current_stage": current_stage,
+            "iteration": 1,
+            "status": status,
+            "stages": {},
+        },
+    )
+
+
+def _smoke_readiness(project: Path, *, gate: str, blocking: list[str]) -> dict:
+    return {
+        "schema_version": "c2c_e2e_readiness_report_v1",
+        "project_id": project.name,
+        "mode": "real",
+        "gate": gate,
+        "checks": {"env_python_executable": gate != "fail"},
+        "warnings": [],
+        "blocking_reasons": blocking,
+        "recommended_action": "run_c2c" if gate != "fail" else "fix_environment",
+    }
+
+
+def _smoke_manifest(project: Path, *, final_status: str) -> dict:
+    return {
+        "schema_version": "c2c_e2e_run_manifest_v1",
+        "project_id": project.name,
+        "mode": "real",
+        "command": {"name": "smoke-c2c"},
+        "stage_boundaries": {"S3_experiment": {"status": final_status}},
+        "final_status": final_status,
+    }
+
+
+def _smoke_audit(project: Path, *, gate: str) -> dict:
+    return {
+        "schema_version": "c2c_artifact_audit_report_v1",
+        "project_id": project.name,
+        "gate": gate,
+        "summary": {"checked_artifacts": 1, "missing": 0, "schema_failures": 0, "hash_mismatches": 0, "stale_artifacts": 0},
+        "by_stage": {},
+        "blocking_reasons": [],
+    }
+
+
+def _smoke_replay(project: Path, *, status: str) -> dict:
+    return {
+        "schema_version": "c2c_replay_result_v1",
+        "project_id": project.name,
+        "status": status,
+        "replayed_decisions": {},
+        "expected_decisions": {},
+        "mismatches": [],
+    }
 
 
 def test_c2c_importers_parse_refs_and_historical_results(tmp_path: Path) -> None:

@@ -1,5 +1,12 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-05 C2C Real Smoke CLI Entry
+
+- Added `auto-research smoke-c2c --project-id <id>` as a one-command real C2C smoke regression entrypoint.
+- The command now runs the stable sequence `doctor-c2c -> run-c2c(max_iterations=1, stop_after_stage=S3_experiment) -> audit-c2c -> replay-c2c -> report --json` and rewrites `meta/c2c_real_smoke_record.json` at the end.
+- Readiness `fail` now short-circuits before the real run and still writes the final smoke record for debugging.
+- Added CLI regression coverage for the readiness-fail short circuit, smoke sequence order, fixed real-smoke run overrides, parser registration, and final record writeback.
+
 ## 2026-07-05 C2C S0 Cache Validity And Evidence Brief Hardening
 
 - Added a validity fingerprint to C2C S0 `static_bundle.json` covering reference inputs, editable repo surface, allowed edit policy, baseline/datasets, PDF ingest config, and semantic enrichment config.
