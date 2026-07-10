@@ -406,7 +406,22 @@ def retrieve_s1_c2c_requested_evidence(
     code_neighborhood_max = int(retriever_cfg.get("code_neighborhood_max_per_request", 2) or 2)
     for request in plan["evidence_requests"]:
         scored = [_score_candidate(request, candidate, implementation_surface_map or {}) for candidate in candidates]
-        scored = [item for item in scored if item["score"] >= min_score and _request_source_matches(request, item["candidate"])]
+        source_only = [
+            item
+            for item in scored
+            if _request_source_matches(request, item["candidate"]) and not item.get("relevance_match")
+        ]
+        rejected_top_candidates.extend(
+            _trace_candidate(request, item["candidate"], item, reason="source_only_match")
+            for item in sorted(source_only, key=lambda value: -float(value.get("score") or 0.0))[:5]
+        )
+        scored = [
+            item
+            for item in scored
+            if item["score"] >= min_score
+            and _request_source_matches(request, item["candidate"])
+            and item.get("relevance_match")
+        ]
         scored.sort(key=lambda item: (-item["score"], item["candidate"]["source_type"], item["candidate"]["locator"]))
         request_selected = []
         for score_item in scored:
@@ -783,7 +798,7 @@ def _score_candidate(request: dict[str, Any], candidate: dict[str, Any], impleme
     candidate_tokens = _tokens(candidate.get("text") or "") | set(_tokens(" ".join(candidate.get("keywords") or []))) | _tokens(candidate.get("locator") or "")
     keyword_overlap = len(keyword_tokens & candidate_tokens)
     query_token_score = len(query_tokens & candidate_tokens)
-    source_type_match = 2.0 if _request_source_matches(request, candidate) else -10.0
+    source_type_match = 0.0 if _request_source_matches(request, candidate) else -10.0
     implementation_surface_boost = 0.0
     if candidate.get("source_type") == "code":
         surface_status = _candidate_surface_status(candidate, implementation_surface_map)
@@ -795,10 +810,12 @@ def _score_candidate(request: dict[str, Any], candidate: dict[str, Any], impleme
             implementation_surface_boost -= 1.0
     counterevidence_boost = 1.0 if request.get("purpose") == "counterevidence" and candidate.get("source_type") in {"rebuttal", "failure_memory", "feedback"} else 0.0
     recent_failure_boost = 0.8 if candidate.get("source_type") in {"failure_memory", "feedback"} else 0.0
+    relevance_match = keyword_overlap > 0 or query_token_score > 0
     score = source_type_match + keyword_overlap * 1.2 + query_token_score * 0.4 + implementation_surface_boost + counterevidence_boost + recent_failure_boost
     return {
         "candidate": candidate,
         "score": score,
+        "relevance_match": relevance_match,
         "components": {
             "keyword_overlap": keyword_overlap,
             "query_token_score": query_token_score,

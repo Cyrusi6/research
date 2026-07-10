@@ -193,6 +193,9 @@ code_patch:
     exclude_extensions: [".pt", ".pth", ".safetensors", ".bin", ".ckpt", ".parquet", ".arrow"]
 
 ideation:
+  contract_quality:
+    reject_placeholder_evidence: true
+    require_novelty_audit: true
   challenge_target_rsum: 507.0
   max_regeneration_rounds: 3
   debate:

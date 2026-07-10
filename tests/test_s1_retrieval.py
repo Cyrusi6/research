@@ -133,6 +133,39 @@ def test_deterministic_retriever_prefers_allowed_code_surface_over_docs() -> Non
     assert trace["coverage"]["code"] == 2
 
 
+def test_must_resolve_rejects_same_source_zero_overlap_candidate() -> None:
+    plan = default_c2c_evidence_request_plan(topic="cache")
+    plan["evidence_requests"] = [
+        {
+            "request_id": "paper_router",
+            "source_type": "paper",
+            "query": "utility conditioned cache router",
+            "keywords": ["utility", "router"],
+            "purpose": "support",
+            "top_k": 1,
+            "filters": {},
+            "must_resolve": True,
+        }
+    ]
+    unrelated = {
+        "chunk_id": "paper:unrelated",
+        "source_type": "paper",
+        "source_path": "intake/c2c/paper_chunks.jsonl",
+        "text": "vision transformer image augmentation benchmark",
+        "keywords": ["vision", "augmentation"],
+    }
+
+    bundle, trace = retrieve_s1_c2c_requested_evidence(
+        plan,
+        chunk_index={"entries": [unrelated]},
+        paper_chunks=[unrelated],
+    )
+
+    assert bundle["items"] == []
+    assert trace["unfilled_must_resolve_requests"][0]["request_id"] == "paper_router"
+    assert any(item["reason"] == "source_only_match" for item in trace["rejected_top_candidates"])
+
+
 def test_deterministic_retriever_expands_code_neighborhood_from_edges() -> None:
     plan = default_c2c_evidence_request_plan(topic="cache")
     plan["evidence_requests"] = [

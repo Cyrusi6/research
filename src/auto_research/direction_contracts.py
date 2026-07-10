@@ -14,7 +14,7 @@ DIRECTION_SCHEMA_VERSION = "auto_research_direction_v1"
 DIRECTION_SCORECARD_SCHEMA_VERSION = "auto_research_direction_scorecard_v1"
 NOVELTY_AUDIT_SCHEMA_VERSION = "auto_research_novelty_audit_v1"
 PLANNER_DECISION_SCHEMA_VERSION = "auto_research_planner_decision_v1"
-VARIANT_CONTRACT_SCHEMA_VERSION = "auto_research_variant_contract_v1"
+VARIANT_CONTRACT_SCHEMA_VERSION = "auto_research_variant_contract_v2"
 VARIANT_FINGERPRINT_SCHEMA_VERSION = "auto_research_variant_fingerprint_v1"
 C2C_S1_EVIDENCE_QUALITY_SCHEMA_VERSION = "c2c_s1_evidence_quality_v1"
 C2C_S1_EVIDENCE_RETRIEVAL_TRACE_SCHEMA_VERSION = "c2c_s1_evidence_retrieval_trace_v1"
@@ -155,9 +155,9 @@ def build_direction_contract(
         "hypothesis": hypothesis,
         "why_baseline_fails": why_baseline_fails,
         "expected_metric_signature": expected_metric_signature,
-        "required_evidence_refs": required_refs or [{"source_type": "artifact", "source_label": "evidence_bundle", "claim": "S1 evidence bundle supports this direction."}],
-        "counterevidence_refs": counter_refs or [{"source_type": "artifact", "source_label": "risk", "claim": "S2 must verify the direction under baseline-comparable controls."}],
-        "implementation_surface_refs": implementation_refs or [{"source_type": "artifact", "source_label": "S2", "claim": "S2 must identify the concrete implementation surface."}],
+        "required_evidence_refs": required_refs or [_placeholder_ref("required_evidence", "S1 evidence is missing for this direction.")],
+        "counterevidence_refs": counter_refs or [_placeholder_ref("counterevidence", "Counterevidence is missing for this direction.")],
+        "implementation_surface_refs": implementation_refs or [_placeholder_ref("implementation_surface", "The concrete implementation surface is missing.")],
         "known_negative_memory_refs": _known_negative_refs(direction, decision, selected, negative_constraints, refs),
         "go_to_s2_conditions": _as_list(direction.get("go_to_s2_conditions")) or _as_list(decision.get("go_to_s2_conditions")) or [
             "required evidence refs resolve",
@@ -309,7 +309,7 @@ def build_s1_evidence_quality_score(
             coverage_contributors["failure_memory"].append({"ref": key})
 
     support_coverage = {bucket: len(keys) for bucket, keys in coverage_keys.items()}
-    counter_refs = _counter_refs(direction=direction, payload=payload, evidence_bundle=evidence_bundle)
+    counter_refs = [item for item in _counter_refs(direction=direction, payload=payload, evidence_bundle=evidence_bundle) if not (isinstance(item, dict) and item.get("placeholder") is True)]
     resolved_counter_keys = {
         _ref_identity(entry)
         for entry in resolved_refs
@@ -341,8 +341,8 @@ def build_s1_evidence_quality_score(
         failed_rules.append("support_coverage.paper")
     if support_coverage["code"] < thresholds["support_coverage.code"]:
         failed_rules.append("support_coverage.code")
-    if counterevidence["count"] < thresholds["counterevidence.count"]:
-        failed_rules.append("counterevidence.count")
+    if counterevidence["resolved_count"] < thresholds["counterevidence.count"]:
+        failed_rules.append("counterevidence.resolved_count")
     if surface_coverage < thresholds["implementation_surface_coverage"]:
         failed_rules.append("implementation_surface_coverage")
     if novelty_score < thresholds["novelty_score"]:
@@ -431,19 +431,26 @@ def normalize_novelty_audit(value: dict[str, Any] | list[Any] | None, *, directi
     latest = next((item for item in reversed(audits) if isinstance(item, dict)), {})
     if not latest and isinstance(value, dict):
         latest = value
-    passed = latest.get("passed")
-    if passed is None:
-        passed = True
-    status = str(latest.get("status") or ("ok" if latest else "skipped"))
+    enabled = bool(latest.get("enabled", bool(latest)))
+    passed = latest.get("passed") is True
+    status = str(latest.get("status") or ("ok" if latest else "unavailable"))
+    quality_debt = []
+    if not latest:
+        quality_debt.append("novelty_audit_unavailable")
+    elif not enabled:
+        quality_debt.append("novelty_audit_disabled")
+    elif latest.get("passed") is not True:
+        quality_debt.append("novelty_not_verified")
     return {
         "schema_version": NOVELTY_AUDIT_SCHEMA_VERSION,
         "direction_id": direction_id,
         "status": status,
-        "enabled": latest.get("enabled", bool(latest)),
+        "enabled": enabled,
         "passed": bool(passed),
         "threshold": latest.get("threshold"),
         "latest": latest,
         "audits": audits,
+        "quality_debt": quality_debt,
     }
 
 
@@ -539,6 +546,64 @@ def build_variant_contract(
     )
     ablation_switch = contract.get("ablation_switch") or ablation_plan.get("switch") or variant.get("ablation_switch")
     fingerprint = variant.get("variant_fingerprint") or ((variant.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(variant.get("s2_variant"), dict) else "")
+    hypothesis = str(variant.get("hypothesis") or direction.get("hypothesis") or "")
+    mechanism_axis = variant.get("mechanism_axis") or ((variant.get("s2_variant") or {}).get("mechanism_axis") if isinstance(variant.get("s2_variant"), dict) else None) or direction.get("mechanism_axis")
+    integration_point = variant.get("integration_point") or ((variant.get("s2_variant") or {}).get("integration_point") if isinstance(variant.get("s2_variant"), dict) else None) or direction.get("integration_point")
+    control_signal = variant.get("control_signal") or ((variant.get("s2_variant") or {}).get("control_signal") if isinstance(variant.get("s2_variant"), dict) else None) or direction.get("control_signal")
+    seeds = _as_list((plan.get("statistical_testing") or {}).get("seeds") if isinstance(plan.get("statistical_testing"), dict) else None)
+    experiment_hypothesis = {
+        "intervention": {
+            "target": integration_point,
+            "operation": variant.get("mechanism_summary") or variant.get("description") or hypothesis,
+            "mediator": control_signal,
+        },
+        "null_hypothesis": variant.get("null_hypothesis") or f"Changing {control_signal or 'the selected control'} at {integration_point or 'the selected integration point'} does not improve the primary outcome.",
+        "alternative_hypothesis": hypothesis,
+        "minimum_effect": execution.get("min_delta_to_pass")
+        if execution.get("min_delta_to_pass") is not None
+        else (plan.get("acceptance_criteria") or {}).get("min_delta_to_pass", 0.0)
+        if isinstance(plan.get("acceptance_criteria"), dict)
+        else 0.0,
+        "mechanism_predictions": _as_list(variant.get("mechanism_predictions")) or [
+            {
+                "observable": key,
+                "expected_direction": value,
+            }
+            for key, value in expected_metric_signature.items()
+        ],
+        "falsification_conditions": _as_list(variant.get("falsification_conditions")) or [
+            "The primary metric does not clear the registered minimum effect.",
+            "The ablation-off control retains the candidate effect.",
+            "The expected mechanism observables do not change in the registered direction.",
+        ],
+    }
+    variable_control = {
+        "treatment_variables": _as_list(variant.get("treatment_variables")) or [
+            {"name": "mechanism_axis", "value": mechanism_axis},
+            {"name": "integration_point", "value": integration_point},
+            {"name": "control_signal", "value": control_signal},
+        ],
+        "fixed_variables": variant.get("fixed_variables") if isinstance(variant.get("fixed_variables"), dict) else {
+            "datasets": plan.get("datasets") or [],
+            "baselines": plan.get("baselines") or [],
+            "seeds": seeds,
+            "training_protocol": execution.get("train") or execution.get("commands") or [],
+        },
+        "nuisance_variables": _as_list(variant.get("nuisance_variables")),
+        "forbidden_simultaneous_changes": _as_list(variant.get("forbidden_simultaneous_changes")) or [
+            "dataset or evaluator changes",
+            "baseline protocol changes",
+            "unregistered training-budget changes",
+        ],
+    }
+    resource_budget = plan.get("resource_budget") if isinstance(plan.get("resource_budget"), dict) else {}
+    resource_budget = {
+        **resource_budget,
+        "estimated_gpu_minutes": resource_budget.get("estimated_gpu_minutes"),
+        "min_replicates": int(resource_budget.get("min_replicates") or 1),
+        "max_replicates": int(resource_budget.get("max_replicates") or max(1, len(seeds))),
+        "early_stop_rule": resource_budget.get("early_stop_rule") or "stop only on registered safety, infrastructure, or futility conditions",
+    }
     return {
         "schema_version": VARIANT_CONTRACT_SCHEMA_VERSION,
         "direction_id": direction.get("direction_id") or variant.get("s1_direction_id"),
@@ -546,14 +611,16 @@ def build_variant_contract(
         "title": variant.get("title") or variant.get("id") or "Selected variant",
         "mode": mode,
         "variant_fingerprint": fingerprint,
-        "mechanism_axis": variant.get("mechanism_axis") or ((variant.get("s2_variant") or {}).get("mechanism_axis") if isinstance(variant.get("s2_variant"), dict) else None) or direction.get("mechanism_axis"),
-        "integration_point": variant.get("integration_point") or ((variant.get("s2_variant") or {}).get("integration_point") if isinstance(variant.get("s2_variant"), dict) else None) or direction.get("integration_point"),
-        "control_signal": variant.get("control_signal") or ((variant.get("s2_variant") or {}).get("control_signal") if isinstance(variant.get("s2_variant"), dict) else None) or direction.get("control_signal"),
-        "hypothesis": variant.get("hypothesis") or direction.get("hypothesis") or "",
+        "mechanism_axis": mechanism_axis,
+        "integration_point": integration_point,
+        "control_signal": control_signal,
+        "hypothesis": hypothesis,
+        "experiment_hypothesis": experiment_hypothesis,
+        "variable_control": variable_control,
         "why_next": variant.get("why_next") or variant.get("anti_repeat") or "",
         "expected_files": expected_files,
         "implementation_surface_refs": _as_list(variant.get("implementation_surface_refs")) or _as_list(variant.get("code_refs")) or _surface_refs_from_files(expected_files) or _as_list(direction.get("implementation_surface_refs")),
-        "resource_budget": plan.get("resource_budget") if isinstance(plan.get("resource_budget"), dict) else {},
+        "resource_budget": resource_budget,
         "expected_metric_signature": expected_metric_signature,
         "ablation": {
             "switch": ablation_switch or "disable_selected_mechanism",
@@ -878,9 +945,18 @@ def _extract_novelty_score(audit: dict[str, Any]) -> float:
             if score > 1.0:
                 score = score / 10.0
             return max(0.0, min(1.0, score))
-    if audit.get("passed") is False:
-        return 0.0
-    return 0.60
+    if audit.get("enabled") is False and audit.get("passed") is True:
+        return 0.60
+    return 0.0
+
+
+def _placeholder_ref(kind: str, claim: str) -> dict[str, Any]:
+    return {
+        "source_type": "artifact",
+        "source_label": f"placeholder:{kind}",
+        "claim": claim,
+        "placeholder": True,
+    }
 
 
 def _selected_idea(raw: Any) -> dict[str, Any]:

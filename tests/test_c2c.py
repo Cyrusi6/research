@@ -628,7 +628,7 @@ def test_c2c_s1_evidence_quality_counts_distinct_code_refs_in_same_file(tmp_path
                 payload["selected_ideas"][0].update({"counterevidence_refs": []}),
                 [item.update({"risks": []}) for item in payload["evidence_bundle"]["items"]],
             ),
-            "counterevidence.count",
+            "counterevidence.resolved_count",
         ),
         (
             "low_surface_coverage",
@@ -5258,7 +5258,7 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
         * 18,
         encoding="utf-8",
     )
-    ref_rebuttal.write_text("review text", encoding="utf-8")
+    ref_rebuttal.write_text("reviewer risk failure coverage regression counterevidence", encoding="utf-8")
     config = _base_config(tmp_path / "workspace", simulate=True)
     config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
     config.setdefault("orchestration", {})["shared_method_memory"] = {

@@ -101,6 +101,23 @@ class S2GateValidator(StageGateValidator):
             errors.append("variant_contract.expected_files must be non-empty")
         if not _non_empty_list(variant_contract.get("implementation_surface_refs")):
             errors.append("variant_contract.implementation_surface_refs must be non-empty")
+        if variant_contract.get("schema_version") == "auto_research_variant_contract_v2":
+            experiment_hypothesis = variant_contract.get("experiment_hypothesis") if isinstance(variant_contract.get("experiment_hypothesis"), dict) else {}
+            for key in ["intervention", "null_hypothesis", "alternative_hypothesis", "minimum_effect", "mechanism_predictions", "falsification_conditions"]:
+                value = experiment_hypothesis.get(key)
+                if value in (None, "", [], {}):
+                    errors.append(f"variant_contract.experiment_hypothesis.{key} must be present")
+            variable_control = variant_contract.get("variable_control") if isinstance(variant_contract.get("variable_control"), dict) else {}
+            if not _non_empty_list(variable_control.get("treatment_variables")):
+                errors.append("variant_contract.variable_control.treatment_variables must be non-empty")
+            if not isinstance(variable_control.get("fixed_variables"), dict):
+                errors.append("variant_contract.variable_control.fixed_variables must be an object")
+            if not _non_empty_list(variable_control.get("forbidden_simultaneous_changes")):
+                errors.append("variant_contract.variable_control.forbidden_simultaneous_changes must be non-empty")
+            budget = variant_contract.get("resource_budget") if isinstance(variant_contract.get("resource_budget"), dict) else {}
+            for key in ["min_replicates", "max_replicates", "early_stop_rule"]:
+                if budget.get(key) in (None, "", [], {}):
+                    errors.append(f"variant_contract.resource_budget.{key} must be present")
         ablation = variant_contract.get("ablation") if isinstance(variant_contract.get("ablation"), dict) else {}
         if not ablation.get("switch"):
             errors.append("variant_contract.ablation.switch must be present")

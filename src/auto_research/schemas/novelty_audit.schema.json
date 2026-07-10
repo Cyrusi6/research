@@ -11,6 +11,7 @@
     "passed": {"type": "boolean"},
     "threshold": {},
     "latest": {"type": "object"},
-    "audits": {"type": "array"}
+    "audits": {"type": "array"},
+    "quality_debt": {"type": "array"}
   }
 }

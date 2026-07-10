@@ -1,5 +1,17 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-10 S1 Evidence Quality And S2 Falsifiability Contracts
+
+- Removed the deterministic S1 retriever's positive score for source-type matches alone; paper/code/rebuttal type is now a filter, and a request requires lexical/query relevance before it can satisfy `must_resolve`.
+- Added `source_only_match` rejection traces so irrelevant same-type candidates remain observable without being admitted into the evidence bundle.
+- Marked compatibility-generated direction evidence as explicit placeholders and added configurable S1 Gate enforcement through `ideation.contract_quality.reject_placeholder_evidence`.
+- Changed C2C evidence quality to require resolved counterevidence and to exclude framework placeholders from counterevidence counts.
+- Added explicit novelty quality debt for unavailable or disabled audits and configurable strict enforcement through `ideation.contract_quality.require_novelty_audit`.
+- Upgraded newly generated variant contracts to `auto_research_variant_contract_v2` with structured intervention, null/alternative hypotheses, minimum effect, mechanism predictions, falsification conditions, treatment/fixed/nuisance variables, forbidden simultaneous changes, replicate bounds, and an early-stop rule.
+- Kept legacy v1 contracts readable while making S2 Gate enforce the additional scientific fields whenever a v2 contract is declared.
+- Enabled strict placeholder and novelty enforcement in the repository's default real-run config.
+- Added regression coverage for source-only retrieval rejection, placeholder evidence rejection, disabled novelty audits, resolved counterevidence, and v2 falsifiability/variable-control fields.
+
 ## 2026-07-05 C2C Smoke Audit And Execution Probe Hardening
 
 - Added stage-aware `audit-c2c --scope completed|up-to-current|full`; default `completed` now skips unreached stages and records `expected_stages` / `skipped_stages`.

@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from auto_research.c2c import default_c2c_ideas
+from auto_research.direction_contracts import build_variant_contract
 from auto_research.s2_planner_contracts import (
     build_s2_5_patch_gate_report,
     build_s2_candidate_pool,
@@ -571,6 +572,74 @@ def test_s1_gate_retries_failed_novelty_audit(tmp_path: Path) -> None:
 
     assert report["status"] == "NEEDS_RETRY"
     assert any(check["name"] == "s1_novelty_audit" and check["status"] == "NEEDS_RETRY" for check in report["checks"])
+
+
+def test_s1_gate_retries_disabled_novelty_audit(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config["ideation"] = {"contract_quality": {"require_novelty_audit": True}}
+    paths = init_workspace(config, "topic", project_id="proj_s1_novelty_disabled", simulate=True)
+    _write_s1_contract(paths)
+    novelty_path = paths.root / "literature" / "novelty_audit.json"
+    payload = json.loads(novelty_path.read_text(encoding="utf-8"))
+    payload.update({"status": "skipped", "enabled": False, "passed": False, "quality_debt": ["novelty_audit_disabled"]})
+    novelty_path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = run_stage_gate("S1_literature", paths.root, config).to_dict()
+
+    assert any(check["name"] == "s1_novelty_audit" and check["status"] == "NEEDS_RETRY" for check in report["checks"])
+
+
+def test_s1_gate_rejects_framework_placeholder_refs(tmp_path: Path) -> None:
+    config = _config(tmp_path)
+    config["ideation"] = {"contract_quality": {"reject_placeholder_evidence": True}}
+    paths = init_workspace(config, "topic", project_id="proj_s1_placeholder", simulate=True)
+    _write_s1_contract(paths)
+    direction_path = paths.root / "literature" / "direction.json"
+    direction = json.loads(direction_path.read_text(encoding="utf-8"))
+    direction["required_evidence_refs"] = [
+        {"source_type": "artifact", "source_label": "placeholder:required_evidence", "claim": "missing", "placeholder": True}
+    ]
+    direction_path.write_text(json.dumps(direction), encoding="utf-8")
+
+    report = run_stage_gate("S1_literature", paths.root, config).to_dict()
+
+    direction_check = next(check for check in report["checks"] if check["name"] == "direction_schema")
+    assert direction_check["status"] == "NEEDS_RETRY"
+    assert any("placeholder evidence" in error for error in direction_check["details"]["errors"])
+
+
+def test_variant_contract_v2_contains_falsifiable_experiment_controls() -> None:
+    direction = {
+        "direction_id": "utility_routing",
+        "mechanism_axis": "routing",
+        "integration_point": "projector",
+        "control_signal": "utility",
+        "hypothesis": "Utility-conditioned routing improves the paired benchmark.",
+        "expected_metric_signature": {"primary_metric": "increase", "gate_sparsity": "non_uniform"},
+        "implementation_surface_refs": [{"source_type": "code", "source_label": "projector.py"}],
+    }
+    variant = {
+        "id": "utility_router_v2",
+        "variant_fingerprint": "fp_v2",
+        "expected_files": ["rosetta/model/projector.py"],
+        "experiment_contract": {"ablation_switch": "disable_utility_router"},
+    }
+
+    contract = build_variant_contract(
+        direction=direction,
+        variant=variant,
+        plan={"statistical_testing": {"seeds": [42, 123, 456]}, "resource_budget": {}},
+        execution={"min_delta_to_pass": 0.1, "max_dataset_regression": 2.0},
+        mode="c2c",
+    )
+
+    assert contract["schema_version"] == "auto_research_variant_contract_v2"
+    assert contract["experiment_hypothesis"]["null_hypothesis"]
+    assert contract["experiment_hypothesis"]["mechanism_predictions"]
+    assert contract["experiment_hypothesis"]["falsification_conditions"]
+    assert contract["variable_control"]["treatment_variables"]
+    assert contract["variable_control"]["fixed_variables"]["seeds"] == [42, 123, 456]
+    assert contract["resource_budget"]["max_replicates"] == 3
 
 
 def test_s1_gate_passes_direction_contract(tmp_path: Path) -> None:

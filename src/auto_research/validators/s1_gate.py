@@ -31,7 +31,8 @@ class S1GateValidator(StageGateValidator):
             return self.finalize()
 
         direction_errors = validate_min_schema(direction, load_schema("direction.schema.json"))
-        direction_errors.extend(_direction_semantic_errors(direction))
+        reject_placeholders = bool(((self.config.get("ideation") or {}).get("contract_quality") or {}).get("reject_placeholder_evidence", False))
+        direction_errors.extend(_direction_semantic_errors(direction, reject_placeholders=reject_placeholders))
         if direction_errors:
             self.retry_check("direction_schema", "direction.json does not satisfy direction contract", artifact="literature/direction.json", details={"errors": direction_errors[:10]})
         else:
@@ -110,19 +111,19 @@ class S1GateValidator(StageGateValidator):
             return
         if isinstance(payload, dict) and payload.get("schema_version") == "auto_research_novelty_audit_v1":
             latest = payload.get("latest") if isinstance(payload.get("latest"), dict) else {}
-            if payload.get("passed") is True or payload.get("status") == "skipped" or payload.get("enabled") is False:
+            strict_novelty = bool(((self.config.get("ideation") or {}).get("contract_quality") or {}).get("require_novelty_audit", False))
+            if payload.get("passed") is True and (payload.get("enabled") is not False or not strict_novelty):
                 self.pass_check("s1_novelty_audit", artifact=str(path.relative_to(self.project_root)), details={"status": payload.get("status"), "threshold": payload.get("threshold")})
             else:
-                self.retry_check("s1_novelty_audit", "S1 novelty audit did not pass", artifact=str(path.relative_to(self.project_root)), details={"latest": latest or payload})
+                self.retry_check("s1_novelty_audit", "S1 novelty audit is unavailable, disabled, or did not pass", artifact=str(path.relative_to(self.project_root)), details={"latest": latest or payload, "quality_debt": payload.get("quality_debt") or []})
             return
         audits = payload
         if not isinstance(audits, list) or not audits:
             self.retry_check("s1_novelty_audit", "novelty audit artifact must be a non-empty list", artifact=str(path.relative_to(self.project_root)))
             return
         latest = next((item for item in reversed(audits) if isinstance(item, dict)), {})
-        if latest.get("status") == "skipped" or latest.get("enabled") is False:
-            self.pass_check("s1_novelty_audit", artifact=str(path.relative_to(self.project_root)), details={"status": latest.get("status"), "reason": latest.get("reason")})
-        elif latest.get("passed") is True:
+        strict_novelty = bool(((self.config.get("ideation") or {}).get("contract_quality") or {}).get("require_novelty_audit", False))
+        if latest.get("passed") is True and (latest.get("enabled") is not False or not strict_novelty):
             audit = latest.get("audit") if isinstance(latest.get("audit"), dict) else {}
             self.pass_check("s1_novelty_audit", artifact=str(path.relative_to(self.project_root)), details={"novelty_score": audit.get("novelty_score"), "threshold": latest.get("threshold")})
         else:
@@ -467,7 +468,7 @@ class S1GateValidator(StageGateValidator):
             return None
 
 
-def _direction_semantic_errors(direction: object) -> list[str]:
+def _direction_semantic_errors(direction: object, *, reject_placeholders: bool = False) -> list[str]:
     if not isinstance(direction, dict):
         return ["direction must be an object"]
     errors: list[str] = []
@@ -479,6 +480,11 @@ def _direction_semantic_errors(direction: object) -> list[str]:
     for field in ["required_evidence_refs", "counterevidence_refs", "implementation_surface_refs", "go_to_s2_conditions", "return_to_s1_conditions"]:
         if not isinstance(direction.get(field), list) or not direction.get(field):
             errors.append(f"{field} must be a non-empty list")
+    if reject_placeholders:
+        for field in ["required_evidence_refs", "counterevidence_refs", "implementation_surface_refs"]:
+            refs = direction.get(field) if isinstance(direction.get(field), list) else []
+            if any(isinstance(item, dict) and item.get("placeholder") is True for item in refs):
+                errors.append(f"{field} must not contain placeholder evidence")
     return errors
 
 
