@@ -1,5 +1,16 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-13 Bootstrap S0-S3 Proxy Path
+
+- Added an explicit `orchestration.profile: bootstrap` mode for the narrow first milestone: complete one `S0 -> S1 -> S2 -> S2.5 -> S3` traversal and obtain a cheap proxy metric.
+- Added `run-c2c --profile bootstrap`; it forces one iteration, one candidate, and `stop_after_stage: S3_experiment`. Standard mode remains the default.
+- Applied bootstrap behavior as a runtime configuration overlay rather than permanently expanding relaxed values into project config, so switching back to `standard` restores normal gates.
+- Kept S1 schemas, bundle-grounded references, must-resolve requests, counterevidence, implementation coverage, and direction contracts strict. Only paper/code evidence-count shortfalls can be recorded as explicit bootstrap quality debt.
+- Kept S2/S2.5 patch generation, whitelist/frozen-patch safety, `py_compile`, and targeted tests. Bootstrap disables config-activation hard gating, mechanism self-review, runtime training smoke, wiring smoke, and forward probes.
+- Added an S3 proxy-only terminal path: a completed cheap proxy metric records `bootstrap_proxy_complete`, skips activation/readiness/full train/eval/posthoc/failure rerouting, and does not mislabel proxy metrics as full experiment metrics.
+- Added `experiment/results/bootstrap_proxy_completion.json` and profile-sensitive S3 stage contracts. Bootstrap still validates S2.5 artifact locks and requires a real proxy mean metric.
+- Added regression coverage for CLI/config overlays, profile compatibility, negative cached proxy completion, and S3 bootstrap gate pass/retry behavior.
+
 ## 2026-07-10 S1 Evidence Quality And S2 Falsifiability Contracts
 
 - Removed the deterministic S1 retriever's positive score for source-type matches alone; paper/code/rebuttal type is now a filter, and a request requires lexical/query relevance before it can satisfy `must_resolve`.

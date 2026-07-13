@@ -240,10 +240,19 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
                     "experiment/results/c2c_effective_proxy_policy.json",
                     "experiment/results/c2c_proxy_decision_report.json",
                     "experiment/results/c2c_proxy_calibration_policy.json",
+                ],
+            },
+            {
+                "when": "execution.c2c_profile == standard",
+                "paths": [
                     "experiment/results/c2c_full_s3_worthiness.json",
                     "experiment/results/c2c_full_s3_decision.json",
                 ],
-            }
+            },
+            {
+                "when": "execution.c2c_profile == bootstrap",
+                "paths": ["experiment/results/bootstrap_proxy_completion.json"],
+            },
         ],
         "required_config": ["experiment"],
         "conditional_config": [{"when": "project.mode == c2c", "keys": ["c2c", "llm.execution_provider"]}],
@@ -531,10 +540,12 @@ def _combined_hash(records: list[dict[str, Any]]) -> str | None:
 def _condition_context(project_root: Path, config: dict[str, Any], iteration: int | None) -> dict[str, Any]:
     c2c_enabled = bool(config.get("c2c", {}).get("enabled") or (project_root / "external" / "c2c_snapshot").exists())
     collector = _discover_execution_collector(project_root)
+    profile = str(((config.get("orchestration") or {}).get("profile") or "standard")).strip().lower()
     return {
         "project.mode": "c2c" if c2c_enabled else "generic",
         "iteration": int(iteration or 1),
         "execution.collector": collector,
+        "execution.c2c_profile": profile if collector == "c2c_small_loop" else "",
         "code_patch.enabled": bool((config.get("code_patch") or {}).get("enabled")) if isinstance(config.get("code_patch"), dict) else False,
     }
 

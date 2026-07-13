@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import shlex
 import copy
+import math
 import shutil
 import re
 import time
@@ -15,6 +16,7 @@ import yaml
 
 from ..c2c import C2CAdapter, DEFAULT_BASELINE, c2c_candidate_config_overrides, c2c_proxy_screen_config, default_c2c_ideas
 from ..code_patch import DynamicEditPolicy, FrozenPatchGuard, archive_patched_code_snapshot
+from ..config import bootstrap_proxy_only_enabled
 from ..adapters.runner import ExperimentRunner
 from ..failure_log import FailureLogManager, build_c2c_feedback_bundle, is_retryable_c2c_candidate
 from ..itr_ideas import screening_summary_markdown
@@ -614,6 +616,7 @@ class ExperimentAgent:
         env_source: str,
         revision_source: str | None,
     ) -> dict[str, Any]:
+        bootstrap_proxy_only = bootstrap_proxy_only_enabled(self.context.config)
         adapter = C2CAdapter(self.context.project_root, self.context.config)
         raw_candidates = list(plan.get("candidate_ideas") or default_c2c_ideas(plan.get("selected_idea", {}).get("title", "C2C"), adapter.baseline))
         candidate_selection = self._c2c_s3_candidate_selection(
@@ -693,6 +696,12 @@ class ExperimentAgent:
             "s3_candidate_selection": candidate_selection["report"],
             "acceptance": comparison,
             "workflow_goal": self.context.config.get("c2c", {}).get("workflow_goal", "effect_first_discovery"),
+            "bootstrap": {
+                "enabled": bootstrap_proxy_only,
+                "profile": "bootstrap" if bootstrap_proxy_only else "standard",
+                "proxy_only": bootstrap_proxy_only,
+                "proxy_reached": bool(best_proxy),
+            },
             "gpu_selection": {
                 "selected_gpu_ids": gpu_selection.selected_ids,
                 "cuda_visible_devices": gpu_selection.cuda_visible_devices,
@@ -727,8 +736,11 @@ class ExperimentAgent:
             "best_proxy_delta_so_far": history.get("best_proxy_delta_so_far"),
             "consecutive_not_viable": history.get("consecutive_not_viable"),
         }
-        posthoc = None if comparison.get("passed") else self._c2c_posthoc_review(main_payload)
-        main_payload["posthoc_review"] = posthoc or {"status": "skipped", "reason": "candidate accepted"}
+        posthoc = None if comparison.get("passed") or bootstrap_proxy_only else self._c2c_posthoc_review(main_payload)
+        main_payload["posthoc_review"] = posthoc or {
+            "status": "skipped",
+            "reason": "bootstrap proxy-only profile" if bootstrap_proxy_only else "candidate accepted",
+        }
         ablation_payload = self._c2c_ablation_payload(main_payload, adapter)
         main_payload["ablation_summary"] = {
             "status": ablation_payload.get("status"),
@@ -747,6 +759,25 @@ class ExperimentAgent:
             summary="C2C small-loop candidate results",
             source_paths=sources,
         )
+        bootstrap_record = None
+        if bootstrap_proxy_only:
+            bootstrap_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "results/bootstrap_proxy_completion.json",
+                {
+                    "schema_version": "bootstrap_proxy_completion_v1",
+                    "profile": "bootstrap",
+                    "proxy_only": True,
+                    "status": "proxy_reached" if best_proxy else "proxy_missing",
+                    "candidate_id": best_proxy.get("id") if isinstance(best_proxy, dict) else None,
+                    "proxy_screen": best_proxy.get("proxy_screen") if isinstance(best_proxy, dict) else None,
+                    "full_train_executed": False,
+                    "full_eval_executed": False,
+                },
+                artifact_type="bootstrap_proxy_completion",
+                summary="Bootstrap profile stopped after the first cheap proxy metric",
+                source_paths=[main_record["path"]],
+            )
         ablation_record = self.context.artifacts.write_json(
             self.stage_key,
             "results/ablation_results.json",
@@ -796,7 +827,7 @@ class ExperimentAgent:
             source_paths=[main_record["path"], posthoc_record["path"]],
         )
         feedback_record = None
-        if not comparison.get("passed"):
+        if not comparison.get("passed") and not bootstrap_proxy_only:
             feedback_record = self._write_c2c_failure_feedback(main_payload, artifacts=[main_record["path"], posthoc_record["path"]])
         self.context.artifacts.write_text(
             self.stage_key,
@@ -817,6 +848,7 @@ class ExperimentAgent:
                         loop_record["path"],
                         posthoc_record["path"],
                         failure_analysis_record["path"],
+                        *([bootstrap_record["path"]] if bootstrap_record else []),
                         *([feedback_record["path"]] if feedback_record else []),
                     ],
                     "status": "blocked",
@@ -831,9 +863,10 @@ class ExperimentAgent:
                 loop_record["path"],
                 posthoc_record["path"],
                 failure_analysis_record["path"],
+                *([bootstrap_record["path"]] if bootstrap_record else []),
                 *([feedback_record["path"]] if feedback_record else []),
             ],
-            "status": "ok" if comparison.get("passed") else "not_viable",
+            "status": "ok" if comparison.get("passed") or (bootstrap_proxy_only and best_proxy) else "not_viable",
         }
 
     def _c2c_proxy_gpu_policy(self, *, execution: dict[str, Any]) -> dict[str, Any]:
@@ -1500,6 +1533,7 @@ class ExperimentAgent:
         gpu_selection: Any,
         proxy_gpu_selection: Any,
     ) -> dict[str, Any]:
+        bootstrap_proxy_only = bootstrap_proxy_only_enabled(self.context.config)
         patch = self._load_frozen_c2c_patch(candidate)
         original_repo_root = adapter.repo_root
         execution_repo = self._prepare_c2c_execution_repo(candidate, adapter, patch)
@@ -1997,7 +2031,27 @@ class ExperimentAgent:
                             }
                         )
                     run_state["proxy_screen"] = proxy_screen
-                if proxy_enabled and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
+                proxy_screen = run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else {}
+                proxy_mean = _finite_proxy_mean(proxy_screen)
+                if bootstrap_proxy_only and proxy_enabled and proxy_mean is not None and command_status not in {"failed", "blocked"}:
+                    original_command_status = command_status
+                    command_status = "bootstrap_proxy_complete"
+                    run_state["bootstrap"] = {
+                        "profile": "bootstrap",
+                        "proxy_only": True,
+                        "status": "proxy_reached",
+                        "original_command_status": original_command_status,
+                        "original_proxy_status": proxy_screen.get("status"),
+                    }
+                    logs.append(
+                        {
+                            "candidate_id": candidate.get("id"),
+                            "event": "bootstrap_proxy_complete",
+                            "proxy_mean": proxy_mean,
+                            "original_command_status": original_command_status,
+                        }
+                    )
+                if not bootstrap_proxy_only and proxy_enabled and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
                     readiness = self._record_c2c_full_s3_readiness(
                         candidate=candidate,
                         run_spec=run_spec,
@@ -2063,7 +2117,7 @@ class ExperimentAgent:
                         )
                     if command_status == "proxy_repairable":
                         metrics = None
-                if command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
+                if not bootstrap_proxy_only and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
                     if proxy_enabled:
                         full_s3_decision = {
                             "schema_version": "c2c_full_s3_decision_v1",
@@ -2234,6 +2288,21 @@ class ExperimentAgent:
                 )
                 logs.append({"candidate_id": candidate.get("id"), "event": "commands", "log_path": str(log_path), "status": command_status})
                 self._save_c2c_run_state(run_spec, run_state)
+        final_proxy = run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else {}
+        final_proxy_mean = _finite_proxy_mean(final_proxy)
+        if bootstrap_proxy_only and final_proxy_mean is not None and command_status not in {"failed", "blocked"}:
+            existing_bootstrap = run_state.get("bootstrap") if isinstance(run_state.get("bootstrap"), dict) else {}
+            original_command_status = existing_bootstrap.get("original_command_status") or command_status
+            command_status = "bootstrap_proxy_complete"
+            run_state["command_status"] = command_status
+            run_state["bootstrap"] = {
+                "profile": "bootstrap",
+                "proxy_only": True,
+                "status": "proxy_reached",
+                "original_command_status": original_command_status,
+                "original_proxy_status": final_proxy.get("status"),
+            }
+            self._save_c2c_run_state(run_spec, run_state)
         mean = (metrics or {}).get("mean")
         ablation_result = run_state.get("ablation") or {"enabled": False, "status": "skipped", "reason": "not run"}
         dataset_regressions = self._c2c_dataset_regressions(metrics, adapter.baseline)
@@ -2259,6 +2328,8 @@ class ExperimentAgent:
             decision = "proxy_rejected"
         elif command_status == "proxy_repairable":
             decision = "proxy_repairable"
+        elif command_status == "bootstrap_proxy_complete":
+            decision = "bootstrap_proxy_complete"
         elif metrics is None:
             decision = "failed_no_metrics" if command_status == "failed" else "partial"
         result = {
@@ -5364,6 +5435,17 @@ def _c2c_selection_artifact_lock(project_root: Path, rel_path: Any) -> dict[str,
         "exists": exists,
         "sha256": sha256_file(path) if exists else None,
     }
+
+
+def _finite_proxy_mean(proxy_screen: dict[str, Any]) -> float | None:
+    if str(proxy_screen.get("status") or "").strip().lower() in {"failed", "blocked", "resource_retry", "baseline_blocked"}:
+        return None
+    metrics = proxy_screen.get("metrics") if isinstance(proxy_screen.get("metrics"), dict) else {}
+    try:
+        mean = float(metrics.get("mean"))
+    except (TypeError, ValueError):
+        return None
+    return mean if math.isfinite(mean) else None
 
 
 def _config_with_c2c_snapshot_path(config: dict[str, Any], repo_root: str) -> dict[str, Any]:

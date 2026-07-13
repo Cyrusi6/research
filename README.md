@@ -41,6 +41,16 @@ uv run auto-research replay-c2c --project-id <project_id> --from-stage S3_experi
 
 `doctor-c2c` writes readiness and runtime-health reports under `meta/`, `audit-c2c` checks C2C stage artifacts, schemas, manifest hashes, and stale route-invalidated files, and `replay-c2c` replays deterministic route-policy decisions from frozen artifacts without rerunning S1/S2 LLM calls.
 
+To first prove that a real project can traverse S0-S2.5 and produce one cheap S3 proxy metric, use the explicit bootstrap profile:
+
+```bash
+uv run auto-research run-c2c \
+  --project-id <project_id> \
+  --profile bootstrap
+```
+
+Bootstrap forces one iteration and stops at `S3_experiment`. It keeps schemas, evidence references, patch safety, `py_compile`, and targeted tests, while deferring strict S1 evidence-count thresholds, S2.5 runtime activation smoke, full training/evaluation, effect acceptance, and automatic failure rerouting. The default `standard` profile is unchanged.
+
 ## Layout
 
 ```text

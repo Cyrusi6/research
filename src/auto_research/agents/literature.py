@@ -16,6 +16,7 @@ from ..c2c import (
     build_c2c_ideas_with_llm,
     is_c2c_project,
 )
+from ..config import bootstrap_profile_enabled, bootstrap_profile_options
 from ..adapters.literature import LiteratureProvider
 from ..direction_contracts import (
     build_direction_contract,
@@ -1204,6 +1205,17 @@ class LiteratureAgent:
             if not retrieval_feedback:
                 break
             if request_round >= max_request_rounds:
+                bootstrap_options = bootstrap_profile_options(self.context.config)
+                waivable_retrieval_rules = {"retrieval_coverage.paper<2", "retrieval_coverage.code<2"}
+                if (
+                    bootstrap_profile_enabled(self.context.config)
+                    and bootstrap_options.get("allow_retrieval_warnings", True)
+                    and set(retrieval_feedback).issubset(waivable_retrieval_rules)
+                ):
+                    deterministic_trace = dict(deterministic_trace)
+                    deterministic_trace["bootstrap_warnings"] = list(retrieval_feedback)
+                    deterministic_trace["bootstrap_degraded_retrieval"] = True
+                    break
                 return _blocked_c2c_two_phase_result(
                     reason="S1b deterministic retriever could not satisfy required C2C evidence coverage.",
                     phases=[
@@ -3352,12 +3364,13 @@ def _c2c_two_phase_session(
         },
         {
             "phase": "deterministic_retriever",
-            "status": "ok",
+            "status": "warning" if deterministic_trace.get("bootstrap_degraded_retrieval") else "ok",
             "retriever_version": deterministic_trace.get("retriever_version"),
             "request_plan_id": deterministic_trace.get("request_plan_id"),
             "selected_ref_count": len(deterministic_trace.get("selected_refs") or []),
             "coverage": deterministic_trace.get("coverage"),
             "unfilled_must_resolve_requests": deterministic_trace.get("unfilled_must_resolve_requests") or [],
+            "warnings": deterministic_trace.get("bootstrap_warnings") or [],
         },
         {
             "phase": "direction_agent",

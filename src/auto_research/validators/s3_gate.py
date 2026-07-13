@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import math
+
 from .base import StageGateValidator, load_schema, validate_min_schema
+from ..config import bootstrap_proxy_only_enabled
 from ..utils import sha256_file
 
 
@@ -27,11 +30,46 @@ class S3GateValidator(StageGateValidator):
         if not isinstance(main_results, dict):
             return self.finalize()
         self._validate_s3_candidate_selection(main_results)
+        if bootstrap_proxy_only_enabled(self.config):
+            self._validate_bootstrap_proxy_reached(main_results)
+            return self.finalize()
         if self._requires_c2c_proxy_contracts(main_results):
             self._validate_c2c_proxy_contracts(main_results)
         if "candidate_results" in main_results and "baseline" in main_results:
             self._validate_c2c_acceptance(main_results)
         return self.finalize()
+
+    def _validate_bootstrap_proxy_reached(self, main_results: dict) -> None:
+        candidates = [item for item in main_results.get("candidate_results") or [] if isinstance(item, dict)]
+        reached = []
+        for candidate in candidates:
+            proxy = candidate.get("proxy_screen") if isinstance(candidate.get("proxy_screen"), dict) else {}
+            metrics = proxy.get("metrics") if isinstance(proxy.get("metrics"), dict) else {}
+            try:
+                mean = float(metrics.get("mean"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(mean) or str(proxy.get("status") or "").strip().lower() in {"failed", "blocked", "resource_retry", "baseline_blocked"}:
+                continue
+            reached.append(
+                {
+                    "candidate_id": candidate.get("id"),
+                    "mean": mean,
+                    "proxy_status": proxy.get("status"),
+                }
+            )
+        if not reached:
+            self.retry_check(
+                "bootstrap_proxy_reached",
+                "Bootstrap profile requires at least one cheap proxy mean metric",
+                artifact="experiment/results/main_results.json",
+            )
+            return
+        self.pass_check(
+            "bootstrap_proxy_reached",
+            artifact="experiment/results/main_results.json",
+            details={"candidates": reached},
+        )
 
     def _validate_s3_candidate_selection(self, main_results: dict) -> None:
         selection_path = self.project_root / "experiment/results/s3_candidate_selection.json"

@@ -238,6 +238,10 @@ hitl:
     - "S4_writing"
 
 orchestration:
+  profile: standard
+  bootstrap:
+    allow_retrieval_warnings: true
+    proxy_only: true
   auto_mode: false            # auto_mode=false means HITL is active
   user_confirm_idea: false
   per_stage_judge: true

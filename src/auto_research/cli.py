@@ -54,6 +54,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_c2c_parser.add_argument("--env-python", default=DEFAULT_C2C_ENV_PYTHON)
     run_c2c_parser.add_argument("--max-iterations", type=int, default=3)
     run_c2c_parser.add_argument("--stop-after-stage", default="S3_experiment")
+    run_c2c_parser.add_argument("--profile", choices=["standard", "bootstrap"], default="standard")
     run_c2c_parser.add_argument("--simulate", action="store_true")
     run_c2c_parser.add_argument("--hitl", action="store_true", help="Keep HITL approvals enabled instead of unattended auto mode")
     run_c2c_parser.add_argument("--no-s0-cache", action="store_true", help="Do not restore a compatible S0 static bundle from previous C2C projects")
@@ -97,6 +98,7 @@ def build_parser() -> argparse.ArgumentParser:
     smoke_c2c_parser.add_argument("--s0-cache-path", help="Restore S0 static bundle from an explicit JSON path")
     smoke_c2c_parser.add_argument("--s0-force-refresh", action="store_true", help="Force S0 to regenerate instead of using any local or restored bundle")
     smoke_c2c_parser.add_argument("--prepare-only", action="store_true", help="Prepare/bootstrap and run doctor checks, but do not start the C2C pipeline")
+    smoke_c2c_parser.add_argument("--profile", choices=["standard", "bootstrap"], default="standard")
 
     memory_parser = subparsers.add_parser("memory", help="Inspect shared method failure memory")
     memory_subparsers = memory_parser.add_subparsers(dest="memory_command", required=True)
@@ -280,10 +282,11 @@ def _run_c2c_command(args: argparse.Namespace, orchestrator: Orchestrator) -> di
     assert project_root is not None
     override_result = _apply_c2c_run_overrides(
         project_root,
-        max_iterations=args.max_iterations,
-        stop_after_stage=args.stop_after_stage,
+        max_iterations=1 if getattr(args, "profile", "standard") == "bootstrap" else args.max_iterations,
+        stop_after_stage="S3_experiment" if getattr(args, "profile", "standard") == "bootstrap" else args.stop_after_stage,
         auto_mode=not args.hitl,
         s0_force_refresh=args.s0_force_refresh,
+        profile=getattr(args, "profile", "standard"),
     )
     cache_result = {"status": "disabled"}
     if args.s0_force_refresh:
@@ -403,6 +406,7 @@ def _smoke_run_args(args: argparse.Namespace, *, prepare_only: bool) -> argparse
         s0_cache_path=getattr(args, "s0_cache_path", None),
         s0_force_refresh=bool(getattr(args, "s0_force_refresh", False)),
         prepare_only=prepare_only,
+        profile=getattr(args, "profile", "standard"),
     )
 
 
@@ -459,30 +463,42 @@ def _apply_c2c_run_overrides(
     stop_after_stage: str,
     auto_mode: bool,
     s0_force_refresh: bool = False,
+    profile: str = "standard",
 ) -> dict[str, object]:
     if max_iterations < 1:
         raise SystemExit("--max-iterations must be >= 1")
     config_path = project_root / "meta" / "project_config.yaml"
     project_config = read_yaml(config_path, default={}) or {}
+    if profile not in {"standard", "bootstrap"}:
+        raise SystemExit("--profile must be one of: standard, bootstrap")
+    effective_iterations = 1 if profile == "bootstrap" else int(max_iterations)
+    effective_stop_after_stage = "S3_experiment" if profile == "bootstrap" else stop_after_stage
     overrides = {
-        "review": {"max_iterations": int(max_iterations)},
+        "review": {"max_iterations": effective_iterations},
         "orchestration": {
             "auto_mode": bool(auto_mode),
-            "stop_after_stage": stop_after_stage,
+            "stop_after_stage": effective_stop_after_stage,
+            "profile": profile,
         },
     }
+    if profile == "bootstrap":
+        overrides = deep_merge(
+            overrides,
+            {"orchestration": {"bootstrap": {"allow_retrieval_warnings": True, "proxy_only": True}}},
+        )
     if s0_force_refresh:
-        overrides["c2c"] = {"s0_force_refresh": True}
+        overrides = deep_merge(overrides, {"c2c": {"s0_force_refresh": True}})
     write_yaml(config_path, deep_merge(project_config, overrides))
 
     registry_path = project_root / "meta" / "registry.yaml"
     registry = read_yaml(registry_path, default={}) or {}
-    registry["max_iterations"] = int(max_iterations)
+    registry["max_iterations"] = effective_iterations
     write_yaml(registry_path, registry)
     return {
-        "max_iterations": int(max_iterations),
-        "stop_after_stage": stop_after_stage,
+        "max_iterations": effective_iterations,
+        "stop_after_stage": effective_stop_after_stage,
         "auto_mode": bool(auto_mode),
+        "profile": profile,
         "s0_force_refresh": bool(s0_force_refresh),
         "project_config": "meta/project_config.yaml",
         "registry": "meta/registry.yaml",

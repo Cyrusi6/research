@@ -102,3 +102,20 @@ def test_stage_contract_activates_c2c_small_loop_inputs(tmp_path: Path) -> None:
     assert "plan/short_loop_plan.yaml" in s3["required_inputs"]
     assert "external/c2c_snapshot" in s3["required_inputs"]
     assert "plan/candidate_ideas.json" in s3["missing_inputs"]
+
+
+def test_stage_contract_switches_c2c_s3_outputs_for_bootstrap(tmp_path: Path) -> None:
+    config = {
+        "project": {"workspace_root": str(tmp_path)},
+        "review": {"max_iterations": 1},
+        "c2c": {"enabled": True},
+        "orchestration": {"profile": "bootstrap"},
+    }
+    paths = init_workspace(config, "topic", project_id="proj_c2c_bootstrap_contract", simulate=True)
+    (paths.root / "plan" / "plan.yaml").write_text("execution:\n  collector: c2c_small_loop\n", encoding="utf-8")
+
+    s3 = StageContractManager(paths.root).stage_started("S3_experiment", iteration=1, config=config)
+
+    assert "experiment/results/bootstrap_proxy_completion.json" in s3["required_outputs"]
+    assert "experiment/results/c2c_full_s3_worthiness.json" not in s3["required_outputs"]
+    assert "experiment/results/c2c_full_s3_decision.json" not in s3["required_outputs"]

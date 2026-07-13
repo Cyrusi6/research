@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 
 from auto_research.evidence_refs import resolve_s1_evidence_refs, validate_direction_refs_subset_of_bundle
+from auto_research.config import bootstrap_profile_enabled
 
 from .base import StageGateValidator, load_schema, validate_min_schema
 
@@ -430,6 +431,20 @@ class S1GateValidator(StageGateValidator):
         quality = payloads["literature/c2c/evidence_quality_score.json"]
         failed_rules = _c2c_quality_failed_rules(quality if isinstance(quality, dict) else {})
         declared_failed = quality.get("failed_rules") if isinstance(quality, dict) and isinstance(quality.get("failed_rules"), list) else []
+        bootstrap_waivable = {"support_coverage.paper", "support_coverage.code"}
+        effective_failed_rules = failed_rules or declared_failed
+        if bootstrap_profile_enabled(self.config) and effective_failed_rules and set(effective_failed_rules).issubset(bootstrap_waivable):
+            self.pass_check(
+                "s1_evidence_quality_bootstrap_waiver",
+                artifact="literature/c2c/evidence_quality_score.json",
+                details={
+                    "profile": "bootstrap",
+                    "declared_gate": quality.get("gate") if isinstance(quality, dict) else None,
+                    "waived_rules": effective_failed_rules,
+                    "quality_debt": effective_failed_rules,
+                },
+            )
+            return
         if isinstance(quality, dict) and quality.get("gate") == "pass" and not failed_rules:
             self.pass_check(
                 "s1_evidence_quality_gate",

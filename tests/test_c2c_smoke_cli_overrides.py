@@ -3,7 +3,9 @@ from types import SimpleNamespace
 
 import auto_research.cli as cli_module
 from auto_research.cli import _smoke_c2c_command
-from auto_research.utils import write_json, write_yaml
+from auto_research.cli import _apply_c2c_run_overrides
+from auto_research.config import load_project_config
+from auto_research.utils import read_yaml, write_json, write_yaml
 
 
 def test_smoke_c2c_bootstraps_missing_project_with_user_overrides(monkeypatch, tmp_path: Path) -> None:
@@ -94,3 +96,38 @@ def test_smoke_c2c_help_exposes_override_flags() -> None:
     assert args.no_s0_cache is True
     assert args.s0_force_refresh is True
     assert args.prepare_only is True
+
+
+def test_bootstrap_profile_forces_single_iteration_and_s3_proxy_overlay(monkeypatch, tmp_path: Path) -> None:
+    project = tmp_path / "workspace" / "bootstrap_profile"
+    write_yaml(project / "meta" / "project_config.yaml", {"orchestration": {"profile": "standard"}})
+    write_yaml(project / "meta" / "registry.yaml", {"max_iterations": 9})
+    monkeypatch.setattr("auto_research.config.load_root_config", lambda: {"project": {"workspace_root": str(tmp_path / "workspace")}})
+
+    result = _apply_c2c_run_overrides(
+        project,
+        max_iterations=9,
+        stop_after_stage="S4_writing",
+        auto_mode=True,
+        profile="bootstrap",
+    )
+
+    persisted = read_yaml(project / "meta" / "project_config.yaml", default={})
+    effective = load_project_config(project)
+    assert result["max_iterations"] == 1
+    assert result["stop_after_stage"] == "S3_experiment"
+    assert persisted["orchestration"]["profile"] == "bootstrap"
+    assert "code_patch" not in persisted
+    assert effective["review"]["max_iterations"] == 1
+    assert effective["orchestration"]["stop_after_stage"] == "S3_experiment"
+    assert effective["code_patch"]["validation"]["require_py_compile"] is True
+    assert effective["code_patch"]["validation"]["require_targeted_tests"] is True
+    assert effective["code_patch"]["validation"]["require_config_activation"] is False
+    assert effective["code_patch"]["validation"]["runtime_smoke"]["enabled"] is False
+    assert effective["c2c"]["small_loop"]["max_candidates"] == 1
+    assert effective["c2c"]["small_loop"]["proxy_screen"]["activation_smoke"]["enabled"] is False
+
+
+def test_smoke_profile_defaults_to_standard() -> None:
+    args = cli_module.build_parser().parse_args(["smoke-c2c", "--project-id", "p"])
+    assert args.profile == "standard"

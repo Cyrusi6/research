@@ -173,6 +173,46 @@ def test_s3_gate_passes_valid_proxy_contracts(tmp_path: Path) -> None:
     assert any(check["name"] == "proxy_decision_allows_full_s3" for check in report["checks"])
 
 
+def test_s3_bootstrap_gate_passes_on_proxy_metric_without_full_acceptance(tmp_path: Path) -> None:
+    _write_required_outputs(
+        tmp_path,
+        proxy_screen={"enabled": True, "status": "rejected", "metrics": {"mean": 48.5}},
+    )
+    config = _config(tmp_path)
+    config["orchestration"] = {"profile": "bootstrap", "bootstrap": {"proxy_only": True}}
+
+    report = run_stage_gate("S3_experiment", tmp_path, config).to_dict()
+
+    assert report["status"] == "PASS"
+    assert any(check["name"] == "bootstrap_proxy_reached" for check in report["checks"])
+    assert not any(check["name"] == "c2c_acceptance_passed" for check in report["checks"])
+
+
+def test_s3_bootstrap_gate_retries_without_proxy_metric(tmp_path: Path) -> None:
+    _write_required_outputs(tmp_path, proxy_screen={"enabled": True, "status": "failed", "metrics": {}})
+    config = _config(tmp_path)
+    config["orchestration"] = {"profile": "bootstrap"}
+
+    report = run_stage_gate("S3_experiment", tmp_path, config).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    assert any(check["name"] == "bootstrap_proxy_reached" for check in report["checks"])
+
+
+def test_s3_bootstrap_gate_retries_on_resource_failure_even_with_stale_metric(tmp_path: Path) -> None:
+    _write_required_outputs(
+        tmp_path,
+        proxy_screen={"enabled": True, "status": "resource_retry", "metrics": {"mean": 49.0}},
+    )
+    config = _config(tmp_path)
+    config["orchestration"] = {"profile": "bootstrap"}
+
+    report = run_stage_gate("S3_experiment", tmp_path, config).to_dict()
+
+    assert report["status"] == "NEEDS_RETRY"
+    assert any(check["name"] == "bootstrap_proxy_reached" for check in report["checks"])
+
+
 def test_s3_gate_retries_neutral_proxy_without_worthiness(tmp_path: Path) -> None:
     _write_required_outputs(tmp_path)
     _write_proxy_contracts(tmp_path, decision="neutral_proxy_full_s3", include_worthiness=False)

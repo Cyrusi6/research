@@ -9246,7 +9246,8 @@ def test_c2c_proxy_carries_instrumentation_quality_repair_request(monkeypatch, t
     assert result["failure_attribution"]["quality_repair"]["acceptance_guard"]["rerun_same_proxy_subset"] is True
 
 
-def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch, tmp_path: Path) -> None:
+@pytest.mark.parametrize("bootstrap", [False, True], ids=["standard", "bootstrap"])
+def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch, tmp_path: Path, bootstrap: bool) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
     config["c2c"] = {
@@ -9274,6 +9275,8 @@ def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch,
         "allowed_files": ["rosetta/model/projector.py"],
         "allowed_prefixes": ["recipe/", "local/auto_research_runs/"],
     }
+    if bootstrap:
+        config["orchestration"] = {"profile": "bootstrap", "bootstrap": {"proxy_only": True}}
     paths = init_workspace(config, "topic", project_id="proj_proxy_resume_reuse", simulate=False)
     context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
     agent = ExperimentAgent(context)
@@ -9341,8 +9344,8 @@ def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch,
         proxy_gpu_selection=gpu_selection,
     )
 
-    assert result["decision"] == "proxy_rejected"
-    assert result["command_status"] == "proxy_rejected"
+    assert result["decision"] == ("bootstrap_proxy_complete" if bootstrap else "proxy_rejected")
+    assert result["command_status"] == ("bootstrap_proxy_complete" if bootstrap else "proxy_rejected")
     assert result["proxy_screen"]["proxy_delta_vs_baseline"] == -1.0
     assert result["proxy_screen"]["comparison_baseline_mean"] == 50.0
     assert result["proxy_screen"]["proxy_delta_vs_comparison_baseline"] == -1.0
@@ -9352,6 +9355,9 @@ def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch,
     saved = json.loads(state_path.read_text(encoding="utf-8"))
     assert saved["proxy_screen"]["status"] == "rejected"
     assert saved["patch_fingerprint"] == patch_fingerprint
+    if bootstrap:
+        assert saved["bootstrap"]["status"] == "proxy_reached"
+        assert saved["bootstrap"]["original_proxy_status"] == "rejected"
 
 
 def test_s3_proxy_reuse_requires_matching_patch_fingerprint(tmp_path: Path) -> None:
