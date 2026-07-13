@@ -1,5 +1,12 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-13 Bootstrap Cached-S0-Only Mode
+
+- Added `orchestration.bootstrap.cached_s0_only`, enabled by default for the bootstrap profile.
+- Bootstrap now requires a compatible `intake/c2c/static_bundle.json`; if it is absent, stale, or force-refresh is requested, S0 blocks explicitly instead of calling DeepSeek enrichment or MinerU PDF parsing.
+- Readiness treats DeepSeek credentials as unnecessary when the cached bundle is present and compatible, and exposes `cached_s0_only_ready` as a blocking environment check.
+- The prepared project `c2c_bootstrap_s3_20260713_1` now passes readiness with zero warnings and zero blocking reasons without DeepSeek or MinerU credentials.
+
 ## 2026-07-13 C2C Symlinked Dataset Readiness
 
 - Updated the C2C execution-hook dataset probe to traverse symlinked dataset directories while tracking resolved directories to avoid cycles.

@@ -12,6 +12,7 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .config import bootstrap_cached_s0_only_enabled
 from .route_policy import build_route_context, decide_next_route
 from .utils import ensure_dir, now_utc, read_json, read_yaml, sha256_file, write_json
 from .validators.base import load_schema, validate_min_schema
@@ -100,9 +101,14 @@ def build_c2c_e2e_readiness_report(project_root: Path, config: dict[str, Any] | 
     checks["workspace_writable"] = _writable(workspace_root)
     checks["worktree_root_writable"] = _writable(code_patch_root.parent)
     checks["snapshot_ready"] = snapshot_path.exists() or checks["target_repo_exists"]
+    cached_s0_only = bootstrap_cached_s0_only_enabled(config)
     checks["s0_cache_compatible"] = _s0_cache_compatible(project_root, snapshot_path)
+    checks["cached_s0_only_ready"] = bool(
+        not cached_s0_only
+        or (_s0_cache_available(project_root) and checks["s0_cache_compatible"])
+    )
     checks["llm_config_ready"] = _llm_config_ready(config, mode=mode, warnings=warnings)
-    checks["semantic_enrichment_key_ready"] = _semantic_enrichment_ready(config, mode=mode, warnings=warnings)
+    checks["semantic_enrichment_key_ready"] = True if checks["cached_s0_only_ready"] and cached_s0_only else _semantic_enrichment_ready(config, mode=mode, warnings=warnings)
     checks["dataset_paths_ready"] = _dataset_paths_ready(c2c, mode=mode, warnings=warnings)
     checks["gpu_policy_ready"] = _gpu_policy_ready(config, mode=mode, warnings=warnings)
     checks["baseline_cache_valid_or_invalidated"] = _baseline_cache_ready(project_root, warnings=warnings)
@@ -123,6 +129,7 @@ def build_c2c_e2e_readiness_report(project_root: Path, config: dict[str, Any] | 
         "workspace_writable",
         "worktree_root_writable",
         "snapshot_ready",
+        "cached_s0_only_ready",
         "llm_config_ready",
         "dataset_paths_ready",
         "gpu_policy_ready",
@@ -893,6 +900,14 @@ def _s0_cache_compatible(project_root: Path, snapshot_path: Path) -> bool:
         if not path.exists() or sha256_file(path) != expected:
             return False
     return True
+
+
+def _s0_cache_available(project_root: Path) -> bool:
+    bundle = read_json(project_root / "intake" / "c2c" / "static_bundle.json", default={}) or {}
+    if not isinstance(bundle, dict) or bundle.get("schema_version") != "c2c_static_intake_bundle_v1":
+        return False
+    chunk_index = bundle.get("chunk_index") if isinstance(bundle.get("chunk_index"), dict) else {}
+    return bool(chunk_index.get("entries"))
 
 
 def _expected_audit_stages(

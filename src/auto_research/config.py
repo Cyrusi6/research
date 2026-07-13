@@ -61,6 +61,10 @@ def bootstrap_proxy_only_enabled(config: dict[str, Any] | None) -> bool:
     return bootstrap_profile_enabled(config) and bool(bootstrap_profile_options(config).get("proxy_only", True))
 
 
+def bootstrap_cached_s0_only_enabled(config: dict[str, Any] | None) -> bool:
+    return bootstrap_profile_enabled(config) and bool(bootstrap_profile_options(config).get("cached_s0_only", True))
+
+
 def apply_orchestration_profile(config: dict[str, Any]) -> dict[str, Any]:
     if not bootstrap_profile_enabled(config):
         return config
@@ -68,7 +72,10 @@ def apply_orchestration_profile(config: dict[str, Any]) -> dict[str, Any]:
         config,
         {
             "review": {"max_iterations": 1},
-            "orchestration": {"stop_after_stage": "S3_experiment"},
+            "orchestration": {
+                "stop_after_stage": "S3_experiment",
+                "bootstrap": {"cached_s0_only": True},
+            },
             "ideation": {
                 "contract_quality": {
                     "reject_placeholder_evidence": False,

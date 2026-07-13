@@ -120,6 +120,7 @@ def test_bootstrap_profile_forces_single_iteration_and_s3_proxy_overlay(monkeypa
     assert "code_patch" not in persisted
     assert effective["review"]["max_iterations"] == 1
     assert effective["orchestration"]["stop_after_stage"] == "S3_experiment"
+    assert effective["orchestration"]["bootstrap"]["cached_s0_only"] is True
     assert effective["code_patch"]["validation"]["require_py_compile"] is True
     assert effective["code_patch"]["validation"]["require_targeted_tests"] is True
     assert effective["code_patch"]["validation"]["require_config_activation"] is False

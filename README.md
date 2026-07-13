@@ -49,7 +49,7 @@ uv run auto-research run-c2c \
   --profile bootstrap
 ```
 
-Bootstrap forces one iteration and stops at `S3_experiment`. It keeps schemas, evidence references, patch safety, `py_compile`, and targeted tests, while deferring strict S1 evidence-count thresholds, S2.5 runtime activation smoke, full training/evaluation, effect acceptance, and automatic failure rerouting. The default `standard` profile is unchanged.
+Bootstrap forces one iteration and stops at `S3_experiment`. It requires a compatible cached S0 bundle and will block rather than fall back to DeepSeek semantic enrichment or MinerU PDF parsing. It keeps schemas, evidence references, patch safety, `py_compile`, and targeted tests, while deferring strict S1 evidence-count thresholds, S2.5 runtime activation smoke, full training/evaluation, effect acceptance, and automatic failure rerouting. The default `standard` profile is unchanged.
 
 ## Layout
 

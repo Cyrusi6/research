@@ -484,7 +484,15 @@ def _apply_c2c_run_overrides(
     if profile == "bootstrap":
         overrides = deep_merge(
             overrides,
-            {"orchestration": {"bootstrap": {"allow_retrieval_warnings": True, "proxy_only": True}}},
+            {
+                "orchestration": {
+                    "bootstrap": {
+                        "allow_retrieval_warnings": True,
+                        "proxy_only": True,
+                        "cached_s0_only": True,
+                    }
+                }
+            },
         )
     if s0_force_refresh:
         overrides = deep_merge(overrides, {"c2c": {"s0_force_refresh": True}})

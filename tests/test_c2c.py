@@ -5107,6 +5107,44 @@ def test_c2c_s0_rejects_stale_cached_static_bundle(tmp_path: Path) -> None:
     assert IntakeAgent(context)._load_reusable_c2c_static_bundle(_c2c_static_bundle_validity(project_root, config)) is None
 
 
+def test_bootstrap_cached_s0_only_blocks_before_external_reference_parsing(monkeypatch, tmp_path: Path) -> None:
+    repo = _fake_c2c_repo(tmp_path)
+    paper = tmp_path / "paper.md"
+    rebuttal = tmp_path / "rebuttal.md"
+    paper.write_text("paper", encoding="utf-8")
+    rebuttal.write_text("rebuttal", encoding="utf-8")
+    config = _base_config(tmp_path / "workspace", simulate=False)
+    config["c2c"] = {
+        "enabled": True,
+        "target_repo": str(repo),
+        "snapshot_path": str(repo),
+        "ref_paper": str(paper),
+        "ref_rebuttal": str(rebuttal),
+        "env_python": sys.executable,
+        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
+        "datasets": ["mmlu-redux"],
+        "allowed_files": ["rosetta/model/aligner.py"],
+        "allowed_prefixes": ["recipe/"],
+    }
+    config["orchestration"] = {
+        "profile": "bootstrap",
+        "bootstrap": {"cached_s0_only": True},
+    }
+    paths = init_workspace(config, "topic", project_id="proj_cached_s0_required", simulate=False)
+
+    def fail_import(self):
+        raise AssertionError("cached-S0-only bootstrap must not call MinerU/reference parsing")
+
+    monkeypatch.setattr(C2CAdapter, "import_reference_materials", fail_import)
+    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
+
+    result = IntakeAgent(context).run("topic")
+
+    assert result["status"] == "blocked"
+    assert "DeepSeek and MinerU fallback are disabled" in result["blocked_reason"]
+    assert (paths.root / "intake/c2c/cache_required_blocked.json").exists()
+
+
 def test_c2c_evidence_brief_uses_current_repo_and_retrieval_fields() -> None:
     brief = _c2c_evidence_brief(
         topic="cache routing",

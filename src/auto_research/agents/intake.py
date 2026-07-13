@@ -9,6 +9,7 @@ from typing import Any
 
 from ..c2c import C2CAdapter, is_c2c_project
 from ..code_intake import rebuild_code_intake_indexes
+from ..config import bootstrap_cached_s0_only_enabled
 from ..method_memory import load_shared_method_memory, shared_method_memory_query_context
 from ..s0_enrichment import DeepSeekS0SemanticEnricher, S0SemanticEnrichmentError, semantic_enrichment_enabled
 from ..utils import read_json, sha256_file
@@ -127,6 +128,26 @@ class IntakeAgent:
                 "status": "ok",
                 "static_bundle": cached,
                 "cache_status": "reused",
+            }
+
+        if bootstrap_cached_s0_only_enabled(self.context.config):
+            blocked_reason = "Bootstrap cached-S0-only mode requires a compatible intake/c2c/static_bundle.json; DeepSeek and MinerU fallback are disabled."
+            blocked_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "c2c/cache_required_blocked.json",
+                {
+                    "status": "blocked",
+                    "reason": blocked_reason,
+                    "cached_s0_only": True,
+                    "force_refresh": force_refresh,
+                },
+                artifact_type="c2c_cache_required_blocked",
+                summary="Bootstrap S0 blocked instead of calling external enrichment or PDF parsing APIs",
+            )
+            return {
+                "artifacts": [blocked_record["path"]],
+                "status": "blocked",
+                "blocked_reason": blocked_reason,
             }
 
         adapter = C2CAdapter(self.context.project_root, self.context.config)

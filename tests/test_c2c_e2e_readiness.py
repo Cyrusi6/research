@@ -108,3 +108,43 @@ def test_c2c_readiness_warns_on_s0_cache_fingerprint_mismatch(tmp_path: Path) ->
     assert report["gate"] == "warn"
     assert report["checks"]["s0_cache_compatible"] is False
     assert "s0_cache_fingerprint_mismatch_or_unchecked" in report["warnings"]
+
+
+def test_bootstrap_cached_s0_skips_deepseek_key_requirement(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    repo = tmp_path / "C2C"
+    repo.mkdir()
+    project = tmp_path / "workspace" / "proj"
+    project.mkdir(parents=True)
+    config = _config(tmp_path, target_repo=repo)
+    config["orchestration"] = {"profile": "bootstrap", "bootstrap": {"cached_s0_only": True}}
+    config["intake"] = {"semantic_enrichment": {"enabled": True, "provider": "deepseek"}}
+    write_json(
+        project / "intake" / "c2c" / "static_bundle.json",
+        {
+            "schema_version": "c2c_static_intake_bundle_v1",
+            "repo_manifest": {"core_files": []},
+            "chunk_index": {"entries": [{"chunk_id": "cached"}]},
+        },
+    )
+
+    report = build_c2c_e2e_readiness_report(project, config)
+
+    assert report["checks"]["cached_s0_only_ready"] is True
+    assert report["checks"]["semantic_enrichment_key_ready"] is True
+    assert "deepseek_api_key_missing_for_semantic_enrichment" not in report["warnings"]
+
+
+def test_bootstrap_cached_s0_blocks_when_cache_missing(tmp_path: Path) -> None:
+    repo = tmp_path / "C2C"
+    repo.mkdir()
+    project = tmp_path / "workspace" / "proj"
+    project.mkdir(parents=True)
+    config = _config(tmp_path, target_repo=repo)
+    config["orchestration"] = {"profile": "bootstrap", "bootstrap": {"cached_s0_only": True}}
+
+    report = build_c2c_e2e_readiness_report(project, config)
+
+    assert report["gate"] == "fail"
+    assert report["checks"]["cached_s0_only_ready"] is False
+    assert "cached_s0_only_ready" in report["blocking_reasons"]
