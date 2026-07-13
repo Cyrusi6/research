@@ -61,6 +61,25 @@ def test_execution_hooks_report_passes_cheap_real_probes(tmp_path: Path) -> None
     assert read_json(project / "meta" / "c2c_execution_hooks_report.json")["schema_version"] == "c2c_execution_hooks_report_v1"
 
 
+def test_execution_hooks_follow_symlinked_dataset_directories(tmp_path: Path) -> None:
+    repo = _repo(tmp_path)
+    cached_dataset = tmp_path / "hf-cache" / "dataset-snapshot"
+    cached_dataset.mkdir(parents=True)
+    (cached_dataset / "sample.json").write_text(json.dumps([{"question": "q", "answer": "a"}]), encoding="utf-8")
+    dataset_root = tmp_path / "datasets"
+    dataset_root.mkdir()
+    (dataset_root / "linked-snapshot").symlink_to(cached_dataset, target_is_directory=True)
+    (tmp_path / "paper.md").write_text("paper", encoding="utf-8")
+    (tmp_path / "rebuttal.md").write_text("rebuttal", encoding="utf-8")
+    project = tmp_path / "workspace" / "proj"
+    project.mkdir(parents=True)
+
+    report = build_c2c_execution_hooks_report(project, _config(tmp_path, repo, dataset_root))
+
+    assert report["gate"] == "pass"
+    assert report["checks"]["dataset_one_example_loadable"] is True
+
+
 def test_readiness_fails_when_execution_hooks_gate_fails(tmp_path: Path) -> None:
     repo = _repo(tmp_path)
     dataset_root = tmp_path / "datasets"

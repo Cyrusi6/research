@@ -1,5 +1,12 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-13 C2C Symlinked Dataset Readiness
+
+- Updated the C2C execution-hook dataset probe to traverse symlinked dataset directories while tracking resolved directories to avoid cycles.
+- This supports the existing Hugging Face snapshot layout under `/home/lijunsi/projects/KVcache/datasets/c2c`, where dataset names are symbolic links to cache snapshots.
+- Added regression coverage proving a valid JSON sample inside a symlinked dataset snapshot satisfies `dataset_one_example_loadable`.
+- Created and validated the real bootstrap project `c2c_bootstrap_s3_20260713_1`; readiness now has no blocking reasons and recommends `run_c2c`.
+
 ## 2026-07-13 Bootstrap S0-S3 Proxy Path
 
 - Added an explicit `orchestration.profile: bootstrap` mode for the narrow first milestone: complete one `S0 -> S1 -> S2 -> S2.5 -> S3` traversal and obtain a cheap proxy metric.

@@ -806,14 +806,29 @@ def _dataset_one_example_loadable(dataset_root: Path | None) -> bool:
     if dataset_root.is_file():
         return _load_one_dataset_example(dataset_root)
     checked = 0
-    for path in sorted(dataset_root.rglob("*")):
-        if not path.is_file() or path.suffix.lower() not in {".jsonl", ".json", ".csv", ".txt"}:
+    pending = [dataset_root]
+    visited_dirs: set[Path] = set()
+    while pending and checked < 25:
+        current = pending.pop()
+        try:
+            resolved = current.resolve()
+            if resolved in visited_dirs:
+                continue
+            visited_dirs.add(resolved)
+            children = sorted(current.iterdir(), key=lambda path: path.name, reverse=True)
+        except OSError:
             continue
-        checked += 1
-        if _load_one_dataset_example(path):
-            return True
-        if checked >= 25:
-            break
+        for path in children:
+            if path.is_dir():
+                pending.append(path)
+                continue
+            if not path.is_file() or path.suffix.lower() not in {".jsonl", ".json", ".csv", ".txt"}:
+                continue
+            checked += 1
+            if _load_one_dataset_example(path):
+                return True
+            if checked >= 25:
+                break
     return False
 
 
