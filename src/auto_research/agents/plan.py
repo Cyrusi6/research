@@ -3278,6 +3278,9 @@ def _run_s2_codex_json_planner(
     model = str(llm_cfg.get("model") or "")
     if model:
         command.extend(["-m", model])
+    reasoning_effort = str(llm_cfg.get("reasoning_effort") or "").strip()
+    if reasoning_effort and reasoning_effort != "none":
+        command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
     command.extend(["-C", str(project_root.resolve())])
     merged_prompt = (
         "Follow this task exactly. You are planning experiments only. Do not edit files. "

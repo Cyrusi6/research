@@ -3636,6 +3636,9 @@ def _run_s1_codex_cli_once(
     model = str(agent_cfg.get("model") or llm_cfg.get("model") or "")
     if model:
         command.extend(["-m", model])
+    reasoning_effort = str(agent_cfg.get("reasoning_effort") or llm_cfg.get("reasoning_effort") or "").strip()
+    if reasoning_effort and reasoning_effort != "none":
+        command.extend(["-c", f'model_reasoning_effort="{reasoning_effort}"'])
     command.extend(["-C", str(project_root.resolve())])
     if session_id:
         command.extend(["resume", session_id, "-"])

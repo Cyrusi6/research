@@ -1,5 +1,12 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-13 C2C Bootstrap GPT-5.6 Terra XHigh
+
+- Configured `c2c_bootstrap_s3_20260713_1` to use `gpt-5.6-terra` with `reasoning_effort: xhigh` for the global LLM client, all configured reasoning agents, S1 evidence/novelty agents, and S2.5 code patching.
+- Added explicit `model_reasoning_effort` forwarding to the S1 evidence-direction and S2 directional-planner Codex CLI subprocesses.
+- Verified the effective merged project config resolves every configured agent model to `gpt-5.6-terra`, while S1 and code patch reasoning both resolve to `xhigh`.
+- Readiness remains `pass` with no warnings or blocking reasons.
+
 ## 2026-07-13 Bootstrap Cached-S0-Only Mode
 
 - Added `orchestration.bootstrap.cached_s0_only`, enabled by default for the bootstrap profile.

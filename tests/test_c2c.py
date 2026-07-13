@@ -5298,6 +5298,7 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     )
     ref_rebuttal.write_text("reviewer risk failure coverage regression counterevidence", encoding="utf-8")
     config = _base_config(tmp_path / "workspace", simulate=True)
+    config["llm"].update({"model": "gpt-5.6-terra", "reasoning_effort": "xhigh"})
     config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
     config.setdefault("orchestration", {})["shared_method_memory"] = {
         "enabled": True,
@@ -5557,6 +5558,8 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert len(evidence_session["attempts"]) == 3
     assert "resume" in s1_codex_commands[1]
     assert "resume" in s1_codex_commands[2]
+    assert s1_codex_commands[0][s1_codex_commands[0].index("-m") + 1] == "gpt-5.6-terra"
+    assert 'model_reasoning_effort="xhigh"' in s1_codex_commands[0]
     assert "Validation errors" in s1_codex_prompts[1]
 
 
@@ -7344,6 +7347,7 @@ def test_c2c_s2_resume_planner_uses_codex_session(monkeypatch, tmp_path: Path) -
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
     config["llm"]["codex_cli"] = {"use_resume": True, "sandbox": "read-only", "approval_policy": "never", "json_events": True}
+    config["llm"].update({"model": "gpt-5.6-terra", "reasoning_effort": "xhigh"})
     config["c2c"] = {
         "enabled": True,
         "snapshot_path": str(repo),
@@ -7369,6 +7373,8 @@ def test_c2c_s2_resume_planner_uses_codex_session(monkeypatch, tmp_path: Path) -
         assert command[0] == "codex"
         assert "-s" in command and command[command.index("-s") + 1] == "read-only"
         assert "--json" in command
+        assert command[command.index("-m") + 1] == "gpt-5.6-terra"
+        assert 'model_reasoning_effort="xhigh"' in command
         assert command[-1] == "-"
         output_path = Path(command[command.index("--output-last-message") + 1])
         variant_id = "utility_resume_memory_variant" if "resume" in command else "utility_resume_soft_residual"
