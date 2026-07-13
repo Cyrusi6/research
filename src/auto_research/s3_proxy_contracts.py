@@ -634,7 +634,7 @@ def _dataset_signature(config: dict[str, Any], proxy_config: dict[str, Any], run
 
 
 def _plan_hash(project_root: Path, plan: dict[str, Any]) -> str:
-    for rel in ["plan/plan.yaml", "plan/short_loop_plan.yaml"]:
+    for rel in ["plan/trial_spec.json"]:
         path = project_root / rel
         if path.exists() and path.is_file():
             return sha256_file(path)

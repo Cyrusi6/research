@@ -19,8 +19,8 @@ from ..direction_contracts import (
     build_planner_decision_artifact,
     build_variant_contract,
     build_variant_fingerprint_artifact,
-    direction_to_legacy_idea,
-    load_direction_or_legacy_idea,
+    direction_planner_seed,
+    load_direction,
 )
 from ..failure_log import load_c2c_feedback_bundle
 from ..method_memory import collect_used_shared_memory_refs, shared_method_memory_for_prompt, shared_method_memory_query_context
@@ -41,6 +41,8 @@ from ..s2_feedback_policy import (
     build_s2_score_adjustment_report,
 )
 from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, write_yaml
+from ..domain_contracts import canonical_hash
+from ..research_state import ResearchEventLedger
 from .base import AgentContext
 
 
@@ -54,8 +56,18 @@ class PlanAgent:
     def run(self) -> dict[str, Any]:
         if is_c2c_project(self.context.config):
             return self._run_c2c_plan()
-        direction, ideas = load_direction_or_legacy_idea(self.context.project_root)
+        direction = load_direction(self.context.project_root)
+        ideas = [direction_planner_seed(direction)]
         selected = next((idea for idea in ideas if idea.get("selected")), ideas[0])
+        research_state = read_json(self.context.project_root / "meta" / "research_state.json", default={}) or {}
+        direction_budget = (((research_state.get("directions") or {}).get(direction.get("direction_hash")) or {}).get("budget") or {})
+        variant_index = int(direction_budget.get("consumed", 0)) + 1
+        selected = dict(selected)
+        selected["id"] = f"{direction['direction_id']}-variant-{variant_index}"
+        selected["variant_id"] = selected["id"]
+        selected["variation_coordinates"] = {"intervention": f"sequential_method_variant_{variant_index}"}
+        selected["algorithm_operations"] = [f"apply sequential method variant {variant_index}"]
+        selected["config_overrides"] = {"variant_index": variant_index}
         selected.setdefault("s1_direction_id", direction.get("direction_id"))
         selected.setdefault("direction_id", direction.get("direction_id"))
         selected.setdefault("mechanism_axis", direction.get("mechanism_axis"))
@@ -126,6 +138,7 @@ class PlanAgent:
         )
         variant_fingerprint = _s2_variant_fingerprint(selected)
         selected["variant_fingerprint"] = selected.get("variant_fingerprint") or variant_fingerprint
+        plan["project_root"] = str(self.context.project_root)
         variant_contract = build_variant_contract(direction=direction, variant=selected, plan=plan, mode="generic")
         variant_fingerprint_artifact = build_variant_fingerprint_artifact(
             direction=direction,
@@ -147,7 +160,7 @@ class PlanAgent:
         )
         variant_contract_record = self.context.artifacts.write_json(
             self.stage_key,
-            "variant_contract.json",
+            "variant.json",
             variant_contract,
             artifact_type="s2_variant_contract",
             summary="Executable S2 variant contract for S2.5/S3",
@@ -161,13 +174,56 @@ class PlanAgent:
             summary="Stable S2 variant fingerprint",
             source_paths=["literature/direction.json"],
         )
-        plan_record = self.context.artifacts.write_yaml(
+        implementation_contract_record = self.context.artifacts.write_json(
             self.stage_key,
-            "plan.yaml",
-            plan,
+            "code_patches/implementation_contract.json",
+            {
+                "schema_version": "auto_research_implementation_contract_v1",
+                "direction_id": direction["direction_id"],
+                "variant_id": variant_contract["variant_id"],
+                "variant_spec_hash": variant_contract["variant_spec_hash"],
+                "mode": "no_patch_required",
+                "implementation_surface_ids": variant_contract["implementation_surface_ids"],
+            },
+            artifact_type="implementation_contract",
+            summary="Generic implementation contract",
+            source_paths=[variant_contract_record["path"]],
+        )
+        patch_manifest_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "code_patches/patch_manifest.json",
+            {
+                "schema_version": "auto_research_patch_manifest_v1",
+                "status": "disabled",
+                "selected_candidate_id": variant_contract["variant_id"],
+                "variant_spec_hash": variant_contract["variant_spec_hash"],
+                "reason": "generic simulated or externally implemented variant",
+            },
+            artifact_type="patch_manifest",
+            summary="Generic no-op implementation manifest",
+            source_paths=[implementation_contract_record["path"]],
+        )
+        patch_gate_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "code_patches/patch_gate_report.json",
+            {
+                "schema_version": "auto_research_patch_gate_v1",
+                "gate": "pass",
+                "variant_id": variant_contract["variant_id"],
+                "variant_spec_hash": variant_contract["variant_spec_hash"],
+                "checks": {"no_patch_required": True},
+            },
+            artifact_type="patch_gate_report",
+            summary="Generic no-op implementation gate",
+            source_paths=[patch_manifest_record["path"]],
+        )
+        plan_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "trial_spec.json",
+            _trial_spec_from_plan(plan, variant_contract),
             artifact_type="plan",
             summary="Structured experiment plan",
-            source_paths=["literature/direction.json", "literature/ideas.json"],
+            source_paths=["literature/direction.json", "literature/direction.json"],
         )
         hypotheses = self._hypotheses_md(plan["hypotheses"])
         hypotheses_record = self.context.artifacts.write_text(
@@ -192,6 +248,9 @@ class PlanAgent:
                 planner_record["path"],
                 variant_contract_record["path"],
                 variant_fingerprint_record["path"],
+                implementation_contract_record["path"],
+                patch_manifest_record["path"],
+                patch_gate_record["path"],
                 plan_record["path"],
                 hypotheses_record["path"],
                 task_graph["path"],
@@ -207,7 +266,8 @@ class PlanAgent:
 
     def _run_c2c_plan_regular(self, adapter: C2CAdapter | None = None) -> dict[str, Any]:
         adapter = adapter or C2CAdapter(self.context.project_root, self.context.config)
-        s1_direction, s1_ideas = load_direction_or_legacy_idea(self.context.project_root)
+        s1_direction = load_direction(self.context.project_root)
+        s1_ideas = [direction_planner_seed(s1_direction)]
         s1_selected = next((idea for idea in s1_ideas if idea.get("selected")), s1_ideas[0])
         s1_selected.setdefault("s1_direction_id", s1_direction.get("direction_id"))
         s1_selected.setdefault("direction_id", s1_direction.get("direction_id"))
@@ -239,6 +299,26 @@ class PlanAgent:
         next_variant = variant_selection.get("next_variant") if isinstance(variant_selection.get("next_variant"), dict) else {}
         selected = next((idea for idea in ideas if idea.get("selected")), ideas[0])
         selected["selected"] = True
+        profile = str(((self.context.config.get("orchestration") or {}).get("profile") or "standard")).lower()
+        if profile == "standard":
+            research_state = read_json(self.context.project_root / "meta" / "research_state.json", default={}) or {}
+            direction_state = ((research_state.get("directions") or {}).get(s1_direction.get("direction_hash")) or {})
+            consumed = int(((direction_state.get("budget") or {}).get("consumed") or 0))
+            if consumed:
+                planner_candidate_id = str(selected.get("id") or selected.get("variant_id") or "candidate")
+                variant_id = f"{s1_direction['direction_id']}-variant-{consumed + 1}"
+                retargeted = _replace_variant_identity_strings(selected, planner_candidate_id, variant_id)
+                selected.clear()
+                selected.update(retargeted)
+                selected["id"] = variant_id
+                selected["variant_id"] = variant_id
+                selected["variation_coordinates"] = {
+                    "intervention": variant_id,
+                }
+                variant_selection["candidate_pool"] = [selected]
+                variant_selection["selected_ideas"] = [selected]
+                variant_selection["next_variant"] = selected
+                variant_selection["selected_variant_id"] = variant_id
         selected.setdefault("s1_direction_id", s1_direction.get("direction_id"))
         selected.setdefault("direction_id", s1_direction.get("direction_id"))
         selected.setdefault("mechanism_axis", s1_direction.get("mechanism_axis"))
@@ -479,6 +559,7 @@ class PlanAgent:
             used_shared_memory_refs=planning_result["metadata"].get("used_shared_memory_refs") if isinstance(planning_result.get("metadata"), dict) else [],
             source=str(planning_result["metadata"].get("source") or "c2c_plan_agent"),
         )
+        plan["project_root"] = str(self.context.project_root)
         variant_contract = build_variant_contract(direction=s1_direction, variant=selected, plan=plan, execution=short_loop, mode="c2c")
         variant_fingerprint_artifact = build_variant_fingerprint_artifact(
             direction=s1_direction,
@@ -520,11 +601,11 @@ class PlanAgent:
         if variant_selection:
             variant_selection_record = self.context.artifacts.write_json(
                 self.stage_key,
-                "next_variant.json",
+                "variant_selection_report.json",
                 variant_selection,
                 artifact_type="c2c_s2_next_variant",
                 summary="Direction-conditioned S2 next variant selected for S2.5",
-                source_paths=["literature/ideas.json", "plan/performance_feedback.json", "plan/s2_planner_memory.json"],
+                source_paths=["literature/direction.json", "plan/performance_feedback.json", "plan/s2_planner_memory.json"],
             )
         else:
             variant_selection_record = None
@@ -543,8 +624,8 @@ class PlanAgent:
             artifact_type="c2c_s2_feedback_context",
             summary="S2 feedback context assembled from route, attempt, proxy, and memory history",
             source_paths=[
-                "meta/attempt_ledger.json",
-                "meta/route_decision.json",
+                "meta/research_state.json",
+                "meta/route_outcome.json",
                 "experiment/results/c2c_proxy_calibration_policy.json",
                 "experiment/results/c2c_proxy_decision_report.json",
                 "plan/performance_feedback.json",
@@ -584,7 +665,7 @@ class PlanAgent:
         )
         s2_next_variant_record = self.context.artifacts.write_json(
             self.stage_key,
-            "s2_planner/next_variant.json",
+            "s2_planner/selected_variant_report.json",
             next_variant or selected,
             artifact_type="c2c_s2_selected_next_variant",
             summary="S2c selected next variant passed by deterministic planner gate",
@@ -600,11 +681,11 @@ class PlanAgent:
         )
         variant_contract_record = self.context.artifacts.write_json(
             self.stage_key,
-            "variant_contract.json",
+            "variant.json",
             variant_contract,
             artifact_type="s2_variant_contract",
             summary="C2C executable variant contract for S2.5",
-            source_paths=["literature/direction.json", "plan/next_variant.json", "plan/plan.yaml"],
+            source_paths=["literature/direction.json", "plan/variant.json", "plan/trial_spec.json"],
         )
         variant_fingerprint_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -612,9 +693,28 @@ class PlanAgent:
             variant_fingerprint_artifact,
             artifact_type="s2_variant_fingerprint",
             summary="C2C stable variant fingerprint and history check",
-            source_paths=["literature/direction.json", "plan/next_variant.json", "plan/s2_planner_memory.json"],
+            source_paths=["literature/direction.json", "plan/variant.json", "plan/s2_planner_memory.json"],
         )
         if planner_gate_report.get("gate") == "pass":
+            ledger = ResearchEventLedger(self.context.project_root)
+            ledger.select_direction(s1_direction, event_id=f"direction:{s1_direction['direction_hash']}")
+            ledger.plan_variant(
+                variant_contract,
+                feedback_from_attempt_ids=list((variant_contract.get("lineage") or {}).get("feedback_from_attempt_ids") or []),
+                event_id=f"variant:{variant_contract['variant_spec_hash']}",
+            )
+            profile = str(((self.context.config.get("orchestration") or {}).get("profile") or "standard")).lower()
+            planned_hash = canonical_hash({"variant_spec_hash": variant_contract["variant_spec_hash"], "implementation": "planned"})
+            attempt = ledger.reserve_attempt(
+                profile=profile,
+                direction=s1_direction,
+                variant=variant_contract,
+                implementation_hash=planned_hash,
+                attempt_input_hash=canonical_hash({"implementation_hash": planned_hash, "trial_spec": plan}),
+                attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full",
+                event_id=f"attempt-reservation:{s1_direction['direction_hash']}:{variant_contract['variant_spec_hash']}",
+            )
+            ledger.transition_attempt(attempt["attempt_id"], "IMPLEMENTING")
             implementation_contract = build_s2_implementation_contract(
                 direction=s1_direction,
                 selected_variant=next_variant or selected,
@@ -629,6 +729,13 @@ class PlanAgent:
                 planner_gate_report,
                 variant_fingerprint_artifact,
             )
+            patch_status = str(code_patch_manifest.get("status") or "")
+            if code_patch_manifest.get("resource_retry") is True or "resource" in patch_status:
+                ledger.transition_attempt(attempt["attempt_id"], "RESOURCE_PAUSED", changes={"implementation_hash": canonical_hash(code_patch_manifest)})
+            elif patch_status in {"ok", "disabled"} and int(code_patch_manifest.get("valid_patch_count") or 0) >= (0 if patch_status == "disabled" else 1):
+                ledger.transition_attempt(attempt["attempt_id"], "READY", changes={"implementation_hash": canonical_hash(code_patch_manifest)})
+            else:
+                ledger.transition_attempt(attempt["attempt_id"], "IMPLEMENTATION_REPAIR", changes={"implementation_hash": canonical_hash(code_patch_manifest)})
         else:
             code_patch_manifest = {
                 "status": "planner_gate_failed",
@@ -657,17 +764,17 @@ class PlanAgent:
         )
         planning_result["metadata"]["memory_path"] = "plan/s2_planner_memory.json"
         planning_result["metadata"]["memory_entry_count"] = memory_record["entry_count"]
-        plan_record = self.context.artifacts.write_yaml(
+        plan_record = self.context.artifacts.write_json(
             self.stage_key,
-            "plan.yaml",
-            plan,
+            "trial_spec.json",
+            _trial_spec_from_plan(plan, variant_contract),
             artifact_type="plan",
             summary="C2C structured small-loop experiment plan",
-            source_paths=["literature/ideas.json", "literature/c2c/baseline_evidence.json"],
+            source_paths=["literature/direction.json", "literature/c2c/baseline_evidence.json"],
         )
         candidate_record = self.context.artifacts.write_json(
             self.stage_key,
-            "candidate_ideas.json",
+            "s2_planner/candidate_pool_snapshot.json",
             ideas,
             artifact_type="c2c_candidate_ideas",
             summary="C2C candidate ideas with bounded edit scope",
@@ -748,12 +855,12 @@ class PlanAgent:
     def _run_c2c_s2_5_patch_only(self, adapter: C2CAdapter, feedback: dict[str, Any]) -> dict[str, Any]:
         del adapter
         repair_dispatch = _load_s2_5_repair_dispatch(self.context.project_root)
-        candidate_path = self.context.project_root / "plan" / "candidate_ideas.json"
+        candidate_path = self.context.project_root / "plan" / "s2_planner/candidate_pool_snapshot.json"
         if not candidate_path.exists():
-            return self._run_c2c_patch_only_blocked("implementation_failure requested S2.5 patch-only repair but plan/candidate_ideas.json is missing", feedback, repair_dispatch)
+            return self._run_c2c_patch_only_blocked("implementation_failure requested S2.5 patch-only repair but plan/s2_planner/candidate_pool.json is missing", feedback, repair_dispatch)
         ideas = read_json(candidate_path, default=[])
         if not isinstance(ideas, list) or not ideas:
-            return self._run_c2c_patch_only_blocked("implementation_failure requested S2.5 patch-only repair but candidate_ideas.json has no candidates", feedback, repair_dispatch)
+            return self._run_c2c_patch_only_blocked("implementation_failure requested S2.5 patch-only repair but candidate pool has no variants", feedback, repair_dispatch)
         target_candidate_id = str(repair_dispatch.get("selected_candidate_id") or "").strip()
         target_fingerprint = str(repair_dispatch.get("variant_fingerprint") or "").strip()
         candidate_objects = [idea for idea in ideas if isinstance(idea, dict)]
@@ -768,7 +875,7 @@ class PlanAgent:
         ]
         if not patch_ideas:
             return self._run_c2c_patch_only_blocked("implementation_failure requested S2.5 patch-only repair but target candidate is missing", feedback, repair_dispatch)
-        plan_path = self.context.project_root / "plan" / "plan.yaml"
+        plan_path = self.context.project_root / "plan" / "trial_spec.json"
         plan = read_yaml(plan_path, default={}) if plan_path.exists() else {}
         if not isinstance(plan, dict):
             plan = {}
@@ -795,7 +902,7 @@ class PlanAgent:
         }
         if repair_dispatch:
             plan["s2_5_repair_dispatch"] = repair_dispatch
-        s1_direction, _ = load_direction_or_legacy_idea(self.context.project_root)
+        s1_direction = load_direction(self.context.project_root)
         selected_patch_idea.setdefault("s1_direction_id", s1_direction.get("direction_id"))
         selected_patch_idea.setdefault("direction_id", s1_direction.get("direction_id"))
         selected_patch_idea.setdefault("mechanism_axis", s1_direction.get("mechanism_axis"))
@@ -822,6 +929,7 @@ class PlanAgent:
             used_shared_memory_refs=selected_patch_idea.get("used_shared_memory_refs") if isinstance(selected_patch_idea, dict) else [],
             source="s2_5_patch_only_repair",
         )
+        plan["project_root"] = str(self.context.project_root)
         variant_contract = build_variant_contract(direction=s1_direction, variant=selected_patch_idea, plan=plan, mode="implementation_repair")
         variant_fingerprint_artifact = build_variant_fingerprint_artifact(
             direction=s1_direction,
@@ -900,7 +1008,7 @@ class PlanAgent:
             candidate_pool,
             artifact_type="c2c_s2_candidate_pool",
             summary="S2a candidate pool reused for S2.5-only implementation repair",
-            source_paths=["plan/performance_feedback.json", "plan/candidate_ideas.json"],
+            source_paths=["plan/performance_feedback.json", "plan/s2_planner/candidate_pool.json"],
         )
         feedback_context_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -908,7 +1016,7 @@ class PlanAgent:
             feedback_context,
             artifact_type="c2c_s2_feedback_context",
             summary="S2 feedback context for S2.5-only implementation repair",
-            source_paths=["plan/performance_feedback.json", "meta/route_decision.json", "meta/attempt_ledger.json"],
+            source_paths=["plan/performance_feedback.json", "meta/route_outcome.json", "meta/research_state.json"],
         )
         adaptive_policy_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -944,7 +1052,7 @@ class PlanAgent:
         )
         s2_next_variant_record = self.context.artifacts.write_json(
             self.stage_key,
-            "s2_planner/next_variant.json",
+            "s2_planner/selected_variant_report.json",
             selected_patch_idea,
             artifact_type="c2c_s2_selected_next_variant",
             summary="Locked selected variant reused by S2.5-only implementation repair",
@@ -952,7 +1060,7 @@ class PlanAgent:
         )
         legacy_next_variant_record = self.context.artifacts.write_json(
             self.stage_key,
-            "next_variant.json",
+            "variant_selection_report.json",
             planner_decision,
             artifact_type="c2c_s2_next_variant",
             summary="Compatibility next-variant mirror for S2.5-only implementation repair",
@@ -1002,15 +1110,15 @@ class PlanAgent:
             planner_decision,
             artifact_type="s2_planner_decision",
             summary="S2.5-only implementation repair planner decision",
-            source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json", "plan/candidate_ideas.json"],
+            source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json", "plan/s2_planner/candidate_pool.json"],
         )
         variant_contract_record = self.context.artifacts.write_json(
             self.stage_key,
-            "variant_contract.json",
+            "variant.json",
             variant_contract,
             artifact_type="s2_variant_contract",
             summary="S2.5-only implementation repair variant contract",
-            source_paths=["plan/performance_feedback.json", "plan/candidate_ideas.json"],
+            source_paths=["plan/performance_feedback.json", "plan/s2_planner/candidate_pool.json"],
         )
         variant_fingerprint_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -1018,15 +1126,15 @@ class PlanAgent:
             variant_fingerprint_artifact,
             artifact_type="s2_variant_fingerprint",
             summary="S2.5-only implementation repair variant fingerprint",
-            source_paths=["plan/performance_feedback.json", "plan/candidate_ideas.json"],
+            source_paths=["plan/performance_feedback.json", "plan/s2_planner/candidate_pool.json"],
         )
-        plan_record = self.context.artifacts.write_yaml(
+        plan_record = self.context.artifacts.write_json(
             self.stage_key,
-            "plan.yaml",
-            plan,
+            "trial_spec.json",
+            _trial_spec_from_plan(plan, variant_contract),
             artifact_type="plan",
             summary="C2C plan updated after S2.5-only implementation repair",
-            source_paths=["plan/performance_feedback.json", "plan/candidate_ideas.json", "plan/code_patches/patch_manifest.json"],
+            source_paths=["plan/performance_feedback.json", "plan/s2_planner/candidate_pool.json", "plan/code_patches/patch_manifest.json"],
         )
         patch_only_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -1058,11 +1166,11 @@ class PlanAgent:
             },
             artifact_type="c2c_s2_5_patch_only_repair",
             summary="S2.5-only patch repair for implementation failure; S2 planning was not rerun",
-            source_paths=["plan/performance_feedback.json", "plan/candidate_ideas.json", "plan/code_patches/patch_manifest.json"],
+            source_paths=["plan/performance_feedback.json", "plan/s2_planner/candidate_pool.json", "plan/code_patches/patch_manifest.json"],
         )
         candidate_record = self.context.artifacts.write_json(
             self.stage_key,
-            "candidate_ideas.json",
+            "s2_planner/candidate_pool_snapshot.json",
             patch_ideas,
             artifact_type="c2c_candidate_ideas",
             summary="C2C candidate ideas reused for S2.5-only implementation repair",
@@ -1125,7 +1233,7 @@ class PlanAgent:
         repair_dispatch: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         repair_dispatch = repair_dispatch if isinstance(repair_dispatch, dict) else {}
-        plan_path = self.context.project_root / "plan" / "plan.yaml"
+        plan_path = self.context.project_root / "plan" / "trial_spec.json"
         plan = read_yaml(plan_path, default={}) if plan_path.exists() else {}
         if not isinstance(plan, dict):
             plan = {}
@@ -1190,7 +1298,7 @@ class PlanAgent:
             "patch_eligible_for_s3": False,
             "implementation_blocked": True,
         }
-        s1_direction, _ = load_direction_or_legacy_idea(self.context.project_root)
+        s1_direction = load_direction(self.context.project_root)
         repair_variant = {
             "id": repair_dispatch.get("selected_candidate_id") or "implementation_blocked",
             "title": "Implementation repair blocked",
@@ -1213,6 +1321,7 @@ class PlanAgent:
             used_shared_memory_refs=s1_direction.get("used_shared_memory_refs") if isinstance(s1_direction, dict) else [],
             source="s2_5_patch_only_blocked",
         )
+        plan["project_root"] = str(self.context.project_root)
         variant_contract = build_variant_contract(direction=s1_direction, variant=repair_variant, plan=plan, mode="implementation_repair")
         variant_fingerprint_artifact = build_variant_fingerprint_artifact(
             direction=s1_direction,
@@ -1295,7 +1404,7 @@ class PlanAgent:
         )
         s2_next_variant_record = self.context.artifacts.write_json(
             self.stage_key,
-            "s2_planner/next_variant.json",
+            "s2_planner/selected_variant_report.json",
             repair_variant,
             artifact_type="c2c_s2_selected_next_variant",
             summary="Blocked implementation-repair selected variant",
@@ -1303,7 +1412,7 @@ class PlanAgent:
         )
         legacy_next_variant_record = self.context.artifacts.write_json(
             self.stage_key,
-            "next_variant.json",
+            "variant_selection_report.json",
             planner_decision,
             artifact_type="c2c_s2_next_variant",
             summary="Compatibility next-variant mirror for blocked implementation repair",
@@ -1335,7 +1444,7 @@ class PlanAgent:
         )
         variant_contract_record = self.context.artifacts.write_json(
             self.stage_key,
-            "variant_contract.json",
+            "variant.json",
             variant_contract,
             artifact_type="s2_variant_contract",
             summary="Blocked S2.5-only implementation repair variant contract",
@@ -1349,10 +1458,10 @@ class PlanAgent:
             summary="Blocked S2.5-only implementation repair variant fingerprint",
             source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json"],
         )
-        plan_record = self.context.artifacts.write_yaml(
+        plan_record = self.context.artifacts.write_json(
             self.stage_key,
-            "plan.yaml",
-            plan,
+            "trial_spec.json",
+            _trial_spec_from_plan(plan, variant_contract),
             artifact_type="plan",
             summary="C2C S2.5-only implementation repair blocked",
             source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json"],
@@ -1862,22 +1971,30 @@ class PlanAgent:
         return {"status": "ok", "ideas": selected_ideas, "variant_selection": variant_selection, "metadata": metadata}
 
     def _load_c2c_s2_planner_memory(self) -> dict[str, Any]:
-        memory = read_json(
-            self.context.project_root / "plan" / "s2_planner_memory.json",
-            default={
-                "schema_version": "c2c_s2_planner_memory_v1",
-                "project_id": self.context.project_root.name,
-                "entries": [],
-                "compacted_summary": {},
-            },
-        )
-        if not isinstance(memory, dict):
-            return {"schema_version": "c2c_s2_planner_memory_v1", "project_id": self.context.project_root.name, "entries": [], "compacted_summary": {}}
-        memory.setdefault("schema_version", "c2c_s2_planner_memory_v1")
-        memory.setdefault("project_id", self.context.project_root.name)
-        memory.setdefault("entries", [])
-        memory.setdefault("compacted_summary", {})
-        return memory
+        state = read_json(self.context.project_root / "meta" / "research_state.json", default={}) or {}
+        variants = state.get("variants") if isinstance(state.get("variants"), dict) else {}
+        entries = []
+        for outcome in state.get("method_tried_history") or []:
+            if not isinstance(outcome, dict) or outcome.get("method_evaluable") is not True:
+                continue
+            variant = variants.get(outcome.get("variant_spec_hash")) if isinstance(variants, dict) else {}
+            entries.append(
+                {
+                    "selected_candidate": {
+                        "id": outcome.get("variant_id"),
+                        "variant_fingerprint": outcome.get("variant_spec_hash"),
+                        "integration_point": ((variant or {}).get("implementation_surface_ids") or [None])[0],
+                    },
+                    "method_outcome": outcome.get("outcome_classification"),
+                    "attempt_id": outcome.get("attempt_id"),
+                }
+            )
+        return {
+            "schema_version": "c2c_s2_planner_memory_v2",
+            "project_id": self.context.project_root.name,
+            "entries": entries,
+            "compacted_summary": {"method_evaluable_outcomes": len(entries)},
+        }
 
     def _append_c2c_s2_planner_memory(
         self,
@@ -2957,6 +3074,19 @@ def _ensure_c2c_s2_config_overrides(idea: dict[str, Any]) -> None:
     }
 
 
+def _replace_variant_identity_strings(value: Any, old: str, new: str) -> Any:
+    if isinstance(value, dict):
+        return {
+            (str(key).replace(old, new) if isinstance(key, str) else key): _replace_variant_identity_strings(item, old, new)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_replace_variant_identity_strings(item, old, new) for item in value]
+    if isinstance(value, str):
+        return value.replace(old, new)
+    return value
+
+
 def _load_s2_5_repair_dispatch(project_root: Path) -> dict[str, Any]:
     dispatch_path = project_root / "plan" / "s2_5_repair_dispatch.json"
     if not dispatch_path.exists():
@@ -3170,7 +3300,7 @@ def _c2c_s2_available_artifacts() -> dict[str, str]:
         "main_results": "experiment/results/main_results.json",
         "proxy_calibration": "experiment/results/proxy_calibration.json",
         "iteration_trace": "meta/iteration_trace.jsonl",
-        "candidate_ideas": "plan/candidate_ideas.json",
+        "candidate_ideas": "plan/s2_planner/candidate_pool.json",
         "patch_manifest": "plan/code_patches/patch_manifest.json",
     }
 
@@ -3491,6 +3621,29 @@ def _parse_s2_codex_session_id(stderr: str, stdout: str = "") -> str | None:
             return str(event["thread_id"])
     return None
 
+
+
+def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "schema_version": "auto_research_trial_spec_v1",
+        "direction_id": variant.get("direction_id"),
+        "direction_hash": variant.get("direction_hash"),
+        "variant_id": variant.get("variant_id"),
+        "variant_spec_hash": variant.get("variant_spec_hash"),
+        "protocol": {
+            "hypotheses": plan.get("hypotheses") or [],
+            "acceptance_criteria": plan.get("acceptance_criteria") or {},
+            "statistical_testing": plan.get("statistical_testing") or {},
+            "ablation_matrix": plan.get("ablation_matrix") or [],
+        },
+        "baselines": plan.get("baselines") or [],
+        "datasets": plan.get("datasets") or [],
+        "sample_manifest": {"datasets": [item.get("name") if isinstance(item, dict) else item for item in plan.get("datasets") or []]},
+        "metrics": plan.get("metrics") or [],
+        "statistical_testing": plan.get("statistical_testing") or {},
+        "execution": plan.get("execution") or {},
+        "resource_budget": plan.get("resource_budget") or {},
+    }
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
     try:

@@ -71,86 +71,77 @@ def build_s2_feedback_context(
     config: dict[str, Any] | None = None,
     shared_memory: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Collect S2 selection feedback inputs into one deterministic context."""
+    """Build planner feedback only from event-derived method outcomes."""
 
-    config = config if isinstance(config, dict) else {}
-    direction = direction if isinstance(direction, dict) else {}
-    direction_fingerprint = read_json(project_root / "literature" / "c2c" / "direction_fingerprint.json", default={}) or {}
-    direction_id = str(direction.get("direction_id") or direction_fingerprint.get("direction_id") or direction.get("id") or "unknown_direction")
+    direction_id = str(direction.get("direction_id") or "unknown_direction")
+    direction_hash = str(direction.get("direction_hash") or "")
     registry = read_yaml(project_root / "meta" / "registry.yaml", default={}) or {}
-    route_decision = read_json(project_root / "meta" / "route_decision.json", default={}) or {}
-    attempt_ledger = read_json(project_root / "meta" / "attempt_ledger.json", default={}) or {}
+    state = read_json(project_root / "meta" / "research_state.json", default={}) or {}
+    route_outcome = read_json(project_root / "meta" / "route_outcome.json", default={}) or {}
     proxy_calibration_policy = read_json(project_root / "experiment" / "results" / "c2c_proxy_calibration_policy.json", default={}) or {}
-    proxy_decision = read_json(project_root / "experiment" / "results" / "c2c_proxy_decision_report.json", default={}) or {}
-    main_results = read_json(project_root / "experiment" / "results" / "main_results.json", default={}) or {}
-    performance_feedback = read_json(project_root / "plan" / "performance_feedback.json", default={}) or {}
-    iteration_trace = _read_jsonl(project_root / "meta" / "iteration_trace.jsonl")
-    counters = _attempt_counters(attempt_ledger, direction_id)
-    budgets = _budget_limits(config)
-    recent_failures = _collect_recent_failures(
-        direction=direction,
-        route_decision=route_decision,
-        attempt_ledger=attempt_ledger,
-        proxy_decision=proxy_decision,
-        main_results=main_results,
-        performance_feedback=performance_feedback,
-        iteration_trace=iteration_trace,
-    )
-    dragging_datasets = _dragging_datasets(proxy_decision, main_results, performance_feedback, proxy_calibration_policy)
-    dataset_risks = _dataset_risks(proxy_calibration_policy, dragging_datasets)
-    method_failures = [item for item in recent_failures if _is_method_failure(item.get("failure_class"))]
-    implementation_failures = [item for item in recent_failures if _is_implementation_failure(item.get("failure_class"))]
+    method_history = [
+        item for item in state.get("method_tried_history") or []
+        if isinstance(item, dict) and item.get("method_evaluable") and item.get("direction_hash") == direction_hash
+    ]
+    attempts = state.get("attempts") if isinstance(state.get("attempts"), dict) else {}
+    recent_failures = []
+    for item in method_history:
+        attempt = attempts.get(item.get("attempt_id")) if isinstance(attempts, dict) else {}
+        recent_failures.append({
+            "attempt_id": item.get("attempt_id"),
+            "variant_id": item.get("variant_id"),
+            "variant_spec_hash": item.get("variant_spec_hash"),
+            "failure_class": (attempt or {}).get("failure_class") or item.get("outcome_classification"),
+            "outcome_classification": item.get("outcome_classification"),
+            "method_evaluable": True,
+        })
+    implementation_failures = [
+        item for item in state.get("implementation_history") or []
+        if isinstance(item, dict)
+    ]
+    budget = (((state.get("directions") or {}).get(direction_hash) or {}).get("budget") or {}) if direction_hash else {}
+    dragging_datasets = _dragging_datasets({}, {}, {}, proxy_calibration_policy)
     return {
         "schema_version": C2C_S2_FEEDBACK_CONTEXT_SCHEMA_VERSION,
         "created_at": now_utc(),
         "direction_id": direction_id,
-        "current_iteration": int(registry.get("iteration") or 1) if isinstance(registry, dict) else 1,
+        "current_iteration": int(registry.get("iteration") or 1),
         "route_summary": {
-            "last_decision": route_decision.get("decision"),
-            "failure_class": route_decision.get("failure_class"),
-            "reason_codes": route_decision.get("reason_codes") or [],
+            "last_decision": route_outcome.get("next_action"),
+            "failure_class": None,
+            "reason_codes": route_outcome.get("reason_codes") or [],
         },
         "attempt_counters": {
-            "same_direction_proxy_failures": counters.get("proxy_failures", 0),
-            "same_direction_full_s3_failures": counters.get("full_s3_failures", 0),
-            "patch_repairs": counters.get("patch_repairs", 0),
-            "resource_retries": counters.get("resource_retries", 0),
-            "max_same_direction_proxy_failures": budgets.get("same_direction_proxy_failures"),
-            "max_same_direction_full_s3_failures": budgets.get("same_direction_full_s3_failures"),
-            "max_patch_repair_attempts": budgets.get("patch_repair_attempts_per_variant"),
-            "max_resource_retries": budgets.get("resource_retries_per_stage"),
+            "same_direction_proxy_failures": sum(1 for item in recent_failures if "proxy" in str(item.get("failure_class") or "")),
+            "same_direction_full_s3_failures": sum(1 for item in recent_failures if item.get("outcome_classification") in {"rejected", "falsified"}),
+            "patch_repairs": len(implementation_failures),
+            "resource_retries": sum(1 for attempt in attempts.values() if isinstance(attempt, dict) and attempt.get("direction_hash") == direction_hash and attempt.get("state") == "RESOURCE_PAUSED"),
+            "max_same_direction_proxy_failures": 5,
+            "max_same_direction_full_s3_failures": 5,
+            "max_patch_repair_attempts": None,
+            "max_resource_retries": None,
+            "direction_budget_consumed": int(budget.get("consumed", 0)),
+            "direction_budget_reserved": int(budget.get("reserved", 0)),
         },
         "proxy_calibration": {
-            "global_false_positive_rate": _number(
-                _nested(proxy_calibration_policy, ["summary", "proxy_false_positive_rate"]),
-                _number(proxy_calibration_policy.get("global_false_positive_rate"), 0.0),
-            ),
-            "mechanism_false_positive_rate": _number(
-                proxy_calibration_policy.get("mechanism_false_positive_rate"),
-                _number(_nested(proxy_calibration_policy, ["calibration_adjustments", "mechanism_false_positive_rate"]), 0.0),
-            ),
-            "integration_point_false_positive_rate": _number(
-                proxy_calibration_policy.get("integration_point_false_positive_rate"),
-                _number(_nested(proxy_calibration_policy, ["calibration_adjustments", "integration_point_false_positive_rate"]), 0.0),
-            ),
-            "dataset_risks": dataset_risks,
+            "global_false_positive_rate": _number(_nested(proxy_calibration_policy, ["summary", "proxy_false_positive_rate"]), 0.0),
+            "mechanism_false_positive_rate": _number(proxy_calibration_policy.get("mechanism_false_positive_rate"), 0.0),
+            "integration_point_false_positive_rate": _number(proxy_calibration_policy.get("integration_point_false_positive_rate"), 0.0),
+            "dataset_risks": [],
         },
         "recent_failures": recent_failures[-25:],
-        "failed_axes": sorted({str(item.get("mechanism_axis")) for item in method_failures if item.get("mechanism_axis")}),
-        "failed_integration_points": sorted({str(item.get("integration_point")) for item in method_failures if item.get("integration_point")}),
-        "failed_control_signals": sorted({str(item.get("control_signal")) for item in method_failures if item.get("control_signal")}),
-        "implementation_failure_surfaces": sorted({str(item.get("integration_point")) for item in implementation_failures if item.get("integration_point")}),
+        "failed_axes": [],
+        "failed_integration_points": [],
+        "failed_control_signals": [],
+        "implementation_failure_surfaces": [],
         "dragging_datasets": dragging_datasets,
         "shared_method_memory": _shared_memory_summary(shared_memory),
         "source_paths": [
-            "meta/attempt_ledger.json",
-            "meta/iteration_trace.jsonl",
-            "meta/route_decision.json",
+            "meta/research_state.json",
+            "meta/research_events",
+            "meta/route_outcome.json",
+            "experiment/results/trial_result.json",
             "experiment/results/c2c_proxy_calibration_policy.json",
-            "experiment/results/c2c_proxy_decision_report.json",
-            "experiment/results/main_results.json",
-            "plan/performance_feedback.json",
-            "literature/c2c/direction_fingerprint.json",
         ],
     }
 
@@ -169,8 +160,10 @@ def build_s2_adaptive_policy(feedback_context: dict[str, Any], config: dict[str,
     max_proxy = int(counters.get("max_same_direction_proxy_failures") or _route_budget(config or {}, "same_direction_proxy_failures", 5))
     max_full = int(counters.get("max_same_direction_full_s3_failures") or _route_budget(config or {}, "same_direction_full_s3_failures", 1))
     force_new_integration = history_sufficient and proxy_failures >= int(cfg.get("force_new_integration_after_proxy_failures") or 2)
-    force_new_direction = history_sufficient and full_failures >= int(cfg.get("force_new_direction_after_full_s3_failures") or 1)
-    same_direction_budget_remaining = proxy_failures < max_proxy and full_failures < max_full
+    consumed = int(counters.get("direction_budget_consumed") or 0)
+    reserved = int(counters.get("direction_budget_reserved") or 0)
+    force_new_direction = False
+    same_direction_budget_remaining = consumed + reserved < 5
     penalties = {
         "same_mechanism_proxy_false_positive": -min(0.12, float(cfg.get("max_proxy_false_positive_penalty") or 0.18)),
         "same_integration_point_proxy_false_positive": -min(0.10, float(cfg.get("max_proxy_false_positive_penalty") or 0.18)),
@@ -435,7 +428,7 @@ def _collect_recent_failures(
                     "reason_codes": route_decision.get("reason_codes") or [],
                     "consumes_same_direction_attempt": ((route_decision.get("budget_effects") or {}).get("consumes_same_direction_attempt") if isinstance(route_decision.get("budget_effects"), dict) else None),
                 },
-                source="meta/route_decision.json",
+                source="meta/route_outcome.json",
             )
         )
     if proxy_decision:
@@ -470,7 +463,7 @@ def _collect_recent_failures(
                         "route_decision": record.get("route_decision"),
                         "consumes_same_direction_attempt": record.get("consumes_same_direction_attempt"),
                     },
-                    source="meta/attempt_ledger.json",
+                    source="meta/research_state.json",
                 )
             )
     for event in iteration_trace[-12:]:

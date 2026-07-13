@@ -8,13 +8,19 @@ from pathlib import Path
 from typing import Any
 
 from .utils import read_json
+from .domain_contracts import (
+    DIRECTION_SCHEMA_VERSION,
+    VARIANT_SCHEMA_VERSION,
+    build_direction_spec,
+    build_variant_spec,
+    variant_spec_hash,
+)
 
 
-DIRECTION_SCHEMA_VERSION = "auto_research_direction_v1"
 DIRECTION_SCORECARD_SCHEMA_VERSION = "auto_research_direction_scorecard_v1"
 NOVELTY_AUDIT_SCHEMA_VERSION = "auto_research_novelty_audit_v1"
 PLANNER_DECISION_SCHEMA_VERSION = "auto_research_planner_decision_v1"
-VARIANT_CONTRACT_SCHEMA_VERSION = "auto_research_variant_contract_v2"
+VARIANT_CONTRACT_SCHEMA_VERSION = VARIANT_SCHEMA_VERSION
 VARIANT_FINGERPRINT_SCHEMA_VERSION = "auto_research_variant_fingerprint_v1"
 C2C_S1_EVIDENCE_QUALITY_SCHEMA_VERSION = "c2c_s1_evidence_quality_v1"
 C2C_S1_EVIDENCE_RETRIEVAL_TRACE_SCHEMA_VERSION = "c2c_s1_evidence_retrieval_trace_v1"
@@ -62,125 +68,74 @@ def build_direction_contract(
     mode: str = "generic",
     used_shared_memory_refs: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Build the new S1 direction artifact from legacy S1 payload shapes."""
+    """Normalize S1 output into the only authoritative DirectionSpec v2."""
 
     direction = payload.get("direction") if isinstance(payload.get("direction"), dict) else {}
     decision = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
     selected = _selected_idea(payload.get("selected_ideas"))
     evidence_bundle = payload.get("evidence_bundle") if isinstance(payload.get("evidence_bundle"), dict) else {}
     negative_constraints = payload.get("negative_constraints") if isinstance(payload.get("negative_constraints"), dict) else {}
-    refs = _as_list(used_shared_memory_refs)
-    if not refs:
-        refs = _as_list(payload.get("used_shared_memory_refs")) or _as_list(decision.get("used_shared_memory_refs")) or _as_list(selected.get("used_shared_memory_refs"))
-
-    mechanism_type = str(
-        direction.get("mechanism_type")
-        or decision.get("mechanism_type")
-        or selected.get("mechanism_type")
-        or ""
-    )
+    source = {**selected, **decision, **direction}
+    title = str(source.get("title") or source.get("mechanism_direction") or source.get("direction_id") or source.get("id") or "selected_direction")
+    direction_id = str(source.get("direction_id") or source.get("s1_direction_id") or source.get("id") or _snakeish(title))
+    mechanism_type = str(source.get("mechanism_type") or "generic_direction")
     defaults = MECHANISM_DEFAULTS.get(mechanism_type, {})
-    title = (
-        direction.get("title")
-        or decision.get("title")
-        or decision.get("mechanism_direction")
-        or selected.get("title")
-        or decision.get("direction_id")
-        or selected.get("id")
-        or "Selected direction"
-    )
-    direction_id = str(
-        direction.get("direction_id")
-        or decision.get("direction_id")
-        or selected.get("direction_id")
-        or selected.get("s1_direction_id")
-        or selected.get("id")
-        or _snakeish(title)
-    )
-    expected_files = _as_list(direction.get("expected_files")) or _as_list(decision.get("expected_files")) or _as_list(selected.get("expected_files"))
-    implementation_refs = (
-        _as_list(direction.get("implementation_surface_refs"))
-        or _as_list(decision.get("implementation_surface_refs"))
-        or _as_list(selected.get("implementation_surface_refs"))
-        or _as_list(selected.get("code_refs"))
-        or _surface_refs_from_files(expected_files)
-    )
-    required_refs = (
-        _as_list(direction.get("required_evidence_refs"))
-        or _as_list(decision.get("required_evidence_refs"))
-        or _as_list(selected.get("evidence_refs"))
-        or _refs_from_evidence_bundle(evidence_bundle, want_risk=False)
-    )
-    counter_refs = (
-        _as_list(direction.get("counterevidence_refs"))
-        or _as_list(decision.get("counterevidence_refs"))
-        or _as_list(selected.get("counterevidence_refs"))
-        or _refs_from_evidence_bundle(evidence_bundle, want_risk=True)
-    )
-    expected_metric_signature = (
-        direction.get("expected_metric_signature")
-        if isinstance(direction.get("expected_metric_signature"), dict)
-        else decision.get("expected_metric_signature")
-        if isinstance(decision.get("expected_metric_signature"), dict)
-        else selected.get("expected_metric_signature")
-        if isinstance(selected.get("expected_metric_signature"), dict)
-        else selected.get("expected_signature")
-        if isinstance(selected.get("expected_signature"), dict)
-        else _default_metric_signature(mode, selected, decision)
-    )
-    hypothesis = str(
-        direction.get("hypothesis")
-        or decision.get("hypothesis")
-        or decision.get("core_hypothesis")
-        or selected.get("hypothesis")
-        or selected.get("description")
-        or "S2 should instantiate and test this direction."
-    )
-    why_baseline_fails = str(
-        direction.get("why_baseline_fails")
-        or decision.get("why_baseline_fails")
-        or selected.get("why_baseline_fails")
-        or selected.get("motivation")
-        or decision.get("rationale")
-        or "The current baseline lacks the proposed control signal or mechanism axis."
-    )
-    return {
-        "schema_version": DIRECTION_SCHEMA_VERSION,
+    mechanism_axis = str(source.get("mechanism_axis") or defaults.get("mechanism_axis") or "method")
+    integration_point = str(source.get("integration_point") or defaults.get("integration_point") or "experiment_surface")
+    control_signal = str(source.get("control_signal") or defaults.get("control_signal") or "primary_metric")
+    hypothesis = str(source.get("hypothesis") or source.get("core_hypothesis") or source.get("description") or "The proposed mechanism causally improves the target outcome.")
+    mediator = str(source.get("target_mediator") or control_signal)
+    expected_metric_signature = source.get("expected_metric_signature") if isinstance(source.get("expected_metric_signature"), dict) else source.get("expected_signature") if isinstance(source.get("expected_signature"), dict) else _default_metric_signature(mode, selected, decision)
+    evidence_items = [item for item in evidence_bundle.get("items") or [] if isinstance(item, dict)]
+    support_ids = [str(item.get("claim_id") or item.get("chunk_id") or item.get("source_path") or item.get("id") or "") for item in evidence_items if not item.get("risks")]
+    counter_ids = [str(item.get("claim_id") or item.get("chunk_id") or item.get("source_path") or item.get("id") or "") for item in evidence_items if item.get("risks")]
+    support_ids = [item for item in support_ids if item] or [str(item) for item in _as_list(source.get("support_claim_ids")) if item]
+    counter_ids = [item for item in counter_ids if item] or [str(item) for item in _as_list(source.get("counter_claim_ids")) if item]
+    surface_values = _as_list(source.get("implementation_surface_ids")) or _as_list(source.get("expected_files")) or _as_list(source.get("implementation_surface_refs")) or _as_list(source.get("code_refs"))
+    surface_ids = []
+    for value in surface_values:
+        if isinstance(value, dict):
+            label = value.get("surface_id") or value.get("source_path") or value.get("source_label")
+        else:
+            label = value
+        if label:
+            surface_ids.append(str(label))
+    mutable_axes = [str(item) for item in _as_list(source.get("mutable_axes")) or ["intervention", "configuration", "algorithm_operation"]]
+    immutable_axes = [str(item) for item in _as_list(source.get("immutable_axes")) or ["research_question", "mechanism_invariants", "benchmark_contract"]]
+    forbidden = source.get("forbidden_combinations") if isinstance(source.get("forbidden_combinations"), list) else []
+    if not forbidden:
+        forbidden = [item for item in _as_list(source.get("forbidden_patterns")) or _as_list(negative_constraints.get("forbidden_patterns")) if isinstance(item, dict)]
+    lineage = source.get("lineage") if isinstance(source.get("lineage"), dict) else {}
+    input_manifest_hash = str(lineage.get("input_manifest_hash") or payload.get("input_manifest_hash") or hashlib.sha256(json.dumps(evidence_bundle, sort_keys=True, default=str).encode()).hexdigest())
+    benchmark_contract_hash = str(source.get("benchmark_contract_hash") or hashlib.sha256(json.dumps(expected_metric_signature, sort_keys=True, default=str).encode()).hexdigest())
+    spec = {
         "direction_id": direction_id,
-        "title": str(title),
-        "mechanism_type": mechanism_type or "generic_direction",
-        "mechanism_axis": str(direction.get("mechanism_axis") or decision.get("mechanism_axis") or selected.get("mechanism_axis") or defaults.get("mechanism_axis") or "method"),
-        "integration_point": str(direction.get("integration_point") or decision.get("integration_point") or selected.get("integration_point") or _infer_integration_point(expected_files) or defaults.get("integration_point") or "experiment_plan"),
-        "control_signal": str(direction.get("control_signal") or decision.get("control_signal") or selected.get("control_signal") or defaults.get("control_signal") or "primary_metric"),
-        "hypothesis": hypothesis,
-        "why_baseline_fails": why_baseline_fails,
-        "expected_metric_signature": expected_metric_signature,
-        "required_evidence_refs": required_refs or [_placeholder_ref("required_evidence", "S1 evidence is missing for this direction.")],
-        "counterevidence_refs": counter_refs or [_placeholder_ref("counterevidence", "Counterevidence is missing for this direction.")],
-        "implementation_surface_refs": implementation_refs or [_placeholder_ref("implementation_surface", "The concrete implementation surface is missing.")],
-        "known_negative_memory_refs": _known_negative_refs(direction, decision, selected, negative_constraints, refs),
-        "go_to_s2_conditions": _as_list(direction.get("go_to_s2_conditions")) or _as_list(decision.get("go_to_s2_conditions")) or [
-            "required evidence refs resolve",
-            "novelty audit passes or is explicitly skipped",
-            "implementation surface refs are available for S2 planning",
-        ],
-        "return_to_s1_conditions": _as_list(direction.get("return_to_s1_conditions")) or _as_list(decision.get("return_to_s1_conditions")) or [
-            "same-direction failure budget is exhausted",
-            "S2 cannot instantiate an executable variant without violating forbidden patterns",
-            "S3 shows repeated method-level metric collapse for this direction",
-        ],
-        "allowed_variants": _as_list(direction.get("allowed_variants")) or _as_list(decision.get("allowed_variants")) or _as_list(selected.get("s1_allowed_variants")),
-        "forbidden_patterns": _as_list(direction.get("forbidden_patterns")) or _as_list(decision.get("forbidden_patterns")) or _as_list(selected.get("s1_forbidden_patterns")) or _as_list(negative_constraints.get("forbidden_patterns")),
-        "target_datasets": _as_list(direction.get("target_datasets")) or _as_list(decision.get("target_datasets")),
-        "expected_files": expected_files,
-        "verification_commands": _as_list(direction.get("verification_commands")) or _as_list(decision.get("verification_commands")) or _as_list(selected.get("verification_commands")),
-        "used_shared_memory_refs": refs,
-        "source": {
-            "mode": mode,
-            "legacy_direction_decision": decision,
-            "legacy_selected_idea_id": selected.get("id"),
+        "research_question": str(source.get("research_question") or title),
+        "mechanism_invariants": {
+            "causal_hypothesis": hypothesis,
+            "target_mediator": mediator,
+            "invariants": [
+                str(item)
+                for item in _as_list(source.get("mechanism_invariants"))
+                or [f"mechanism_axis={mechanism_axis}", f"integration_point={integration_point}", f"control_signal={control_signal}"]
+            ],
+        },
+        "falsification_conditions": [str(item) for item in _as_list(source.get("falsification_conditions")) or ["The intervention does not change the target mediator.", "The target outcome does not improve under the fixed benchmark contract."]],
+        "support_claim_ids": list(dict.fromkeys(support_ids or ["support-claim-required"])),
+        "counter_claim_ids": list(dict.fromkeys(counter_ids or ["counter-claim-required"])),
+        "implementation_surface_ids": list(dict.fromkeys(surface_ids or [integration_point])),
+        "metric_signature": expected_metric_signature or {"primary_metric": "primary_metric", "expected_direction": "increase"},
+        "benchmark_contract_hash": benchmark_contract_hash,
+        "variant_space": {"mutable_axes": list(dict.fromkeys(mutable_axes)), "immutable_axes": list(dict.fromkeys(immutable_axes)), "forbidden_combinations": forbidden},
+        "s2_entry_conditions": [str(item) for item in _as_list(source.get("s2_entry_conditions")) or _as_list(source.get("go_to_s2_conditions")) or ["S1 gate passes", "DirectionSpec identity validates"]],
+        "return_to_s1_conditions": [str(item) for item in _as_list(source.get("return_to_s1_conditions")) or ["five method-evaluable variants fail or falsify the direction", "integrity block requires a new direction"]],
+        "lineage": {
+            "s1_run_id": str(lineage.get("s1_run_id") or payload.get("s1_run_id") or f"s1-{direction_id}"),
+            "iteration": int(lineage.get("iteration") or payload.get("iteration") or 1),
+            "input_manifest_hash": input_manifest_hash,
         },
     }
+    return build_direction_spec(spec)
 
 
 def build_direction_scorecard(
@@ -191,16 +146,17 @@ def build_direction_scorecard(
 ) -> dict[str, Any]:
     audit = normalize_novelty_audit(novelty_audit, direction_id=str(direction.get("direction_id") or "unknown_direction"))
     evidence_items = (evidence_bundle or {}).get("items") if isinstance(evidence_bundle, dict) else []
-    required_refs = _as_list(direction.get("required_evidence_refs"))
-    counter_refs = _as_list(direction.get("counterevidence_refs"))
-    surfaces = _as_list(direction.get("implementation_surface_refs"))
+    required_refs = _as_list(direction.get("support_claim_ids"))
+    counter_refs = _as_list(direction.get("counter_claim_ids"))
+    surfaces = _as_list(direction.get("implementation_surface_ids"))
+    invariants = direction.get("mechanism_invariants") if isinstance(direction.get("mechanism_invariants"), dict) else {}
     return {
         "schema_version": DIRECTION_SCORECARD_SCHEMA_VERSION,
         "direction_id": direction.get("direction_id"),
-        "title": direction.get("title"),
-        "mechanism_axis": direction.get("mechanism_axis"),
-        "integration_point": direction.get("integration_point"),
-        "control_signal": direction.get("control_signal"),
+        "title": direction.get("research_question"),
+        "mechanism_axis": "mechanism_invariants",
+        "integration_point": surfaces[0] if surfaces else None,
+        "control_signal": invariants.get("target_mediator"),
         "evidence_item_count": len(evidence_items or []),
         "required_evidence_ref_count": len(required_refs),
         "counterevidence_ref_count": len(counter_refs),
@@ -211,9 +167,9 @@ def build_direction_scorecard(
             "threshold": audit.get("threshold"),
         },
         "go_to_s2_ready": bool(direction.get("direction_id") and required_refs and surfaces and audit.get("passed") is not False),
-        "go_to_s2_conditions": _as_list(direction.get("go_to_s2_conditions")),
+        "go_to_s2_conditions": _as_list(direction.get("s2_entry_conditions")),
         "return_to_s1_conditions": _as_list(direction.get("return_to_s1_conditions")),
-        "used_shared_memory_refs": _as_list(direction.get("used_shared_memory_refs")),
+        "used_shared_memory_refs": [],
     }
 
 
@@ -224,20 +180,21 @@ def build_s1_direction_fingerprint(
 ) -> dict[str, Any]:
     """Build a deterministic identity for the selected C2C S1 direction."""
 
+    invariants = direction.get("mechanism_invariants") if isinstance(direction.get("mechanism_invariants"), dict) else {}
+    surfaces = [str(item) for item in _as_list(direction.get("implementation_surface_ids"))]
     features = {
         "direction_id": str(direction.get("direction_id") or ""),
-        "mechanism_axis": str(direction.get("mechanism_axis") or ""),
-        "integration_point": str(direction.get("integration_point") or ""),
-        "control_signal": str(direction.get("control_signal") or ""),
-        "mechanism_type": str(direction.get("mechanism_type") or ""),
-        "expected_files": sorted(str(item) for item in _as_list(direction.get("expected_files"))),
-        "implementation_surface_refs": sorted(_ref_label(item) for item in _as_list(direction.get("implementation_surface_refs"))),
+        "mechanism_axis": "mechanism_invariants",
+        "integration_point": surfaces[0] if surfaces else "",
+        "control_signal": str(invariants.get("target_mediator") or ""),
+        "mechanism_type": "direction_v2",
+        "expected_files": sorted(surfaces),
+        "implementation_surface_refs": sorted(surfaces),
     }
     token_text = " ".join(
         [
-            str(direction.get("title") or ""),
-            str(direction.get("hypothesis") or ""),
-            str(direction.get("why_baseline_fails") or ""),
+            str(direction.get("research_question") or ""),
+            str(invariants.get("causal_hypothesis") or ""),
             " ".join(str(value) for value in features.values() if not isinstance(value, list)),
             " ".join(features["expected_files"]),
             " ".join(features["implementation_surface_refs"]),
@@ -454,50 +411,36 @@ def normalize_novelty_audit(value: dict[str, Any] | list[Any] | None, *, directi
     }
 
 
-def direction_to_legacy_idea(direction: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "id": direction.get("direction_id") or "selected_direction",
-        "direction_id": direction.get("direction_id"),
-        "s1_direction_id": direction.get("direction_id"),
-        "title": direction.get("title") or direction.get("direction_id") or "Selected direction",
-        "selected": True,
-        "hypothesis": direction.get("hypothesis") or "",
-        "novelty_score": 7,
-        "feasibility_score": 7,
-        "mechanism_type": direction.get("mechanism_type"),
-        "description": direction.get("hypothesis") or "",
-        "motivation": direction.get("why_baseline_fails") or "",
-        "why_baseline_fails": direction.get("why_baseline_fails"),
-        "expected_signature": direction.get("expected_metric_signature"),
-        "expected_files": _as_list(direction.get("expected_files")),
-        "verification_commands": _as_list(direction.get("verification_commands")),
-        "evidence_refs": _as_list(direction.get("required_evidence_refs")),
-        "counterevidence_refs": _as_list(direction.get("counterevidence_refs")),
-        "code_refs": _as_list(direction.get("implementation_surface_refs")),
-        "s1_allowed_variants": _as_list(direction.get("allowed_variants")),
-        "s1_forbidden_patterns": _as_list(direction.get("forbidden_patterns")),
-        "used_shared_memory_refs": _as_list(direction.get("used_shared_memory_refs")),
-        "s1_direction_contract": {
-            "schema_version": direction.get("schema_version"),
-            "mechanism_axis": direction.get("mechanism_axis"),
-            "integration_point": direction.get("integration_point"),
-            "control_signal": direction.get("control_signal"),
-        },
-    }
-
-
-def load_direction_or_legacy_idea(project_root: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def load_direction(project_root: Path) -> dict[str, Any]:
     direction = read_json(project_root / "literature" / "direction.json", default={}) or {}
-    if isinstance(direction, dict) and direction.get("direction_id"):
-        ideas = read_json(project_root / "literature" / "ideas.json", default=[]) or []
-        if not isinstance(ideas, list) or not ideas:
-            ideas = [direction_to_legacy_idea(direction)]
-        return direction, [item for item in ideas if isinstance(item, dict)] or [direction_to_legacy_idea(direction)]
-    ideas = read_json(project_root / "literature" / "ideas.json", default=[]) or []
-    ideas = [item for item in ideas if isinstance(item, dict)] if isinstance(ideas, list) else []
-    selected = next((idea for idea in ideas if idea.get("selected")), ideas[0] if ideas else {})
-    payload = {"selected_ideas": [selected], "direction_decision": selected, "evidence_bundle": {"items": selected.get("evidence_refs") or []}}
-    return build_direction_contract(payload), ideas or [direction_to_legacy_idea(build_direction_contract(payload))]
+    if not isinstance(direction, dict) or direction.get("schema_version") != DIRECTION_SCHEMA_VERSION:
+        raise RuntimeError("DirectionSpec v2 is missing or invalid; rerun the project from S1")
+    return direction
+
+
+def direction_planner_seed(direction: dict[str, Any]) -> dict[str, Any]:
+    invariants = direction.get("mechanism_invariants") or {}
+    invariant_items = invariants.get("invariants") if isinstance(invariants, dict) else []
+    coordinates = {}
+    for item in invariant_items or []:
+        if isinstance(item, str) and "=" in item:
+            key, value = item.split("=", 1)
+            coordinates[key] = value
+    return {
+        "id": f"{direction['direction_id']}-seed",
+        "direction_id": direction["direction_id"],
+        "s1_direction_id": direction["direction_id"],
+        "title": direction["research_question"],
+        "selected": True,
+        "hypothesis": invariants.get("causal_hypothesis") if isinstance(invariants, dict) else "",
+        "mechanism_axis": coordinates.get("mechanism_axis", "method"),
+        "integration_point": coordinates.get("integration_point", direction["implementation_surface_ids"][0]),
+        "control_signal": coordinates.get("control_signal", invariants.get("target_mediator") if isinstance(invariants, dict) else "primary_metric"),
+        "expected_signature": direction["metric_signature"],
+        "expected_files": list(direction["implementation_surface_ids"]),
+        "s1_allowed_variants": list(direction["variant_space"]["mutable_axes"]),
+        "s1_forbidden_patterns": list(direction["variant_space"]["forbidden_combinations"]),
+    }
 
 
 def build_planner_decision_artifact(
@@ -532,113 +475,47 @@ def build_variant_contract(
     execution = execution if isinstance(execution, dict) else plan.get("execution") if isinstance(plan.get("execution"), dict) else {}
     contract = variant.get("experiment_contract") if isinstance(variant.get("experiment_contract"), dict) else {}
     ablation_plan = variant.get("ablation_plan") if isinstance(variant.get("ablation_plan"), dict) else {}
-    expected_files = _as_list(contract.get("expected_files")) or _as_list(variant.get("expected_files")) or _as_list(direction.get("expected_files"))
-    if not expected_files and mode != "c2c":
-        expected_files = ["S2 implementation surface TBD"]
-    expected_metric_signature = (
-        variant.get("expected_metric_signature")
-        if isinstance(variant.get("expected_metric_signature"), dict)
-        else variant.get("expected_signature")
-        if isinstance(variant.get("expected_signature"), dict)
-        else direction.get("expected_metric_signature")
-        if isinstance(direction.get("expected_metric_signature"), dict)
-        else {}
-    )
-    ablation_switch = contract.get("ablation_switch") or ablation_plan.get("switch") or variant.get("ablation_switch")
-    fingerprint = variant.get("variant_fingerprint") or ((variant.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(variant.get("s2_variant"), dict) else "")
-    hypothesis = str(variant.get("hypothesis") or direction.get("hypothesis") or "")
-    mechanism_axis = variant.get("mechanism_axis") or ((variant.get("s2_variant") or {}).get("mechanism_axis") if isinstance(variant.get("s2_variant"), dict) else None) or direction.get("mechanism_axis")
-    integration_point = variant.get("integration_point") or ((variant.get("s2_variant") or {}).get("integration_point") if isinstance(variant.get("s2_variant"), dict) else None) or direction.get("integration_point")
-    control_signal = variant.get("control_signal") or ((variant.get("s2_variant") or {}).get("control_signal") if isinstance(variant.get("s2_variant"), dict) else None) or direction.get("control_signal")
-    seeds = _as_list((plan.get("statistical_testing") or {}).get("seeds") if isinstance(plan.get("statistical_testing"), dict) else None)
-    experiment_hypothesis = {
+    intervention_config = contract.get("config_overrides") if isinstance(contract.get("config_overrides"), dict) else variant.get("config_overrides") if isinstance(variant.get("config_overrides"), dict) else {"enabled": True}
+    coordinates = variant.get("variation_coordinates") if isinstance(variant.get("variation_coordinates"), dict) else {}
+    if not coordinates:
+        mutable = direction.get("variant_space", {}).get("mutable_axes") or ["intervention"]
+        coordinates = {str(mutable[0]): variant.get("mechanism_type") or variant.get("id") or "selected"}
+    expected_signature = variant.get("expected_metric_signature") if isinstance(variant.get("expected_metric_signature"), dict) else variant.get("expected_signature") if isinstance(variant.get("expected_signature"), dict) else direction.get("metric_signature") or {}
+    operation = str(variant.get("mechanism_summary") or variant.get("description") or variant.get("hypothesis") or "apply selected intervention")
+    variant_id = str(variant.get("variant_id") or variant.get("id") or "selected_variant")
+    lineage = variant.get("lineage") if isinstance(variant.get("lineage"), dict) else {}
+    payload = {
+        "variant_id": variant_id,
+        "variation_coordinates": coordinates,
         "intervention": {
-            "target": integration_point,
-            "operation": variant.get("mechanism_summary") or variant.get("description") or hypothesis,
-            "mediator": control_signal,
+            "summary": operation,
+            "algorithm_operations": [str(item) for item in _as_list(variant.get("algorithm_operations")) or [operation]],
+            "configuration": intervention_config or {"enabled": True},
         },
-        "null_hypothesis": variant.get("null_hypothesis") or f"Changing {control_signal or 'the selected control'} at {integration_point or 'the selected integration point'} does not improve the primary outcome.",
-        "alternative_hypothesis": hypothesis,
-        "minimum_effect": execution.get("min_delta_to_pass")
-        if execution.get("min_delta_to_pass") is not None
-        else (plan.get("acceptance_criteria") or {}).get("min_delta_to_pass", 0.0)
-        if isinstance(plan.get("acceptance_criteria"), dict)
-        else 0.0,
-        "mechanism_predictions": _as_list(variant.get("mechanism_predictions")) or [
-            {
-                "observable": key,
-                "expected_direction": value,
-            }
-            for key, value in expected_metric_signature.items()
-        ],
-        "falsification_conditions": _as_list(variant.get("falsification_conditions")) or [
-            "The primary metric does not clear the registered minimum effect.",
-            "The ablation-off control retains the candidate effect.",
-            "The expected mechanism observables do not change in the registered direction.",
-        ],
+        "hypothesis": str(variant.get("hypothesis") or direction["mechanism_invariants"]["causal_hypothesis"]),
+        "null_hypothesis": str(variant.get("null_hypothesis") or "The intervention does not improve the primary outcome."),
+        "alternative_hypothesis": str(variant.get("alternative_hypothesis") or variant.get("hypothesis") or direction["mechanism_invariants"]["causal_hypothesis"]),
+        "controlled_variables": contract.get("fixed_variables") if isinstance(contract.get("fixed_variables"), dict) else {"benchmark_contract_hash": direction["benchmark_contract_hash"]},
+        "nuisance_variables": [str(item) for item in _as_list(contract.get("nuisance_variables")) or _as_list(variant.get("nuisance_variables"))],
+        "implementation_surface_ids": [str(item) for item in _as_list(contract.get("expected_files")) or _as_list(variant.get("expected_files")) or direction["implementation_surface_ids"]],
+        "expected_metric_signature": expected_signature,
+        "falsification_conditions": [str(item) for item in _as_list(variant.get("falsification_conditions")) or direction["falsification_conditions"]],
+        "ablation": ablation_plan or {"switch": contract.get("ablation_switch") or variant.get("ablation_switch") or "disable_selected_intervention"},
+        "resource_budget": {
+            "max_wall_seconds": int((variant.get("resource_budget") or {}).get("max_wall_seconds") or execution.get("timeout_seconds") or 3600),
+            "max_retries": int((variant.get("resource_budget") or {}).get("max_retries") or 2),
+        },
+        "failure_routing": variant.get("failure_routing") if isinstance(variant.get("failure_routing"), dict) else {"implementation": "REPAIR_IMPLEMENTATION", "resource": "PAUSE_RESOURCE", "method": "PROPOSE_NEXT_VARIANT"},
+        "lineage": {
+            "s2_run_id": str(lineage.get("s2_run_id") or f"s2-{variant_id}"),
+            "iteration": int(lineage.get("iteration") or 1),
+            "direction_spec_hash": direction["direction_hash"],
+            "feedback_from_attempt_ids": [str(item) for item in _as_list(lineage.get("feedback_from_attempt_ids")) or _as_list(variant.get("feedback_from_attempt_ids"))],
+        },
     }
-    variable_control = {
-        "treatment_variables": _as_list(variant.get("treatment_variables")) or [
-            {"name": "mechanism_axis", "value": mechanism_axis},
-            {"name": "integration_point", "value": integration_point},
-            {"name": "control_signal", "value": control_signal},
-        ],
-        "fixed_variables": variant.get("fixed_variables") if isinstance(variant.get("fixed_variables"), dict) else {
-            "datasets": plan.get("datasets") or [],
-            "baselines": plan.get("baselines") or [],
-            "seeds": seeds,
-            "training_protocol": execution.get("train") or execution.get("commands") or [],
-        },
-        "nuisance_variables": _as_list(variant.get("nuisance_variables")),
-        "forbidden_simultaneous_changes": _as_list(variant.get("forbidden_simultaneous_changes")) or [
-            "dataset or evaluator changes",
-            "baseline protocol changes",
-            "unregistered training-budget changes",
-        ],
-    }
-    resource_budget = plan.get("resource_budget") if isinstance(plan.get("resource_budget"), dict) else {}
-    resource_budget = {
-        **resource_budget,
-        "estimated_gpu_minutes": resource_budget.get("estimated_gpu_minutes"),
-        "min_replicates": int(resource_budget.get("min_replicates") or 1),
-        "max_replicates": int(resource_budget.get("max_replicates") or max(1, len(seeds))),
-        "early_stop_rule": resource_budget.get("early_stop_rule") or "stop only on registered safety, infrastructure, or futility conditions",
-    }
-    return {
-        "schema_version": VARIANT_CONTRACT_SCHEMA_VERSION,
-        "direction_id": direction.get("direction_id") or variant.get("s1_direction_id"),
-        "variant_id": variant.get("id") or "selected_variant",
-        "title": variant.get("title") or variant.get("id") or "Selected variant",
-        "mode": mode,
-        "variant_fingerprint": fingerprint,
-        "mechanism_axis": mechanism_axis,
-        "integration_point": integration_point,
-        "control_signal": control_signal,
-        "hypothesis": hypothesis,
-        "experiment_hypothesis": experiment_hypothesis,
-        "variable_control": variable_control,
-        "why_next": variant.get("why_next") or variant.get("anti_repeat") or "",
-        "expected_files": expected_files,
-        "implementation_surface_refs": _as_list(variant.get("implementation_surface_refs")) or _as_list(variant.get("code_refs")) or _surface_refs_from_files(expected_files) or _as_list(direction.get("implementation_surface_refs")),
-        "resource_budget": resource_budget,
-        "expected_metric_signature": expected_metric_signature,
-        "ablation": {
-            "switch": ablation_switch or "disable_selected_mechanism",
-            "control": contract.get("ablation_control") or "candidate ablation-off control",
-            "expected_signature": expected_metric_signature,
-        },
-        "acceptance": {
-            "min_delta_to_pass": execution.get("min_delta_to_pass"),
-            "max_dataset_regression": execution.get("max_dataset_regression"),
-            "criteria": plan.get("acceptance_criteria") if isinstance(plan.get("acceptance_criteria"), dict) else {},
-        },
-        "failure_routing": {
-            "go_to_s3_conditions": _as_list(variant.get("go_to_s3_conditions")) or ["S2 gate passes", "S2.5 patch manifest is executable or disabled"],
-            "return_to_s2_conditions": _as_list(variant.get("return_to_s2_conditions")) or ["variant implementation fails", "ablation switch does not change mechanism trace"],
-            "return_to_s1_conditions": _as_list(variant.get("return_to_s1_conditions")) or _as_list(direction.get("return_to_s1_conditions")),
-        },
-        "used_shared_memory_refs": _as_list(variant.get("used_shared_memory_refs")) or _as_list(direction.get("used_shared_memory_refs")),
-    }
+    tried = read_json(Path(plan.get("project_root")) / "meta" / "research_state.json", default={}) if plan.get("project_root") else {}
+    history = tried.get("method_tried_history") if isinstance(tried, dict) else []
+    return build_variant_spec(direction, payload, tried_variants=history if isinstance(history, list) else [])
 
 
 def build_variant_fingerprint_artifact(
@@ -649,39 +526,27 @@ def build_variant_fingerprint_artifact(
     history_fingerprints: list[str] | None = None,
     mode: str = "regular",
 ) -> dict[str, Any]:
-    current = fingerprint or variant.get("variant_fingerprint") or ((variant.get("s2_variant") or {}).get("variant_fingerprint") if isinstance(variant.get("s2_variant"), dict) else "")
-    if not current:
-        current = variant_fingerprint(variant, direction=direction)
+    spec = variant if variant.get("schema_version") == VARIANT_SCHEMA_VERSION else build_variant_contract(direction=direction, variant=variant, mode=mode)
+    current = spec["variant_spec_hash"]
     history = [str(item) for item in history_fingerprints or [] if item]
-    s2_variant = variant.get("s2_variant") if isinstance(variant.get("s2_variant"), dict) else {}
     return {
         "schema_version": VARIANT_FINGERPRINT_SCHEMA_VERSION,
-        "direction_id": direction.get("direction_id") or variant.get("s1_direction_id"),
-        "variant_id": variant.get("id") or "selected_variant",
-        "variant_fingerprint": current,
-        "mechanism_axis": variant.get("mechanism_axis") or s2_variant.get("mechanism_axis") or direction.get("mechanism_axis"),
-        "integration_point": variant.get("integration_point") or s2_variant.get("integration_point") or direction.get("integration_point"),
-        "control_signal": variant.get("control_signal") or s2_variant.get("control_signal") or direction.get("control_signal"),
+        "direction_id": direction.get("direction_id"),
+        "direction_hash": direction.get("direction_hash"),
+        "variant_id": spec.get("variant_id"),
+        "variant_spec_hash": current,
         "history_fingerprints": history,
-        "is_repeat": bool(current and current in set(history)),
+        "is_repeat": current in set(history),
         "mode": mode,
     }
 
 
 def variant_fingerprint(variant: dict[str, Any], *, direction: dict[str, Any] | None = None) -> str:
-    direction = direction or {}
-    contract = variant.get("experiment_contract") if isinstance(variant.get("experiment_contract"), dict) else {}
-    s2_variant = variant.get("s2_variant") if isinstance(variant.get("s2_variant"), dict) else {}
-    payload = {
-        "direction_id": direction.get("direction_id") or variant.get("s1_direction_id"),
-        "mechanism_type": variant.get("mechanism_type") or direction.get("mechanism_type"),
-        "mechanism_axis": variant.get("mechanism_axis") or s2_variant.get("mechanism_axis") or direction.get("mechanism_axis"),
-        "integration_point": variant.get("integration_point") or s2_variant.get("integration_point") or direction.get("integration_point"),
-        "control_signal": variant.get("control_signal") or s2_variant.get("control_signal") or direction.get("control_signal"),
-        "expected_files": sorted(_as_list(contract.get("expected_files")) or _as_list(variant.get("expected_files")) or _as_list(direction.get("expected_files"))),
-        "config_keys": sorted(_flatten_keys(contract.get("config_overrides") or {})),
-    }
-    return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=True, default=str).encode("utf-8")).hexdigest()[:16]
+    if variant.get("variant_spec_hash"):
+        return str(variant["variant_spec_hash"])
+    if direction is None:
+        raise ValueError("direction is required to fingerprint a VariantSpec")
+    return build_variant_contract(direction=direction, variant=variant)["variant_spec_hash"]
 
 
 def _ref_label(value: Any) -> str:

@@ -27,6 +27,7 @@ from auto_research.failure_log import build_c2c_feedback_bundle, load_c2c_feedba
 from auto_research.artifacts import ArtifactManager
 from auto_research.c2c import C2CAdapter, C2CPatchGuard, DEFAULT_C2C_PROXY_SCREEN, c2c_idea_novelty_report, collect_c2c_eval_smoke, default_c2c_ideas
 from auto_research.direction_contracts import build_direction_contract, build_s1_direction_fingerprint, build_s1_evidence_quality_score
+from auto_research.domain_contracts import build_direction_spec, build_variant_spec, canonical_hash
 from auto_research.evidence_refs import resolve_s1_evidence_refs
 from auto_research.judges import gate_s0
 from auto_research.s2_planner_contracts import build_s2_candidate_pool, build_s2_planner_gate_report, build_s2_variant_scorecard
@@ -295,150 +296,103 @@ def _s1_codex_direction_payload(
 
 
 def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: str = "utility_predicted_cache_routing") -> None:
-    (project / "literature").mkdir(parents=True, exist_ok=True)
-    (project / "plan").mkdir(parents=True, exist_ok=True)
-    direction = {
-        "schema_version": "auto_research_direction_v1",
-        "direction_id": direction_id,
-        "title": "Utility Predicted Cache Routing",
-        "mechanism_type": "utility_predicted_cache_routing",
-        "mechanism_axis": "routing",
-        "integration_point": "wrapper",
-        "control_signal": "utility",
-        "hypothesis": "Predict utility for transferred cache states.",
-        "why_baseline_fails": "The baseline lacks downstream utility control.",
-        "expected_metric_signature": {"primary_metric": "three_dataset_mean", "expected_direction": "increase"},
-        "required_evidence_refs": [{"source_type": "code", "source_label": "rosetta/model/wrapper.py", "claim": "surface"}],
-        "counterevidence_refs": [{"source_type": "failure_feedback", "source_label": "risk", "claim": "avoid hard gates"}],
-        "implementation_surface_refs": [{"source_type": "code", "source_label": "rosetta/model/wrapper.py", "claim": "surface"}],
-        "known_negative_memory_refs": [],
-        "go_to_s2_conditions": ["evidence resolved"],
-        "return_to_s1_conditions": ["budget exhausted"],
-        "expected_files": ["rosetta/model/wrapper.py"],
-        "verification_commands": ["py_compile"],
-        "used_shared_memory_refs": [],
-    }
-    variant = {
-        "id": "wrapper_utility_variant",
-        "title": "Wrapper utility variant",
-        "direction_id": direction_id,
-        "s1_direction_id": direction_id,
-        "variant_fingerprint": "fp_wrapper_utility",
-        "mechanism_axis": "routing",
-        "integration_point": "wrapper",
-        "control_signal": "utility",
-        "expected_files": ["rosetta/model/wrapper.py"],
-        "ablation_switch": "disable_wrapper_utility",
-        "experiment_contract": {
-            "expected_files": ["rosetta/model/wrapper.py"],
-            "ablation_switch": "disable_wrapper_utility",
+    direction = build_direction_spec(
+        {
+            "direction_id": direction_id,
+            "research_question": "Does utility-aware cache routing improve the benchmark?",
+            "mechanism_invariants": {
+                "causal_hypothesis": "Utility-aware routing improves transferred-cache quality.",
+                "target_mediator": "cache_routing_quality",
+                "invariants": ["fixed benchmark", "fixed evaluator", "same causal mediator"],
+            },
+            "falsification_conditions": ["routing quality does not change", "the benchmark does not improve"],
+            "support_claim_ids": ["support-1"],
+            "counter_claim_ids": ["counter-1"],
+            "implementation_surface_ids": ["rosetta/model/wrapper.py"],
+            "metric_signature": {"primary": "three_dataset_mean", "direction": "increase"},
+            "benchmark_contract_hash": canonical_hash({"datasets": ["mmlu-redux"]}),
+            "variant_space": {
+                "mutable_axes": ["intervention"],
+                "immutable_axes": ["benchmark", "evaluator"],
+                "forbidden_combinations": [],
+            },
+            "s2_entry_conditions": ["S1 gate passes"],
+            "return_to_s1_conditions": ["five outcomes reject the direction"],
+            "lineage": {"s1_run_id": "s1-test", "iteration": 1, "input_manifest_hash": canonical_hash({"input": 1})},
+        }
+    )
+    variant = build_variant_spec(
+        direction,
+        {
+            "variant_id": "wrapper_utility_variant",
+            "variation_coordinates": {"intervention": "wrapper_utility"},
+            "intervention": {
+                "summary": "Route transferred cache states using predicted utility.",
+                "algorithm_operations": ["predict utility", "route cache states"],
+                "configuration": {"cache_routing_mode": "wrapper_utility"},
+            },
+            "hypothesis": "Utility-aware routing improves the benchmark.",
+            "null_hypothesis": "Utility-aware routing does not improve the benchmark.",
+            "alternative_hypothesis": "Utility-aware routing improves the benchmark.",
+            "controlled_variables": {"dataset": "mmlu-redux"},
+            "nuisance_variables": ["gpu_noise"],
+            "implementation_surface_ids": ["rosetta/model/wrapper.py"],
+            "expected_metric_signature": {"primary": "three_dataset_mean", "direction": "increase"},
+            "falsification_conditions": ["the benchmark does not improve"],
+            "ablation": {"switch": "disable_wrapper_utility"},
+            "resource_budget": {"max_wall_seconds": 60, "max_retries": 2},
+            "failure_routing": {"implementation": "REPAIR_IMPLEMENTATION", "method": "PROPOSE_NEXT_VARIANT"},
+            "lineage": {
+                "s2_run_id": "s2-test",
+                "iteration": 1,
+                "direction_spec_hash": direction["direction_hash"],
+                "feedback_from_attempt_ids": [],
+            },
         },
-    }
-    (project / "literature" / "direction.json").write_text(json.dumps(direction), encoding="utf-8")
-    (project / "plan" / "planner_decision.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "auto_research_planner_decision_v1",
-                "direction_id": direction_id,
-                "planner_summary": "Select wrapper utility variant.",
-                "planning_mode": "same_direction_variant",
-                "used_shared_memory_refs": [],
-                "next_variant": variant,
-            }
-        ),
-        encoding="utf-8",
     )
-    (project / "plan" / "variant_contract.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "auto_research_variant_contract_v1",
-                "direction_id": direction_id,
-                "variant_id": variant["id"],
-                "title": variant["title"],
-                "mode": "regular",
-                "variant_fingerprint": variant["variant_fingerprint"],
-                "mechanism_axis": "routing",
-                "integration_point": "wrapper",
-                "control_signal": "utility",
-                "hypothesis": direction["hypothesis"],
-                "why_next": "Wrapper utility routing.",
-                "expected_files": ["rosetta/model/wrapper.py"],
-                "implementation_surface_refs": direction["implementation_surface_refs"],
-                "resource_budget": {},
-                "expected_metric_signature": direction["expected_metric_signature"],
-                "ablation": {"switch": "disable_wrapper_utility", "control": "ablation-off"},
-                "acceptance": {"min_delta_to_pass": 0.1, "max_dataset_regression": 2.0},
-                "failure_routing": {
-                    "go_to_s3_conditions": ["gate passes"],
-                    "return_to_s2_conditions": ["patch invalid"],
-                    "return_to_s1_conditions": ["budget exhausted"],
-                },
-                "used_shared_memory_refs": [],
-            }
-        ),
-        encoding="utf-8",
+    write_json(project / "literature" / "direction.json", direction)
+    write_json(
+        project / "plan" / "planner_decision.json",
+        {
+            "schema_version": "auto_research_planner_decision_v1",
+            "direction_id": direction_id,
+            "planner_summary": "Select wrapper utility variant.",
+            "planning_mode": "same_direction_variant",
+            "used_shared_memory_refs": [],
+            "next_variant": {"id": variant["variant_id"]},
+        },
     )
-    (project / "plan" / "variant_fingerprint.json").write_text(
-        json.dumps(
-            {
-                "schema_version": "auto_research_variant_fingerprint_v1",
-                "direction_id": direction_id,
-                "variant_id": variant["id"],
-                "variant_fingerprint": variant["variant_fingerprint"],
-                "mechanism_axis": "routing",
-                "integration_point": "wrapper",
-                "control_signal": "utility",
-                "history_fingerprints": [],
-                "is_repeat": False,
-                "mode": "regular",
-            }
-        ),
-        encoding="utf-8",
+    write_json(project / "plan" / "variant.json", variant)
+    write_json(
+        project / "plan" / "trial_spec.json",
+        {
+            "schema_version": "auto_research_trial_spec_v1",
+            "direction_id": direction_id,
+            "direction_hash": direction["direction_hash"],
+            "variant_id": variant["variant_id"],
+            "variant_spec_hash": variant["variant_spec_hash"],
+            "metrics": [{"name": "three_dataset_mean", "primary": True}],
+            "execution": {"collector": "c2c_small_loop"},
+        },
     )
-    contract = json.loads((project / "plan" / "variant_contract.json").read_text(encoding="utf-8"))
-    fingerprint = json.loads((project / "plan" / "variant_fingerprint.json").read_text(encoding="utf-8"))
-    candidate_pool = build_s2_candidate_pool(direction=direction, candidates=[variant], source="test_fixture")
-    feedback_context = build_s2_feedback_context(project_root=project, direction=direction, config={})
-    adaptive_policy = build_s2_adaptive_policy(feedback_context, {})
-    scorecard = build_s2_variant_scorecard(
-        direction=direction,
-        candidate_pool=candidate_pool,
-        selected_variant=variant,
-        evidence_quality={"support_coverage": {"paper": 2, "code": 2}},
-        variant_fingerprint=fingerprint,
-        planner_memory={"entries": []},
-        feedback=[],
-        feedback_context=feedback_context,
-        adaptive_policy=adaptive_policy,
-        config={},
+    write_json(
+        project / "plan" / "code_patches" / "implementation_contract.json",
+        {
+            "schema_version": "c2c_s2_5_implementation_contract_v1",
+            "direction_id": direction_id,
+            "variant_id": variant["variant_id"],
+            "variant_spec_hash": variant["variant_spec_hash"],
+        },
     )
-    score_adjustment_report = build_s2_score_adjustment_report(
-        direction=direction,
-        candidate_pool=candidate_pool,
-        scorecard=scorecard,
-        adaptive_policy=adaptive_policy,
-        feedback_context=feedback_context,
+    write_json(
+        project / "plan" / "code_patches" / "patch_gate_report.json",
+        {
+            "schema_version": "c2c_s2_5_patch_gate_report_v1",
+            "gate": "fail",
+            "variant_id": variant["variant_id"],
+            "variant_spec_hash": variant["variant_spec_hash"],
+        },
     )
-    planner_gate = build_s2_planner_gate_report(
-        direction=direction,
-        candidate_pool=candidate_pool,
-        scorecard=scorecard,
-        next_variant=variant,
-        variant_contract=contract,
-        variant_fingerprint=fingerprint,
-        adaptive_policy=adaptive_policy,
-        score_adjustment_report=score_adjustment_report,
-        config={},
-    )
-    (project / "plan" / "s2_planner").mkdir(parents=True, exist_ok=True)
-    (project / "plan" / "next_variant.json").write_text((project / "plan" / "planner_decision.json").read_text(encoding="utf-8"), encoding="utf-8")
-    (project / "plan" / "s2_planner" / "candidate_pool.json").write_text(json.dumps(candidate_pool), encoding="utf-8")
-    (project / "plan" / "s2_planner" / "feedback_context.json").write_text(json.dumps(feedback_context), encoding="utf-8")
-    (project / "plan" / "s2_planner" / "adaptive_policy.json").write_text(json.dumps(adaptive_policy), encoding="utf-8")
-    (project / "plan" / "s2_planner" / "variant_scorecard.json").write_text(json.dumps(scorecard), encoding="utf-8")
-    (project / "plan" / "s2_planner" / "score_adjustment_report.json").write_text(json.dumps(score_adjustment_report), encoding="utf-8")
-    (project / "plan" / "s2_planner" / "next_variant.json").write_text(json.dumps(variant), encoding="utf-8")
-    (project / "plan" / "s2_planner" / "planner_gate_report.json").write_text(json.dumps(planner_gate), encoding="utf-8")
 
 
 def _write_minimal_s1_ref_catalog(project_root: Path) -> None:
@@ -2431,7 +2385,7 @@ def test_code_patch_persistent_backend_rejects_non_git_target_repo(tmp_path: Pat
 
     manifest = CodePatchAgent(paths.root, config, artifacts).run({"candidate_ideas": ideas}, ideas)
 
-    assert manifest["status"] == "no_valid_patch"
+    assert manifest["status"] == "retryable_no_valid_patch"
     assert "Git worktree requires c2c.target_repo to be a git repo" in ideas[0]["code_patch"]["reason"]
 
 
@@ -2465,7 +2419,7 @@ def test_code_patch_persistent_backend_rejects_target_repo_that_differs_from_sna
     ideas = [{"id": "baseline_guard", "title": "Baseline Guard", "hypothesis": "h"}]
     manifest = CodePatchAgent(paths.root, config, artifacts).run({"candidate_ideas": ideas}, ideas)
 
-    assert manifest["status"] == "no_valid_patch"
+    assert manifest["status"] == "retryable_no_valid_patch"
     assert "does not match the baseline snapshot" in ideas[0]["code_patch"]["reason"]
 
 
@@ -3453,7 +3407,7 @@ def test_code_patch_validation_preserves_pytest_failure_context(tmp_path: Path) 
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=FailingTestBackend()).run({"candidate_ideas": ideas}, ideas)
     validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
 
-    assert manifest["status"] == "no_valid_patch"
+    assert manifest["status"] == "retryable_no_valid_patch"
     assert validation["status"] == "validation_failed"
     failed = [check for check in validation["checks"] if check["returncode"] != 0]
     assert failed
@@ -3489,7 +3443,7 @@ def test_code_patch_validation_records_pytest_timeout(tmp_path: Path, monkeypatc
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=TimeoutBackend()).run({"candidate_ideas": ideas}, ideas)
     validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
 
-    assert manifest["status"] == "no_valid_patch"
+    assert manifest["status"] == "retryable_no_valid_patch"
     assert ideas[0]["code_patch"]["status"] == "validation_failed"
     timeout_check = next(check for check in validation["checks"] if check["name"].startswith("pytest:"))
     assert timeout_check["returncode"] == 124
@@ -3515,7 +3469,7 @@ def test_code_patch_agent_marks_py_compile_failure_as_validation_failed(tmp_path
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=BadBackend()).run({"candidate_ideas": ideas}, ideas)
     validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
 
-    assert manifest["status"] == "no_valid_patch"
+    assert manifest["status"] == "retryable_no_valid_patch"
     assert ideas[0]["code_patch"]["status"] == "validation_failed"
     assert validation["status"] == "validation_failed"
     assert any(check["returncode"] != 0 for check in validation["checks"])
@@ -3553,7 +3507,7 @@ def test_code_patch_agent_blocks_unactivated_new_config_parameter_by_default(tmp
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=NewParamBackend()).run({"candidate_ideas": ideas}, ideas)
     validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
 
-    assert manifest["status"] == "no_valid_patch"
+    assert manifest["status"] == "retryable_no_valid_patch"
     assert ideas[0]["code_patch"]["status"] == "config_activation_missing"
     assert ideas[0]["code_patch"]["has_executable_change"] is False
     assert validation["activation_check"]["blocking"] is True
@@ -3635,7 +3589,7 @@ def test_code_patch_agent_blocks_unactivated_new_config_parameter_in_strict_mode
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=NewParamBackend()).run({"candidate_ideas": ideas}, ideas)
     validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
 
-    assert manifest["status"] == "no_valid_patch"
+    assert manifest["status"] == "retryable_no_valid_patch"
     assert ideas[0]["code_patch"]["status"] == "config_activation_missing"
     assert ideas[0]["code_patch"]["has_executable_change"] is False
     assert validation["activation_check"]["blocking"] is True
@@ -3841,7 +3795,7 @@ def test_code_patch_agent_includes_previous_patch_failure_in_retry_contract(tmp_
 
     ideas = [{"id": "retry_feedback", "title": "Retry Feedback", "hypothesis": "h"}]
     first_manifest = CodePatchAgent(paths.root, config, artifacts, backend=FailingBackend()).run({"candidate_ideas": ideas}, ideas)
-    assert first_manifest["status"] == "no_valid_patch"
+    assert first_manifest["status"] == "retryable_no_valid_patch"
 
     captured: dict[str, object] = {}
 
@@ -3993,7 +3947,7 @@ def test_code_patch_agent_marks_codex_429_as_retryable(tmp_path: Path) -> None:
     assert ideas[0]["code_patch"]["status"] == "retryable_codex_failed"
     assert ideas[0]["code_patch"]["retryable"] is True
     assert report["status"] == "NEEDS_RETRY"
-    patch_status = next(check for check in report["checks"] if check["name"] == "s2_5_patch_manifest_status")
+    patch_status = next(check for check in report["checks"] if check["name"] == "s2_5_patch_gate")
     assert patch_status["status"] == "NEEDS_RETRY"
 
 
@@ -4543,7 +4497,7 @@ def test_code_patch_mechanism_self_review_can_be_strict_for_diagnostics(tmp_path
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=StrictBackend()).run({"candidate_ideas": ideas}, ideas)
     validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
 
-    assert manifest["status"] == "no_valid_patch"
+    assert manifest["status"] == "retryable_no_valid_patch"
     assert ideas[0]["code_patch"]["status"] == "mechanism_self_review_failed"
     assert "ablation_switch_not_wired" in validation["mechanism_review"]["issues"]
     assert "missing_coverage_diagnostics_evidence" in validation["mechanism_review"]["issues"]
@@ -4641,7 +4595,7 @@ def test_code_patch_strict_max_changed_files_still_blocks(tmp_path: Path) -> Non
     manifest = CodePatchAgent(paths.root, config, artifacts, backend=BroadBackend()).run({"candidate_ideas": ideas}, ideas)
     validation = json.loads((paths.root / ideas[0]["code_patch"]["validation"]).read_text(encoding="utf-8"))
 
-    assert manifest["status"] == "no_valid_patch"
+    assert manifest["status"] == "retryable_no_valid_patch"
     assert ideas[0]["code_patch"]["status"] == "patch_too_broad"
     assert validation["risk_check"]["status"] == "patch_too_broad"
     assert validation["risk_check"]["risk_labels"] == ["patch_too_broad"]
@@ -5481,7 +5435,7 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert (root / "intake/c2c/implementation_surface_map.json").exists()
     assert (root / "intake/c2c/code_retrieval_index.json").exists()
     assert (root / "plan/short_loop_plan.yaml").exists()
-    assert (root / "literature/idea_debate.json").exists()
+    assert (root / "literature/direction_analysis.json").exists()
     assert (root / "literature/negative_constraints.json").exists()
     assert (root / "literature/direction.json").exists()
     assert (root / "literature/direction_scorecard.json").exists()
@@ -5490,7 +5444,6 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert (root / "literature/c2c/evidence_request_plan.json").exists()
     assert (root / "literature/c2c/evidence_requests.json").exists()
     assert (root / "literature/c2c/evidence_bundle.json").exists()
-    assert (root / "literature/c2c/direction_decision.json").exists()
     assert (root / "literature/c2c/direction_candidate_scorecard.json").exists()
     assert (root / "literature/c2c/evidence_session.json").exists()
     assert (root / "literature/c2c/evidence_quality_score.json").exists()
@@ -5511,7 +5464,8 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert (root / "literature/c2c/retrieval_plan.json").exists()
     assert (root / "literature/c2c/retrieval_followup.json").exists()
     assert (root / "plan/planner_decision.json").exists()
-    assert (root / "plan/variant_contract.json").exists()
+    assert (root / "plan/variant.json").exists()
+    assert (root / "plan/trial_spec.json").exists()
     assert (root / "plan/variant_fingerprint.json").exists()
     bundle = json.loads((root / "intake/c2c/static_bundle.json").read_text(encoding="utf-8"))
     assert bundle["chunk_index"]["counts"]["paper"] > 0
@@ -5529,25 +5483,22 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     assert retrieval_trace["schema_version"] == "c2c_s1_deterministic_retrieval_trace_v1"
     deterministic_bundle = json.loads((root / "literature/c2c/evidence_bundle.json").read_text(encoding="utf-8"))
     assert deterministic_bundle["producer"] == "deterministic_retriever"
-    ideas = json.loads((root / "literature/ideas.json").read_text(encoding="utf-8"))
+    ideas = json.loads((root / "literature/candidate_directions.json").read_text(encoding="utf-8"))
     assert len(ideas) == 1
     assert ideas[0]["id"] == "utility_predicted_cache_routing"
     assert ideas[0]["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     assert ideas[0]["s1_evidence_agent"]["source"] == "codex_two_phase_direction_agent"
     assert ideas[0]["s1_evidence_agent"]["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
-    direction = json.loads((root / "literature/c2c/direction_decision.json").read_text(encoding="utf-8"))
-    assert direction["direction_id"] == "utility_predicted_cache_routing"
-    assert direction["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     direction_candidate_scorecard = json.loads((root / "literature/c2c/direction_candidate_scorecard.json").read_text(encoding="utf-8"))
     assert direction_candidate_scorecard["selected_direction_id"] == "utility_predicted_cache_routing"
     assert any(candidate["why_not_selected"] for candidate in direction_candidate_scorecard["candidates"] if not candidate["selected"])
     root_direction = json.loads((root / "literature/direction.json").read_text(encoding="utf-8"))
     assert root_direction["direction_id"] == "utility_predicted_cache_routing"
-    assert root_direction["mechanism_axis"]
-    variant_contract = json.loads((root / "plan/variant_contract.json").read_text(encoding="utf-8"))
+    assert root_direction["mechanism_invariants"]["causal_hypothesis"]
+    variant_contract = json.loads((root / "plan/variant.json").read_text(encoding="utf-8"))
     assert variant_contract["direction_id"] == "utility_predicted_cache_routing"
     assert variant_contract["ablation"]["switch"]
-    debate = json.loads((root / "literature/idea_debate.json").read_text(encoding="utf-8"))
+    debate = json.loads((root / "literature/direction_analysis.json").read_text(encoding="utf-8"))
     assert debate["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     constraints = json.loads((root / "literature/negative_constraints.json").read_text(encoding="utf-8"))
     assert constraints["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
@@ -6596,1083 +6547,6 @@ def test_c2c_s1_codex_resets_duplicate_direction_session(monkeypatch, tmp_path: 
     assert sessions["session_reset_history"][-1]["reason"] == "duplicate_direction_streak"
 
 
-def test_c2c_s2_directional_planner_falls_back_without_real_llm(tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
-        "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py", "test/test_aligner_span_overlap.py"],
-    }
-    config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
-    config["code_patch"] = {"enabled": False}
-    paths = init_workspace(config, "topic", project_id="proj_s2_planner_fallback", simulate=False)
-    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
-    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
-    result = PlanAgent(context).run()
-
-    planned = result["plan"]["candidate_ideas"]
-    assert planned[0]["id"] == "utility_predicted_cache_routing"
-    assert result["plan"]["directional_planning"]["status"] == "fallback_no_real_llm"
-    assert (paths.root / "plan" / "s2_planner" / "candidate_pool.json").exists()
-    assert (paths.root / "plan" / "s2_planner" / "feedback_context.json").exists()
-    assert (paths.root / "plan" / "s2_planner" / "adaptive_policy.json").exists()
-    assert (paths.root / "plan" / "s2_planner" / "variant_scorecard.json").exists()
-    assert (paths.root / "plan" / "s2_planner" / "score_adjustment_report.json").exists()
-    assert (paths.root / "plan" / "s2_planner" / "next_variant.json").exists()
-    adaptive_policy = json.loads((paths.root / "plan" / "s2_planner" / "adaptive_policy.json").read_text(encoding="utf-8"))
-    scorecard = json.loads((paths.root / "plan" / "s2_planner" / "variant_scorecard.json").read_text(encoding="utf-8"))
-    adjustment = json.loads((paths.root / "plan" / "s2_planner" / "score_adjustment_report.json").read_text(encoding="utf-8"))
-    assert scorecard["policy_hash"] == adaptive_policy["policy_hash"]
-    assert adjustment["selected_variant_id"] == scorecard["selected_variant_id"]
-    planner_gate = json.loads((paths.root / "plan" / "s2_planner" / "planner_gate_report.json").read_text(encoding="utf-8"))
-    assert planner_gate["gate"] == "pass"
-
-
-def test_c2c_s2_planner_current_direction_fallback_gets_execution_contract(tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
-        "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
-    }
-    config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
-    config["code_patch"] = {"enabled": False}
-    paths = init_workspace(config, "topic", project_id="proj_s2_direction_contract_fallback", simulate=False)
-    s1_direction = {
-        "id": "pathology_conditioned_transfer_controller",
-        "title": "Pathology-Conditioned Transfer Controller",
-        "selected": True,
-        "hypothesis": "Condition transfer on alignment pathology buckets.",
-        "description": "Use pathology statistics to abstain or attenuate harmful transfer.",
-        "mechanism_type": "pathology_conditioned_controller",
-        "expected_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
-    }
-    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", [s1_direction], artifact_type="ideas", summary="ideas")
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
-    result = PlanAgent(context).run()
-
-    planned = result["plan"]["candidate_ideas"]
-    assert planned[0]["id"] == "pathology_conditioned_transfer_controller"
-    assert planned[0]["mechanism_type"] == "pathology_conditioned_controller"
-    assert planned[0]["novelty_gate"]["status"] == "pass"
-    assert planned[0]["implementation_scope_gate"]["status"] == "pass"
-    assert planned[0]["experiment_contract"]["ablation_switch"]
-    assert planned[0]["experiment_contract"]["config_overrides"]["train"]["model"]["cache_controller_mode"] == "pathology_conditioned_transfer_controller"
-
-
-def test_c2c_s2_directional_planner_uses_direction_variants(tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
-        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py", "test/test_aligner_span_overlap.py"],
-    }
-    config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
-    config["code_patch"] = {"enabled": False}
-    config.setdefault("orchestration", {})["shared_method_memory"] = {
-        "enabled": True,
-        "path": str(tmp_path / "s2_shared_memory.jsonl"),
-        "summary_path": str(tmp_path / "s2_shared_memory.md"),
-    }
-    shared_memory_entry = {
-        "schema_version": "shared_method_failure_memory_v1",
-        "memory_id": "mem_s2_proxy_collapse",
-        "timestamp": "2026-06-10T00:00:00Z",
-        "project_id": "old_project",
-        "topic": "cross tokenizer cache",
-        "kind": "shared_c2c_method_failure",
-        "route": "proxy_rejected_same_direction",
-        "failure_class": "method_failure",
-        "summary": {
-            "failed_idea_ids": ["old_hard_gate"],
-            "dragging_datasets": [{"dataset": "mmlu-redux", "regression": 2.0}],
-            "avoid_repeat_rules": ["Avoid hard gates that collapse coverage."],
-        },
-        "entries": [{"id": "old_hard_gate", "decision": "proxy_rejected", "proxy_screen": {"proxy_dataset_deltas": {"mmlu-redux": -2.0}}}],
-    }
-    Path(config["orchestration"]["shared_method_memory"]["path"]).write_text(json.dumps(shared_memory_entry, ensure_ascii=False) + "\n", encoding="utf-8")
-    paths = init_workspace(config, "topic", project_id="proj_s2_planner_variants", simulate=False)
-    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
-    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-
-    class PlannerLLM(ModelClient):
-        def __init__(self, config, project_root=None):
-            super().__init__(config, project_root=project_root)
-            self.use_real_api = True
-            self.prompts = []
-
-        def generate_json_with_schema(self, **kwargs):
-            self.prompts.append(kwargs.get("prompt", ""))
-            return {
-                "planner_summary": "Create two utility-routing implementation variants within the S1 direction.",
-                "planning_mode": "same_direction_variant",
-                "used_shared_memory_refs": ["mem_s2_proxy_collapse"],
-                "variant_candidates": [
-                    {
-                        "id": "utility_router_soft_residual_variant",
-                        "title": "Utility router soft residual variant",
-                        "mechanism_axis": "normalization",
-                        "integration_point": "wrapper",
-                        "control_signal": "utility",
-                        "expected_dataset_tradeoff": {"mmlu-redux": "flat", "ai2-arc": "up", "openbookqa": "flat"},
-                        "risk_budget": {"max_changed_files": 2, "forbidden_files": ["script/evaluation/*"]},
-                        "anti_repeat": "Moves away from projector hard routing toward wrapper residual scaling.",
-                        "description": "Keep baseline transfer as the default path and use predicted utility to scale a residual correction rather than adding a hard accept/reject gate.",
-                        "motivation": "Previous proxy failures collapsed all datasets, so the variant should preserve baseline coverage while only attenuating harmful residual transfer.",
-                        "hypothesis": "A soft residual utility router improves proxy mean without lowering transfer coverage across mmlu-redux, ai2-arc, and openbookqa.",
-                        "mechanism_type": "utility_predicted_cache_routing",
-                        "paper_claim": "Receiver utility should modulate residual cache transfer instead of replacing the original C2C path.",
-                        "why_baseline_fails": "The baseline lacks a downstream utility signal for residual cache injection.",
-                        "expected_signature": {"primary": "utility-positive spans keep baseline coverage while harmful residuals shrink", "stats": ["utility_residual_scale", "baseline_transfer_coverage"]},
-                        "experiment_contract": {
-                            "config_overrides": {
-                                "train": {"model": {"cache_routing_mode": "utility_soft_residual", "cache_routing_loss_weight": 0.05}},
-                                "eval": {"model": {"rosetta_config": {"cache_routing_mode": "utility_soft_residual"}}},
-                            }
-                        },
-                        "failure_avoidance": ["Do not add another hard gate", "Preserve baseline transfer coverage"],
-                        "failure_feedback_refs": [{"source_type": "failure_feedback", "source_label": "proxy collapsed all datasets"}],
-                        "used_shared_memory_refs": ["mem_s2_proxy_collapse"],
-                    }
-                ],
-            }
-
-    llm = PlannerLLM(config, project_root=paths.root)
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), llm)
-    result = PlanAgent(context).run()
-
-    planned = result["plan"]["candidate_ideas"]
-    assert result["plan"]["directional_planning"]["status"] == "ok"
-    assert result["plan"]["directional_planning"]["memory_entry_count"] == 1
-    assert planned[0]["id"] == "utility_router_soft_residual_variant"
-    assert planned[0]["mechanism_type"] == "utility_predicted_cache_routing"
-    assert planned[0]["selected"] is True
-    assert planned[0]["variant_fingerprint"]
-    assert planned[0]["s2_variant"]["integration_point"] == "wrapper"
-    assert planned[0]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
-    assert planned[0]["s2_variant"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
-    assert planned[0]["s2_variant"]["variant_score"]["score"] > 0
-    assert planned[0]["s2_planner"]["source"] == "directional_planner"
-    assert planned[0]["s2_planner"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
-    assert result["plan"]["directional_planning"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
-    assert result["plan"]["next_variant"]["variant_fingerprint"] == planned[0]["variant_fingerprint"]
-    assert result["plan"]["next_variant"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
-    assert (paths.root / "plan" / "next_variant.json").exists()
-
-    saved = json.loads((paths.root / "plan" / "candidate_ideas.json").read_text(encoding="utf-8"))
-    assert saved[0]["id"] == "utility_router_soft_residual_variant"
-    assert saved[0]["s2_variant"]["variant_fingerprint"] == planned[0]["variant_fingerprint"]
-    assert saved[0]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
-    variant_artifact = json.loads((paths.root / "plan" / "next_variant.json").read_text(encoding="utf-8"))
-    assert variant_artifact["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
-    assert variant_artifact["next_variant"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
-    memory = json.loads((paths.root / "plan" / "s2_planner_memory.json").read_text(encoding="utf-8"))
-    assert memory["entry_count"] == 1
-    assert memory["entries"][0]["selected_candidate"]["id"] == "utility_router_soft_residual_variant"
-    assert memory["entries"][0]["selected_candidate"]["variant_fingerprint"] == planned[0]["variant_fingerprint"]
-    assert memory["entries"][0]["selected_candidate"]["used_shared_memory_refs"] == ["mem_s2_proxy_collapse"]
-
-    second = PlanAgent(context).run()
-
-    assert second["plan"]["directional_planning"]["memory_entry_count"] == 2
-    assert "utility_router_soft_residual_variant" in llm.prompts[-1]
-    memory = json.loads((paths.root / "plan" / "s2_planner_memory.json").read_text(encoding="utf-8"))
-    assert memory["entry_count"] == 2
-
-
-def test_c2c_s2_adaptive_selector_avoids_failed_integration_after_route_to_s2(tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
-        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py"],
-        "allowed_prefixes": ["rosetta/model"],
-        "s2_adaptive_policy": {"enabled": True},
-    }
-    config["code_patch"] = {"enabled": False}
-    config["agents"] = {"s2_directional_planner": {"resume_enabled": False}}
-    config["orchestration"]["route_policy"] = {"budgets": {"same_direction_proxy_failures": 2, "same_direction_full_s3_failures": 1}}
-    paths = init_workspace(config, "topic", project_id="proj_s2_adaptive_selector", simulate=False)
-    direction = {
-        "direction_id": "direction_x",
-        "title": "Utility routing",
-        "mechanism_axis": "routing",
-        "integration_point": "projector",
-        "control_signal": "utility",
-        "hypothesis": "Route cache by utility.",
-        "expected_metric_signature": {"primary_metric": "three_dataset_mean"},
-        "expected_files": ["rosetta/model/projector.py"],
-    }
-    ArtifactManager(paths.root).write_json("S1_literature", "direction.json", direction, artifact_type="direction", summary="direction")
-    ArtifactManager(paths.root).write_json(
-        "S1_literature",
-        "ideas.json",
-        [
-            {
-                "id": "direction_x",
-                "title": "Utility routing",
-                "selected": True,
-                "s1_direction_id": "direction_x",
-                "mechanism_axis": "routing",
-                "integration_point": "projector",
-                "control_signal": "utility",
-                "expected_files": ["rosetta/model/projector.py"],
-            }
-        ],
-        artifact_type="ideas",
-        summary="ideas",
-    )
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-    write_json(
-        paths.root / "meta" / "route_decision.json",
-        {
-            "decision": "route_to_s2",
-            "failure_class": "proxy_false_positive",
-            "reason_codes": ["proxy_decision_report_route_hint_return_s2"],
-            "budget_effects": {"consumes_same_direction_attempt": True},
-        },
-    )
-    write_json(
-        paths.root / "meta" / "attempt_ledger.json",
-        {
-            "schema_version": "c2c_attempt_ledger_v1",
-            "project_id": paths.root.name,
-            "records": [],
-            "counters": {"by_direction": {"direction_x": {"proxy_failures": 1, "full_s3_failures": 0, "patch_repairs": 0, "resource_retries": 0}}},
-        },
-    )
-
-    class PlannerLLM(ModelClient):
-        def __init__(self, config, project_root=None):
-            super().__init__(config, project_root=project_root)
-            self.use_real_api = True
-
-        def generate_json_with_schema(self, **kwargs):
-            del kwargs
-            return {
-                "planner_summary": "Compare old and new integration points.",
-                "planning_mode": "same_direction_variant",
-                "used_shared_memory_refs": [],
-                "variant_candidates": [
-                    {
-                        "id": "old_projector_variant",
-                        "title": "Old projector variant",
-                        "mechanism_axis": "routing",
-                        "integration_point": "projector",
-                        "control_signal": "utility",
-                        "hypothesis": "Keep projector utility routing.",
-                        "expected_files": ["rosetta/model/projector.py"],
-                        "ablation_switch": "disable_old_projector",
-                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"], "ablation_switch": "disable_old_projector"},
-                    },
-                    {
-                        "id": "new_wrapper_variant",
-                        "title": "New wrapper variant",
-                        "mechanism_axis": "routing",
-                        "integration_point": "wrapper",
-                        "control_signal": "utility",
-                        "hypothesis": "Move utility routing to wrapper residual scaling.",
-                        "expected_files": ["rosetta/model/wrapper.py"],
-                        "ablation_switch": "disable_new_wrapper",
-                        "experiment_contract": {"expected_files": ["rosetta/model/wrapper.py"], "ablation_switch": "disable_new_wrapper"},
-                    },
-                ],
-            }
-
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerLLM(config, project_root=paths.root))
-    result = PlanAgent(context).run()
-
-    assert result["plan"]["next_variant"]["id"] == "new_wrapper_variant"
-    scorecard = json.loads((paths.root / "plan" / "s2_planner" / "variant_scorecard.json").read_text(encoding="utf-8"))
-    assert scorecard["selected_variant_id"] == "new_wrapper_variant"
-    old_row = next(row for row in scorecard["ranking"] if row["variant_id"] == "old_projector_variant")
-    assert old_row["components"]["route_history_prior"] < 0
-
-
-def test_c2c_implementation_failure_reruns_only_s2_5_patch_repair(monkeypatch, tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux"], "gpu_ids": [0], "max_candidates": 1},
-        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py"],
-    }
-    config["agents"] = {"s2_directional_planner": {"resume_enabled": True}}
-    config["code_patch"] = {
-        "enabled": True,
-        "backend": "mock_codex",
-        "max_candidates": 1,
-        "validation": {
-            "require_py_compile": True,
-            "require_targeted_tests": False,
-            "runtime_smoke": {"enabled": False},
-            "mechanism_self_review": {"enabled": False},
-        },
-    }
-    paths = init_workspace(config, "topic", project_id="proj_s2_5_patch_only", simulate=False)
-    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
-    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-    existing_candidate = dict(ideas[0])
-    existing_candidate["selected"] = True
-    existing_candidate["variant_fingerprint"] = "vf-implementation-repair"
-    other_candidate = dict(ideas[1])
-    other_candidate["id"] = "must_not_patch"
-    other_candidate["selected"] = False
-    write_json(paths.root / "plan" / "candidate_ideas.json", [existing_candidate, other_candidate])
-    write_json(
-        paths.root / "plan" / "s2_5_repair_dispatch.json",
-        {
-            "schema_version": "c2c_s2_5_only_repair_dispatch_v1",
-            "mode": "s2_5_only_implementation_repair",
-            "repair_lane": "s2_5_only_implementation_repair",
-            "selected_candidate_id": existing_candidate["id"],
-            "variant_fingerprint": "vf-implementation-repair",
-            "same_candidate_required": True,
-            "same_variant_fingerprint_required": True,
-            "reuse_persistent_codex_session": True,
-            "do_not_replan_method": True,
-            "repair_until": "patch_eligible_for_s3_or_implementation_blocked",
-            "changed_files": ["rosetta/model/projector.py"],
-            "implementation_failure_signals": ["mechanism_activation_wiring_failed", "forward_missing_switch_read"],
-            "activation_forward_probe_diagnostics": {"switch_seen_by_forward": False, "projector_output_identical": True},
-            "tensor_checks": {"identical_tensors": ["projector_output"], "changed_tensors": []},
-            "patch_manifest": {"selected_candidate_id": existing_candidate["id"], "status": "no_valid_patch"},
-            "performance_feedback_path": "plan/performance_feedback.json",
-            "patch_manifest_path": "plan/code_patches/patch_manifest.json",
-        },
-    )
-    write_json(
-        paths.root / "plan" / "performance_feedback.json",
-        {
-            "summary": {
-                "failure_class": "implementation_failure",
-                "recommended_s2_action": "patch_repair",
-                "does_not_consume_same_direction_attempt": True,
-            },
-            "reason": "runtime_smoke:mechanism_activation_wiring failed",
-        },
-    )
-    write_json(
-        paths.root / "plan" / "s2_planner_memory.json",
-        {"schema_version": "c2c_s2_planner_memory_v1", "entries": [{"selected_candidate": {"id": "old"}}]},
-    )
-
-    class PlannerMustNotRun(ModelClient):
-        def __init__(self, config, project_root=None):
-            super().__init__(config, project_root=project_root)
-            self.use_real_api = True
-
-        def generate_json_with_schema(self, **kwargs):
-            raise AssertionError("S2 planner must be skipped for implementation_failure patch-only repair")
-
-    class PatchBackend:
-        def generate(self, implementation_contract, temp_repo, edit_policy):
-            assert implementation_contract["candidate_id"] == existing_candidate["id"]
-            assert implementation_contract["variant_fingerprint"] == "vf-implementation-repair"
-            assert implementation_contract["previous_failure"]["proxy_screen"]["reason"] == "runtime_smoke:mechanism_activation_wiring failed"
-            previous_failure = implementation_contract["previous_failure"]
-            dispatch = previous_failure["s2_5_repair_dispatch"]
-            assert dispatch["selected_candidate_id"] == existing_candidate["id"]
-            assert dispatch["tensor_checks"]["identical_tensors"] == ["projector_output"]
-            contract = previous_failure["proxy_effect_repair_contract"]
-            assert contract["mode"] == "s2_5_only_implementation_repair"
-            assert contract["force_new_codex_session"] is False
-            assert contract["reuse_persistent_codex_session"] is True
-            assert contract["same_candidate_required"] is True
-            assert contract["same_variant_fingerprint_required"] is True
-            assert "forward_missing_switch_read" in contract["implementation_failure_signals"]
-            assert edit_policy.allowed("rosetta/model/projector.py", repo_root=temp_repo)
-            (temp_repo / "rosetta/model/projector.py").write_text("VALUE = 's2.5 repaired projector'\n", encoding="utf-8")
-            return {"status": "ok", "rationale": "S2.5 patch-only implementation repair."}
-
-    monkeypatch.setattr("auto_research.agents.plan.CodePatchAgent", lambda project_root, config, artifacts: CodePatchAgent(project_root, config, artifacts, backend=PatchBackend()))
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerMustNotRun(config, project_root=paths.root))
-    result = PlanAgent(context).run()
-
-    assert result["plan"]["s2_5_patch_only_repair"]["enabled"] is True
-    assert result["plan"]["s2_5_patch_only_repair"]["repair_lane"] == "s2_5_only_implementation_repair"
-    assert result["plan"]["s2_5_patch_only_repair"]["skips_s2_planner"] is True
-    assert result["plan"]["s2_5_patch_only_repair"]["reuse_persistent_codex_session"] is True
-    assert (paths.root / "plan" / "s2_5_patch_only_repair.json").exists()
-    assert (paths.root / "plan" / "code_patches" / existing_candidate["id"] / "patch.json").exists()
-    assert not (paths.root / "plan" / "code_patches" / other_candidate["id"] / "patch.json").exists()
-    plan_yaml = yaml.safe_load((paths.root / "plan" / "plan.yaml").read_text(encoding="utf-8"))
-    assert plan_yaml["selected_idea"]["id"] == existing_candidate["id"]
-    assert plan_yaml["s2_5_patch_only_repair"]["patch_eligible_for_s3"] is True
-    assert len(plan_yaml["candidate_ideas"]) == 1
-    assert plan_yaml["candidate_ideas"][0]["id"] == existing_candidate["id"]
-    manifest = json.loads((paths.root / "plan" / "code_patches" / "patch_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["status"] == "ok"
-    assert manifest["selected_candidate_id"] == existing_candidate["id"]
-    assert (paths.root / "plan" / "code_patches" / "implementation_contract.json").exists()
-    patch_gate = json.loads((paths.root / "plan" / "code_patches" / "patch_gate_report.json").read_text(encoding="utf-8"))
-    assert patch_gate["gate"] == "pass"
-    assert patch_gate["variant_id"] == existing_candidate["id"]
-    patch_only_record = json.loads((paths.root / "plan" / "s2_5_patch_only_repair.json").read_text(encoding="utf-8"))
-    assert patch_only_record["repair_lane"] == "s2_5_only_implementation_repair"
-    assert patch_only_record["patch_eligible_for_s3"] is True
-    assert patch_only_record["implementation_blocked"] is False
-    assert patch_only_record["selected_candidate_id"] == existing_candidate["id"]
-    assert patch_only_record["requested_variant_fingerprint"] == "vf-implementation-repair"
-    memory = json.loads((paths.root / "plan" / "s2_planner_memory.json").read_text(encoding="utf-8"))
-    assert memory["entries"] == [{"selected_candidate": {"id": "old"}}]
-
-
-def test_c2c_implementation_failure_missing_candidate_blocks_without_s2_planner(monkeypatch, tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
-        "datasets": ["mmlu-redux"],
-        "small_loop": {"eval_datasets": ["mmlu-redux"], "gpu_ids": [0], "max_candidates": 1},
-        "allowed_files": ["rosetta/model/projector.py"],
-    }
-    config["agents"] = {"s2_directional_planner": {"resume_enabled": True}}
-    config["code_patch"] = {"enabled": True, "backend": "mock_codex"}
-    paths = init_workspace(config, "topic", project_id="proj_s2_5_missing_candidate", simulate=False)
-    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
-    existing_candidate = dict(ideas[0])
-    existing_candidate["id"] = "actual_candidate"
-    existing_candidate["selected"] = True
-    write_json(paths.root / "plan" / "candidate_ideas.json", [existing_candidate])
-    write_json(
-        paths.root / "plan" / "s2_5_repair_dispatch.json",
-        {
-            "mode": "s2_5_only_implementation_repair",
-            "selected_candidate_id": "missing_candidate",
-            "variant_fingerprint": "missing-fingerprint",
-            "reuse_persistent_codex_session": True,
-        },
-    )
-    write_json(
-        paths.root / "plan" / "performance_feedback.json",
-        {
-            "summary": {
-                "failure_class": "implementation_failure",
-                "recommended_s2_action": "patch_repair",
-                "does_not_consume_same_direction_attempt": True,
-            },
-            "reason": "target candidate missing after S3 implementation failure",
-        },
-    )
-
-    class PlannerMustNotRun(ModelClient):
-        def __init__(self, config, project_root=None):
-            super().__init__(config, project_root=project_root)
-            self.use_real_api = True
-
-        def generate_json_with_schema(self, **kwargs):
-            raise AssertionError("S2 planner must not run for missing-candidate implementation repair")
-
-    class PatchMustNotRun:
-        def run(self, plan, patch_ideas):
-            raise AssertionError("S2.5 patch generation must not run without the locked candidate")
-
-    monkeypatch.setattr("auto_research.agents.plan.CodePatchAgent", lambda project_root, config, artifacts: PatchMustNotRun())
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerMustNotRun(config, project_root=paths.root))
-    result = PlanAgent(context).run()
-
-    assert result["plan"]["s2_5_patch_only_repair"]["status"] == "implementation_blocked"
-    assert result["plan"]["s2_5_patch_only_repair"]["patch_eligible_for_s3"] is False
-    assert result["plan"]["s2_5_patch_only_repair"]["selected_candidate_id"] == "missing_candidate"
-    blocked = json.loads((paths.root / "plan" / "s2_5_patch_only_repair.json").read_text(encoding="utf-8"))
-    assert blocked["implementation_blocked"] is True
-    manifest = json.loads((paths.root / "plan" / "code_patches" / "patch_manifest.json").read_text(encoding="utf-8"))
-    assert manifest["status"] == "no_valid_patch"
-    assert manifest["implementation_blocked"] is True
-    assert (paths.root / "plan" / "s2_planner" / "planner_gate_report.json").exists()
-    patch_gate = json.loads((paths.root / "plan" / "code_patches" / "patch_gate_report.json").read_text(encoding="utf-8"))
-    assert patch_gate["gate"] == "fail"
-    assert patch_gate["repairable"] is True
-
-
-def test_c2c_s2_variant_scorer_prefers_diverse_failure_targeted_variant(tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 1},
-        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py"],
-    }
-    config["agents"] = {"s2_directional_planner": {"resume_enabled": False, "max_variant_candidates": 3}}
-    config["code_patch"] = {"enabled": False}
-    paths = init_workspace(config, "topic", project_id="proj_s2_variant_scorer", simulate=False)
-    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
-    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-    write_json(
-        paths.root / "plan" / "performance_feedback.json",
-        {
-            "summary": {
-                "recommended_s2_action": "mechanism_repair",
-                "repair_vs_variant_signals": ["single_dataset_small_drop"],
-            },
-            "candidate_results": [
-                {
-                    "id": "old_projector_variant",
-                    "proxy_screen": {"proxy_dataset_deltas": {"mmlu-redux": 0.2, "ai2-arc": -0.8, "openbookqa": 0.1}},
-                    "failure_attribution": {
-                        "patch_risk": {
-                            "risk_files": [{"path": "rosetta/model/projector.py"}],
-                            "risk_labels": ["projector_mechanism_changed"],
-                        }
-                    },
-                }
-            ],
-        },
-    )
-    write_json(
-        paths.root / "plan" / "s2_planner_memory.json",
-        {
-            "schema_version": "c2c_s2_planner_memory_v1",
-            "entries": [
-                {
-                    "selected_candidate": {
-                        "id": "old_projector_variant",
-                        "variant_fingerprint": "oldfp",
-                        "mechanism_axis": "routing",
-                        "integration_point": "projector",
-                        "control_signal": "utility",
-                    },
-                    "candidate_summaries": [],
-                    "feedback_digest": {"patch_risk_files": ["rosetta/model/projector.py"]},
-                }
-            ],
-        },
-    )
-
-    class PlannerLLM(ModelClient):
-        def __init__(self, config, project_root=None):
-            super().__init__(config, project_root=project_root)
-            self.use_real_api = True
-
-        def generate_json_with_schema(self, **kwargs):
-            return {
-                "planner_summary": "Generate projector repeat and wrapper repair variants.",
-                "planning_mode": "same_direction_variant",
-                "variant_candidates": [
-                    {
-                        "id": "repeat_projector_router",
-                        "title": "Repeat projector router",
-                        "mechanism_axis": "routing",
-                        "integration_point": "projector",
-                        "control_signal": "utility",
-                        "expected_dataset_tradeoff": {"mmlu-redux": "up", "ai2-arc": "risk", "openbookqa": "up"},
-                        "risk_budget": {"max_changed_files": 3, "forbidden_files": ["script/evaluation/*"]},
-                        "anti_repeat": "Still mostly projector routing.",
-                        "description": "Repeat projector routing.",
-                        "hypothesis": "Projector router improves utility.",
-                        "mechanism_type": "utility_predicted_cache_routing",
-                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"]},
-                        "implementation_plan": {"integration_points": ["rosetta/model/projector.py"]},
-                    },
-                    {
-                        "id": "wrapper_arc_recovery_residual",
-                        "title": "Wrapper ARC recovery residual",
-                        "mechanism_axis": "normalization",
-                        "integration_point": "wrapper",
-                        "control_signal": "span_agreement",
-                        "expected_dataset_tradeoff": {"mmlu-redux": "flat", "ai2-arc": "up", "openbookqa": "flat"},
-                        "risk_budget": {"max_changed_files": 2, "forbidden_files": ["script/evaluation/*"]},
-                        "anti_repeat": "Moves integration from projector to wrapper and targets AI2-ARC regression.",
-                        "description": "Use wrapper residual normalization to preserve positive datasets while recovering AI2-ARC.",
-                        "hypothesis": "Wrapper residual normalization reduces AI2-ARC regression without losing MMLU/OpenBook gains.",
-                        "mechanism_type": "utility_predicted_cache_routing",
-                        "experiment_contract": {"expected_files": ["rosetta/model/wrapper.py"]},
-                        "implementation_plan": {"integration_points": ["rosetta/model/wrapper.py"]},
-                    },
-                ],
-            }
-
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerLLM(config, project_root=paths.root))
-    result = PlanAgent(context).run()
-
-    planned = result["plan"]["candidate_ideas"]
-    assert len(planned) == 1
-    assert planned[0]["id"] == "wrapper_arc_recovery_residual"
-    assert planned[0]["s2_variant"]["integration_point"] == "wrapper"
-    assert planned[0]["s2_variant"]["variant_score"]["score"] > 0
-    variant_artifact = json.loads((paths.root / "plan" / "next_variant.json").read_text(encoding="utf-8"))
-    assert variant_artifact["next_variant"]["id"] == "wrapper_arc_recovery_residual"
-    assert "wrapper_arc_recovery_residual" in variant_artifact["considered_variant_ids"]
-    assert "repeat_projector_router" in variant_artifact["considered_variant_ids"]
-    assert "targets_dragging_dataset" in variant_artifact["next_variant"]["variant_score"]["reasons"]
-
-
-def test_c2c_s2_variant_scorer_penalizes_repeated_failed_integration_point_and_proxy_calibration(tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 1},
-        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py"],
-    }
-    config["agents"] = {"s2_directional_planner": {"resume_enabled": False, "max_variant_candidates": 3}}
-    config["code_patch"] = {"enabled": False}
-    paths = init_workspace(config, "topic", project_id="proj_s2_calibration_penalty", simulate=False)
-    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
-    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-    write_json(
-        paths.root / "plan" / "performance_feedback.json",
-        {
-            "proxy_calibration": {
-                "summary": {
-                    "method_feedback": {
-                        "risky_datasets": [{"dataset": "mmlu-redux", "misprediction_rate": 1.0}],
-                        "risky_mechanisms": [{"mechanism_type": "utility_predicted_cache_routing", "false_positive_rate": 1.0}],
-                        "risky_integration_points": [{"integration_point": "projector", "false_positive_rate": 1.0}],
-                    }
-                }
-            }
-        },
-    )
-    write_json(
-        paths.root / "plan" / "s2_planner_memory.json",
-        {
-            "schema_version": "c2c_s2_planner_memory_v1",
-            "entries": [
-                {
-                    "selected_candidate": {
-                        "id": "failed_projector_1",
-                        "integration_point": "projector",
-                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"]},
-                    },
-                    "feedback_digest": {"latest_decision": "proxy_repairable"},
-                },
-                {
-                    "selected_candidate": {
-                        "id": "failed_projector_2",
-                        "integration_point": "projector",
-                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"]},
-                    },
-                    "feedback_digest": {"latest_decision": "not_viable"},
-                },
-            ],
-        },
-    )
-
-    class PlannerLLM(ModelClient):
-        def __init__(self, config, project_root=None):
-            super().__init__(config, project_root=project_root)
-            self.use_real_api = True
-
-        def generate_json_with_schema(self, **kwargs):
-            return {
-                "planner_summary": "Compare failed projector reuse with wrapper alternative.",
-                "planning_mode": "same_direction_variant",
-                "variant_candidates": [
-                    {
-                        "id": "projector_proxy_overtrust",
-                        "title": "Projector proxy overtrust",
-                        "mechanism_axis": "routing",
-                        "integration_point": "projector",
-                        "control_signal": "utility",
-                        "expected_dataset_tradeoff": {"mmlu-redux": "up", "ai2-arc": "flat", "openbookqa": "flat"},
-                        "risk_budget": {"max_changed_files": 2},
-                        "description": "Projector utility routing.",
-                        "hypothesis": "Projector utility routing improves proxy.",
-                        "mechanism_type": "utility_predicted_cache_routing",
-                        "experiment_contract": {"expected_files": ["rosetta/model/projector.py"]},
-                    },
-                    {
-                        "id": "wrapper_calibrated_variant",
-                        "title": "Wrapper calibrated variant",
-                        "mechanism_axis": "normalization",
-                        "integration_point": "wrapper",
-                        "control_signal": "span_agreement",
-                        "expected_dataset_tradeoff": {"mmlu-redux": "flat", "ai2-arc": "up", "openbookqa": "flat"},
-                        "risk_budget": {"max_changed_files": 2},
-                        "description": "Wrapper normalization addresses calibration risk.",
-                        "hypothesis": "Wrapper normalization avoids projector false positives.",
-                        "mechanism_type": "semantic_span_graph_alignment",
-                        "experiment_contract": {"expected_files": ["rosetta/model/wrapper.py"]},
-                    },
-                ],
-            }
-
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), PlannerLLM(config, project_root=paths.root))
-    result = PlanAgent(context).run()
-    planned = result["plan"]["candidate_ideas"]
-    artifact = json.loads((paths.root / "plan" / "next_variant.json").read_text(encoding="utf-8"))
-
-    assert planned[0]["id"] == "wrapper_calibrated_variant"
-    assert artifact["next_variant"]["id"] == "wrapper_calibrated_variant"
-    assert "projector_proxy_overtrust" in artifact["considered_variant_ids"]
-
-
-def test_c2c_s2_resume_planner_uses_codex_session(monkeypatch, tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["llm"]["codex_cli"] = {"use_resume": True, "sandbox": "read-only", "approval_policy": "never", "json_events": True}
-    config["llm"].update({"model": "gpt-5.6-terra", "reasoning_effort": "xhigh"})
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
-        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py", "test/test_aligner_span_overlap.py"],
-    }
-    config["code_patch"] = {"enabled": False}
-    paths = init_workspace(config, "topic", project_id="proj_s2_resume_planner", simulate=False)
-    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
-    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-
-    monkeypatch.setattr("auto_research.agents.plan.shutil.which", lambda name: "/usr/bin/codex" if name == "codex" else None)
-    commands = []
-    prompts = []
-
-    def fake_run(command, **kwargs):
-        commands.append(command)
-        prompts.append(kwargs.get("input") or "")
-        assert command[0] == "codex"
-        assert "-s" in command and command[command.index("-s") + 1] == "read-only"
-        assert "--json" in command
-        assert command[command.index("-m") + 1] == "gpt-5.6-terra"
-        assert 'model_reasoning_effort="xhigh"' in command
-        assert command[-1] == "-"
-        output_path = Path(command[command.index("--output-last-message") + 1])
-        variant_id = "utility_resume_memory_variant" if "resume" in command else "utility_resume_soft_residual"
-        payload = {
-            "planner_summary": "Resume planner inspected memory and made a soft residual variant.",
-            "planning_mode": "same_direction_variant",
-            "candidates": [
-                {
-                    "id": variant_id,
-                    "title": "Utility resume soft residual",
-                    "description": "Use utility prediction to softly scale residual transfer while preserving baseline cache coverage.",
-                    "motivation": "The previous direction collapsed all datasets, so preserve coverage and only modulate residual transfer.",
-                    "hypothesis": "Soft residual utility routing avoids all-dataset collapse in cheap proxy.",
-                    "mechanism_type": "utility_predicted_cache_routing",
-                    "paper_claim": "Receiver utility should modulate residual cache transfer rather than hard-filtering spans.",
-                    "why_baseline_fails": "The baseline lacks a downstream utility signal for residual transfer.",
-                    "expected_signature": {
-                        "primary": "residual scale changes without coverage collapse",
-                        "stats": ["utility_residual_scale", "baseline_transfer_coverage"],
-                    },
-                    "experiment_contract": {
-                        "config_overrides": {
-                            "train": {"model": {"cache_routing_mode": variant_id}},
-                            "eval": {"model": {"rosetta_config": {"cache_routing_mode": variant_id}}},
-                        }
-                    },
-                    "failure_avoidance": ["preserve baseline coverage"],
-                    "failure_feedback_refs": [{"source_type": "failure_feedback", "source_label": "memory"}],
-                }
-            ],
-        }
-        output_path.write_text(json.dumps(payload), encoding="utf-8")
-        return SimpleNamespace(
-            returncode=0,
-            stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174111"}\n',
-            stderr="",
-        )
-
-    import auto_research.agents.plan as plan_module
-
-    monkeypatch.setattr(plan_module.subprocess, "run", fake_run)
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
-
-    result = PlanAgent(context).run()
-
-    assert result["plan"]["directional_planning"]["source"] == "codex_resume_planner"
-    assert result["plan"]["directional_planning"]["session_id"] == "123e4567-e89b-12d3-a456-426614174111"
-    assert result["plan"]["candidate_ideas"][0]["id"] == "utility_resume_soft_residual"
-    sessions = yaml.safe_load((paths.root / "meta" / "codex_sessions.yaml").read_text(encoding="utf-8"))
-    assert sessions["sessions"]["s2_planner:utility_predicted_cache_routing"]["session_id"] == "123e4567-e89b-12d3-a456-426614174111"
-    events = (paths.root / "plan" / "logs" / "s2_planner_codex_events.jsonl").read_text(encoding="utf-8")
-    assert "s2_planner:utility_predicted_cache_routing" in events
-    assert "resume" not in commands[0]
-
-    second = PlanAgent(context).run()
-
-    assert second["plan"]["directional_planning"]["used_existing_session"] is True
-    assert second["plan"]["candidate_ideas"][0]["id"] == "utility_resume_memory_variant"
-    assert "resume" in commands[1]
-    assert commands[1][commands[1].index("resume") + 1] == "123e4567-e89b-12d3-a456-426614174111"
-    assert "utility_resume_soft_residual" in prompts[1]
-    memory = json.loads((paths.root / "plan" / "s2_planner_memory.json").read_text(encoding="utf-8"))
-    assert memory["entry_count"] == 2
-
-
-def test_c2c_s2_resume_planner_inherits_mechanism_type_from_s1_direction(monkeypatch, tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["llm"]["codex_cli"] = {"use_resume": True, "sandbox": "read-only", "approval_policy": "never", "json_events": True}
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
-        "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
-    }
-    config["code_patch"] = {"enabled": False}
-    paths = init_workspace(config, "topic", project_id="proj_s2_resume_inherit_mechanism", simulate=False)
-    s1_direction = {
-        "id": "pathology_conditioned_transfer_controller",
-        "title": "Pathology-Conditioned Transfer Controller",
-        "selected": True,
-        "hypothesis": "Condition transfer on alignment pathology buckets.",
-        "description": "Use pathology statistics to abstain or attenuate harmful transfer.",
-        "mechanism_type": "pathology_conditioned_controller",
-        "expected_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
-    }
-    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", [s1_direction], artifact_type="ideas", summary="ideas")
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-    monkeypatch.setattr("auto_research.agents.plan.shutil.which", lambda name: "/usr/bin/codex" if name == "codex" else None)
-
-    def fake_run(command, **kwargs):
-        output_path = Path(command[command.index("--output-last-message") + 1])
-        output_path.write_text(
-            json.dumps(
-                {
-                    "planner_summary": "Make a bucketed abstain variant.",
-                    "planning_mode": "new_direction_after_budget",
-                    "candidates": [
-                        {
-                            "id": "pathology_conditioned_transfer_controller_bucketed_abstain_v1",
-                            "title": "Bucketed pathology abstain",
-                            "description": "Abstain only on high-pathology alignment buckets.",
-                            "hypothesis": "High-pathology abstention removes localized harmful transfer.",
-                            "mechanism_type": "pathology_conditioned_transfer_controller",
-                            "experiment_contract": {},
-                            "implementation_plan": {},
-                            "failure_avoidance": ["no evaluator changes"],
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        return SimpleNamespace(
-            returncode=0,
-            stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174333"}\n',
-            stderr="",
-        )
-
-    import auto_research.agents.plan as plan_module
-
-    monkeypatch.setattr(plan_module.subprocess, "run", fake_run)
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
-
-    result = PlanAgent(context).run()
-
-    planned = result["plan"]["candidate_ideas"]
-    assert result["plan"]["directional_planning"]["status"] == "ok"
-    assert planned[0]["id"] == "pathology_conditioned_transfer_controller_bucketed_abstain_v1"
-    assert planned[0]["mechanism_type"] == "pathology_conditioned_controller"
-    assert planned[0]["novelty_gate"]["status"] == "pass"
-    assert planned[0]["implementation_scope_gate"]["status"] == "pass"
-    assert planned[0]["experiment_contract"]["config_overrides"]["train"]["model"]["cache_controller_mode"] == "pathology_conditioned_transfer_controller_bucketed_abstain_v1"
-
-
-def test_c2c_s2_resume_planner_resets_duplicate_session_but_keeps_memory(monkeypatch, tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["llm"]["codex_cli"] = {"use_resume": True, "sandbox": "read-only", "approval_policy": "never", "json_events": True}
-    config["agents"] = {"s2_directional_planner": {"session_reset_duplicate_streak": 1}}
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
-        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py", "test/test_aligner_span_overlap.py"],
-    }
-    config["code_patch"] = {"enabled": False}
-    paths = init_workspace(config, "topic", project_id="proj_s2_resume_reset", simulate=False)
-    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
-    ArtifactManager(paths.root).write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
-    ArtifactManager(paths.root).write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-
-    monkeypatch.setattr("auto_research.agents.plan.shutil.which", lambda name: "/usr/bin/codex" if name == "codex" else None)
-
-    def payload_for_variant(variant_id: str) -> dict:
-        return {
-            "planner_summary": "Duplicate reset test.",
-            "planning_mode": "same_direction_variant",
-            "candidates": [
-                {
-                    "id": variant_id,
-                    "title": "Utility duplicate candidate",
-                    "description": "Use utility prediction to softly scale residual transfer while preserving baseline cache coverage.",
-                    "hypothesis": "Soft residual utility routing avoids all-dataset collapse in cheap proxy.",
-                    "mechanism_type": "utility_predicted_cache_routing",
-                    "paper_claim": "Receiver utility should modulate residual cache transfer rather than hard-filtering spans.",
-                    "why_baseline_fails": "The baseline lacks a downstream utility signal for residual transfer.",
-                    "expected_signature": {"primary": "residual scale changes without coverage collapse", "stats": ["utility_residual_scale"]},
-                    "experiment_contract": {
-                        "config_overrides": {
-                            "train": {"model": {"cache_routing_mode": variant_id}},
-                            "eval": {"model": {"rosetta_config": {"cache_routing_mode": variant_id}}},
-                        }
-                    },
-                    "failure_avoidance": ["preserve baseline coverage"],
-                }
-            ],
-        }
-
-    commands = []
-
-    def fake_run(command, **kwargs):
-        commands.append(command)
-        output_path = Path(command[command.index("--output-last-message") + 1])
-        output_path.write_text(json.dumps(payload_for_variant("utility_duplicate_candidate")), encoding="utf-8")
-        return SimpleNamespace(
-            returncode=0,
-            stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174222"}\n',
-            stderr="",
-        )
-
-    import auto_research.agents.plan as plan_module
-
-    monkeypatch.setattr(plan_module.subprocess, "run", fake_run)
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
-
-    first = PlanAgent(context).run()
-    second = PlanAgent(context).run()
-
-    assert first["plan"]["directional_planning"]["source"] == "codex_resume_planner"
-    assert first["plan"]["candidate_ideas"][0]["id"] == "utility_duplicate_candidate"
-    assert second["plan"]["directional_planning"]["status"] == "fallback_no_real_llm"
-    assert second["plan"]["directional_planning"]["resume_planner"]["session_reset"] is True
-    assert second["plan"]["directional_planning"]["resume_planner"]["session_reset_reason"] == "duplicate_output_streak"
-    assert "resume" in commands[1]
-    sessions = yaml.safe_load((paths.root / "meta" / "codex_sessions.yaml").read_text(encoding="utf-8"))
-    assert "s2_planner:utility_predicted_cache_routing" not in sessions.get("sessions", {})
-    memory = json.loads((paths.root / "plan" / "s2_planner_memory.json").read_text(encoding="utf-8"))
-    assert memory["entry_count"] == 2
-    assert memory["entries"][0]["selected_candidate"]["id"] == "utility_duplicate_candidate"
-    events = (paths.root / "plan" / "logs" / "s2_planner_codex_events.jsonl").read_text(encoding="utf-8")
-    assert "session_reset" in events
-
-
-def test_c2c_s2_resume_planner_real_api_skips_gpt_fallback_after_duplicate_reset(monkeypatch, tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["llm"]["use_real_api"] = True
-    config["llm"]["codex_cli"] = {"use_resume": True, "sandbox": "read-only", "approval_policy": "never", "json_events": True}
-    config["agents"] = {"s2_directional_planner": {"session_reset_duplicate_streak": 1}}
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0, "ai2-arc": 50.0, "openbookqa": 50.0}},
-        "datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
-        "small_loop": {"eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"], "gpu_ids": [0], "max_candidates": 2},
-        "allowed_files": ["rosetta/model/projector.py", "rosetta/model/wrapper.py", "script/train/SFT_train.py", "test/test_aligner_span_overlap.py"],
-    }
-    config["code_patch"] = {"enabled": False}
-    paths = init_workspace(config, "topic", project_id="proj_s2_resume_real_api_no_gpt_fallback", simulate=False)
-    ideas = default_c2c_ideas("topic", config["c2c"]["baseline"])
-    artifacts = ArtifactManager(paths.root)
-    artifacts.write_json("S1_literature", "ideas.json", ideas, artifact_type="ideas", summary="ideas")
-    artifacts.write_json("S1_literature", "c2c/baseline_evidence.json", config["c2c"]["baseline"], artifact_type="baseline", summary="baseline")
-
-    monkeypatch.setattr("auto_research.agents.plan.shutil.which", lambda name: "/usr/bin/codex" if name == "codex" else None)
-
-    def fake_run(command, **kwargs):
-        output_path = Path(command[command.index("--output-last-message") + 1])
-        output_path.write_text(
-            json.dumps(
-                {
-                    "planner_summary": "Duplicate reset test.",
-                    "planning_mode": "same_direction_variant",
-                    "candidates": [
-                        {
-                            "id": "utility_duplicate_candidate",
-                            "title": "Utility duplicate candidate",
-                            "description": "Use utility prediction to softly scale residual transfer while preserving baseline cache coverage.",
-                            "hypothesis": "Soft residual utility routing avoids all-dataset collapse in cheap proxy.",
-                            "mechanism_type": "utility_predicted_cache_routing",
-                            "experiment_contract": {
-                                "config_overrides": {
-                                    "train": {"model": {"cache_routing_mode": "utility_duplicate_candidate"}},
-                                    "eval": {"model": {"rosetta_config": {"cache_routing_mode": "utility_duplicate_candidate"}}},
-                                }
-                            },
-                            "failure_avoidance": ["preserve baseline coverage"],
-                        }
-                    ],
-                }
-            ),
-            encoding="utf-8",
-        )
-        return SimpleNamespace(
-            returncode=0,
-            stdout='{"type":"thread.started","thread_id":"123e4567-e89b-12d3-a456-426614174333"}\n',
-            stderr="",
-        )
-
-    import auto_research.agents.plan as plan_module
-
-    monkeypatch.setattr(plan_module.subprocess, "run", fake_run)
-    client = ModelClient(config, project_root=paths.root)
-    client.use_real_api = True
-
-    def fail_gpt_fallback(**_kwargs):
-        raise AssertionError("S2 should not call GPT fallback after Codex resume duplicate reset in real API mode")
-
-    client.generate_json_with_schema = fail_gpt_fallback
-    context = AgentContext(paths.root, config, artifacts, client)
-
-    first = PlanAgent(context).run()
-    second = PlanAgent(context).run()
-
-    assert first["plan"]["directional_planning"]["source"] == "codex_resume_planner"
-    assert second["plan"]["directional_planning"]["status"] == "fallback_resume_planner_unavailable"
-    assert second["plan"]["directional_planning"]["resume_planner"]["session_reset"] is True
-    assert second["plan"]["candidate_ideas"][0]["s2_planner"]["source"] == "fallback_s1_ideas"
-
-
 def test_c2c_novelty_report_rejects_pure_local_tuning() -> None:
     report = c2c_idea_novelty_report(
         {
@@ -7725,86 +6599,6 @@ def test_c2c_novelty_report_accepts_default_mechanism_idea() -> None:
     assert "matched_coverage_ablation" in report["signals"]
 
 
-def test_s2_gate_tracks_missing_coverage_controls_as_debt_by_default(tmp_path: Path) -> None:
-    project = tmp_path / "project"
-    (project / "plan").mkdir(parents=True)
-    (project / "plan" / "short_loop_plan.yaml").write_text("collector: c2c_small_loop\n", encoding="utf-8")
-    ideas = default_c2c_ideas("topic", {"name": "base", "mean": 50.0, "datasets": {}})
-    (project / "plan" / "candidate_ideas.json").write_text(json.dumps(ideas), encoding="utf-8")
-    plan = {
-        "selected_idea": ideas[0],
-        "candidate_ideas": ideas,
-        "hypotheses": [{"id": "h1"}],
-        "baselines": [{"name": "base"}, {"name": "candidate"}],
-        "datasets": [{"name": "mmlu-redux"}],
-        "metrics": [],
-        "statistical_testing": {},
-        "ablation_matrix": [],
-        "task_graph": {},
-        "resource_budget": {},
-        "execution": {
-            "collector": "c2c_small_loop",
-            "min_delta_to_pass": 0.1,
-            "max_dataset_regression": 2.0,
-        },
-        "acceptance_criteria": {
-            "minimum_mean_delta": 0.1,
-            "max_dataset_regression": 2.0,
-        },
-        "reviewer_risk_controls": {"top_concerns": []},
-    }
-    (project / "plan" / "plan.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
-    _write_direction_and_variant_gate_artifacts(project)
-
-    report = S2GateValidator(project, {}).validate()
-
-    assert report.status == "PASS"
-    check_names = {check.name for check in report.checks if check.status == "PASS"}
-    assert "c2c_coverage_control_requirements" in check_names
-    assert "c2c_matched_coverage_ablation" in check_names
-    debt_checks = [check for check in report.checks if check.name == "c2c_coverage_control_requirements"]
-    assert debt_checks[0].details["quality_debt"] is True
-
-
-def test_s2_gate_requires_coverage_controls_in_strict_mode(tmp_path: Path) -> None:
-    project = tmp_path / "project"
-    (project / "plan").mkdir(parents=True)
-    (project / "plan" / "short_loop_plan.yaml").write_text("collector: c2c_small_loop\n", encoding="utf-8")
-    ideas = default_c2c_ideas("topic", {"name": "base", "mean": 50.0, "datasets": {}})
-    (project / "plan" / "candidate_ideas.json").write_text(json.dumps(ideas), encoding="utf-8")
-    plan = {
-        "selected_idea": ideas[0],
-        "candidate_ideas": ideas,
-        "hypotheses": [{"id": "h1"}],
-        "baselines": [{"name": "base"}, {"name": "candidate"}],
-        "datasets": [{"name": "mmlu-redux"}],
-        "metrics": [],
-        "statistical_testing": {},
-        "ablation_matrix": [],
-        "task_graph": {},
-        "resource_budget": {},
-        "execution": {
-            "collector": "c2c_small_loop",
-            "min_delta_to_pass": 0.1,
-            "max_dataset_regression": 2.0,
-        },
-        "acceptance_criteria": {
-            "minimum_mean_delta": 0.1,
-            "max_dataset_regression": 2.0,
-        },
-        "reviewer_risk_controls": {"top_concerns": []},
-    }
-    (project / "plan" / "plan.yaml").write_text(yaml.safe_dump(plan), encoding="utf-8")
-    _write_direction_and_variant_gate_artifacts(project)
-
-    report = S2GateValidator(project, {"code_patch": {"validation": {"gate_mode": "strict"}}}).validate()
-
-    assert report.status == "NEEDS_RETRY"
-    check_names = {check.name for check in report.checks if check.status == "NEEDS_RETRY"}
-    assert "c2c_coverage_control_requirements" in check_names
-    assert "c2c_matched_coverage_ablation" in check_names
-
-
 def test_c2c_debate_structures_fallback_refs(tmp_path: Path) -> None:
     config = _base_config(tmp_path / "workspace", simulate=True)
     config["ideation"] = {"debate": {"enabled": True, "rounds": 1}}
@@ -7853,7 +6647,7 @@ def test_c2c_debate_parallel_timeout_falls_back(tmp_path: Path, monkeypatch) -> 
     statuses = [output.get("status") for output in debate["rounds"][0]["outputs"]]
     assert statuses == ["timeout_fallback"] * 6
     assert debate["selected_ideas"]
-    progress_path = tmp_path / "workspace" / "p" / "literature" / "c2c" / "idea_debate_progress.jsonl"
+    progress_path = tmp_path / "workspace" / "p" / "literature" / "c2c" / "direction_analysis_progress.jsonl"
     assert progress_path.exists()
     assert "timeout_fallback" in progress_path.read_text(encoding="utf-8")
 
@@ -7903,7 +6697,7 @@ def test_c2c_debate_role_specific_timeout_and_recovery_flag(tmp_path: Path, monk
         flag.get("type") == "gpt_recovered_after_timeout" and flag.get("role") == "systems_feasibility"
         for flag in debate["quality_flags"]
     )
-    progress_path = tmp_path / "workspace" / "p" / "literature" / "c2c" / "idea_debate_progress.jsonl"
+    progress_path = tmp_path / "workspace" / "p" / "literature" / "c2c" / "direction_analysis_progress.jsonl"
     progress = progress_path.read_text(encoding="utf-8")
     assert '"role": "method_inventor"' in progress
     assert '"timeout_seconds": 2' in progress
@@ -7947,7 +6741,7 @@ def test_c2c_debate_meta_timeout_falls_back(tmp_path: Path, monkeypatch) -> None
     assert debate["meta_judge"]["status"] == "timeout_fallback"
     assert any(flag.get("type") == "meta_timeout_fallback" for flag in debate["quality_flags"])
     assert debate["selected_ideas"]
-    progress_path = tmp_path / "workspace" / "p" / "literature" / "c2c" / "idea_debate_progress.jsonl"
+    progress_path = tmp_path / "workspace" / "p" / "literature" / "c2c" / "direction_analysis_progress.jsonl"
     assert "meta_judge" in progress_path.read_text(encoding="utf-8")
 
 
@@ -8684,148 +7478,6 @@ def test_s3_blocks_outputs_written_to_original_snapshot(monkeypatch, tmp_path: P
     assert audit["status"] == "failed"
     assert "local/auto_research_runs/polluter/checkpoints/final/marker.txt" in audit["output_pollution"]["added_files"]
     assert any(action["action"] == "block_original_snapshot_output_pollution" for action in state["recovery_actions"])
-
-
-def test_c2c_small_loop_locks_to_selected_patch_manifest_candidate(monkeypatch, tmp_path: Path) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["experiment"]["disable_llm_during_execution"] = True
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "model_map": {},
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
-        "datasets": ["mmlu-redux"],
-        "small_loop": {
-            "eval_datasets": ["mmlu-redux"],
-            "train_samples": 1,
-            "gpu_ids": [0],
-            "proxy_screen": {"enabled": False},
-            "max_candidates": 3,
-        },
-    }
-    paths = init_workspace(config, "topic", project_id="proj_s3_manifest_lock", simulate=False)
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
-    agent = ExperimentAgent(context)
-    plan = {
-        "selected_idea": {"title": "Selected"},
-        "candidate_ideas": [
-            {
-                "id": "local_monotonic_neighbor_window_router",
-                "title": "Old Local Monotonic",
-                "code_patch": {"status": "ok", "patch_json": "plan/code_patches/local_monotonic_neighbor_window_router/patch.json", "changed_files": ["rosetta/model/aligner.py"], "has_executable_change": True},
-                "hypothesis": "old",
-            },
-            {
-                "id": "pathology_triggered_prior_fallback",
-                "title": "Selected Pathology",
-                "code_patch": {"status": "ok", "patch_json": "plan/code_patches/pathology_triggered_prior_fallback/patch.json", "changed_files": ["rosetta/model/projector.py"], "has_executable_change": True},
-                "hypothesis": "new",
-            },
-        ],
-    }
-    (paths.root / "plan" / "code_patches").mkdir(parents=True, exist_ok=True)
-    selected_patch_dir = paths.root / "plan" / "code_patches" / "pathology_triggered_prior_fallback"
-    selected_patch_dir.mkdir(parents=True, exist_ok=True)
-    write_json(
-        selected_patch_dir / "implementation_contract.json",
-        {
-            "candidate_id": "pathology_triggered_prior_fallback",
-            "hypothesis": "new",
-            "mechanism_contract": {"mechanism_type": "pathology_triggered_prior_fallback"},
-            "experiment_contract": {"config_overrides": {}, "ablation_switch": "disable_pathology"},
-        },
-    )
-    write_json(
-        selected_patch_dir / "patch.json",
-        {
-            "schema_version": 1,
-            "candidate_id": "pathology_triggered_prior_fallback",
-            "operations": [],
-            "changed_files": ["rosetta/model/projector.py"],
-            "implementation_contract": {"candidate_id": "pathology_triggered_prior_fallback"},
-        },
-    )
-    write_json(
-        paths.root / "plan" / "code_patches" / "patch_manifest.json",
-        {
-            "status": "ok",
-            "selected_candidate_id": "pathology_triggered_prior_fallback",
-            "selected_patch": {
-                "candidate_id": "pathology_triggered_prior_fallback",
-                "title": "Selected Pathology",
-                "status": "ok",
-                "patch_json": "plan/code_patches/pathology_triggered_prior_fallback/patch.json",
-                "implementation_contract": "plan/code_patches/pathology_triggered_prior_fallback/implementation_contract.json",
-                "changed_files": ["rosetta/model/projector.py"],
-                "has_executable_change": True,
-                "quality_score": {"score": 99},
-            },
-            "candidates": [
-                {
-                    "candidate_id": "local_monotonic_neighbor_window_router",
-                    "title": "Old Local Monotonic",
-                    "status": "ok",
-                    "patch_json": "plan/code_patches/local_monotonic_neighbor_window_router/patch.json",
-                    "changed_files": ["rosetta/model/aligner.py"],
-                    "has_executable_change": True,
-                    "quality_score": {"score": 10},
-                },
-                {
-                    "candidate_id": "pathology_triggered_prior_fallback",
-                    "title": "Selected Pathology",
-                    "status": "ok",
-                    "patch_json": "plan/code_patches/pathology_triggered_prior_fallback/patch.json",
-                    "implementation_contract": "plan/code_patches/pathology_triggered_prior_fallback/implementation_contract.json",
-                    "changed_files": ["rosetta/model/projector.py"],
-                    "has_executable_change": True,
-                    "quality_score": {"score": 99},
-                },
-            ],
-        },
-    )
-
-    seen_candidates: list[str] = []
-
-    def fake_run_single_c2c_candidate(*, candidate, **kwargs):
-        seen_candidates.append(candidate["id"])
-        return {
-            "id": candidate["id"],
-            "title": candidate["title"],
-            "decision": "candidate_win" if candidate["id"] == "pathology_triggered_prior_fallback" else "not_viable",
-            "command_status": "ok",
-            "metrics": {"mean": 51.0 if candidate["id"] == "pathology_triggered_prior_fallback" else 49.0},
-            "proxy_screen": {"metrics": {"mean": 49.0}, "status": "passed"},
-            "activation_smoke": {"status": "passed"},
-            "full_s3_readiness": {"status": "ready", "full_train_allowed": False, "worth_full_train": {"decision": "no", "reason": "blocked"}},
-            "ablation": {"comparison": {"mechanism_supported": True}},
-            "delta_vs_baseline": 1.0 if candidate["id"] == "pathology_triggered_prior_fallback" else -1.0,
-            "worst_dataset_regression": 0.0,
-            "patch_result": {"status": "ok"},
-            "command_logs": [],
-            "run_state_path": str(paths.root / "dummy_run_state.json"),
-            "has_executable_change": True,
-            "decision_reason": "",
-        }
-
-    monkeypatch.setattr(agent, "_run_single_c2c_candidate", fake_run_single_c2c_candidate)
-    result = agent._run_c2c_small_loop(
-        plan,
-        {"baseline": {"mean": 50.0}, "max_candidates": 3, "min_delta_to_pass": 0.1, "max_dataset_regression": 2.0, "selected_gpu_ids": [0], "gpu_policy": {}},
-        "env.md",
-        None,
-    )
-
-    selection = json.loads((paths.root / "experiment" / "results" / "s3_candidate_selection.json").read_text(encoding="utf-8"))
-    assert seen_candidates == ["pathology_triggered_prior_fallback"]
-    assert selection["mode"] == "patch_manifest_selected"
-    assert selection["executed_candidate_ids"] == ["pathology_triggered_prior_fallback"]
-    assert selection["skipped_candidate_ids"] == ["local_monotonic_neighbor_window_router"]
-    assert selection["patch_manifest"]["sha256"]
-    assert selection["selected_patch"]["sha256"] == sha256_file(selected_patch_dir / "patch.json")
-    assert selection["selected_implementation_contract"]["sha256"] == sha256_file(selected_patch_dir / "implementation_contract.json")
-    assert result["artifacts"]
 
 
 def test_s3_runs_ablation_switch_disabled_eval(monkeypatch, tmp_path: Path) -> None:
@@ -9812,130 +8464,6 @@ def test_c2c_proxy_command_failure_classifies_distributed_child_failure() -> Non
     assert "single auto-selected GPU" in failure["repair_hint"]
     assert failure["rank_failure"] == {"local_rank": 3, "exitcode": 1, "pid": 12345}
     assert "ChildFailedError" in failure["stderr_tail"]
-
-
-def test_c2c_result_payload_compacts_patch_state_and_proxy_logs(tmp_path: Path, monkeypatch) -> None:
-    repo = _fake_c2c_repo(tmp_path)
-    config = _base_config(tmp_path / "workspace", simulate=False)
-    config["c2c"] = {
-        "enabled": True,
-        "snapshot_path": str(repo),
-        "env_python": "/usr/bin/python3",
-        "model_map": {},
-        "baseline": {"name": "base", "mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
-        "datasets": ["mmlu-redux"],
-        "small_loop": {
-            "eval_datasets": ["mmlu-redux"],
-            "train_samples": 1,
-            "gpu_ids": [0],
-            "proxy_screen": {
-                "enabled": True,
-                "mode": "replay",
-                "eval_datasets": ["mmlu-redux"],
-                "train_samples": 1,
-                "eval_limit": 1,
-                "reject_on_command_failure": True,
-            },
-        },
-    }
-    config["code_patch"] = {
-        "enabled": True,
-        "dynamic_whitelist": {
-            "include_prefixes": ["rosetta/", "script/", "recipe/", "test/", "tests/"],
-            "include_extensions": [".py", ".json", ".yaml", ".yml", ".toml", ".txt"],
-        },
-    }
-    paths = init_workspace(config, "topic", project_id="proj_compact_payload", simulate=False)
-    context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
-    agent = ExperimentAgent(context)
-    adapter = C2CAdapter(paths.root, config)
-
-    patch_path = paths.root / "plan" / "code_patches" / "compact" / "patch.json"
-    patch_path.parent.mkdir(parents=True, exist_ok=True)
-    old_sha = sha256_file(adapter.repo_root / "rosetta/model/aligner.py")
-    patch_path.write_text(
-        json.dumps(
-            {
-                "operations": [
-                    {
-                        "op": "replace_file",
-                        "path": "rosetta/model/aligner.py",
-                        "old_sha256": old_sha,
-                        "new": "VALUE = 'compact payload patch'\n",
-                    }
-                ],
-                "changed_files": ["rosetta/model/aligner.py"],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    def fake_preflight(run_spec, gpu_selection):
-        del gpu_selection
-        payload = {"status": "ok", "checks": [], "errors": [], "warnings": [], "recovery_actions": []}
-        Path(run_spec["preflight_path"]).write_text(json.dumps(payload), encoding="utf-8")
-        return payload
-
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, retry_policy
-        run_repo = Path(working_dir)
-        if name.startswith("preflight_command_") or name.startswith("proxy_baseline_"):
-            if name == "proxy_baseline_train":
-                final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
-                final.mkdir(parents=True, exist_ok=True)
-                (final / "marker.txt").write_text("ok", encoding="utf-8")
-            if name == "proxy_baseline_eval_mmlu-redux":
-                out = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results" / "mmlu-redux"
-                out.mkdir(parents=True, exist_ok=True)
-                (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                    json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.5}),
-                    encoding="utf-8",
-                )
-            return {"step": name, "status": "ok", "returncode": 0, "stdout": "ok", "stderr": "", "attempts": []}
-        return {
-            "step": name,
-            "status": "failed",
-            "returncode": 1,
-            "stdout": "x" * 9000,
-            "stderr": "RuntimeError: compact failure\n" + "y" * 9000,
-            "attempts": [{"stdout": "nested" * 1000, "stderr": "nested-err" * 1000}],
-        }
-
-    monkeypatch.setattr(adapter, "preflight", fake_preflight)
-    monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result = agent._run_single_c2c_candidate(
-        adapter=adapter,
-        candidate={
-            "id": "compact",
-            "title": "Compact",
-            "code_patch": {
-                "status": "ok",
-                "patch_json": "plan/code_patches/compact/patch.json",
-                "changed_files": ["rosetta/model/aligner.py"],
-                "has_executable_change": True,
-            },
-        },
-        index=0,
-        simulate=False,
-        baseline_mean=50.0,
-        min_delta=0.1,
-        max_regression=2.0,
-        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
-        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
-    )
-
-    rendered = json.dumps(result, ensure_ascii=False)
-    command_log = json.loads((paths.root / "experiment" / "logs" / "c2c_compact_commands.json").read_text(encoding="utf-8"))
-
-    assert "restore_state" not in result["patch_result"]
-    assert result["patch_result"]["restore_state_omitted"] is True
-    assert len(rendered) < 30000
-    assert "x" * 5000 not in rendered
-    assert "y" * 5000 not in rendered
-    assert "stdout_tail" in result["proxy_screen"]["attempts"][0]
-    assert "stdout" not in result["proxy_screen"]["attempts"][0]
-    assert "stdout_tail" in command_log["runs"][0]
-    assert "stdout" not in command_log["runs"][0]
 
 
 def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch, tmp_path: Path) -> None:

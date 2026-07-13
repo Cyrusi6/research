@@ -39,7 +39,7 @@ uv run auto-research audit-c2c --project-id <project_id>
 uv run auto-research replay-c2c --project-id <project_id> --from-stage S3_experiment
 ```
 
-`doctor-c2c` writes readiness and runtime-health reports under `meta/`, `audit-c2c` checks C2C stage artifacts, schemas, manifest hashes, and stale route-invalidated files, and `replay-c2c` replays deterministic route-policy decisions from frozen artifacts without rerunning S1/S2 LLM calls.
+`doctor-c2c` writes readiness and runtime-health reports under `meta/`, `audit-c2c` checks C2C stage artifacts, schemas, manifest hashes, and stale route-invalidated files, and `replay-c2c` rebuilds the deterministic event-derived research state without rerunning S1/S2 LLM calls.
 
 To first prove that a real project can traverse S0-S2.5 and produce one cheap S3 proxy metric, use the explicit bootstrap profile:
 
@@ -49,7 +49,22 @@ uv run auto-research run-c2c \
   --profile bootstrap
 ```
 
-Bootstrap forces one iteration and stops at `S3_experiment`. It requires a compatible cached S0 bundle and will block rather than fall back to DeepSeek semantic enrichment or MinerU PDF parsing. It keeps schemas, evidence references, patch safety, `py_compile`, and targeted tests, while deferring strict S1 evidence-count thresholds, S2.5 runtime activation smoke, full training/evaluation, effect acceptance, and automatic failure rerouting. The default `standard` profile is unchanged.
+Bootstrap forces one S0→S1→S2→S2.5→S3 cheap-proxy traversal and stops after `bootstrap_proxy_complete`. It requires a compatible cached S0 bundle and will block rather than fall back to DeepSeek semantic enrichment or MinerU PDF parsing. Its attempt has `consumes_direction_budget=false`, so it never enters or consumes the standard five-variant loop.
+
+## Authoritative S1-S3 Model
+
+The breaking S1-S3 contract has one canonical artifact for each scientific identity:
+
+- `literature/direction.json`: `DirectionSpec v2`, containing the research question, causal invariants, falsification conditions, benchmark identity, and allowed variant space. It never embeds a fixed implementation variant.
+- `plan/variant.json`: `VariantSpec v3`, containing exactly one intervention inside the current direction's mutable axes.
+- `meta/attempts/<attempt_id>.json`: `AttemptRecord v1`, derived from the immutable event ledger and reused across crash/resume and implementation repair.
+- `experiment/results/trial_result.json`: `TrialResult v1`, the only S3 result consumed by the state machine.
+- `meta/route_outcome.json`: `RouteOutcome v1`, the only routing action contract.
+- `meta/research_events/<sequence>-<event_id>.json`: immutable events; `meta/research_state.json` is a rebuildable snapshot, not an independent truth source.
+
+The `standard` profile executes five sequential method-evaluable variants under one unchanged `direction_id` and `direction_hash` with `execution_width=1` and `stop_on_success=false`. Patch generation failures, static validation failures, activation wiring failures, resource pauses, and OOM retries release their reserved slot. A proxy or full result consumes exactly one slot only when the reducer records `method_evaluable=true`. Outcomes 1–4 route to `PROPOSE_NEXT_VARIANT`; outcome 5 routes to `FINISH_DIRECTION` when any variant meets acceptance, otherwise `START_NEW_DIRECTION`. A sixth variant cannot be reserved.
+
+Planner pools, scorecards, patch diagnostics, proxy diagnostics, and human-readable summaries remain diagnostic artifacts only. Runtime stages do not read `plan.yaml` or infer direction/variant identity from older files. Projects without the v2/v3 canonical artifacts must restart from S1; no legacy loader or automatic artifact migration is provided. See `docs/authoritative_s1_s3_contracts.md`.
 
 ## Layout
 
@@ -83,5 +98,6 @@ workspace/<project_id>/
 ## Notes
 
 - The system keeps output management strict: stage files are committed atomically and recorded in manifests.
+- Required stage inputs are checked before the agent runs or writes any artifact.
 - S2.5 persistent Codex sessions keep metadata/events in `workspace/<project_id>/plan/code_worktrees/`, but new Git worktree repos are stored outside the repo by default via `code_patch.worktree_storage_root` or `AUTO_RESEARCH_WORKTREE_ROOT`.
 - It is designed to be honest. If a stage lacks the data or execution hooks needed to proceed, the registry is marked blocked or failed instead of fabricating artifacts.

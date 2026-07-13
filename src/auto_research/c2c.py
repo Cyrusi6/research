@@ -350,7 +350,6 @@ def build_c2c_project_config(
                 "c2c_only": True,
                 "write_route_context": True,
                 "write_attempt_ledger": True,
-                "legacy_route_fallback": True,
                 "require_route_decision_for_s3_feedback": True,
                 "budgets": {
                     "patch_repair_attempts_per_variant": 2,

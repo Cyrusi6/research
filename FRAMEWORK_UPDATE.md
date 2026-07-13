@@ -110,3 +110,20 @@ See `FRAMEWORK_STAGE_UPDATES.md` for the full implementation and validation log.
 - Allowed implementation-repair mode to reuse the same integration point/fingerprint without being blocked by adaptive force-new-integration constraints.
 - Aligned the default C2C same-direction method-level proxy failure budget to 5 attempts across project config, route policy fallback, and S2 adaptive feedback context.
 - Added regression tests for repairable proxy routing, attempt ledger budget accounting, S2 feedback dedupe, and implementation repair gate behavior.
+# 2026-07-14 S1-S3 Authoritative Contracts / Five-Variant Reducer Breaking Change
+
+- Added strict `DirectionSpec v2`, `VariantSpec v3`, `AttemptRecord v1`, `TrialResult v1`, and `RouteOutcome v1` contracts with Draft 2020-12 schemas, fixed versions, closed objects, and recomputed identities.
+- Replaced split attempt/route counters with an immutable atomic event ledger and deterministic `ResearchEventLedger` reducer. `meta/research_state.json` and per-attempt files are derived snapshots; duplicate event IDs and crash/resume are idempotent.
+- Standard profile now reserves and sequentially executes exactly five method-evaluable variants under one direction. Success does not stop outcomes 1–4; implementation/resource failures release reservations; the fifth outcome finishes or starts a new direction and a sixth reservation is rejected.
+- Bootstrap remains a single cached-S0 cheap-proxy traversal with `consumes_direction_budget=false` and `bootstrap_proxy_complete`, isolated from the standard budget.
+- Feedback attribution now separates planner feedback, implementation repair history, and method tried history. Only `AttemptCompleted` with `method_evaluable=true` enters scientific anti-repeat history.
+- S1/S2/S3 producers, consumers, Gates, reporting, C2C replay/audit, and tests now use only `literature/direction.json`, `plan/variant.json`, `experiment/results/trial_result.json`, and unified route outcomes.
+- Removed legacy loaders, route policy modules, direction-to-idea conversion, legacy C2C debate selection, old attempt/route facts, and inference from ideas or `plan.yaml`. Old projects must rerun from S1.
+- Preserved cached-S0 bootstrap, GPT-5.6 Terra `xhigh` propagation, persistent Codex patch/repair, activation smoke, and C2C proxy/full execution hooks.
+
+Validation:
+
+```text
+TMPDIR=$PWD/.tmp uv run pytest -q
+326 passed, 2 skipped
+```

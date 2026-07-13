@@ -249,7 +249,7 @@ class MultiAgentReasoningService:
         return outputs
 
     def _write_progress(self, **record: Any) -> None:
-        progress_path = self.context.project_root / "literature" / "c2c" / "idea_debate_progress.jsonl"
+        progress_path = self.context.project_root / "literature" / "c2c" / "direction_analysis_progress.jsonl"
         try:
             progress_path.parent.mkdir(parents=True, exist_ok=True)
             with progress_path.open("a", encoding="utf-8") as handle:
@@ -258,9 +258,9 @@ class MultiAgentReasoningService:
             return
 
     def _load_run_log(self) -> dict[str, Any]:
-        progress_path = self.context.project_root / "literature" / "c2c" / "idea_debate_progress.jsonl"
+        progress_path = self.context.project_root / "literature" / "c2c" / "direction_analysis_progress.jsonl"
         if not progress_path.exists():
-            return {"progress_path": "literature/c2c/idea_debate_progress.jsonl", "events": []}
+            return {"progress_path": "literature/c2c/direction_analysis_progress.jsonl", "events": []}
         events = []
         for line in progress_path.read_text(encoding="utf-8").splitlines()[-80:]:
             try:
@@ -268,7 +268,7 @@ class MultiAgentReasoningService:
             except json.JSONDecodeError:
                 continue
         return {
-            "progress_path": "literature/c2c/idea_debate_progress.jsonl",
+            "progress_path": "literature/c2c/direction_analysis_progress.jsonl",
             "events": events,
             "fallback_events": [event for event in events if "fallback" in str(event.get("status", ""))],
         }
@@ -1283,7 +1283,7 @@ def _infer_source_type(item: dict[str, Any], source_path: str) -> str:
         return "rebuttal"
     if any(marker in lowered for marker in ["paper", "ref_paper", "bibliography"]) or source_path.endswith(".pdf"):
         return "paper"
-    if any(marker in lowered for marker in ["repo_card", "rebuttal_concern_matrix", "negative_result_memory", "retrieval_plan", "idea_debate", "negative_constraints"]):
+    if any(marker in lowered for marker in ["repo_card", "rebuttal_concern_matrix", "negative_result_memory", "retrieval_plan", "direction_analysis", "negative_constraints"]):
         return "repo_artifact"
     return "summary" if str(item.get("snippet") or item.get("claim") or item.get("text") or "").strip() else "unknown"
 

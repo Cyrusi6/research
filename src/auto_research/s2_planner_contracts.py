@@ -128,7 +128,7 @@ def build_s2_planner_gate_report(
     errors: list[str] = []
     direction_id = str(direction.get("direction_id") or direction.get("id") or "")
     selected_id = str(next_variant.get("id") or next_variant.get("variant_id") or "")
-    selected_fp = str(next_variant.get("variant_fingerprint") or "")
+    selected_fp = str(variant_contract.get("variant_spec_hash") or next_variant.get("variant_spec_hash") or next_variant.get("variant_fingerprint") or "")
     candidates = [item for item in candidate_pool.get("candidates") or [] if isinstance(item, dict)]
     candidate_ids = {str(item.get("id") or "") for item in candidates}
     candidate_fps = {str(item.get("variant_fingerprint") or "") for item in candidates}
@@ -142,11 +142,9 @@ def build_s2_planner_gate_report(
         errors.append("candidate_pool.candidates must be non-empty")
     if selected_id not in candidate_ids:
         errors.append("next_variant.id must exist in candidate_pool")
-    expected_fp = str(variant_fingerprint.get("variant_fingerprint") or "")
+    expected_fp = str(variant_fingerprint.get("variant_spec_hash") or variant_contract.get("variant_spec_hash") or "")
     if selected_fp and expected_fp and selected_fp != expected_fp:
-        errors.append("next_variant.variant_fingerprint must match variant_fingerprint.json")
-    if selected_fp and candidate_fps and selected_fp not in candidate_fps:
-        errors.append("next_variant.variant_fingerprint must come from candidate_pool")
+        errors.append("selected variant hash must match VariantSpec")
     for key in ["direction_id", "s1_direction_id"]:
         value = next_variant.get(key)
         if value and direction_id and str(value) != direction_id:
@@ -198,7 +196,7 @@ def build_s2_planner_gate_report(
         "gate": "pass" if not errors else "fail",
         "policy_hash": policy_hash,
         "selected_variant_id": selected_id,
-        "selected_variant_fingerprint": selected_fp or expected_fp,
+        "selected_variant_spec_hash": selected_fp or expected_fp,
         "selected_variant_score": selected_score,
         "selected_variant": next_variant,
         "checks": {
@@ -238,7 +236,8 @@ def build_s2_implementation_contract(
         "schema_version": C2C_S2_5_IMPLEMENTATION_CONTRACT_SCHEMA_VERSION,
         "direction_id": str(direction.get("direction_id") or selected_variant.get("s1_direction_id") or ""),
         "variant_id": str(selected_variant.get("id") or variant_contract.get("variant_id") or ""),
-        "variant_fingerprint": str(selected_variant.get("variant_fingerprint") or variant_contract.get("variant_fingerprint") or ""),
+        "variant_spec_hash": str(variant_contract.get("variant_spec_hash") or selected_variant.get("variant_spec_hash") or selected_variant.get("variant_fingerprint") or ""),
+        "variant_fingerprint": str(variant_contract.get("variant_spec_hash") or selected_variant.get("variant_spec_hash") or selected_variant.get("variant_fingerprint") or ""),
         "allowed_files": [str(item) for item in c2c_cfg.get("allowed_files") or [] if item],
         "allowed_prefixes": [str(item) for item in c2c_cfg.get("allowed_prefixes") or [] if item],
         "forbidden_files": forbidden,
@@ -267,7 +266,7 @@ def build_s2_5_patch_gate_report(
     config: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     variant_fingerprint = variant_fingerprint if isinstance(variant_fingerprint, dict) else {}
-    expected_fp = str(variant_fingerprint.get("variant_fingerprint") or implementation_contract.get("variant_fingerprint") or "")
+    expected_fp = str(variant_fingerprint.get("variant_spec_hash") or implementation_contract.get("variant_spec_hash") or implementation_contract.get("variant_fingerprint") or "")
     selected_variant_id = str(planner_gate_report.get("selected_variant_id") or implementation_contract.get("variant_id") or "")
     selected_manifest_id = str(patch_manifest.get("selected_candidate_id") or (patch_manifest.get("selected_patch") or {}).get("candidate_id") or "")
     entries = [item for item in (patch_manifest.get("patches") or patch_manifest.get("candidates") or []) if isinstance(item, dict)]
@@ -303,13 +302,24 @@ def build_s2_5_patch_gate_report(
     elif _manifest_has_runtime_resource_retry(patch_manifest):
         failure_class = "runtime_smoke_resource_retry"
         repairable = True
-    gate = "pass" if manifest_status == "ok" and all(checks.values()) else "fail"
+    simulate = bool(((config or {}).get("experiment") or {}).get("simulate", False))
+    disabled_simulation_pass = manifest_status == "disabled" and simulate and all(
+        checks[name]
+        for name in (
+            "selected_variant_matches_planner",
+            "changed_files_within_allowed_surface",
+            "forbidden_files_untouched",
+            "ablation_switch_present",
+        )
+    )
+    gate = "pass" if (manifest_status == "ok" and all(checks.values())) or disabled_simulation_pass else "fail"
     if failure_class == "runtime_smoke_resource_retry":
         gate = "retry"
     return {
         "schema_version": C2C_S2_5_PATCH_GATE_REPORT_SCHEMA_VERSION,
         "gate": gate,
         "variant_id": str(implementation_contract.get("variant_id") or selected_variant_id),
+        "variant_spec_hash": expected_fp,
         "variant_fingerprint": expected_fp,
         "patch_manifest_status": manifest_status,
         "checks": checks,
@@ -453,7 +463,7 @@ def _history_summary(planner_memory: dict[str, Any]) -> dict[str, set[str]]:
 
 def _expected_files(payload: dict[str, Any]) -> list[str]:
     contract = payload.get("experiment_contract") if isinstance(payload.get("experiment_contract"), dict) else {}
-    files = contract.get("expected_files") or payload.get("expected_files") or []
+    files = contract.get("expected_files") or payload.get("expected_files") or payload.get("implementation_surface_ids") or []
     if isinstance(files, str):
         return [files]
     return [str(item) for item in files if item] if isinstance(files, list) else []

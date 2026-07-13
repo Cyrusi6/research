@@ -45,7 +45,7 @@ def test_artifact_manifest_supports_override_source_and_dedup(tmp_path: Path) ->
 
     first = manager.write_json(
         "S1_literature",
-        "ideas.json",
+        "candidate_directions.json",
         {"idea": "v1"},
         artifact_type="ideas",
         source_paths=["references/papers/demo.pdf"],
@@ -54,7 +54,7 @@ def test_artifact_manifest_supports_override_source_and_dedup(tmp_path: Path) ->
     )
     second = manager.write_json(
         "S1_literature",
-        "ideas.json",
+        "candidate_directions.json",
         {"idea": "v2"},
         artifact_type="ideas",
         source_paths=["literature/paper_cards.json"],
@@ -63,7 +63,7 @@ def test_artifact_manifest_supports_override_source_and_dedup(tmp_path: Path) ->
     )
 
     manifest = json.loads((paths.root / "literature" / "stage_manifest.json").read_text(encoding="utf-8"))
-    assert first["path"] == second["path"] == "literature/ideas.json"
+    assert first["path"] == second["path"] == "literature/candidate_directions.json"
     assert manifest["artifact_count"] == 1
     entry = manifest["artifacts"][0]
     assert entry["created_by"] == "method-inventor"

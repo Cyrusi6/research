@@ -5,214 +5,6 @@ from auto_research.reporting import build_memory_report, build_project_report, f
 from auto_research.utils import write_json, write_yaml
 
 
-def test_project_report_summarizes_c2c_route(tmp_path, monkeypatch, capsys) -> None:
-    project = tmp_path / "proj_report"
-    (project / "meta").mkdir(parents=True)
-    (project / "literature").mkdir()
-    (project / "plan").mkdir()
-    (project / "experiment" / "results").mkdir(parents=True)
-    write_yaml(
-        project / "meta" / "registry.yaml",
-        {
-            "project_id": "proj_report",
-            "research_topic": "cross tokenizer cache",
-            "status": "running",
-            "current_stage": "S2_plan",
-            "iteration": 2,
-            "blocked_reason": None,
-            "stages": {},
-        },
-    )
-    write_json(
-        project / "literature" / "ideas.json",
-        [
-            {
-                "id": "utility_predicted_cache_routing",
-                "title": "Utility Predicted Cache Routing",
-                "selected": True,
-                "mechanism_type": "utility_predicted_cache_routing",
-            }
-        ],
-    )
-    write_json(
-        project / "plan" / "direction_scorecard.json",
-        {
-            "current_direction": {
-                "direction_id": "utility_predicted_cache_routing",
-                "title": "Utility Predicted Cache Routing",
-                "mechanism_type": "utility_predicted_cache_routing",
-                "summary": {
-                    "same_direction_failure_count": 2,
-                    "same_direction_failure_budget": 5,
-                    "best_proxy_delta": 0.4,
-                    "direction_quality": "mixed_direction_evidence",
-                },
-                "attempts": [
-                    {
-                        "iteration": 1,
-                        "route": "proxy_rejected_same_direction",
-                        "candidate_ids": ["utility_v1"],
-                        "best_proxy_delta": -1.2,
-                        "dragging_datasets": [{"dataset": "mmlu-redux"}],
-                    }
-                ],
-            }
-        },
-    )
-    write_json(
-        project / "plan" / "performance_feedback.json",
-        {
-            "reason": "proxy rejected",
-            "summary": {
-                "recommended_s2_action": "mechanism_repair",
-                "next_action": "repair_or_variant_same_direction",
-                "s2_action_policy": {
-                    "action": "mechanism_repair",
-                    "matched_rule": "single_dataset_small_drop",
-                    "reason": "only one dataset dropped",
-                },
-                "repair_vs_variant_signals": ["single_dataset_small_drop"],
-            },
-        },
-    )
-    write_json(
-        project / "experiment" / "results" / "main_results.json",
-        {
-            "best_proxy_candidate": {
-                "id": "utility_v2",
-                "title": "Utility v2",
-                "decision": "proxy_rejected",
-                "delta_vs_baseline": None,
-                "proxy_screen": {"proxy_delta_vs_baseline": 0.4, "proxy_dataset_deltas": {"mmlu-redux": -0.2, "ai2-arc": 0.5}},
-                "patch_result": {"changed_files": ["rosetta/model/aligner.py"]},
-            },
-            "candidate_results": [],
-        },
-    )
-    write_json(
-        project / "meta" / "route_decision.json",
-        {
-            "schema_version": "c2c_route_decision_v1",
-            "created_at": "2026-07-03T00:00:00Z",
-            "trigger_stage": "S3_experiment",
-            "trigger_source": "s3_gate",
-            "failure_class": "proxy_negative",
-            "decision": "route_to_s2",
-            "next_stage": "S2_plan",
-            "reason_codes": ["proxy_decision_report_route_hint_return_s2"],
-            "budget_effects": {
-                "consumes_same_direction_attempt": True,
-                "consumes_patch_repair_attempt": False,
-                "consumes_resource_retry": False,
-                "increments_iteration": False,
-            },
-            "memory_effects": {"write_shared_method_memory": True, "memory_kind": "proxy_rejected_variant"},
-            "artifact_effects": {
-                "invalidate_from": "S2_plan",
-                "preserve_s1_direction": True,
-                "preserve_s2_selected_variant": False,
-                "preserve_s2_5_patch_lock": False,
-            },
-            "orchestrator_action": {"registry_current_stage": "S2_plan", "status": "feedback_routed"},
-        },
-    )
-    write_json(
-        project / "meta" / "attempt_ledger.json",
-        {
-            "schema_version": "c2c_attempt_ledger_v1",
-            "project_id": "proj_report",
-            "records": [],
-            "counters": {"by_direction": {"utility_predicted_cache_routing": {"proxy_failures": 1, "full_s3_failures": 0, "patch_repairs": 0, "resource_retries": 0}}},
-        },
-    )
-    write_json(project / "literature" / "c2c" / "evidence_quality_score.json", {"gate": "pass", "novelty_score": 0.68})
-    write_json(project / "plan" / "s2_planner" / "planner_gate_report.json", {"gate": "pass", "selected_variant_id": "utility_v2"})
-    write_json(project / "plan" / "s2_planner" / "variant_scorecard.json", {"ranking": [{"variant_id": "utility_v2", "score": 0.72, "decision": "selected"}]})
-    write_json(project / "experiment" / "results" / "c2c_proxy_decision_report.json", {"decision": "proxy_rejected", "route_hint": "return_s2", "failure_class": "proxy_negative"})
-    write_json(project / "meta" / "c2c_e2e_readiness_report.json", {"gate": "pass"})
-    write_json(project / "meta" / "c2c_artifact_audit_report.json", {"gate": "fail", "summary": {"missing": 1}})
-    write_json(project / "meta" / "c2c_e2e_run_manifest.json", {"mode": "real", "final_status": "blocked"})
-    write_json(project / "meta" / "c2c_replay_result.json", {"status": "match", "mismatches": []})
-    write_json(
-        project / "meta" / "c2c_real_smoke_record.json",
-        {
-            "schema_version": "c2c_real_smoke_record_v1",
-            "project_id": "proj_report",
-            "readiness_gate": "pass",
-            "execution_hooks_gate": "pass",
-            "run_manifest_final_status": "blocked",
-            "artifact_audit_gate": "fail",
-            "replay_status": "match",
-            "last_stage": "S3_experiment",
-            "s1_evidence_gate": "pass",
-            "s2_planner_gate": "pass",
-            "s2_5_patch_gate": "pass",
-            "s3_proxy_decision": "proxy_rejected",
-            "route_decision": "route_to_s2",
-            "blocking_reasons": ["S3_experiment:missing:proxy"],
-            "warnings": [],
-        },
-    )
-    (project / "plan" / "code_patches").mkdir()
-    write_json(
-        project / "plan" / "code_patches" / "patch_manifest.json",
-        {
-            "status": "ok",
-            "selected_candidate_id": "utility_patch_manifest",
-            "valid_patch_ids": ["utility_patch_manifest"],
-            "selected_patch": {
-                "candidate_id": "utility_patch_manifest",
-                "title": "Utility patch manifest",
-                "status": "ok",
-                "patch_json": "plan/code_patches/utility_patch_manifest/patch.json",
-                "selected_variant": 2,
-                "changed_files": ["rosetta/model/projector.py"],
-                "quality_score": {"score": 80},
-            },
-        },
-    )
-
-    report = build_project_report(project)
-    text = format_project_report(report)
-
-    assert report["s1_direction"]["direction_id"] == "utility_predicted_cache_routing"
-    assert report["same_direction_attempt"]["count"] == 2
-    assert report["current_best_patch"]["candidate_id"] == "utility_v2"
-    assert "stage_states" in report
-    assert report["next_route"]["action"] == "route_to_s2"
-    assert report["route"]["last_decision"] == "route_to_s2"
-    assert report["s1_quality"]["evidence_gate"] == "pass"
-    assert report["s2_planner"]["selected_variant_score"] == 0.72
-    assert report["s3_proxy"]["route_hint"] == "return_s2"
-    assert report["attempt_ledger"]["same_direction_proxy_failures"] == 1
-    assert report["e2e"]["readiness_gate"] == "pass"
-    assert report["e2e"]["artifact_audit_gate"] == "fail"
-    assert report["e2e"]["real_run_manifest"]["mode"] == "real"
-    assert report["e2e"]["replay"]["last_replay_status"] == "match"
-    assert report["e2e"]["real_smoke_record"]["last_stage"] == "S3_experiment"
-    assert report["e2e"]["real_smoke_record"]["route_decision"] == "route_to_s2"
-    assert report["artifact_paths"]["c2c_real_smoke_record"] == "meta/c2c_real_smoke_record.json"
-    assert "S1 direction: utility_predicted_cache_routing" in text
-    assert "Stage states:" in text
-    assert "Next route: route_to_s2" in text
-    assert "Route decision: route_to_s2 -> S2_plan" in text
-    assert "C2C E2E: readiness=pass audit=fail replay=match" in text
-
-    import auto_research.config as config_module
-    import auto_research.orchestrator as orchestrator_module
-
-    config = {"project": {"workspace_root": str(tmp_path)}}
-    monkeypatch.setattr(config_module, "load_root_config", lambda: config)
-    monkeypatch.setattr(orchestrator_module, "load_root_config", lambda: config)
-    main(["report", "--project-id", "proj_report"])
-    output = capsys.readouterr().out
-    assert "Same-direction attempt: 2/5" in output
-
-    main(["report", "--project-id", "proj_report", "--json"])
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["next_route"]["matched_rule"] == "proxy_decision_report_route_hint_return_s2"
-
-
 def test_memory_report_summarizes_shared_pool_and_project_retrieval(tmp_path, monkeypatch, capsys) -> None:
     memory_path = tmp_path / "method_memory.jsonl"
     summary_path = tmp_path / "method_memory.md"
@@ -451,55 +243,38 @@ def test_project_report_uses_selected_patch_manifest_when_no_result_candidate(tm
     assert report["current_best_patch"]["selected_variant"] == 1
 
 
-def test_project_report_prefers_current_s1_idea_over_previous_scorecard(tmp_path) -> None:
-    project = tmp_path / "proj_report_new_direction"
+
+
+def test_project_report_uses_canonical_route_and_research_state(tmp_path) -> None:
+    from test_authoritative_state_machine import _complete, _direction, _initialize, _reserve, _variant
+    from auto_research.research_state import ResearchEventLedger
+
+    project = tmp_path / "proj_report_v2"
     (project / "meta").mkdir(parents=True)
-    (project / "literature").mkdir()
-    (project / "plan").mkdir()
-    (project / "experiment" / "results").mkdir(parents=True)
     write_yaml(
         project / "meta" / "registry.yaml",
         {
-            "project_id": "proj_report_new_direction",
-            "research_topic": "cross tokenizer cache",
+            "project_id": project.name,
+            "research_topic": "topic",
             "status": "running",
             "current_stage": "S2_plan",
-            "iteration": 2,
-            "blocked_reason": None,
+            "iteration": 1,
             "stages": {},
         },
     )
-    write_json(
-        project / "literature" / "ideas.json",
-        [
-            {
-                "id": "pathology_conditioned_transfer_controller",
-                "title": "Pathology-Conditioned Transfer Controller",
-                "selected": True,
-                "mechanism_type": "pathology_conditioned_controller",
-            }
-        ],
-    )
-    write_json(
-        project / "plan" / "direction_scorecard.json",
-        {
-            "current_direction": {
-                "direction_id": "candidate_constrained_soft_span_alignment",
-                "title": "Candidate-Constrained Soft Span Alignment",
-                "mechanism_type": "semantic_span_graph_alignment",
-                "summary": {
-                    "same_direction_failure_count": 4,
-                    "same_direction_failure_budget": 4,
-                    "best_proxy_delta": -0.085,
-                    "direction_quality": "mixed_direction_evidence",
-                },
-                "attempts": [{"iteration": 1, "route": "repairable_proxy_risk", "candidate_ids": ["candidate_constrained_soft_span_alignment"]}],
-            }
-        },
-    )
+    direction = _direction()
+    variant = _variant(direction, 1)
+    (project / "literature").mkdir()
+    (project / "plan").mkdir()
+    write_json(project / "literature" / "direction.json", direction)
+    write_json(project / "plan" / "variant.json", variant)
+    ledger = ResearchEventLedger(project)
+    _initialize(ledger, direction, variant)
+    _complete(ledger, _reserve(ledger, direction, variant), outcome="rejected")
 
     report = build_project_report(project)
 
-    assert report["s1_direction"]["direction_id"] == "pathology_conditioned_transfer_controller"
-    assert report["s1_direction"]["previous_direction_id"] == "candidate_constrained_soft_span_alignment"
-    assert report["same_direction_attempt"]["count"] == 4
+    assert report["route"]["last_decision"] == "PROPOSE_NEXT_VARIANT"
+    assert report["attempt_ledger"]["consumed"] == 1
+    assert report["artifact_paths"]["route_outcome"] == "meta/route_outcome.json"
+    assert report["artifact_paths"]["research_state"] == "meta/research_state.json"

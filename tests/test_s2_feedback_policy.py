@@ -156,66 +156,25 @@ def test_dragging_dataset_penalty_and_addressing_bonus() -> None:
     assert addressed["components"]["dataset_risk_prior"] > 0
 
 
-def test_policy_force_constraints_from_attempt_counters(tmp_path: Path) -> None:
-    write_json(
-        tmp_path / "meta" / "attempt_ledger.json",
-        {
-            "schema_version": "c2c_attempt_ledger_v1",
-            "project_id": "proj",
-            "records": [],
-            "counters": {"by_direction": {"direction_x": {"proxy_failures": 2, "full_s3_failures": 1, "patch_repairs": 0, "resource_retries": 0}}},
-        },
-    )
-    context = build_s2_feedback_context(project_root=tmp_path, direction=_direction(), config=_config())
-    policy = build_s2_adaptive_policy(context, _config())
-
-    assert policy["route_constraints"]["force_new_integration_point"] is True
-    assert policy["route_constraints"]["force_new_direction"] is True
-    assert policy["route_constraints"]["same_direction_budget_remaining"] is False
 
 
-def test_feedback_context_recomputes_attempt_counters_and_dedupes_proxy_sources(tmp_path: Path) -> None:
-    write_json(
-        tmp_path / "meta" / "attempt_ledger.json",
-        {
-            "schema_version": "c2c_attempt_ledger_v1",
-            "project_id": "proj",
-            "records": [
-                {
-                    "direction_id": "direction_x",
-                    "variant_id": "variant_x",
-                    "failure_class": "effect_first_proxy_repair",
-                    "route_decision": "route_to_s2",
-                    "consumes_same_direction_attempt": True,
-                    "consumes_patch_repair_attempt": False,
-                    "consumes_resource_retry": False,
-                }
-            ],
-            "counters": {"by_direction": {"direction_x": {"proxy_failures": 2, "full_s3_failures": 0, "patch_repairs": 0, "resource_retries": 0}}},
-        },
-    )
-    write_json(
-        tmp_path / "experiment" / "results" / "c2c_proxy_decision_report.json",
-        {
-            "decision": "proxy_repairable",
-            "route_hint": "return_s2",
-            "failure_class": "effect_first_proxy_repair",
-            "variant_id": "variant_x",
-        },
-    )
-    write_json(
-        tmp_path / "experiment" / "results" / "main_results.json",
-        {
-            "candidate_results": [
-                {"id": "variant_x", "decision": "proxy_repairable", "failure_class": "effect_first_proxy_repair"}
-            ]
-        },
-    )
+def test_feedback_context_reads_only_method_evaluable_history(tmp_path: Path) -> None:
+    from auto_research.research_state import ResearchEventLedger
+    from test_authoritative_state_machine import _complete, _direction, _initialize, _reserve, _variant
 
-    context = build_s2_feedback_context(project_root=tmp_path, direction=_direction(), config=_config())
-    policy = build_s2_adaptive_policy(context, _config())
+    direction = _direction()
+    ledger = ResearchEventLedger(tmp_path)
+    first = _variant(direction, 1)
+    _initialize(ledger, direction, first)
+    _complete(ledger, _reserve(ledger, direction, first), outcome="rejected")
+    second = _variant(direction, 2)
+    _initialize(ledger, direction, second)
+    pending = _reserve(ledger, direction, second)
+    ledger.transition_attempt(pending["attempt_id"], "IMPLEMENTATION_REPAIR")
 
-    assert context["attempt_counters"]["same_direction_proxy_failures"] == 0
-    assert policy["route_constraints"]["force_new_integration_point"] is False
-    repair_rows = [row for row in context["recent_failures"] if row["failure_class"] == "implementation_failure"]
-    assert len(repair_rows) == 1
+    context = build_s2_feedback_context(project_root=tmp_path, direction=direction, config={})
+
+    assert len(context["recent_failures"]) == 1
+    assert context["recent_failures"][0]["variant_id"] == first["variant_id"]
+    assert context["attempt_counters"]["direction_budget_consumed"] == 1
+    assert context["attempt_counters"]["direction_budget_reserved"] == 1

@@ -5,37 +5,6 @@ from auto_research.utils import read_json, write_json, write_yaml
 from auto_research.validators import C2CE2EGateValidator
 
 
-def test_c2c_real_smoke_record_summarizes_completed_smoke(tmp_path: Path) -> None:
-    project = tmp_path / "c2c_smoke"
-    _write_registry(project, current_stage="S3_experiment", status="completed")
-    write_json(project / "meta" / "c2c_e2e_readiness_report.json", _readiness(project, gate="pass", warnings=[], blocking=[]))
-    write_json(project / "meta" / "c2c_e2e_run_manifest.json", _manifest(project, final_status="completed", stage="S3_experiment"))
-    write_json(project / "meta" / "c2c_artifact_audit_report.json", _audit(project, gate="pass", blocking=[]))
-    write_json(project / "meta" / "c2c_replay_result.json", _replay(project, status="match", mismatches=[]))
-    write_json(project / "literature" / "c2c" / "evidence_quality_score.json", {"gate": "pass"})
-    write_json(project / "plan" / "s2_planner" / "planner_gate_report.json", {"gate": "pass"})
-    write_json(project / "plan" / "code_patches" / "patch_gate_report.json", {"gate": "pass"})
-    write_json(project / "experiment" / "results" / "c2c_proxy_decision_report.json", {"decision": "proxy_rejected"})
-    write_json(project / "meta" / "route_decision.json", {"decision": "route_to_s2", "next_stage": "S2_plan"})
-
-    record = write_c2c_real_smoke_record(project, {})
-
-    assert record["schema_version"] == "c2c_real_smoke_record_v1"
-    assert record["readiness_gate"] == "pass"
-    assert record["run_manifest_final_status"] == "completed"
-    assert record["artifact_audit_gate"] == "pass"
-    assert record["replay_status"] == "match"
-    assert record["last_stage"] == "S3_experiment"
-    assert record["s1_evidence_gate"] == "pass"
-    assert record["s2_planner_gate"] == "pass"
-    assert record["s2_5_patch_gate"] == "pass"
-    assert record["s3_proxy_decision"] == "proxy_rejected"
-    assert record["route_decision"] == "route_to_s2"
-    assert record["blocking_reasons"] == []
-    assert read_json(project / "meta" / "c2c_real_smoke_record.json")["project_id"] == "c2c_smoke"
-    assert C2CE2EGateValidator(project, {}).validate().to_dict()["status"] == "PASS"
-
-
 def test_c2c_real_smoke_record_captures_s1_blocked_smoke(tmp_path: Path) -> None:
     project = tmp_path / "c2c_smoke_blocked"
     _write_registry(

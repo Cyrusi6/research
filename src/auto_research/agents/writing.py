@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 from ..adapters.latex import LatexCompiler
-from ..direction_contracts import direction_to_legacy_idea
+from ..direction_contracts import direction_planner_seed
 from ..utils import read_json
 from ..utils import compact_markdown, split_sentences
 from .base import AgentContext
@@ -26,11 +26,11 @@ class WritingAgent:
         survey = self._read_markdown("literature/survey.md")
         direction = read_json(self.context.project_root / "literature" / "direction.json", default={}) or {}
         if isinstance(direction, dict) and direction.get("direction_id"):
-            ideas = [direction_to_legacy_idea(direction)]
+            ideas = [direction_planner_seed(direction)]
         else:
-            ideas = json.loads((self.context.project_root / "literature" / "ideas.json").read_text(encoding="utf-8"))
+            raise RuntimeError("DirectionSpec v2 is missing; rerun from S1")
         selected = next((idea for idea in ideas if idea.get("selected")), ideas[0])
-        plan_yaml = self._read_markdown("plan/plan.yaml")
+        plan_yaml = json.dumps(read_json(self.context.project_root / "plan" / "trial_spec.json", default={}) or {}, ensure_ascii=False, indent=2)
 
         outline = compact_markdown(
             "\n".join(
@@ -51,7 +51,7 @@ class WritingAgent:
             outline,
             artifact_type="outline",
             summary="Paper outline",
-            source_paths=["experiment/results/summary.md", "plan/plan.yaml"],
+            source_paths=["experiment/results/summary.md", "plan/trial_spec.json"],
         )
         self._copy_experiment_assets()
         bib = self._build_bib()

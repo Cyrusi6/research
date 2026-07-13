@@ -2849,3 +2849,26 @@ uv run pytest -q tests/test_c2c_s3_artifact_registration.py tests/test_c2c_repla
 uv run pytest -q tests/test_route_policy.py tests/test_attempt_ledger.py tests/test_s2_feedback_policy.py tests/test_s2_adaptive_scorecard.py
 uv run pytest -q tests/test_validators.py tests/test_c2c.py tests/test_pipeline.py tests/test_stage_contracts.py
 ```
+# 2026-07-14 S1-S3 Contract and Routing Cutover
+
+## Stage Truth
+
+- S1 emits only `literature/direction.json` as `DirectionSpec v2` authority.
+- S2 emits only `plan/variant.json` as `VariantSpec v3` authority plus `plan/trial_spec.json` for protocol construction.
+- S2.5 binds implementation artifacts to the current `variant_spec_hash`; implementation repair preserves variant identity.
+- S3 emits `experiment/results/trial_result.json` bound to one `attempt_id`; summaries and C2C proxy reports are diagnostic.
+- All next-stage decisions use `RouteOutcome v1` and the event reducer.
+
+## Routing and Budget
+
+- Standard direction budget is reserved before implementation and consumed only by method-evaluable terminal outcomes.
+- Outcomes one through four route to `PROPOSE_NEXT_VARIANT` regardless of success.
+- Outcome five aggregates all five results and routes to `FINISH_DIRECTION` or `START_NEW_DIRECTION`.
+- Bootstrap proxy attempts never consume the standard direction budget and route directly to `FINISH_RUN` after completion.
+- Required inputs now block before agent execution or writes; absent canonical artifacts require rerunning S1.
+
+## Removed Runtime Paths
+
+- Removed old ideas/direction-decision/next-variant/attempt-ledger/route-decision authorities and fallback functions.
+- Removed legacy v1 variant loading and legacy C2C debate selection.
+- Removed independent route decisions from orchestrator, route policy, and S2 adaptive policy.

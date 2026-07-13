@@ -17,15 +17,15 @@ def test_stage_contract_records_inputs_outputs_and_hashes(tmp_path: Path) -> Non
     assert "literature/direction.json" in started["missing_inputs"]
     assert "literature/c2c/baseline_evidence.json" not in started["missing_inputs"]
 
-    (paths.root / "plan" / "plan.yaml").write_text("hypotheses: []\n", encoding="utf-8")
+    (paths.root / "plan" / "trial_spec.json").write_text("{}\n", encoding="utf-8")
     (paths.root / "plan" / "planner_decision.json").write_text("{}\n", encoding="utf-8")
-    (paths.root / "plan" / "variant_contract.json").write_text("{}\n", encoding="utf-8")
+    (paths.root / "plan" / "variant.json").write_text("{}\n", encoding="utf-8")
     (paths.root / "plan" / "variant_fingerprint.json").write_text("{}\n", encoding="utf-8")
-    completed = manager.stage_completed("S2_plan", artifacts=["plan/plan.yaml", "plan/planner_decision.json", "plan/variant_contract.json", "plan/variant_fingerprint.json"])
+    completed = manager.stage_completed("S2_plan", artifacts=["plan/trial_spec.json", "plan/planner_decision.json", "plan/variant.json", "plan/variant_fingerprint.json"])
 
     assert completed["status"] == "completed"
     assert completed["output_hash"]
-    assert any(item["path"] == "plan/plan.yaml" and item["sha256"] for item in completed["produced_outputs"])
+    assert any(item["path"] == "plan/trial_spec.json" and item["sha256"] for item in completed["produced_outputs"])
     on_disk = json.loads((paths.root / "orchestration" / "stage_contracts" / "S2_plan.json").read_text(encoding="utf-8"))
     assert on_disk["schema_version"] == "stage_contract_v2"
 
@@ -37,11 +37,10 @@ def test_stage_contract_keeps_c2c_inputs_conditional_for_generic_project(tmp_pat
 
     s3 = manager.stage_started("S3_experiment", iteration=1, config=config)
 
-    assert "plan/plan.yaml" in s3["required_inputs"]
-    assert "plan/candidate_ideas.json" not in s3["required_inputs"]
-    assert "plan/short_loop_plan.yaml" not in s3["required_inputs"]
+    assert "plan/trial_spec.json" in s3["required_inputs"]
+    assert "plan/s2_planner/candidate_pool.json" not in s3["required_inputs"]
     assert "external/c2c_snapshot" not in s3["required_inputs"]
-    assert s3["missing_inputs"] == ["plan/plan.yaml"]
+    assert set(s3["missing_inputs"]) == {"literature/direction.json", "plan/variant.json", "plan/trial_spec.json", "plan/code_patches/implementation_contract.json", "plan/code_patches/patch_manifest.json"}
 
 
 def test_stage_contract_declares_c2c_s1_quality_outputs(tmp_path: Path) -> None:
@@ -79,7 +78,8 @@ def test_stage_contract_declares_c2c_s2_planner_outputs(tmp_path: Path) -> None:
     assert "plan/s2_planner/adaptive_policy.json" in s2["required_outputs"]
     assert "plan/s2_planner/variant_scorecard.json" in s2["required_outputs"]
     assert "plan/s2_planner/score_adjustment_report.json" in s2["required_outputs"]
-    assert "plan/s2_planner/next_variant.json" in s2["required_outputs"]
+    assert "plan/variant.json" in s2["required_outputs"]
+    assert "plan/trial_spec.json" in s2["required_outputs"]
     assert "plan/s2_planner/planner_gate_report.json" in s2["required_outputs"]
     assert "plan/code_patches/implementation_contract.json" in s2["required_outputs"]
     assert "plan/code_patches/patch_gate_report.json" in s2["required_outputs"]
@@ -93,15 +93,14 @@ def test_stage_contract_activates_c2c_small_loop_inputs(tmp_path: Path) -> None:
     }
     paths = init_workspace(config, "topic", project_id="proj_c2c", simulate=True)
     (paths.root / "plan").mkdir(exist_ok=True)
-    (paths.root / "plan" / "plan.yaml").write_text("execution:\n  collector: c2c_small_loop\n", encoding="utf-8")
+    (paths.root / "plan" / "trial_spec.json").write_text(json.dumps({"execution": {"collector": "c2c_small_loop"}}), encoding="utf-8")
     manager = StageContractManager(paths.root)
 
     s3 = manager.stage_started("S3_experiment", iteration=1, config=config)
 
-    assert "plan/candidate_ideas.json" in s3["required_inputs"]
-    assert "plan/short_loop_plan.yaml" in s3["required_inputs"]
     assert "external/c2c_snapshot" in s3["required_inputs"]
-    assert "plan/candidate_ideas.json" in s3["missing_inputs"]
+    assert "plan/s2_planner/candidate_pool.json" not in s3["required_inputs"]
+    assert "external/c2c_snapshot" in s3["missing_inputs"]
 
 
 def test_stage_contract_switches_c2c_s3_outputs_for_bootstrap(tmp_path: Path) -> None:
@@ -112,7 +111,7 @@ def test_stage_contract_switches_c2c_s3_outputs_for_bootstrap(tmp_path: Path) ->
         "orchestration": {"profile": "bootstrap"},
     }
     paths = init_workspace(config, "topic", project_id="proj_c2c_bootstrap_contract", simulate=True)
-    (paths.root / "plan" / "plan.yaml").write_text("execution:\n  collector: c2c_small_loop\n", encoding="utf-8")
+    (paths.root / "plan" / "trial_spec.json").write_text(json.dumps({"execution": {"collector": "c2c_small_loop"}}), encoding="utf-8")
 
     s3 = StageContractManager(paths.root).stage_started("S3_experiment", iteration=1, config=config)
 

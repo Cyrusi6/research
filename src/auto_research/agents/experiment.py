@@ -12,7 +12,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import yaml
 
 from ..c2c import C2CAdapter, DEFAULT_BASELINE, c2c_candidate_config_overrides, c2c_proxy_screen_config, default_c2c_ideas
 from ..code_patch import DynamicEditPolicy, FrozenPatchGuard, archive_patched_code_snapshot
@@ -29,6 +28,8 @@ from ..s3_proxy_contracts import (
     build_c2c_proxy_decision_report,
 )
 from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, sha256_file, write_json
+from ..domain_contracts import attempt_input_hash, canonical_hash, implementation_hash, validate_direction_identity, validate_variant_identity
+from ..research_state import ResearchEventLedger, build_trial_result
 from .base import AgentContext
 
 
@@ -52,7 +53,50 @@ class ExperimentAgent:
         if mode == "env_check":
             return {"artifacts": [env_record["path"]], "status": "ok"}
 
-        plan = yaml.safe_load((self.context.project_root / "plan" / "plan.yaml").read_text(encoding="utf-8"))
+        direction = read_json(self.context.project_root / "literature" / "direction.json", default={}) or {}
+        variant = read_json(self.context.project_root / "plan" / "variant.json", default={}) or {}
+        trial_spec = read_json(self.context.project_root / "plan" / "trial_spec.json", default={}) or {}
+        validate_direction_identity(direction)
+        ledger = ResearchEventLedger(self.context.project_root)
+        tried = [item for item in ledger.state().get("method_tried_history") or [] if isinstance(item, dict)]
+        validate_variant_identity(direction, variant, tried_variants=tried)
+        ledger.select_direction(direction, event_id=f"direction:{direction['direction_hash']}")
+        ledger.plan_variant(
+            variant,
+            feedback_from_attempt_ids=list((variant.get("lineage") or {}).get("feedback_from_attempt_ids") or []),
+            event_id=f"variant:{variant['variant_spec_hash']}",
+        )
+        patch_manifest = read_json(self.context.project_root / "plan" / "code_patches" / "patch_manifest.json", default={}) or {}
+        implementation_contract = read_json(self.context.project_root / "plan" / "code_patches" / "implementation_contract.json", default={}) or {}
+        implementation_hash_value = implementation_hash(
+            frozen_patch=patch_manifest,
+            files=_implementation_file_hashes(self.context.project_root, patch_manifest),
+            manifest=implementation_contract,
+        )
+        protocol = trial_spec.get("protocol") if isinstance(trial_spec.get("protocol"), dict) else trial_spec
+        sample_manifest = trial_spec.get("sample_manifest") if isinstance(trial_spec.get("sample_manifest"), dict) else {"datasets": trial_spec.get("datasets") or []}
+        seed_values = ((trial_spec.get("statistical_testing") or {}).get("seeds") or self.context.config.get("experiment", {}).get("random_seeds") or [42])
+        seeds = [int(item) for item in seed_values]
+        input_hash = attempt_input_hash(
+            implementation_hash_value=implementation_hash_value,
+            protocol=protocol,
+            sample_manifest=sample_manifest,
+            seeds=seeds,
+            runtime_config=trial_spec.get("execution") if isinstance(trial_spec.get("execution"), dict) else {},
+            evaluator_hash=canonical_hash(trial_spec.get("metrics") or variant.get("expected_metric_signature") or {}),
+        )
+        profile = str(((self.context.config.get("orchestration") or {}).get("profile") or "standard")).lower()
+        attempt = ledger.reserve_attempt(
+            profile=profile,
+            direction=direction,
+            variant=variant,
+            implementation_hash=implementation_hash_value,
+            attempt_input_hash=input_hash,
+            attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full",
+            event_id=f"attempt-reservation:{direction['direction_hash']}:{variant['variant_spec_hash']}",
+        )
+        ledger.transition_attempt(attempt["attempt_id"], "READY")
+        plan = trial_spec
         execution = plan.get("execution", {})
         simulate = bool(self.context.config.get("experiment", {}).get("simulate"))
         if revisions:
@@ -65,53 +109,120 @@ class ExperimentAgent:
             )
         else:
             revision_record = None
+        ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", changes={"phases": {"proxy": "RUNNING", "full": "PENDING"}})
 
         if execution.get("collector") == "c2c_small_loop":
-            return self._run_c2c_small_loop(plan, execution, env_record["path"], revision_record["path"] if revision_record else None)
-        if simulate or execution.get("mode") == "simulate":
-            return self._run_simulated(plan, env_record["path"], revision_record["path"] if revision_record else None)
-        if execution.get("mode") == "reuse" and execution.get("collector") == "reused_runs":
-            return self._collect_reused_run_results(execution, env_record["path"], revision_record["path"] if revision_record else None)
-        if execution.get("collector") == "itr_quick_screen":
-            return self._run_itr_quick_screen(execution, env_record["path"], revision_record["path"] if revision_record else None)
+            result = self._run_c2c_small_loop(plan, execution, env_record["path"], revision_record["path"] if revision_record else None)
+        elif simulate or execution.get("mode") == "simulate":
+            result = self._run_simulated(plan, env_record["path"], revision_record["path"] if revision_record else None)
+        elif execution.get("mode") == "reuse" and execution.get("collector") == "reused_runs":
+            result = self._collect_reused_run_results(execution, env_record["path"], revision_record["path"] if revision_record else None)
+        elif execution.get("collector") == "itr_quick_screen":
+            result = self._run_itr_quick_screen(execution, env_record["path"], revision_record["path"] if revision_record else None)
+        else:
+            commands = execution.get("commands") or []
+            if not commands:
+                blocked_reason = execution.get("blocked_reason") or "No execution commands defined."
+                self.context.artifacts.write_text(
+                    self.stage_key,
+                    "self_heal_log.jsonl",
+                    json.dumps({"result": "blocked", "reason": blocked_reason}) + "\n",
+                    artifact_type="self_heal_log",
+                    summary="Blocked run",
+                )
+                result = {"artifacts": [env_record["path"]], "status": "blocked", "blocked_reason": blocked_reason}
+            else:
+                execution_workdir = Path(execution.get("workdir") or self.context.project_root)
+                log_path = self.context.project_root / "experiment" / "logs" / "command_runs.json"
+                run_result = self.runner.run_plan_commands(commands, execution_workdir, log_path)
+                self.context.artifacts.copy_into_stage(
+                    self.stage_key,
+                    log_path,
+                    "logs/command_runs.json",
+                    artifact_type="run_log",
+                    summary="Executed experiment commands",
+                )
+                if run_result["status"] != "ok":
+                    self.context.artifacts.write_text(
+                        self.stage_key,
+                        "self_heal_log.jsonl",
+                        json.dumps({"result": "failed", "runs": run_result["runs"]}) + "\n",
+                        artifact_type="self_heal_log",
+                        summary="Self-heal trace",
+                    )
+                    result = {"artifacts": [env_record["path"]], "status": "failed", "blocked_reason": "Experiment commands failed."}
+                elif execution.get("collector") == "laps_eval":
+                    result = self._collect_laps_eval_results(log_path, env_record["path"], revision_record["path"] if revision_record else None)
+                else:
+                    result = {"artifacts": [env_record["path"]], "status": "blocked", "blocked_reason": "No supported result collector was available."}
+        return self._finalize_trial(result, attempt=attempt, input_hash=input_hash, protocol=protocol, ledger=ledger)
 
-        commands = execution.get("commands") or []
-        if not commands:
-            blocked_reason = execution.get("blocked_reason") or "No execution commands defined."
-            self.context.artifacts.write_text(
-                self.stage_key,
-                "self_heal_log.jsonl",
-                json.dumps({"result": "blocked", "reason": blocked_reason}) + "\n",
-                artifact_type="self_heal_log",
-                summary="Blocked run",
-            )
-            return {"artifacts": [env_record["path"]], "status": "blocked", "blocked_reason": blocked_reason}
-
-        execution_workdir = Path(execution.get("workdir") or self.context.project_root)
-        log_path = self.context.project_root / "experiment" / "logs" / "command_runs.json"
-        run_result = self.runner.run_plan_commands(commands, execution_workdir, log_path)
-        self.context.artifacts.copy_into_stage(
-            self.stage_key,
-            log_path,
-            "logs/command_runs.json",
-            artifact_type="run_log",
-            summary="Executed experiment commands",
+    def _finalize_trial(
+        self,
+        result: dict[str, Any],
+        *,
+        attempt: dict[str, Any],
+        input_hash: str,
+        protocol: dict[str, Any],
+        ledger: ResearchEventLedger,
+    ) -> dict[str, Any]:
+        main_results = read_json(self.context.project_root / "experiment" / "results" / "main_results.json", default={}) or {}
+        acceptance = main_results.get("acceptance") if isinstance(main_results.get("acceptance"), dict) else {}
+        candidate_results = [item for item in main_results.get("candidate_results") or [] if isinstance(item, dict)]
+        observations = [item.get("metrics") or item for item in candidate_results]
+        proposed = main_results.get("proposed_method") if isinstance(main_results.get("proposed_method"), dict) else {}
+        if proposed:
+            observations.append(proposed)
+        reason = str(result.get("blocked_reason") or result.get("reason") or "").lower()
+        resource_failure = any(token in reason for token in ["resource", "gpu", "oom", "out of memory"])
+        integrity_failure = any(token in reason for token in ["integrity", "identity", "hash mismatch", "safety"])
+        implementation_failure = any(token in reason for token in ["patch", "implementation", "activation", "wiring", "static validation"])
+        method_evaluable = bool(candidate_results or proposed) and not resource_failure and not integrity_failure and not implementation_failure
+        if acceptance.get("passed") is True:
+            outcome = "accepted"
+        elif method_evaluable:
+            outcome = "rejected"
+        elif resource_failure:
+            outcome = "resource_paused"
+        elif integrity_failure:
+            outcome = "integrity_blocked"
+        elif "activation" in reason or "wiring" in reason:
+            outcome = "activation_failed"
+        else:
+            outcome = "implementation_failed"
+        raw_artifacts = {}
+        for rel_path in result.get("artifacts") or []:
+            artifact_path = self.context.project_root / rel_path
+            if artifact_path.exists() and artifact_path.is_file():
+                raw_artifacts[str(rel_path)] = sha256_file(artifact_path)
+        ablations = read_json(self.context.project_root / "experiment" / "results" / "ablation_results.json", default=[]) or []
+        trial = build_trial_result(
+            attempt=attempt,
+            protocol_hash=canonical_hash(protocol),
+            input_hash=input_hash,
+            completeness="proxy" if attempt["profile"] == "bootstrap" else "full" if method_evaluable else "partial",
+            observed_datasets=[str(item) for item in main_results.get("datasets") or []],
+            raw_artifacts=raw_artifacts,
+            proxy_observations=observations if attempt["profile"] == "bootstrap" else [],
+            full_observations=observations if attempt["profile"] != "bootstrap" else [],
+            ablation_observations=[item for item in ablations if isinstance(item, dict)],
+            method_evaluable=method_evaluable,
+            outcome_classification=outcome,
+            failure_classification=None if method_evaluable else outcome,
         )
-        if run_result["status"] != "ok":
-            self.context.artifacts.write_text(
-                self.stage_key,
-                "self_heal_log.jsonl",
-                json.dumps({"result": "failed", "runs": run_result["runs"]}) + "\n",
-                artifact_type="self_heal_log",
-                summary="Self-heal trace",
-            )
-            return {"artifacts": [env_record["path"]], "status": "failed", "blocked_reason": "Experiment commands failed."}
-        collector = execution.get("collector")
-        if collector == "laps_eval":
-            collected = self._collect_laps_eval_results(log_path, env_record["path"], revision_record["path"] if revision_record else None)
-            if collected:
-                return collected
-        return {"artifacts": [env_record["path"]], "status": "blocked", "blocked_reason": "Execution finished but no trusted result collector was available."}
+        trial_record = self.context.artifacts.write_json(
+            self.stage_key,
+            "results/trial_result.json",
+            trial,
+            artifact_type="trial_result",
+            summary="Canonical S3 TrialResult bound to the reserved attempt",
+            source_paths=list(raw_artifacts),
+        )
+        completed_attempt, route = ledger.complete_attempt(trial)
+        result.setdefault("artifacts", []).append(trial_record["path"])
+        result["attempt"] = completed_attempt
+        result["route_outcome"] = route
+        return result
 
     def _scaffold_code(self) -> None:
         self.context.artifacts.write_text(
@@ -138,16 +249,18 @@ class ExperimentAgent:
         self.context.artifacts.write_text(
             self.stage_key,
             "run_all.sh",
-            "#!/usr/bin/env bash\nset -euo pipefail\necho 'Populate commands via plan.yaml execution.commands'\n",
+            "#!/usr/bin/env bash\nset -euo pipefail\necho 'Populate commands via trial_spec.json execution.commands'\n",
             artifact_type="script",
             summary="Run scaffold",
         )
 
     def _run_simulated(self, plan: dict[str, Any], env_source: str, revision_source: str | None) -> dict[str, Any]:
         baseline_name = plan["baselines"][0]["name"]
+        variant = read_json(self.context.project_root / "plan" / "variant.json", default={}) or {}
         results = {
             "baseline": {"name": baseline_name, "primary_metric": {"mean": 78.4, "std": 0.5}},
-            "proposed_method": {"name": plan["selected_idea"]["title"], "primary_metric": {"mean": 80.1, "std": 0.4}},
+            "proposed_method": {"name": variant.get("variant_id"), "primary_metric": {"mean": 80.1, "std": 0.4}},
+            "acceptance": {"passed": True, "baseline_mean": 78.4, "candidate_mean": 80.1},
         }
         ablation = {
             "full_model": 80.1,
@@ -618,10 +731,11 @@ class ExperimentAgent:
     ) -> dict[str, Any]:
         bootstrap_proxy_only = bootstrap_proxy_only_enabled(self.context.config)
         adapter = C2CAdapter(self.context.project_root, self.context.config)
-        raw_candidates = list(plan.get("candidate_ideas") or default_c2c_ideas(plan.get("selected_idea", {}).get("title", "C2C"), adapter.baseline))
+        variant_spec = read_json(self.context.project_root / "plan" / "variant.json", default={}) or {}
+        raw_candidates = [_c2c_candidate_from_variant_spec(variant_spec)]
         candidate_selection = self._c2c_s3_candidate_selection(
             raw_candidates,
-            max_candidates=int(execution.get("max_candidates") or 3),
+            max_candidates=1,
         )
         candidates = candidate_selection["candidates"]
         run_results = []
@@ -661,7 +775,7 @@ class ExperimentAgent:
             },
             artifact_type="c2c_s3_candidate_selection",
             summary="Locked C2C S3 candidate selection from S2.5 patch manifest",
-            source_paths=[path for path in ["plan/code_patches/patch_manifest.json", "plan/plan.yaml", "plan/candidate_ideas.json"] if (self.context.project_root / path).exists()],
+            source_paths=[path for path in ["plan/code_patches/patch_manifest.json", "plan/variant.json", "plan/trial_spec.json"] if (self.context.project_root / path).exists()],
         )
         copied_sources.append(selection_record["path"])
 
@@ -768,6 +882,7 @@ class ExperimentAgent:
                     "schema_version": "bootstrap_proxy_completion_v1",
                     "profile": "bootstrap",
                     "proxy_only": True,
+                    "bootstrap_proxy_complete": bool(best_proxy),
                     "status": "proxy_reached" if best_proxy else "proxy_missing",
                     "candidate_id": best_proxy.get("id") if isinstance(best_proxy, dict) else None,
                     "proxy_screen": best_proxy.get("proxy_screen") if isinstance(best_proxy, dict) else None,
@@ -915,7 +1030,7 @@ class ExperimentAgent:
             "schema_version": "c2c_s3_candidate_selection_v1",
             "created_at": now_utc(),
             "lock_source": "plan/code_patches/patch_manifest.json" if manifest_path.exists() else "plan.candidate_ideas",
-            "lock_policy": "s2_5_artifacts_are_execution_truth; plan.yaml supplies experiment protocol only",
+            "lock_policy": "s2_5_artifacts_are_execution_truth; trial_spec.json supplies experiment protocol only",
             "patch_manifest": _c2c_selection_artifact_lock(self.context.project_root, "plan/code_patches/patch_manifest.json"),
             "manifest_status": manifest.get("status") if isinstance(manifest, dict) else None,
             "selected_candidate_id": selected_candidate_id or None,
@@ -1225,7 +1340,7 @@ class ExperimentAgent:
         results_dir = self.context.project_root / "experiment" / "results"
         direction_fingerprint = read_json(self.context.project_root / "literature" / "c2c" / "direction_fingerprint.json", default={}) or {}
         variant_scorecard = read_json(self.context.project_root / "plan" / "s2_planner" / "variant_scorecard.json", default={}) or {}
-        next_variant = read_json(self.context.project_root / "plan" / "s2_planner" / "next_variant.json", default={}) or {}
+        next_variant = read_json(self.context.project_root / "plan" / "s2_planner" / "variant.json", default={}) or {}
         patch_gate_report = read_json(self.context.project_root / "plan" / "code_patches" / "patch_gate_report.json", default={}) or {}
         calibration_policy = build_c2c_proxy_calibration_policy(
             project_root=self.context.project_root,
@@ -1245,7 +1360,7 @@ class ExperimentAgent:
             for rel in [
                 "literature/c2c/direction_fingerprint.json",
                 "plan/s2_planner/variant_scorecard.json",
-                "plan/s2_planner/next_variant.json",
+                "plan/variant.json",
                 "plan/code_patches/patch_gate_report.json",
             ]
             if (self.context.project_root / rel).exists()
@@ -1335,8 +1450,8 @@ class ExperimentAgent:
         baseline_sources = [
             rel
             for rel in [
-                "plan/plan.yaml",
-                "plan/s2_planner/variant_contract.json",
+                "plan/trial_spec.json",
+                "plan/variant.json",
                 "plan/code_patches/patch_manifest.json",
                 "plan/code_patches/implementation_contract.json",
                 "plan/code_patches/selected_patch.json",
@@ -6137,6 +6252,50 @@ def _posthoc_items(value: Any, *, limit: int | None = None) -> list[str]:
         items.append(render(value))
     items = [item for item in items if item]
     return items[:limit] if limit is not None else items
+
+
+
+def _c2c_candidate_from_variant_spec(variant: dict[str, Any]) -> dict[str, Any]:
+    intervention = variant.get("intervention") if isinstance(variant.get("intervention"), dict) else {}
+    ablation = variant.get("ablation") if isinstance(variant.get("ablation"), dict) else {}
+    return {
+        "id": variant.get("variant_id"),
+        "variant_id": variant.get("variant_id"),
+        "direction_id": variant.get("direction_id"),
+        "s1_direction_id": variant.get("direction_id"),
+        "title": intervention.get("summary") or variant.get("variant_id"),
+        "hypothesis": variant.get("hypothesis"),
+        "null_hypothesis": variant.get("null_hypothesis"),
+        "alternative_hypothesis": variant.get("alternative_hypothesis"),
+        "expected_files": list(variant.get("implementation_surface_ids") or []),
+        "expected_signature": variant.get("expected_metric_signature") or {},
+        "variant_fingerprint": variant.get("variant_spec_hash"),
+        "variation_coordinates": variant.get("variation_coordinates") or {},
+        "experiment_contract": {
+            "expected_files": list(variant.get("implementation_surface_ids") or []),
+            "config_overrides": intervention.get("configuration") or {},
+            "ablation_switch": ablation.get("switch") or "disable_selected_intervention",
+        },
+        "ablation_plan": ablation,
+    }
+
+def _implementation_file_hashes(project_root: Path, patch_manifest: dict[str, Any]) -> dict[str, str]:
+    hashes: dict[str, str] = {}
+    candidates = patch_manifest.get("candidates") if isinstance(patch_manifest.get("candidates"), list) else []
+    selected_id = str(patch_manifest.get("selected_candidate_id") or "")
+    selected = next((item for item in candidates if isinstance(item, dict) and str(item.get("candidate_id") or item.get("id") or "") == selected_id), None)
+    if not isinstance(selected, dict):
+        selected = patch_manifest.get("selected_patch") if isinstance(patch_manifest.get("selected_patch"), dict) else {}
+    for key in ["patch_json", "diff_path", "manifest"]:
+        value = selected.get(key) if isinstance(selected, dict) else None
+        if isinstance(value, dict):
+            value = value.get("path") or value.get("rel_path")
+        if not value:
+            continue
+        path = project_root / str(value)
+        if path.exists() and path.is_file():
+            hashes[str(value)] = sha256_file(path)
+    return hashes
 
 
 def _short_error(exc: Exception, *, limit: int = 500) -> str:

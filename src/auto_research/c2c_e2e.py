@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import bootstrap_cached_s0_only_enabled
-from .route_policy import build_route_context, decide_next_route
+from .research_state import ResearchEventLedger
 from .utils import ensure_dir, now_utc, read_json, read_yaml, sha256_file, write_json
 from .validators.base import load_schema, validate_min_schema
 
@@ -30,7 +30,7 @@ C2C_REAL_SMOKE_RECORD_SCHEMA_VERSION = "c2c_real_smoke_record_v1"
 
 STAGE_ARTIFACT_REQUIREMENTS = {
     "S1_literature": [
-        ("literature/direction.json", "direction.schema.json"),
+        ("literature/direction.json", "direction_v2.schema.json"),
         ("literature/c2c/evidence_request_plan.json", "s1_evidence_request_plan.schema.json"),
         ("literature/c2c/evidence_bundle.json", "s1_deterministic_evidence_bundle.schema.json"),
         ("literature/c2c/direction_candidate_scorecard.json", "s1_direction_candidate_scorecard.schema.json"),
@@ -39,6 +39,8 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("literature/c2c/direction_fingerprint.json", "s1_direction_fingerprint.schema.json"),
     ],
     "S2_plan": [
+        ("plan/variant.json", "variant_v3.schema.json"),
+        ("plan/trial_spec.json", None),
         ("plan/s2_planner/candidate_pool.json", "s2_candidate_pool.schema.json"),
         ("plan/s2_planner/feedback_context.json", "s2_feedback_context.schema.json"),
         ("plan/s2_planner/adaptive_policy.json", "s2_adaptive_policy.schema.json"),
@@ -52,6 +54,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("plan/code_patches/patch_gate_report.json", "s2_5_patch_gate_report.schema.json"),
     ],
     "S3_experiment": [
+        ("experiment/results/trial_result.json", "trial_result_v1.schema.json"),
         ("experiment/results/c2c_proxy_baseline_fingerprint.json", "c2c_proxy_baseline_fingerprint.schema.json"),
         ("experiment/results/c2c_proxy_cache_report.json", "c2c_proxy_cache_report.schema.json"),
         ("experiment/results/c2c_effective_proxy_policy.json", "c2c_effective_proxy_policy.schema.json"),
@@ -60,9 +63,8 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("experiment/results/s3_candidate_selection.json", None),
     ],
     "orchestration": [
-        ("meta/route_context.json", "route_context.schema.json"),
-        ("meta/route_decision.json", "route_decision.schema.json"),
-        ("meta/attempt_ledger.json", "attempt_ledger.schema.json"),
+        ("meta/route_outcome.json", "route_outcome_v1.schema.json"),
+        ("meta/research_state.json", None),
         ("meta/iteration_trace.jsonl", None),
     ],
 }
@@ -457,20 +459,14 @@ def build_c2c_artifact_audit_report(project_root: Path, config: dict[str, Any] |
 
 
 def build_c2c_replay_plan(project_root: Path, *, replay_from: str = "S3_experiment") -> dict[str, Any]:
-    """Freeze deterministic decision inputs for later replay."""
+    """Freeze immutable event hashes for deterministic reducer replay."""
 
-    frozen_inputs = [
-        "plan/s2_planner/planner_gate_report.json",
-        "plan/s2_planner/variant_scorecard.json",
-        "plan/code_patches/patch_gate_report.json",
-        "experiment/results/c2c_proxy_decision_report.json",
-        "experiment/results/c2c_full_s3_worthiness.json",
-        "experiment/results/c2c_proxy_calibration_policy.json",
-        "meta/attempt_ledger.json",
-        "meta/route_decision.json",
-    ]
+    ledger = ResearchEventLedger(project_root)
+    event_paths = sorted((project_root / "meta" / "research_events").glob("*.json"))
+    frozen_inputs = [str(path.relative_to(project_root)) for path in event_paths]
     input_hashes = {rel: _sha_or_none(project_root / rel) for rel in frozen_inputs}
-    expected, expected_source = _route_decision_for_replay(project_root, replay_from)
+    state = ledger.state()
+    normalized = _normalize_research_state(state)
     return {
         "schema_version": C2C_REPLAY_PLAN_SCHEMA_VERSION,
         "created_at": now_utc(),
@@ -478,81 +474,50 @@ def build_c2c_replay_plan(project_root: Path, *, replay_from: str = "S3_experime
         "replay_from": replay_from,
         "frozen_inputs": frozen_inputs,
         "input_hashes": input_hashes,
-        "actions": ["rebuild_route_context", "recompute_route_decision", "compare_route_decision_hash"],
-        "expected_decision_hashes": {"route_decision": _stable_hash(_normalize_route_decision(expected)) if expected else None},
-        "expected_decision_source": expected_source,
-        "expected_decision_summary": _route_decision_summary(expected) if expected else {},
+        "actions": ["replay_immutable_events", "rebuild_research_state", "compare_state_hash"],
+        "expected_decision_hashes": {"research_state": _stable_hash(normalized)},
+        "expected_decision_source": "meta/research_events",
+        "expected_decision_summary": {
+            "last_sequence": state.get("last_sequence"),
+            "next_action": ((state.get("last_route_outcome") or {}).get("next_action") if isinstance(state.get("last_route_outcome"), dict) else None),
+        },
     }
 
 
 def build_c2c_replay_result(project_root: Path, replay_plan: dict[str, Any] | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Replay deterministic route policy decisions from frozen artifacts."""
+    """Rebuild state exclusively from immutable events and compare hashes."""
 
-    config = config if isinstance(config, dict) else {}
+    del config
     plan = replay_plan if isinstance(replay_plan, dict) else read_json(project_root / "meta" / "c2c_replay_plan.json", default={}) or {}
-    replay_from = str(plan.get("replay_from") or "S3_experiment")
-    expected, expected_source = _route_decision_for_replay(project_root, replay_from)
-    if not expected and isinstance(plan.get("expected_decision_summary"), dict):
-        expected = dict(plan.get("expected_decision_summary") or {})
-        expected_source = str(plan.get("expected_decision_source") or "replay_plan")
-    registry = read_yaml(project_root / "meta" / "registry.yaml", default={}) or {}
     mismatches: list[dict[str, Any]] = []
     for rel, expected_hash in (plan.get("input_hashes") or {}).items():
         actual_hash = _sha_or_none(project_root / rel)
         if expected_hash != actual_hash:
             mismatches.append({"kind": "input_hash_mismatch", "path": rel, "expected": expected_hash, "actual": actual_hash})
-    if not expected:
-        return {
-            "schema_version": C2C_REPLAY_RESULT_SCHEMA_VERSION,
-            "created_at": now_utc(),
-            "project_id": project_root.name,
-            "status": "blocked",
-            "replayed_decisions": {},
-            "expected_decisions": {},
-            "mismatches": [{"kind": "missing_expected_route_decision", "path": "meta/route_decision.json"}],
-        }
-    trigger = {
-        "stage": expected.get("trigger_stage") or replay_from or registry.get("current_stage") or "S3_experiment",
-        "source": expected.get("trigger_source") or "replay",
-        "status": "failed",
-        "reason": expected.get("failure_class") or "replay",
-    }
-    route_context = build_route_context(project_root, registry, config, trigger=trigger)
-    _prepare_replay_route_context(route_context, replay_from, expected)
-    replayed = decide_next_route(route_context, config)
-    if expected_source == "iteration_trace":
-        expected_normalized = _route_decision_summary(expected)
-        replayed_normalized = _route_decision_summary(replayed)
-    else:
-        expected_normalized = _normalize_route_decision(expected)
-        replayed_normalized = _normalize_route_decision(replayed)
-    expected_hash = _stable_hash(expected_normalized)
-    replayed_hash = _stable_hash(replayed_normalized)
-    if expected_hash != replayed_hash:
-        mismatches.append({"kind": "route_decision_mismatch", "expected_hash": expected_hash, "actual_hash": replayed_hash})
-    status = "match" if not mismatches else "mismatch"
+    state = ResearchEventLedger(project_root).rebuild()
+    actual_hash = _stable_hash(_normalize_research_state(state))
+    expected_hash = ((plan.get("expected_decision_hashes") or {}).get("research_state"))
+    if expected_hash and expected_hash != actual_hash:
+        mismatches.append({"kind": "research_state_mismatch", "expected_hash": expected_hash, "actual": actual_hash})
+    route = state.get("last_route_outcome") if isinstance(state.get("last_route_outcome"), dict) else {}
     return {
         "schema_version": C2C_REPLAY_RESULT_SCHEMA_VERSION,
         "created_at": now_utc(),
         "project_id": project_root.name,
-        "status": status,
-        "replayed_decisions": {
-            "route_decision": replayed.get("decision"),
-            "next_stage": replayed.get("next_stage"),
-            "failure_class": replayed.get("failure_class"),
-            "reason_codes": replayed.get("reason_codes") or [],
-            "hash": replayed_hash,
-        },
-        "expected_decisions": {
-            "route_decision": expected.get("decision"),
-            "next_stage": expected.get("next_stage"),
-            "failure_class": expected.get("failure_class"),
-            "reason_codes": expected.get("reason_codes") or [],
-            "hash": expected_hash,
-            "source": expected_source,
-        },
+        "status": "match" if not mismatches else "mismatch",
+        "replayed_decisions": {"route_decision": route.get("next_action"), "hash": actual_hash},
+        "expected_decisions": {"route_decision": (plan.get("expected_decision_summary") or {}).get("next_action"), "hash": expected_hash, "source": "meta/research_events"},
         "mismatches": mismatches,
     }
+
+
+def _normalize_research_state(state: dict[str, Any]) -> dict[str, Any]:
+    normalized = json.loads(json.dumps(state))
+    normalized.pop("updated_at", None)
+    for attempt in (normalized.get("attempts") or {}).values():
+        if isinstance(attempt, dict):
+            attempt.pop("updated_at", None)
+    return normalized
 
 
 def build_c2c_real_smoke_record(project_root: Path, config: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -569,7 +534,7 @@ def build_c2c_real_smoke_record(project_root: Path, config: dict[str, Any] | Non
     planner_gate = read_json(project_root / "plan" / "s2_planner" / "planner_gate_report.json", default={}) or {}
     patch_gate = read_json(project_root / "plan" / "code_patches" / "patch_gate_report.json", default={}) or {}
     proxy_decision = read_json(project_root / "experiment" / "results" / "c2c_proxy_decision_report.json", default={}) or {}
-    route_decision = read_json(project_root / "meta" / "route_decision.json", default={}) or {}
+    route_decision = read_json(project_root / "meta" / "route_outcome.json", default={}) or {}
 
     blocking_reasons = _smoke_blocking_reasons(registry, readiness, execution_hooks, audit, replay)
     return {
@@ -586,8 +551,8 @@ def build_c2c_real_smoke_record(project_root: Path, config: dict[str, Any] | Non
         "s2_planner_gate": _gate_value(planner_gate),
         "s2_5_patch_gate": _gate_value(patch_gate),
         "s3_proxy_decision": proxy_decision.get("decision") if isinstance(proxy_decision, dict) else None,
-        "route_decision": route_decision.get("decision") if isinstance(route_decision, dict) else None,
-        "route_next_stage": route_decision.get("next_stage") if isinstance(route_decision, dict) else None,
+        "route_decision": route_decision.get("next_action") if isinstance(route_decision, dict) else None,
+        "route_next_stage": route_decision.get("next_action") if isinstance(route_decision, dict) else None,
         "blocked_reason": registry.get("blocked_reason") if isinstance(registry, dict) else None,
         "blocking_reasons": blocking_reasons,
         "warnings": _string_list(readiness.get("warnings") if isinstance(readiness, dict) else []),
@@ -1081,7 +1046,7 @@ def _optional_artifact_checks(project_root: Path, *, require_schema: bool) -> li
 
 
 def _stale_artifacts_after_route(project_root: Path) -> list[dict[str, Any]]:
-    route_path = project_root / "meta" / "route_decision.json"
+    route_path = project_root / "meta" / "route_outcome.json"
     route = read_json(route_path, default={}) or {}
     if not isinstance(route, dict) or not route_path.exists():
         return []
@@ -1104,7 +1069,7 @@ def _stale_artifacts_after_route(project_root: Path) -> list[dict[str, Any]]:
 
 def _route_decision_for_replay(project_root: Path, replay_from: str) -> tuple[dict[str, Any], str | None]:
     replay_from = str(replay_from or "")
-    latest = read_json(project_root / "meta" / "route_decision.json", default={}) or {}
+    latest = read_json(project_root / "meta" / "route_outcome.json", default={}) or {}
     if isinstance(latest, dict) and latest.get("trigger_stage") == replay_from:
         return latest, "latest_route_decision"
     archived = _archived_route_decision_for_replay(project_root, replay_from)

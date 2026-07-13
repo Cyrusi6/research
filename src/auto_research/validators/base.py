@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from jsonschema import Draft202012Validator
 
 from ..utils import now_utc, read_json
 
@@ -147,29 +148,13 @@ class StageGateValidator:
 
 
 def validate_min_schema(payload: Any, schema: dict[str, Any]) -> list[str]:
-    """Small JSON-schema subset for required contracts without extra dependency."""
+    """Validate with JSON Schema Draft 2020-12."""
 
-    errors: list[str] = []
-    expected_type = schema.get("type")
-    if expected_type and not _matches_type(payload, expected_type):
-        return [f"expected {expected_type}"]
-    if isinstance(payload, dict):
-        for key in schema.get("required", []):
-            if key not in payload:
-                errors.append(f"missing required key: {key}")
-        properties = schema.get("properties") or {}
-        for key, subschema in properties.items():
-            if key in payload:
-                errors.extend(f"{key}.{error}" for error in validate_min_schema(payload[key], subschema))
-    if isinstance(payload, list):
-        min_items = schema.get("minItems")
-        if min_items is not None and len(payload) < int(min_items):
-            errors.append(f"expected at least {min_items} items")
-        item_schema = schema.get("items")
-        if item_schema:
-            for idx, item in enumerate(payload):
-                errors.extend(f"[{idx}].{error}" for error in validate_min_schema(item, item_schema))
-    return errors
+    errors = sorted(Draft202012Validator(schema).iter_errors(payload), key=lambda error: list(error.absolute_path))
+    return [
+        f"{'.'.join(str(item) for item in error.absolute_path) or '$'}: {error.message}"
+        for error in errors
+    ]
 
 
 def load_schema(name: str) -> dict[str, Any]:

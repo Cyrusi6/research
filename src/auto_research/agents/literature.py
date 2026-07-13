@@ -55,7 +55,7 @@ from ..s1_retrieval import (
 )
 from ..utils import compact_markdown, now_utc, read_json, read_yaml, sanitize_filename, split_sentences, write_yaml
 from .base import AgentContext
-from .debate import MultiAgentReasoningService, c2c_debate_markdown
+from .debate import c2c_debate_markdown
 
 
 class LiteratureAgent:
@@ -171,7 +171,7 @@ class LiteratureAgent:
         )
         direction_decision_record = self.context.artifacts.write_json(
             self.stage_key,
-            "direction_decision.json",
+            "direction_selection_report.json",
             evidence_result.get("direction_decision", {}),
             artifact_type="s1_direction_decision",
             summary="Compatibility mirror for the S1 selected direction",
@@ -221,7 +221,7 @@ class LiteratureAgent:
         evidence_records.append(evidence_ref_report_record)
         ideas_record = self.context.artifacts.write_json(
             self.stage_key,
-            "ideas.json",
+            "candidate_directions.json",
             ideas,
             artifact_type="ideas",
             summary=f"{len(ideas)} candidate ideas",
@@ -584,24 +584,7 @@ class LiteratureAgent:
         direction_fingerprint_record = None
         debate: dict[str, Any] = {}
         if self.context.config.get("ideation", {}).get("debate", {}).get("enabled", True):
-            if _use_legacy_c2c_debate(self.context.config):
-                debate = MultiAgentReasoningService(self.context).run_c2c_debate(
-                    topic=topic,
-                    repo_card=repo_card,
-                    paper_cards=paper_cards,
-                    paper_chunks=paper_chunks,
-                    rebuttal_matrix=rebuttal_matrix,
-                    rebuttal_chunks=rebuttal_chunks,
-                    code_cards=code_cards,
-                    code_chunks=code_chunks,
-                    negative_memory=negative_memory,
-                    baseline=baseline,
-                    retrieval_plan=retrieval_plan,
-                    followup_bundle=followup_bundle,
-                    feedback=feedback,
-                )
-            else:
-                debate = self._run_c2c_evidence_on_demand_direction(
+            debate = self._run_c2c_evidence_on_demand_direction(
                     topic=topic,
                     evidence_brief=static_bundle.get("evidence_brief") or {},
                     chunk_index=chunk_index,
@@ -616,8 +599,8 @@ class LiteratureAgent:
                     negative_memory=negative_memory,
                     rebuttal_matrix=rebuttal_matrix,
                     feedback=feedback,
-                )
-                if debate.get("status") == "blocked":
+            )
+            if debate.get("status") == "blocked":
                     blocked_record = self.context.artifacts.write_json(
                         self.stage_key,
                         "c2c/evidence_agent_blocked.json",
@@ -670,9 +653,9 @@ class LiteratureAgent:
                 )
                 direction_record = self.context.artifacts.write_json(
                     self.stage_key,
-                    "c2c/direction_decision.json",
+                    "c2c/direction_selection_report.json",
                     debate.get("direction_decision", {}),
-                    artifact_type="c2c_s1_direction_decision",
+                    artifact_type="c2c_s1_direction_selection_report",
                     summary="S1 selected mechanism direction after evidence retrieval",
                     source_paths=[evidence_bundle_record["path"], negative_record["path"], baseline_record["path"]],
                 )
@@ -711,9 +694,9 @@ class LiteratureAgent:
                     )
             debate_record = self.context.artifacts.write_json(
                 self.stage_key,
-                "idea_debate.json",
+                "direction_analysis.json",
                 debate,
-                artifact_type="c2c_idea_debate",
+                artifact_type="c2c_direction_analysis",
                 summary="C2C multi-agent idea debate",
                 source_paths=[
                     repo_card_record["path"],
@@ -754,9 +737,9 @@ class LiteratureAgent:
             )
             debate_md_record = self.context.artifacts.write_text(
                 self.stage_key,
-                "idea_debate.md",
+                "direction_analysis.md",
                 c2c_debate_markdown(debate),
-                artifact_type="c2c_idea_debate_summary",
+                artifact_type="c2c_direction_analysis_summary",
                 summary="Readable C2C idea debate summary",
                 source_paths=[debate_record["path"]],
             )
@@ -805,7 +788,7 @@ class LiteratureAgent:
             root_evidence_bundle,
             artifact_type="s1_evidence_bundle",
             summary="Root S1 evidence bundle for the selected C2C direction",
-            source_paths=[evidence_bundle_record["path"] if evidence_bundle_record else "literature/ideas.json"],
+            source_paths=[evidence_bundle_record["path"] if evidence_bundle_record else "literature/direction.json"],
         )
         root_direction_record = self.context.artifacts.write_json(
             self.stage_key,
@@ -903,7 +886,7 @@ class LiteratureAgent:
         )
         ideas_record = self.context.artifacts.write_json(
             self.stage_key,
-            "ideas.json",
+            "candidate_directions.json",
             ideas,
             artifact_type="ideas",
             summary="C2C candidate research ideas",
@@ -1967,13 +1950,6 @@ def _code_repo_map_markdown(repo_map: dict[str, Any]) -> str:
             if isinstance(symbol, dict):
                 lines.append(f"- `{symbol.get('symbol')}` ({symbol.get('kind')}) lines {symbol.get('start_line')}-{symbol.get('end_line')}")
     return "\n".join(lines).strip() + "\n"
-
-
-def _use_legacy_c2c_debate(config: dict[str, Any]) -> bool:
-    debate_cfg = ((config.get("ideation") or {}).get("debate") or {})
-    agent_cfg = _s1_codex_agent_config(config, mode="c2c")
-    strategy = str(agent_cfg.get("strategy") or debate_cfg.get("strategy") or "codex_resume_evidence_agent").strip().lower()
-    return bool(debate_cfg.get("legacy_multi_agent")) or strategy in {"legacy_multi_agent", "legacy_debate", "multi_agent_debate"}
 
 
 def _s1_novelty_auditor_config(config: dict[str, Any], *, mode: str = "c2c") -> dict[str, Any]:
@@ -4135,7 +4111,7 @@ def _evidence_bundle_from_selected_ideas(ideas: list[dict[str, Any]]) -> dict[st
         if isinstance(ref, dict):
             items.append(
                 {
-                    "source_path": ref.get("source_path") or ref.get("source_label") or "literature/ideas.json",
+                    "source_path": ref.get("source_path") or ref.get("source_label") or "literature/direction.json",
                     "source_type": ref.get("source_type") or "artifact",
                     "summary": ref.get("claim") or ref.get("summary") or "Evidence supporting the selected direction.",
                     "supports": [selected.get("id") or selected.get("direction_id") or "selected_direction"],
@@ -4146,7 +4122,7 @@ def _evidence_bundle_from_selected_ideas(ideas: list[dict[str, Any]]) -> dict[st
         if isinstance(ref, dict):
             items.append(
                 {
-                    "source_path": ref.get("source_path") or ref.get("source_label") or "literature/ideas.json",
+                    "source_path": ref.get("source_path") or ref.get("source_label") or "literature/direction.json",
                     "source_type": ref.get("source_type") or "artifact",
                     "summary": ref.get("claim") or ref.get("summary") or "Counterevidence or risk for the selected direction.",
                     "supports": [],
@@ -4156,7 +4132,7 @@ def _evidence_bundle_from_selected_ideas(ideas: list[dict[str, Any]]) -> dict[st
     if not items:
         items.append(
             {
-                "source_path": "literature/ideas.json",
+                "source_path": "literature/direction.json",
                 "source_type": "artifact",
                 "summary": "Selected S1 direction compatibility artifact.",
                 "supports": [selected.get("id") or "selected_direction"],

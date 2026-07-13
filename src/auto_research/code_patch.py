@@ -555,7 +555,53 @@ class CodePatchAgent:
     ) -> dict[str, Any]:
         code_patch_config = _code_patch_config(self.config)
         if not code_patch_config.get("enabled", False):
-            return {"status": "disabled", "candidates": [], "artifacts": []}
+            contract_record = self.artifacts.write_json(
+                self.stage_key,
+                "code_patches/implementation_contract.json",
+                implementation_contract,
+                artifact_type="c2c_s2_5_implementation_contract",
+                summary="S2.5 implementation contract with patch execution disabled",
+                source_paths=["plan/s2_planner/planner_gate_report.json", "plan/variant.json"],
+            )
+            manifest = {
+                "schema_version": "auto_research_patch_manifest_v1",
+                "status": "disabled",
+                "selected_candidate_id": str(selected_variant.get("id") or implementation_contract.get("variant_id") or "selected_variant"),
+                "variant_spec_hash": str(implementation_contract.get("variant_spec_hash") or ""),
+                "valid_patch_count": 0,
+                "valid_patch_ids": [],
+                "candidates": [],
+                "reason": "code patch execution disabled by configuration",
+            }
+            manifest_record = self.artifacts.write_json(
+                self.stage_key,
+                "code_patches/patch_manifest.json",
+                manifest,
+                artifact_type="c2c_code_patch_manifest",
+                summary="Explicit no-op patch manifest",
+                source_paths=[contract_record["path"]],
+            )
+            patch_gate_report = build_s2_5_patch_gate_report(
+                patch_manifest=manifest,
+                implementation_contract=implementation_contract,
+                planner_gate_report=planner_gate_report,
+                variant_fingerprint=variant_fingerprint,
+                config=self.config,
+            )
+            patch_gate_record = self.artifacts.write_json(
+                self.stage_key,
+                "code_patches/patch_gate_report.json",
+                patch_gate_report,
+                artifact_type="c2c_s2_5_patch_gate_report",
+                summary="S2.5 no-op patch gate report",
+                source_paths=[contract_record["path"], manifest_record["path"]],
+            )
+            manifest["artifacts"] = [contract_record["path"], manifest_record["path"], patch_gate_record["path"]]
+            manifest["implementation_contract_path"] = contract_record["path"]
+            manifest["patch_manifest_path"] = manifest_record["path"]
+            manifest["patch_gate_report_path"] = patch_gate_record["path"]
+            manifest["patch_gate"] = patch_gate_report.get("gate")
+            return manifest
         candidate = dict(selected_variant)
         candidate["selected"] = True
         candidate["id"] = str(candidate.get("id") or implementation_contract.get("variant_id") or "selected_variant")
@@ -571,7 +617,7 @@ class CodePatchAgent:
             implementation_contract,
             artifact_type="c2c_s2_5_implementation_contract",
             summary="S2.5 implementation contract generated after planner gate pass",
-            source_paths=["plan/s2_planner/planner_gate_report.json", "plan/s2_planner/next_variant.json", "plan/variant_contract.json"],
+            source_paths=["plan/s2_planner/planner_gate_report.json", "plan/variant.json", "plan/variant.json"],
         )
         manifest = self.run(plan, [candidate])
         patch_gate_report = build_s2_5_patch_gate_report(
@@ -1643,6 +1689,13 @@ def _prepare_code_worktree_workspace(
             "enabled": True,
             "status": "codex_failed",
             "reason": "Git worktree requires c2c.target_repo to exist",
+            "recovery_actions": [],
+        }
+    if not (target_repo / ".git").exists():
+        return {
+            "enabled": True,
+            "status": "codex_failed",
+            "reason": "Git worktree requires c2c.target_repo to be a git repo",
             "recovery_actions": [],
         }
     git_check = subprocess.run(["git", "-C", str(target_repo), "rev-parse", "--is-inside-work-tree"], capture_output=True, text=True, timeout=30)
@@ -2755,6 +2808,16 @@ def _patch_failure_retryable(entry: dict[str, Any] | None) -> bool:
     if entry.get("validation_status") == "runtime_smoke_resource_retry":
         return True
     if entry.get("status") == "retryable_codex_failed":
+        return True
+    if entry.get("status") in {
+        "codex_failed",
+        "validation_failed",
+        "config_activation_missing",
+        "mechanism_self_review_failed",
+        "patch_too_broad",
+        "activation_wiring_failed",
+        "static_validation_failed",
+    }:
         return True
     if entry.get("failure_category") in {"llm_rate_limit_or_quota", "runtime_smoke_resource_retry"}:
         return True

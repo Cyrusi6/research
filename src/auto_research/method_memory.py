@@ -139,7 +139,7 @@ def append_shared_c2c_method_failure(
                 [
                     {
                         "kind": "c2c_route_decision",
-                        "source_path": "meta/route_decision.json",
+                        "source_path": "meta/route_outcome.json",
                         "route_decision": _compact_route_decision(route_decision),
                     }
                 ]
@@ -150,7 +150,7 @@ def append_shared_c2c_method_failure(
                 [
                     {
                         "kind": "c2c_attempt_record",
-                        "source_path": "meta/attempt_ledger.json",
+                        "source_path": "meta/research_state.json",
                         "attempt_record": _compact_attempt_record(attempt_record),
                     }
                 ]
@@ -165,8 +165,8 @@ def append_shared_c2c_method_failure(
             "plan/performance_feedback.json",
             "plan/direction_scorecard.json",
             "experiment/results/proxy_calibration.json",
-            "meta/route_decision.json",
-            "meta/attempt_ledger.json",
+            "meta/route_outcome.json",
+            "meta/research_state.json",
         ],
         view="method",
     )
@@ -187,8 +187,8 @@ def append_shared_c2c_method_failure(
             "plan/direction_scorecard.json",
             "experiment/results/main_results.json",
             "experiment/results/failure_feedback.json",
-            "meta/route_decision.json",
-            "meta/attempt_ledger.json",
+            "meta/route_outcome.json",
+            "meta/research_state.json",
         ],
         "summary": method_entries.get("summary") or {},
         "entries": method_entries.get("entries") or [],
@@ -467,8 +467,8 @@ def _method_memory_source_paths(paths: Any) -> list[str]:
         "plan/performance_feedback.json",
         "experiment/results/main_results.json",
         "experiment/results/proxy_calibration.json",
-        "meta/route_decision.json",
-        "meta/attempt_ledger.json",
+        "meta/route_outcome.json",
+        "meta/research_state.json",
     ]
     blocked_markers = [
         "direction_scorecard",

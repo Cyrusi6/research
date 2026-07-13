@@ -76,8 +76,8 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             {
                 "when": "iteration > 1",
                 "paths": [
-                    "experiment/results/failure_feedback.json",
-                    "literature/feedback",
+                    "meta/research_state.json",
+                    "meta/route_outcome.json",
                 ],
             },
             {
@@ -98,8 +98,8 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             "literature/gate_report.json",
         ],
         "optional_outputs": [
-            "literature/ideas.json",
-            "literature/direction_decision.json",
+            "literature/candidate_directions.json",
+            "literature/direction_selection_report.json",
             "literature/evidence_requests.json",
             "literature/evidence_session.json",
             "literature/evidence_ref_report.json",
@@ -108,7 +108,7 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             {
                 "when": "project.mode == c2c",
                 "paths": [
-                    "literature/idea_debate.json",
+                    "literature/direction_analysis.json",
                     "literature/negative_constraints.json",
                     "literature/c2c/baseline_evidence.json",
                     "literature/c2c/rebuttal_concern_matrix.json",
@@ -139,7 +139,7 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             "literature/direction.json",
         ],
         "optional_inputs": [
-            "literature/ideas.json",
+            "literature/direction.json",
             "experiment/results/failure_feedback.json",
             "plan/performance_feedback.json",
         ],
@@ -160,29 +160,25 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             },
         ],
         "required_outputs": [
-            "plan/plan.yaml",
+            "plan/variant.json",
+            "plan/trial_spec.json",
             "plan/planner_decision.json",
-            "plan/variant_contract.json",
             "plan/variant_fingerprint.json",
             "plan/gate_report.json",
         ],
         "optional_outputs": [
             "plan/code_patches/patch_manifest.json",
             "plan/plan_feedback.json",
-            "plan/next_variant.json",
         ],
         "conditional_outputs": [
             {
                 "when": "project.mode == c2c",
                 "paths": [
-                    "plan/candidate_ideas.json",
-                    "plan/short_loop_plan.yaml",
                     "plan/s2_planner/candidate_pool.json",
                     "plan/s2_planner/feedback_context.json",
                     "plan/s2_planner/adaptive_policy.json",
                     "plan/s2_planner/variant_scorecard.json",
                     "plan/s2_planner/score_adjustment_report.json",
-                    "plan/s2_planner/next_variant.json",
                     "plan/s2_planner/planner_gate_report.json",
                 ],
             },
@@ -203,7 +199,11 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
     },
     "S3_experiment": {
         "required_inputs": [
-            "plan/plan.yaml",
+            "literature/direction.json",
+            "plan/variant.json",
+            "plan/trial_spec.json",
+            "plan/code_patches/implementation_contract.json",
+            "plan/code_patches/patch_manifest.json",
         ],
         "optional_inputs": [
             "plan/code_patches/patch_manifest.json",
@@ -212,13 +212,12 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             {
                 "when": "execution.collector == c2c_small_loop",
                 "paths": [
-                    "plan/candidate_ideas.json",
-                    "plan/short_loop_plan.yaml",
                     "external/c2c_snapshot",
                 ],
             }
         ],
         "required_outputs": [
+            "experiment/results/trial_result.json",
             "experiment/results/main_results.json",
             "experiment/results/ablation_results.json",
             "experiment/results/hypothesis_verification.md",
@@ -349,6 +348,11 @@ class StageContractManager:
         contract["gate"] = None
         self.save(stage_key, contract)
         return contract
+
+    def required_input_status(self, stage_key: str, *, iteration: int | None = None, config: dict[str, Any] | None = None) -> dict[str, Any]:
+        contract = self._normalized(stage_key, config=config, iteration=iteration)
+        records = self._records(contract.get("required_inputs", []), required_paths=set(contract.get("required_inputs", [])))
+        return {"records": records, "missing_inputs": [item["path"] for item in records if not item["exists"]]}
 
     def gate_recorded(self, stage_key: str, gate_report: dict[str, Any], *, report_path: str | None = None) -> dict[str, Any]:
         contract = self._normalized(stage_key)
@@ -551,13 +555,11 @@ def _condition_context(project_root: Path, config: dict[str, Any], iteration: in
 
 
 def _discover_execution_collector(project_root: Path) -> str:
-    plan_path = project_root / "plan" / "plan.yaml"
+    plan_path = project_root / "plan" / "trial_spec.json"
     if not plan_path.exists():
         return ""
     try:
-        import yaml
-
-        plan = yaml.safe_load(plan_path.read_text(encoding="utf-8")) or {}
+        plan = read_json(plan_path, default={}) or {}
         return str((plan.get("execution") or {}).get("collector") or "")
     except Exception:
         return ""
