@@ -1,20 +1,30 @@
 from __future__ import annotations
 
+import hashlib
+import sqlite3
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
 from auto_research.domain_contracts import (
+    EXECUTION_OBSERVATION_SCHEMA_VERSION,
     attempt_input_hash,
     build_direction_spec,
     build_variant_spec,
     canonical_hash,
+    classify_trial_result,
+    direction_spec_hash,
     implementation_hash,
     validate_contract,
+    validate_trial_result,
+    validate_variant_identity,
+    variant_semantic_hash,
     variant_spec_hash,
 )
-from auto_research.research_state import ResearchEventLedger, build_trial_result
+from auto_research.research_state import IntegrityError, ResearchEventLedger
 
 
 def _direction() -> dict:
@@ -50,7 +60,7 @@ def _variant(direction: dict, index: int, feedback: list[str] | None = None) -> 
         direction,
         {
             "variant_id": f"variant-{index}",
-            "variation_coordinates": {"intervention": f"operation-{index}"},
+            "variation_coordinates": {"intervention": {"operation": f"operation-{index}", "strength": index}},
             "intervention": {
                 "summary": f"Apply operation {index}",
                 "algorithm_operations": [f"operation-{index}"],
@@ -70,31 +80,77 @@ def _variant(direction: dict, index: int, feedback: list[str] | None = None) -> 
             "lineage": {
                 "s2_run_id": f"s2-run-{index}",
                 "iteration": index,
-                "direction_spec_hash": direction["direction_hash"],
+                "direction_spec_hash": direction["direction_spec_hash"],
                 "feedback_from_attempt_ids": feedback or [],
             },
         },
     )
 
 
-def _reserve(ledger: ResearchEventLedger, direction: dict, variant: dict, *, profile: str = "standard") -> dict:
-    impl_hash = implementation_hash(frozen_patch={"variant": variant["variant_id"]}, files={"src/router.py": variant["variant_id"]}, manifest={"v": 1})
-    input_hash = attempt_input_hash(
-        implementation_hash_value=impl_hash,
-        protocol={"phase": "proxy_full"},
-        sample_manifest={"datasets": ["fake"]},
-        seeds=[1],
-        runtime_config={"batch": 1},
-        evaluator_hash=canonical_hash({"evaluator": 1}),
+def _initialize(ledger: ResearchEventLedger, direction: dict, variant: dict) -> None:
+    ledger.select_direction(direction)
+    ledger.plan_variant(variant, feedback_from_attempt_ids=(variant.get("lineage") or {}).get("feedback_from_attempt_ids") or [])
+
+
+def _attempt_inputs(variant: dict) -> dict:
+    protocol = {"required_phases": ["full"], "terminal_method_phases": ["full"]}
+    sample_manifest = {"datasets": ["fake"]}
+    runtime_config = {"batch": 1}
+    evaluator = canonical_hash({"evaluator": 1})
+    implementation = implementation_hash(
+        frozen_patch={"variant": variant["variant_id"]},
+        files={"src/router.py": variant["variant_id"]},
+        manifest={"v": 1},
     )
+    return {
+        "implementation_hash": implementation,
+        "attempt_input_hash": attempt_input_hash(
+            implementation_hash_value=implementation,
+            protocol=protocol,
+            sample_manifest=sample_manifest,
+            seeds=[1],
+            runtime_config=runtime_config,
+            evaluator_hash=evaluator,
+        ),
+        "protocol_hash": canonical_hash(protocol),
+        "sample_manifest_hash": canonical_hash(sample_manifest),
+        "runtime_config_hash": canonical_hash(runtime_config),
+        "evaluator_hash": evaluator,
+        "seeds": [1],
+    }
+
+
+def _reserve(ledger: ResearchEventLedger, direction: dict, variant: dict, *, profile: str = "standard") -> dict:
+    values = _attempt_inputs(variant)
+    if profile == "bootstrap":
+        protocol = {"required_phases": ["proxy"], "terminal_method_phases": ["proxy"]}
+        values["protocol_hash"] = canonical_hash(protocol)
+        values["attempt_input_hash"] = attempt_input_hash(
+            implementation_hash_value=values["implementation_hash"],
+            protocol=protocol,
+            sample_manifest={"datasets": ["fake"]},
+            seeds=[1],
+            runtime_config={"batch": 1},
+            evaluator_hash=values["evaluator_hash"],
+        )
     return ledger.reserve_attempt(
         profile=profile,
         direction=direction,
         variant=variant,
-        implementation_hash=impl_hash,
-        attempt_input_hash=input_hash,
         attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full",
+        **values,
     )
+
+
+def _trial_spec(attempt: dict) -> dict:
+    phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
+    return {
+        "protocol": {"required_phases": [phase], "terminal_method_phases": [phase]},
+        "sample_manifest": {"datasets": ["fake"]},
+        "datasets": ["fake"],
+        "metrics": [{"name": "accuracy", "primary": True, "higher_is_better": True}],
+        "acceptance_criteria": {"minimum_mean_delta": 0.05},
+    }
 
 
 def _complete(
@@ -105,238 +161,360 @@ def _complete(
     evaluable: bool = True,
     failure: str | None = None,
 ):
-    trial = build_trial_result(
+    if not evaluable:
+        return ledger.disposition_attempt(attempt["attempt_id"], failure_class=failure or "implementation_failure")
+    artifact = ledger.project_root / "experiment" / "raw" / f"{attempt['attempt_id']}.json"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text('{"verified": true}\n', encoding="utf-8")
+    artifact_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
+    candidate = 0.7 if outcome == "accepted" else 0.51
+    observations = []
+    for role, value in [("baseline", 0.5), ("candidate", candidate)]:
+        observations.append(
+            {
+                "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+                "phase": phase,
+                "role": role,
+                "command_status": "completed",
+                "dataset_id": "fake",
+                "metric_id": "accuracy",
+                "metric_value": value,
+                "sample_manifest_hash": attempt["sample_manifest_hash"],
+                "evaluator_hash": attempt["evaluator_hash"],
+                "seed": 1,
+                "raw_artifact_hash": artifact_hash,
+            }
+        )
+    trial = classify_trial_result(
         attempt=attempt,
-        protocol_hash=canonical_hash({"protocol": 1}),
-        input_hash=attempt["attempt_input_hash"],
-        completeness="full" if evaluable else "partial",
-        observed_datasets=["fake"] if evaluable else [],
-        raw_artifacts={},
-        proxy_observations=[{"accuracy": 0.5}] if evaluable else [],
-        full_observations=[{"accuracy": 0.6}] if evaluable else [],
-        ablation_observations=[],
-        method_evaluable=evaluable,
-        outcome_classification=outcome,
-        failure_classification=failure,
+        trial_spec=_trial_spec(attempt),
+        observations=observations,
+        raw_artifacts={str(artifact.relative_to(ledger.project_root)): artifact_hash},
     )
+    if phase == "proxy":
+        ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
+    else:
+        ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
     return ledger.complete_attempt(trial)
 
 
-def _initialize(ledger: ResearchEventLedger, direction: dict, variant: dict, feedback: list[str] | None = None) -> None:
-    ledger.select_direction(direction, event_id=f"direction:{direction['direction_hash']}")
-    ledger.plan_variant(variant, feedback_from_attempt_ids=feedback or [], event_id=f"variant:{variant['variant_spec_hash']}")
-
-
-def test_same_direction_completes_five_distinct_variants_in_sequence(tmp_path: Path) -> None:
+def test_five_outcomes_keep_direction_identity_and_never_create_sixth(tmp_path: Path) -> None:
     ledger = ResearchEventLedger(tmp_path)
     direction = _direction()
-    attempt_ids = []
+    attempts = []
     for index in range(1, 6):
         variant = _variant(direction, index)
         _initialize(ledger, direction, variant)
         attempt = _reserve(ledger, direction, variant)
-        attempt_ids.append(attempt["attempt_id"])
+        attempts.append(attempt)
         _, route = _complete(ledger, attempt, outcome="accepted")
+        assert attempt["direction_spec_hash"] == direction["direction_spec_hash"]
         assert route["next_action"] == ("PROPOSE_NEXT_VARIANT" if index < 5 else "FINISH_DIRECTION")
     state = ledger.state()
-    outcomes = state["method_tried_history"]
-    assert len(outcomes) == 5
-    assert len({item["variant_spec_hash"] for item in outcomes}) == 5
-    assert {item["direction_hash"] for item in outcomes} == {direction["direction_hash"]}
-    assert len(set(attempt_ids)) == 5
+    budget = state["directions"][direction["direction_semantic_hash"]]["budget"]
+    assert budget == {"target": 5, "reserved": 0, "consumed": 5}
+    assert len({item["variant_semantic_hash"] for item in state["method_tried_history"]}) == 5
+    with pytest.raises(IntegrityError, match="closed direction"):
+        ledger.select_direction(direction, event_id="direction:reopen")
 
 
-def test_five_successes_do_not_stop_early(tmp_path: Path) -> None:
+def test_same_scientific_variant_with_new_id_and_lineage_is_duplicate(tmp_path: Path) -> None:
     ledger = ResearchEventLedger(tmp_path)
     direction = _direction()
-    routes = []
-    for index in range(1, 6):
-        variant = _variant(direction, index)
-        _initialize(ledger, direction, variant)
-        _, route = _complete(ledger, _reserve(ledger, direction, variant), outcome="accepted")
-        routes.append(route["next_action"])
-    assert routes == ["PROPOSE_NEXT_VARIANT"] * 4 + ["FINISH_DIRECTION"]
+    first = _variant(direction, 1)
+    _initialize(ledger, direction, first)
+    _complete(ledger, _reserve(ledger, direction, first), outcome="rejected")
+    duplicate = deepcopy(first)
+    duplicate["variant_id"] = "renamed"
+    duplicate["lineage"] = {**duplicate["lineage"], "iteration": 999, "s2_run_id": "new-run"}
+    duplicate.pop("variant_spec_hash")
+    duplicate["variant_spec_hash"] = variant_spec_hash(duplicate)
+    assert duplicate["variant_semantic_hash"] == first["variant_semantic_hash"]
+    ledger.select_direction(direction)
+    with pytest.raises((IntegrityError, ValueError), match="duplicate"):
+        ledger.plan_variant(duplicate)
 
 
-def test_mixed_success_failure_still_runs_five(tmp_path: Path) -> None:
+def test_event_id_idempotency_and_conflict(tmp_path: Path) -> None:
+    ledger = ResearchEventLedger(tmp_path)
+    first, _ = ledger.append("AuditMarker", {"index": 1}, event_id="audit:one")
+    repeated, _ = ledger.append("AuditMarker", {"index": 1}, event_id="audit:one")
+    assert first == repeated
+    assert len(ledger.events()) == 1
+    with pytest.raises(IntegrityError, match="conflict"):
+        ledger.append("AuditMarker", {"index": 2}, event_id="audit:one")
+
+
+def test_concurrent_append_has_unique_contiguous_sequences(tmp_path: Path) -> None:
+    def append(index: int) -> None:
+        ResearchEventLedger(tmp_path).append("AuditMarker", {"index": index}, event_id=f"audit:{index}")
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(append, range(100)))
+    events = ResearchEventLedger(tmp_path).events()
+    assert [event["sequence"] for event in events] == list(range(1, 101))
+    assert len({event["event_id"] for event in events}) == 100
+
+
+def test_rebuild_rejects_hash_chain_tampering(tmp_path: Path) -> None:
+    ledger = ResearchEventLedger(tmp_path)
+    ledger.append("AuditMarker", {"index": 1}, event_id="audit:1")
+    ledger.append("AuditMarker", {"index": 2}, event_id="audit:2")
+    with sqlite3.connect(ledger.db_path) as connection:
+        connection.execute("UPDATE events SET previous_event_hash = ? WHERE sequence = 2", ("f" * 64,))
+    with pytest.raises(IntegrityError, match="hash chain"):
+        ledger.rebuild()
+
+
+def test_commit_crash_before_projection_rebuilds_unique_result_and_route(tmp_path: Path) -> None:
     ledger = ResearchEventLedger(tmp_path)
     direction = _direction()
-    outcomes = ["rejected", "accepted", "falsified", "accepted", "rejected"]
-    routes = []
-    for index, outcome in enumerate(outcomes, 1):
-        variant = _variant(direction, index)
-        _initialize(ledger, direction, variant)
-        _, route = _complete(ledger, _reserve(ledger, direction, variant), outcome=outcome)
-        routes.append(route["next_action"])
-    assert routes[:4] == ["PROPOSE_NEXT_VARIANT"] * 4
-    assert routes[-1] == "FINISH_DIRECTION"
-    assert ledger.state()["directions"][direction["direction_hash"]]["budget"]["consumed"] == 5
+    variant = _variant(direction, 1)
+    _initialize(ledger, direction, variant)
+    attempt = _reserve(ledger, direction, variant)
+    def crash_after_finalization() -> None:
+        if ledger.events()[-1]["event_type"] == "AttemptFinalized":
+            raise RuntimeError("crash after commit")
+
+    ledger.after_commit_hook = crash_after_finalization
+    with pytest.raises(RuntimeError, match="crash after commit"):
+        _complete(ledger, attempt, outcome="rejected")
+    state = ResearchEventLedger(tmp_path).rebuild()
+    assert list(state["trial_results"]) == [attempt["attempt_id"]]
+    assert state["last_route_outcome"]["source"]["attempt_id"] == attempt["attempt_id"]
+    assert state["directions"][direction["direction_semantic_hash"]]["budget"]["consumed"] == 1
 
 
-def test_sixth_variant_is_refused_after_fifth_outcome(tmp_path: Path) -> None:
+def test_trial_identity_mismatch_writes_nothing(tmp_path: Path) -> None:
     ledger = ResearchEventLedger(tmp_path)
     direction = _direction()
-    for index in range(1, 6):
+    variant = _variant(direction, 1)
+    _initialize(ledger, direction, variant)
+    attempt = _reserve(ledger, direction, variant)
+    before_events = len(ledger.events())
+    before_state = ledger.state()
+    artifact = tmp_path / "raw.json"
+    artifact.write_text("{}", encoding="utf-8")
+    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    observation = {
+        "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+        "phase": "full", "role": "candidate", "command_status": "completed", "dataset_id": "fake",
+        "metric_id": "accuracy", "metric_value": 0.7, "sample_manifest_hash": attempt["sample_manifest_hash"],
+        "evaluator_hash": attempt["evaluator_hash"], "seed": 1, "raw_artifact_hash": digest,
+    }
+    trial = classify_trial_result(attempt=attempt, trial_spec=_trial_spec(attempt), observations=[observation], raw_artifacts={"raw.json": digest})
+    trial["attempt_input_hash"] = "f" * 64
+    with pytest.raises(IntegrityError, match="attempt_input_hash mismatch"):
+        ledger.complete_attempt(trial)
+    assert len(ledger.events()) == before_events
+    after_state = ledger.state()
+    assert after_state["directions"] == before_state["directions"]
+    assert after_state["last_route_outcome"] == before_state["last_route_outcome"]
+
+
+def test_fingerprint_stability_and_sensitivity() -> None:
+    direction = _direction()
+    variant = _variant(direction, 1)
+    reordered = {key: variant[key] for key in reversed(list(variant))}
+    assert variant_spec_hash(variant) == variant_spec_hash(reordered)
+    changed = deepcopy(variant)
+    changed["intervention"]["configuration"]["strength"] = 99
+    assert variant_semantic_hash(changed) != variant["variant_semantic_hash"]
+    assert variant_spec_hash(changed) != variant["variant_spec_hash"]
+    changed_direction = deepcopy(direction)
+    changed_direction["research_question"] += " Precisely?"
+    assert direction_spec_hash(changed_direction) != direction["direction_spec_hash"]
+
+
+def test_wrong_lineage_direction_spec_hash_fails() -> None:
+    direction = _direction()
+    variant = _variant(direction, 1)
+    variant["lineage"]["direction_spec_hash"] = "f" * 64
+    variant["variant_spec_hash"] = variant_spec_hash(variant)
+    with pytest.raises(ValueError, match="lineage.direction_spec_hash"):
+        validate_variant_identity(direction, variant)
+
+
+def test_abandoned_attempt_cannot_revive_after_five_outcomes(tmp_path: Path) -> None:
+    ledger = ResearchEventLedger(tmp_path)
+    direction = _direction()
+    first_variant = _variant(direction, 1)
+    _initialize(ledger, direction, first_variant)
+    first_attempt = _reserve(ledger, direction, first_variant)
+    ledger.disposition_attempt(first_attempt["attempt_id"], failure_class="activation_failure")
+    ledger.abandon_attempt(first_attempt["attempt_id"], reason="replace non-evaluable implementation")
+    for index in range(2, 7):
         variant = _variant(direction, index)
         _initialize(ledger, direction, variant)
         _complete(ledger, _reserve(ledger, direction, variant), outcome="rejected")
-    sixth = _variant(direction, 6)
-    with pytest.raises(RuntimeError, match="sixth"):
-        _reserve(ledger, direction, sixth)
+    assert ledger.state()["directions"][direction["direction_semantic_hash"]]["budget"]["consumed"] == 5
+    with pytest.raises(IntegrityError, match="already finalized|cannot finalize|no reserved slot|illegal attempt transition"):
+        _complete(ledger, first_attempt, outcome="accepted")
+
+
+def test_illegal_transition_and_terminal_transition_write_no_event(tmp_path: Path) -> None:
+    ledger = ResearchEventLedger(tmp_path)
+    direction = _direction()
+    variant = _variant(direction, 1)
+    _initialize(ledger, direction, variant)
+    attempt = _reserve(ledger, direction, variant)
+    count = len(ledger.events())
+    with pytest.raises(IntegrityError, match="illegal attempt transition"):
+        ledger.transition_attempt(attempt["attempt_id"], "METHOD_COMPLETED")
+    assert len(ledger.events()) == count
+    completed, _ = _complete(ledger, attempt, outcome="accepted")
+    count = len(ledger.events())
+    with pytest.raises(IntegrityError, match="illegal attempt transition"):
+        ledger.transition_attempt(completed["attempt_id"], "READY")
+    assert len(ledger.events()) == count
+
+
+def test_method_completed_phases_match_trial_completeness(tmp_path: Path) -> None:
+    ledger = ResearchEventLedger(tmp_path)
+    direction = _direction()
+    variant = _variant(direction, 1)
+    _initialize(ledger, direction, variant)
+    attempt = _reserve(ledger, direction, variant)
+    completed, _ = _complete(ledger, attempt, outcome="accepted")
+    trial = ledger.state()["trial_results"][attempt["attempt_id"]]
+    assert completed["state"] == "METHOD_COMPLETED"
+    assert completed["phases"][trial["completeness"]] == "COMPLETED"
+    assert {item["phase"] for item in trial["observations"] if item["role"] == "candidate"} == {trial["completeness"]}
+
+
+def test_bootstrap_then_standard_same_variant_has_independent_identity_and_budget(tmp_path: Path) -> None:
+    ledger = ResearchEventLedger(tmp_path)
+    direction = _direction()
+    variant = _variant(direction, 1)
+    _initialize(ledger, direction, variant)
+    bootstrap = _reserve(ledger, direction, variant, profile="bootstrap")
+    _complete(ledger, bootstrap, outcome="accepted")
+    ledger.select_direction(direction)
+    ledger.plan_variant(variant, event_id="variant:standard:same-science")
+    standard = _reserve(ledger, direction, variant, profile="standard")
+    assert standard["attempt_id"] != bootstrap["attempt_id"]
+    state = ledger.state()
+    assert state["directions"][direction["direction_semantic_hash"]]["budget"] == {"target": 5, "reserved": 1, "consumed": 0}
+
+
+def test_implementation_repair_keeps_attempt_and_variant_identity(tmp_path: Path) -> None:
+    ledger = ResearchEventLedger(tmp_path)
+    direction = _direction()
+    variant = _variant(direction, 1)
+    _initialize(ledger, direction, variant)
+    attempt = _reserve(ledger, direction, variant)
+    ledger.disposition_attempt(attempt["attempt_id"], failure_class="activation_failure")
+    values = _attempt_inputs(variant)
+    new_implementation = implementation_hash(frozen_patch={"repair": True}, files={"src/router.py": "repaired"}, manifest={"v": 2})
+    protocol = {"required_phases": ["full"], "terminal_method_phases": ["full"]}
+    values["implementation_hash"] = new_implementation
+    values["attempt_input_hash"] = attempt_input_hash(
+        implementation_hash_value=new_implementation,
+        protocol=protocol,
+        sample_manifest={"datasets": ["fake"]},
+        seeds=[1],
+        runtime_config={"batch": 1},
+        evaluator_hash=values["evaluator_hash"],
+    )
+    repaired = ledger.reserve_attempt(profile="standard", direction=direction, variant=variant, attempt_kind="proxy_full", **values)
+    assert repaired["attempt_id"] == attempt["attempt_id"]
+    assert repaired["variant_spec_hash"] == attempt["variant_spec_hash"]
+    assert repaired["implementation_hash"] != attempt["implementation_hash"]
+    assert len(repaired["implementation_revisions"]) == 2
 
 
 @pytest.mark.parametrize(
-    ("outcome", "failure"),
-    [
-        ("implementation_failed", "patch_failure"),
-        ("activation_failed", "activation_wiring_failure"),
-        ("resource_paused", "resource_paused"),
-        ("resource_paused", "oom_retry"),
-    ],
+    ("failure_class", "expected_action"),
+    [("resource_paused", "PAUSE_RESOURCE"), ("activation_failure", "REPAIR_IMPLEMENTATION"), ("integrity", "BLOCK_INTEGRITY")],
 )
-def test_non_evaluable_failures_do_not_consume_direction_budget(tmp_path: Path, outcome: str, failure: str) -> None:
-    ledger = ResearchEventLedger(tmp_path)
-    direction = _direction()
-    variant = _variant(direction, 1)
-    _initialize(ledger, direction, variant)
-    attempt = _reserve(ledger, direction, variant)
-    completed, _ = _complete(ledger, attempt, outcome=outcome, evaluable=False, failure=failure)
-    budget = ledger.state()["directions"][direction["direction_hash"]]["budget"]
-    assert completed["consumes_direction_budget"] is False
-    assert budget == {"target": 5, "reserved": 0, "consumed": 0}
-
-
-def test_implementation_repair_preserves_variant_hash_and_changes_implementation_hash(tmp_path: Path) -> None:
-    ledger = ResearchEventLedger(tmp_path)
-    direction = _direction()
-    variant = _variant(direction, 1)
-    _initialize(ledger, direction, variant)
-    attempt = _reserve(ledger, direction, variant)
-    old_implementation = attempt["implementation_hash"]
-    repaired = ledger.transition_attempt(
-        attempt["attempt_id"],
-        "IMPLEMENTATION_REPAIR",
-        changes={"implementation_hash": canonical_hash({"repair": 1})},
-    )
-    assert repaired["attempt_id"] == attempt["attempt_id"]
-    assert repaired["variant_spec_hash"] == variant["variant_spec_hash"]
-    assert repaired["implementation_hash"] != old_implementation
-
-
-def test_failure_attribution_stays_with_a_and_only_feedback_links_to_b(tmp_path: Path) -> None:
-    ledger = ResearchEventLedger(tmp_path)
-    direction = _direction()
-    variant_a = _variant(direction, 1)
-    _initialize(ledger, direction, variant_a)
-    attempt_a = _reserve(ledger, direction, variant_a)
-    _complete(ledger, attempt_a, outcome="rejected")
-    variant_b = _variant(direction, 2, [attempt_a["attempt_id"]])
-    _initialize(ledger, direction, variant_b, [attempt_a["attempt_id"]])
-    state = ledger.state()
-    assert state["variants"][variant_b["variant_spec_hash"]]["feedback_from_attempt_ids"] == [attempt_a["attempt_id"]]
-    assert all(item["variant_id"] != variant_b["variant_id"] for item in state["method_tried_history"])
-    assert state["trial_results"][attempt_a["attempt_id"]]["variant_id"] == variant_a["variant_id"]
-
-
-def test_planned_or_patch_rejected_variant_not_in_method_history(tmp_path: Path) -> None:
-    ledger = ResearchEventLedger(tmp_path)
-    direction = _direction()
-    variant = _variant(direction, 1)
-    _initialize(ledger, direction, variant)
-    attempt = _reserve(ledger, direction, variant)
-    ledger.transition_attempt(attempt["attempt_id"], "IMPLEMENTATION_REPAIR")
-    assert ledger.state()["method_tried_history"] == []
-
-
-def test_crash_after_reservation_resumes_same_attempt_without_double_count(tmp_path: Path) -> None:
-    ledger = ResearchEventLedger(tmp_path)
-    direction = _direction()
-    variant = _variant(direction, 1)
-    _initialize(ledger, direction, variant)
-    first = _reserve(ledger, direction, variant)
-    resumed = ResearchEventLedger(tmp_path)
-    second = _reserve(resumed, direction, variant)
-    assert second["attempt_id"] == first["attempt_id"]
-    assert resumed.state()["directions"][direction["direction_hash"]]["budget"]["reserved"] == 1
-
-
-def test_replaying_same_event_id_is_idempotent(tmp_path: Path) -> None:
-    ledger = ResearchEventLedger(tmp_path)
-    direction = _direction()
-    ledger.select_direction(direction, event_id="same-event")
-    ledger.select_direction(direction, event_id="same-event")
-    assert len(ledger.events()) == 1
-    assert ledger.state()["last_sequence"] == 1
-
-
-def test_force_new_direction_is_executed_by_reducer(tmp_path: Path) -> None:
-    ledger = ResearchEventLedger(tmp_path)
-    direction = _direction()
-    ledger.select_direction(direction)
-    state = ledger.force_new_direction(reason_codes=["human_force_new_direction"])
-    assert state["last_route_outcome"]["next_action"] == "START_NEW_DIRECTION"
-    assert state["current_direction_hash"] is None
-
-
-def test_bootstrap_proxy_finishes_once_without_consuming_standard_budget(tmp_path: Path) -> None:
-    ledger = ResearchEventLedger(tmp_path)
+def test_bootstrap_failures_never_finish_run(tmp_path: Path, failure_class: str, expected_action: str) -> None:
+    ledger = ResearchEventLedger(tmp_path / failure_class)
     direction = _direction()
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant, profile="bootstrap")
-    completed, route = _complete(ledger, attempt, outcome="accepted")
-    assert route["next_action"] == "FINISH_RUN"
-    assert completed["consumes_direction_budget"] is False
-    assert ledger.state()["directions"][direction["direction_hash"]]["budget"]["consumed"] == 0
+    failed, route = ledger.disposition_attempt(attempt["attempt_id"], failure_class=failure_class)
+    assert route["next_action"] == expected_action
+    assert route["next_action"] != "FINISH_RUN"
+    assert failed["method_evaluable"] is False
+    assert ledger.state()["directions"][direction["direction_semantic_hash"]]["budget"]["consumed"] == 0
 
 
-def test_strict_schema_rejects_missing_version_and_extra_fields() -> None:
+def test_evaluable_trial_rejects_empty_evidence_and_none_completeness(tmp_path: Path) -> None:
+    ledger = ResearchEventLedger(tmp_path)
     direction = _direction()
-    missing = dict(direction)
+    variant = _variant(direction, 1)
+    _initialize(ledger, direction, variant)
+    attempt = _reserve(ledger, direction, variant)
+    completed, _ = _complete(ledger, attempt, outcome="accepted")
+    valid = ledger.state()["trial_results"][completed["attempt_id"]]
+    mutations = []
+    for field, value in [("observed_datasets", []), ("observations", []), ("raw_artifacts", {}), ("completeness", "none")]:
+        changed = deepcopy(valid)
+        changed[field] = value
+        mutations.append(changed)
+    for changed in mutations:
+        with pytest.raises(ValueError):
+            validate_trial_result(changed)
+
+
+@pytest.mark.parametrize("field", ["variant_id", "variation_coordinates", "intervention", "hypothesis", "null_hypothesis", "alternative_hypothesis", "controlled_variables", "nuisance_variables", "implementation_surface_ids", "expected_metric_signature", "falsification_conditions", "ablation", "resource_budget", "failure_routing", "lineage"])
+def test_variant_spec_hash_is_sensitive_to_every_authoritative_field(field: str) -> None:
+    direction = _direction()
+    variant = _variant(direction, 1)
+    changed = deepcopy(variant)
+    changed.pop("variant_spec_hash")
+    changed.pop("variant_semantic_hash")
+    value = changed[field]
+    if isinstance(value, str):
+        changed[field] = value + "-changed"
+    elif isinstance(value, list):
+        changed[field] = value + ["changed"]
+    else:
+        changed[field] = {**value, "changed": True}
+    assert variant_spec_hash(changed) != variant["variant_spec_hash"]
+
+
+@pytest.mark.parametrize("field", ["direction_id", "research_question", "mechanism_invariants", "falsification_conditions", "support_claim_ids", "counter_claim_ids", "implementation_surface_ids", "metric_signature", "benchmark_contract_hash", "variant_space", "exploration_policy", "s2_entry_conditions", "return_to_s1_conditions", "lineage"])
+def test_direction_spec_hash_is_sensitive_to_every_authoritative_field(field: str) -> None:
+    direction = _direction()
+    changed = deepcopy(direction)
+    changed.pop("direction_spec_hash")
+    changed.pop("direction_semantic_hash")
+    value = changed[field]
+    if isinstance(value, str):
+        changed[field] = value + "-changed"
+    elif isinstance(value, list):
+        changed[field] = value + ["changed"]
+    else:
+        changed[field] = {**value, "changed": True}
+    assert direction_spec_hash(changed) != direction["direction_spec_hash"]
+
+
+def test_strict_contract_rejects_missing_extra_and_wrong_version() -> None:
+    direction = _direction()
+    missing = deepcopy(direction)
     missing.pop("research_question")
-    with pytest.raises(ValueError):
-        validate_contract(missing, "direction_v2.schema.json")
-    wrong = dict(direction, schema_version="wrong")
-    with pytest.raises(ValueError):
-        validate_contract(wrong, "direction_v2.schema.json")
-    extra = dict(direction, unexpected=True)
-    with pytest.raises(ValueError):
-        validate_contract(extra, "direction_v2.schema.json")
-
-
-def test_fingerprint_is_order_stable_and_sensitive_to_intervention_and_config() -> None:
-    direction = _direction()
-    first = _variant(direction, 1)
-    reordered = {key: first[key] for key in reversed(list(first))}
-    assert variant_spec_hash(first) == variant_spec_hash(reordered)
-    changed_config = dict(first)
-    changed_config["intervention"] = {**first["intervention"], "configuration": {"strength": 99}}
-    assert variant_spec_hash(changed_config) != first["variant_spec_hash"]
-    changed_operation = dict(first)
-    changed_operation["intervention"] = {**first["intervention"], "algorithm_operations": ["different-operation"]}
-    assert variant_spec_hash(changed_operation) != first["variant_spec_hash"]
+    extra = {**direction, "legacy": True}
+    wrong = {**direction, "schema_version": "old"}
+    for payload in [missing, extra, wrong]:
+        with pytest.raises(ValueError):
+            validate_contract(payload, "direction_v3.schema.json")
 
 
 def test_generic_core_state_machine_has_no_c2c_dependency() -> None:
     root = Path(__file__).resolve().parents[1]
     for rel in ["src/auto_research/domain_contracts.py", "src/auto_research/research_state.py"]:
-        source = (root / rel).read_text(encoding="utf-8").lower()
-        assert "c2c" not in source
+        assert "c2c" not in (root / rel).read_text(encoding="utf-8").lower()
 
 
 def test_runtime_source_contains_no_removed_legacy_paths() -> None:
     root = Path(__file__).resolve().parents[1]
     patterns = [
-        "literature/ideas.json",
-        "literature/direction_decision.json",
-        "literature/c2c/direction_decision.json",
-        "direction_to_legacy_idea",
-        "load_direction_or_legacy_idea",
-        "plan/candidate_ideas.json",
-        "plan/next_variant.json",
-        "plan/s2_planner/next_variant.json",
-        "plan/plan.yaml",
-        "legacy_route_fallback",
+        "literature/ideas.json", "literature/direction_decision.json", "literature/c2c/direction_decision.json",
+        "direction_to_legacy_idea", "load_direction_or_legacy_idea", "plan/candidate_ideas.json",
+        "plan/next_variant.json", "plan/s2_planner/next_variant.json", "legacy_route_fallback",
     ]
     command = ["rg", "-n", "|".join(pattern.replace(".", r"\.") for pattern in patterns), "src/auto_research", "--glob", "*.py"]
     completed = subprocess.run(command, cwd=root, text=True, capture_output=True, check=False)

@@ -68,7 +68,7 @@ def build_direction_contract(
     mode: str = "generic",
     used_shared_memory_refs: list[str] | None = None,
 ) -> dict[str, Any]:
-    """Normalize S1 output into the only authoritative DirectionSpec v2."""
+    """Normalize S1 output into the only authoritative DirectionSpec v3."""
 
     direction = payload.get("direction") if isinstance(payload.get("direction"), dict) else {}
     decision = payload.get("direction_decision") if isinstance(payload.get("direction_decision"), dict) else {}
@@ -187,7 +187,7 @@ def build_s1_direction_fingerprint(
         "mechanism_axis": "mechanism_invariants",
         "integration_point": surfaces[0] if surfaces else "",
         "control_signal": str(invariants.get("target_mediator") or ""),
-        "mechanism_type": "direction_v2",
+        "mechanism_type": "direction_v3",
         "expected_files": sorted(surfaces),
         "implementation_surface_refs": sorted(surfaces),
     }
@@ -509,7 +509,7 @@ def build_variant_contract(
         "lineage": {
             "s2_run_id": str(lineage.get("s2_run_id") or f"s2-{variant_id}"),
             "iteration": int(lineage.get("iteration") or 1),
-            "direction_spec_hash": direction["direction_hash"],
+            "direction_spec_hash": direction["direction_spec_hash"],
             "feedback_from_attempt_ids": [str(item) for item in _as_list(lineage.get("feedback_from_attempt_ids")) or _as_list(variant.get("feedback_from_attempt_ids"))],
         },
     }
@@ -532,8 +532,10 @@ def build_variant_fingerprint_artifact(
     return {
         "schema_version": VARIANT_FINGERPRINT_SCHEMA_VERSION,
         "direction_id": direction.get("direction_id"),
-        "direction_hash": direction.get("direction_hash"),
+        "direction_semantic_hash": direction.get("direction_semantic_hash"),
+        "direction_spec_hash": direction.get("direction_spec_hash"),
         "variant_id": spec.get("variant_id"),
+        "variant_semantic_hash": spec.get("variant_semantic_hash"),
         "variant_spec_hash": current,
         "history_fingerprints": history,
         "is_repeat": current in set(history),

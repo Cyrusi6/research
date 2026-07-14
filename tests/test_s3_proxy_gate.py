@@ -35,7 +35,7 @@ def test_s3_gate_passes_strict_trial_result(tmp_path: Path) -> None:
     _write_s3_outputs(tmp_path)
     report = run_stage_gate("S3_experiment", tmp_path, {}).to_dict()
     assert report["status"] == "PASS"
-    assert next(check for check in report["checks"] if check["name"] == "trial_result_v1")["status"] == "PASS"
+    assert next(check for check in report["checks"] if check["name"] == "s3_authoritative_transaction")["status"] == "PASS"
 
 
 def test_s3_gate_retries_without_trial_result(tmp_path: Path) -> None:
@@ -45,7 +45,7 @@ def test_s3_gate_retries_without_trial_result(tmp_path: Path) -> None:
     write_json(tmp_path / "plan" / "variant.json", variant)
     report = run_stage_gate("S3_experiment", tmp_path, {}).to_dict()
     assert report["status"] == "NEEDS_RETRY"
-    assert any(check.get("artifact") == "experiment/results/trial_result.json" for check in report["checks"])
+    assert any(check.get("name") == "s3_authoritative_transaction" for check in report["checks"])
 
 
 def test_s3_bootstrap_gate_passes_once_without_budget_consumption(tmp_path: Path) -> None:
@@ -55,4 +55,4 @@ def test_s3_bootstrap_gate_passes_once_without_budget_consumption(tmp_path: Path
     state = ResearchEventLedger(tmp_path).state()
     assert report["status"] == "PASS"
     assert state["attempts"][attempt["attempt_id"]]["consumes_direction_budget"] is False
-    assert state["directions"][direction["direction_hash"]]["budget"]["consumed"] == 0
+    assert state["directions"][direction["direction_semantic_hash"]]["budget"]["consumed"] == 0

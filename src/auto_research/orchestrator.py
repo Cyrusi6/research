@@ -357,6 +357,13 @@ class Orchestrator:
                     contracts.stage_stopped(stage_key, status="blocked", reason=reason, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
                     return {"status": "blocked", "stage": stage_key, "reason": reason, "route_outcome": route_outcome}
                 next_action = route_outcome.get("next_action")
+                if result.get("status") == "blocked":
+                    reason = result.get("blocked_reason") or "S3 attempt is blocked"
+                    block_stage(registry, stage_key, reason)
+                    save_registry(registry_path, registry)
+                    state.stage_blocked(registry, stage_key, reason)
+                    contracts.stage_stopped(stage_key, status="blocked", reason=reason, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                    return {"status": "blocked", "stage": stage_key, "reason": reason, "route_outcome": route_outcome}
                 if next_action in {"PROPOSE_NEXT_VARIANT", "REPAIR_IMPLEMENTATION"}:
                     complete_stage(registry, stage_key, artifacts=result.get("artifacts", []))
                     invalidate_from(registry, "S2_plan", invalidated_by=f"route_outcome:{next_action}")
@@ -395,6 +402,22 @@ class Orchestrator:
                     state.mark_completed(registry)
                     contracts.stage_completed(stage_key, artifacts=result.get("artifacts", []), status="completed", reason="FINISH_RUN", config=config, iteration=registry.get("iteration"))
                     break
+                if next_action == "FINISH_DIRECTION":
+                    result["direction_finished"] = True
+                elif next_action not in {
+                    "PROPOSE_NEXT_VARIANT",
+                    "REPAIR_IMPLEMENTATION",
+                    "START_NEW_DIRECTION",
+                    "PAUSE_RESOURCE",
+                    "BLOCK_INTEGRITY",
+                    "FINISH_RUN",
+                }:
+                    reason = f"Unknown or illegal S3 RouteOutcome action: {next_action!r}"
+                    block_stage(registry, stage_key, reason)
+                    save_registry(registry_path, registry)
+                    state.stage_blocked(registry, stage_key, reason)
+                    contracts.stage_stopped(stage_key, status="blocked", reason=reason, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                    return {"status": "blocked", "stage": stage_key, "reason": reason}
             elif stage_key == "S4_writing":
                 LiteratureAgent(context).run(topic, phase="related_work_audit")
                 result = WritingAgent(context).run()

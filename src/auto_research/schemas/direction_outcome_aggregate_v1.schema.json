@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "direction_semantic_hash",
+    "direction_spec_hash",
+    "status",
+    "outcomes",
+    "selection"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "auto_research_direction_outcome_aggregate_v1"
+    },
+    "direction_semantic_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "direction_spec_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "status": {
+      "enum": [
+        "finished",
+        "exhausted"
+      ]
+    },
+    "outcomes": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "attempt_id",
+          "variant_id",
+          "variant_semantic_hash",
+          "variant_spec_hash",
+          "trial_result_hash",
+          "outcome",
+          "primary_metric_summary"
+        ],
+        "properties": {
+          "attempt_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "variant_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "variant_semantic_hash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "variant_spec_hash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "trial_result_hash": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "outcome": {
+            "enum": [
+              "accepted",
+              "rejected",
+              "falsified",
+              "inconclusive"
+            ]
+          },
+          "primary_metric_summary": {
+            "type": "object"
+          }
+        }
+      }
+    },
+    "selection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "best_attempt_id",
+        "reason"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "selected",
+            "inconclusive"
+          ]
+        },
+        "best_attempt_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

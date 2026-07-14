@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "sequence", "event_type", "previous_event_hash", "event_hash", "created_at", "payload"],
+  "properties": {
+    "schema_version": {"const": "auto_research_event_v2"},
+    "event_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/\\-]{0,255}$"},
+    "sequence": {"type": "integer", "minimum": 1},
+    "event_type": {"enum": ["DirectionSelected", "VariantPlanned", "AttemptReserved", "AttemptTransitioned", "AttemptImplementationRevised", "AttemptAbandoned", "AttemptDispositioned", "AttemptFinalized", "AuditMarker"]},
+    "previous_event_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "event_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "created_at": {"type": "string", "minLength": 1},
+    "payload": {"type": "object"}
+  },
+  "oneOf": [
+    {"properties": {"event_type": {"const": "DirectionSelected"}, "payload": {"$ref": "#/$defs/directionSelected"}}},
+    {"properties": {"event_type": {"const": "VariantPlanned"}, "payload": {"$ref": "#/$defs/variantPlanned"}}},
+    {"properties": {"event_type": {"const": "AttemptReserved"}, "payload": {"$ref": "#/$defs/attemptReserved"}}},
+    {"properties": {"event_type": {"const": "AttemptTransitioned"}, "payload": {"$ref": "#/$defs/attemptTransitioned"}}},
+    {"properties": {"event_type": {"const": "AttemptImplementationRevised"}, "payload": {"$ref": "#/$defs/implementationRevised"}}},
+    {"properties": {"event_type": {"const": "AttemptAbandoned"}, "payload": {"$ref": "#/$defs/attemptAbandoned"}}},
+    {"properties": {"event_type": {"const": "AttemptDispositioned"}, "payload": {"$ref": "#/$defs/attemptDispositioned"}}},
+    {"properties": {"event_type": {"const": "AttemptFinalized"}, "payload": {"$ref": "#/$defs/attemptFinalized"}}},
+    {"properties": {"event_type": {"const": "AuditMarker"}, "payload": {"$ref": "#/$defs/auditMarker"}}}
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "attemptId": {"type": "string", "pattern": "^[a-f0-9-]{36}$"},
+    "directionSelected": {"type": "object", "additionalProperties": false, "required": ["direction"], "properties": {"direction": {"type": "object"}}},
+    "variantPlanned": {"type": "object", "additionalProperties": false, "required": ["variant", "feedback_from_attempt_ids"], "properties": {"variant": {"type": "object"}, "feedback_from_attempt_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/attemptId"}}}},
+    "attemptReserved": {"type": "object", "additionalProperties": false, "required": ["attempt"], "properties": {"attempt": {"type": "object"}}},
+    "attemptTransitioned": {"type": "object", "additionalProperties": false, "required": ["attempt_id", "new_state", "phase", "phase_state"], "properties": {"attempt_id": {"$ref": "#/$defs/attemptId"}, "new_state": {"type": "string", "minLength": 1}, "phase": {"type": ["string", "null"]}, "phase_state": {"type": ["string", "null"]}}},
+    "implementationRevised": {"type": "object", "additionalProperties": false, "required": ["attempt_id", "implementation_hash", "attempt_input_hash", "protocol_hash", "sample_manifest_hash", "runtime_config_hash", "evaluator_hash"], "properties": {"attempt_id": {"$ref": "#/$defs/attemptId"}, "implementation_hash": {"$ref": "#/$defs/hash"}, "attempt_input_hash": {"$ref": "#/$defs/hash"}, "protocol_hash": {"$ref": "#/$defs/hash"}, "sample_manifest_hash": {"$ref": "#/$defs/hash"}, "runtime_config_hash": {"$ref": "#/$defs/hash"}, "evaluator_hash": {"$ref": "#/$defs/hash"}}},
+    "attemptAbandoned": {"type": "object", "additionalProperties": false, "required": ["attempt_id", "reason"], "properties": {"attempt_id": {"$ref": "#/$defs/attemptId"}, "reason": {"type": "string", "minLength": 1}}},
+    "attemptDispositioned": {"type": "object", "additionalProperties": false, "required": ["attempt_id", "failure_class", "target_state", "artifact_hashes", "route_outcome"], "properties": {"attempt_id": {"$ref": "#/$defs/attemptId"}, "failure_class": {"type": "string", "minLength": 1}, "target_state": {"enum": ["IMPLEMENTATION_REPAIR", "RESOURCE_PAUSED", "INTEGRITY_BLOCKED"]}, "artifact_hashes": {"type": "object", "additionalProperties": {"$ref": "#/$defs/hash"}}, "route_outcome": {"type": "object"}}},
+    "attemptFinalized": {"type": "object", "additionalProperties": false, "required": ["trial_result", "route_outcome", "aggregate"], "properties": {"trial_result": {"type": "object"}, "route_outcome": {"type": "object"}, "aggregate": {"type": ["object", "null"]}}},
+    "auditMarker": {"type": "object", "additionalProperties": false, "required": ["index"], "properties": {"index": {"type": "integer", "minimum": 0}}}
+  }
+}

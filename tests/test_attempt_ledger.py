@@ -17,7 +17,7 @@ def test_immutable_events_rebuild_snapshot_and_attempt_view(tmp_path: Path) -> N
     assert len({event["event_id"] for event in events}) == len(events)
     assert (tmp_path / "meta" / "attempts" / f"{attempt['attempt_id']}.json").exists()
     rebuilt = ResearchEventLedger(tmp_path).rebuild()
-    assert rebuilt["directions"][direction["direction_hash"]]["budget"]["consumed"] == 1
+    assert rebuilt["directions"][direction["direction_semantic_hash"]]["budget"]["consumed"] == 1
 
 
 def test_duplicate_attempt_completion_does_not_double_count(tmp_path: Path) -> None:
@@ -30,4 +30,4 @@ def test_duplicate_attempt_completion_does_not_double_count(tmp_path: Path) -> N
     trial = ledger.state()["trial_results"][attempt["attempt_id"]]
     ledger.complete_attempt(trial)
     assert completed["attempt_id"] == attempt["attempt_id"]
-    assert ledger.state()["directions"][direction["direction_hash"]]["budget"]["consumed"] == 1
+    assert ledger.state()["directions"][direction["direction_semantic_hash"]]["budget"]["consumed"] == 1

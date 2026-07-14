@@ -1,5 +1,14 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-14 M1.1 Authoritative State And S3 Transaction Hardening
+
+- Replaced JSON event files with one SQLite-WAL Event v2 store using transactional sequence allocation, strict type-specific payload validation, event/hash-chain verification, and deterministic rebuilds.
+- Split direction and variant semantic identities from complete specification hashes; IDs and lineage no longer create fake scientific novelty.
+- Constrained the attempt state machine, froze identities/budget fields, retained repair/pause reservations, and required explicit abandonment before release.
+- Changed S3 to typed observations, pure pre-commit validation, and one atomic finalization event containing TrialResult, terminal attempt state, budget update, RouteOutcome, and optional five-result aggregate.
+- Enforced `consumed + reserved <= 5`, `execution_width=1`, one standard outcome per variant semantic hash, closed-direction rejection, and bootstrap/standard identity separation.
+- Added concurrency, tamper, crash-before-projection, idempotency, phase-consistency, bootstrap-to-standard, abandonment, and sixth-outcome adversarial coverage.
+
 ## 2026-07-13 C2C Bootstrap GPT-5.6 Terra XHigh
 
 - Configured `c2c_bootstrap_s3_20260713_1` to use `gpt-5.6-terra` with `reasoning_effort: xhigh` for the global LLM client, all configured reasoning agents, S1 evidence/novelty agents, and S2.5 code patching.

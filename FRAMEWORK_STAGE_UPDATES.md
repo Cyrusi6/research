@@ -2872,3 +2872,10 @@ uv run pytest -q tests/test_validators.py tests/test_c2c.py tests/test_pipeline.
 - Removed old ideas/direction-decision/next-variant/attempt-ledger/route-decision authorities and fallback functions.
 - Removed legacy v1 variant loading and legacy C2C debate selection.
 - Removed independent route decisions from orchestrator, route policy, and S2 adaptive policy.
+
+## 2026-07-14 M1.1 权威状态层与 S3 提交事务
+
+- 2026-07-14 M1.1 replaces the prior S1-S3 event/snapshot implementation with SQLite WAL Event v2 as the only authority. DirectionSpec v3, VariantSpec v4, AttemptRecord v2, TrialResult v2, and RouteOutcome v2 are breaking contracts; v1 workspaces must rerun from S1.
+- S3 now validates typed ExecutionObservation drafts before committing. TrialResult, terminal attempt state, reservation/budget mutation, route, and the fifth-outcome aggregate are one atomic domain event.
+- The reducer enforces continuous hash-chained events, explicit attempt transitions, repair revision history, retained reservations, explicit abandonment, standard `consumed + reserved <= 5`, and no reopening of closed semantic directions.
+- Standard deterministic generic and C2C simulation generate five scientifically distinct intervention configurations. Bootstrap remains one verified non-budget proxy and cannot collide with standard attempt identity.

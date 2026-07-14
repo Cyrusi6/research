@@ -483,7 +483,7 @@ def _s3_proxy_report(proxy_decision: dict[str, Any], worthiness: dict[str, Any])
 
 
 def _attempt_ledger_report(attempt_ledger: dict[str, Any], current_direction: dict[str, Any]) -> dict[str, Any]:
-    direction_hash = attempt_ledger.get("current_direction_hash") if isinstance(attempt_ledger, dict) else None
+    direction_hash = attempt_ledger.get("current_direction_semantic_hash") if isinstance(attempt_ledger, dict) else None
     direction_state = ((attempt_ledger.get("directions") or {}).get(direction_hash) or {}) if direction_hash else {}
     budget = direction_state.get("budget") if isinstance(direction_state.get("budget"), dict) else {}
     attempts = attempt_ledger.get("attempts") if isinstance(attempt_ledger.get("attempts"), dict) else {}

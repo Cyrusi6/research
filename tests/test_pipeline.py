@@ -180,6 +180,13 @@ def test_simulated_pipeline_runs_to_completion(monkeypatch, tmp_path: Path) -> N
     assert s3_contract["gate"]["report_path"] == "experiment/gate_report.json"
     references_manifest = json.loads((tmp_path / project_id / "references" / "papers" / "manifest.json").read_text(encoding="utf-8"))
     assert references_manifest["papers"]
+    research_state = json.loads((tmp_path / project_id / "meta" / "research_state.json").read_text(encoding="utf-8"))
+    standard_history = [item for item in research_state["method_tried_history"] if item.get("consumes_direction_budget")]
+    assert len(standard_history) == 5
+    assert len({item["variant_semantic_hash"] for item in standard_history}) == 5
+    aggregate = research_state["latest_direction_aggregate"]
+    assert aggregate["outcomes"] and len(aggregate["outcomes"]) == 5
+    assert research_state["directions"][aggregate["direction_semantic_hash"]]["budget"] == {"target": 5, "reserved": 0, "consumed": 5}
 
 
 def test_real_mode_blocks_at_experiment_stage(monkeypatch, tmp_path: Path) -> None:

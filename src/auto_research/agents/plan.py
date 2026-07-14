@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import tempfile
 import time
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
@@ -60,14 +61,14 @@ class PlanAgent:
         ideas = [direction_planner_seed(direction)]
         selected = next((idea for idea in ideas if idea.get("selected")), ideas[0])
         research_state = read_json(self.context.project_root / "meta" / "research_state.json", default={}) or {}
-        direction_budget = (((research_state.get("directions") or {}).get(direction.get("direction_hash")) or {}).get("budget") or {})
+        direction_budget = (((research_state.get("directions") or {}).get(direction.get("direction_semantic_hash")) or {}).get("budget") or {})
         variant_index = int(direction_budget.get("consumed", 0)) + 1
         selected = dict(selected)
         selected["id"] = f"{direction['direction_id']}-variant-{variant_index}"
         selected["variant_id"] = selected["id"]
-        selected["variation_coordinates"] = {"intervention": f"sequential_method_variant_{variant_index}"}
-        selected["algorithm_operations"] = [f"apply sequential method variant {variant_index}"]
-        selected["config_overrides"] = {"variant_index": variant_index}
+        selected["variation_coordinates"] = {"intervention": {"strength": variant_index}}
+        selected["algorithm_operations"] = ["apply mediator-aware routing", f"set intervention strength to {variant_index}"]
+        selected["config_overrides"] = {"intervention_strength": variant_index}
         selected.setdefault("s1_direction_id", direction.get("direction_id"))
         selected.setdefault("direction_id", direction.get("direction_id"))
         selected.setdefault("mechanism_axis", direction.get("mechanism_axis"))
@@ -140,6 +141,13 @@ class PlanAgent:
         selected["variant_fingerprint"] = selected.get("variant_fingerprint") or variant_fingerprint
         plan["project_root"] = str(self.context.project_root)
         variant_contract = build_variant_contract(direction=direction, variant=selected, plan=plan, mode="generic")
+        ledger = ResearchEventLedger(self.context.project_root)
+        ledger.select_direction(direction, event_id=f"direction:{direction['direction_spec_hash']}")
+        ledger.plan_variant(
+            variant_contract,
+            feedback_from_attempt_ids=list((variant_contract.get("lineage") or {}).get("feedback_from_attempt_ids") or []),
+            event_id=f"variant:{variant_contract['variant_spec_hash']}",
+        )
         variant_fingerprint_artifact = build_variant_fingerprint_artifact(
             direction=direction,
             variant=selected,
@@ -299,26 +307,6 @@ class PlanAgent:
         next_variant = variant_selection.get("next_variant") if isinstance(variant_selection.get("next_variant"), dict) else {}
         selected = next((idea for idea in ideas if idea.get("selected")), ideas[0])
         selected["selected"] = True
-        profile = str(((self.context.config.get("orchestration") or {}).get("profile") or "standard")).lower()
-        if profile == "standard":
-            research_state = read_json(self.context.project_root / "meta" / "research_state.json", default={}) or {}
-            direction_state = ((research_state.get("directions") or {}).get(s1_direction.get("direction_hash")) or {})
-            consumed = int(((direction_state.get("budget") or {}).get("consumed") or 0))
-            if consumed:
-                planner_candidate_id = str(selected.get("id") or selected.get("variant_id") or "candidate")
-                variant_id = f"{s1_direction['direction_id']}-variant-{consumed + 1}"
-                retargeted = _replace_variant_identity_strings(selected, planner_candidate_id, variant_id)
-                selected.clear()
-                selected.update(retargeted)
-                selected["id"] = variant_id
-                selected["variant_id"] = variant_id
-                selected["variation_coordinates"] = {
-                    "intervention": variant_id,
-                }
-                variant_selection["candidate_pool"] = [selected]
-                variant_selection["selected_ideas"] = [selected]
-                variant_selection["next_variant"] = selected
-                variant_selection["selected_variant_id"] = variant_id
         selected.setdefault("s1_direction_id", s1_direction.get("direction_id"))
         selected.setdefault("direction_id", s1_direction.get("direction_id"))
         selected.setdefault("mechanism_axis", s1_direction.get("mechanism_axis"))
@@ -528,6 +516,14 @@ class PlanAgent:
             selected["expected_files"] = list(s1_direction.get("expected_files") or [])
         _sanitize_c2c_variant_expected_files(selected, s1_direction, self.context.config)
         _ensure_c2c_s2_config_overrides(selected)
+        if bool((self.context.config.get("experiment") or {}).get("simulate")):
+            research_state = read_json(self.context.project_root / "meta" / "research_state.json", default={}) or {}
+            budget = (((research_state.get("directions") or {}).get(s1_direction.get("direction_semantic_hash")) or {}).get("budget") or {})
+            ordinal = int(budget.get("consumed", 0)) + 1
+            selected = deepcopy(selected)
+            selected["variation_coordinates"] = {"intervention": {"utility_temperature": ordinal}}
+            selected["algorithm_operations"] = list(selected.get("algorithm_operations") or []) + [f"set utility temperature to {ordinal}"]
+            selected["config_overrides"] = {**(selected.get("config_overrides") or {}), "utility_temperature": ordinal}
         if isinstance(selected.get("experiment_contract"), dict) and not selected["experiment_contract"].get("expected_files") and selected.get("expected_files"):
             selected["experiment_contract"]["expected_files"] = list(selected.get("expected_files") or [])
         if not selected.get("variant_fingerprint"):
@@ -697,24 +693,12 @@ class PlanAgent:
         )
         if planner_gate_report.get("gate") == "pass":
             ledger = ResearchEventLedger(self.context.project_root)
-            ledger.select_direction(s1_direction, event_id=f"direction:{s1_direction['direction_hash']}")
+            ledger.select_direction(s1_direction, event_id=f"direction:{s1_direction['direction_spec_hash']}")
             ledger.plan_variant(
                 variant_contract,
                 feedback_from_attempt_ids=list((variant_contract.get("lineage") or {}).get("feedback_from_attempt_ids") or []),
                 event_id=f"variant:{variant_contract['variant_spec_hash']}",
             )
-            profile = str(((self.context.config.get("orchestration") or {}).get("profile") or "standard")).lower()
-            planned_hash = canonical_hash({"variant_spec_hash": variant_contract["variant_spec_hash"], "implementation": "planned"})
-            attempt = ledger.reserve_attempt(
-                profile=profile,
-                direction=s1_direction,
-                variant=variant_contract,
-                implementation_hash=planned_hash,
-                attempt_input_hash=canonical_hash({"implementation_hash": planned_hash, "trial_spec": plan}),
-                attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full",
-                event_id=f"attempt-reservation:{s1_direction['direction_hash']}:{variant_contract['variant_spec_hash']}",
-            )
-            ledger.transition_attempt(attempt["attempt_id"], "IMPLEMENTING")
             implementation_contract = build_s2_implementation_contract(
                 direction=s1_direction,
                 selected_variant=next_variant or selected,
@@ -729,13 +713,6 @@ class PlanAgent:
                 planner_gate_report,
                 variant_fingerprint_artifact,
             )
-            patch_status = str(code_patch_manifest.get("status") or "")
-            if code_patch_manifest.get("resource_retry") is True or "resource" in patch_status:
-                ledger.transition_attempt(attempt["attempt_id"], "RESOURCE_PAUSED", changes={"implementation_hash": canonical_hash(code_patch_manifest)})
-            elif patch_status in {"ok", "disabled"} and int(code_patch_manifest.get("valid_patch_count") or 0) >= (0 if patch_status == "disabled" else 1):
-                ledger.transition_attempt(attempt["attempt_id"], "READY", changes={"implementation_hash": canonical_hash(code_patch_manifest)})
-            else:
-                ledger.transition_attempt(attempt["attempt_id"], "IMPLEMENTATION_REPAIR", changes={"implementation_hash": canonical_hash(code_patch_manifest)})
         else:
             code_patch_manifest = {
                 "status": "planner_gate_failed",
@@ -3074,19 +3051,6 @@ def _ensure_c2c_s2_config_overrides(idea: dict[str, Any]) -> None:
     }
 
 
-def _replace_variant_identity_strings(value: Any, old: str, new: str) -> Any:
-    if isinstance(value, dict):
-        return {
-            (str(key).replace(old, new) if isinstance(key, str) else key): _replace_variant_identity_strings(item, old, new)
-            for key, item in value.items()
-        }
-    if isinstance(value, list):
-        return [_replace_variant_identity_strings(item, old, new) for item in value]
-    if isinstance(value, str):
-        return value.replace(old, new)
-    return value
-
-
 def _load_s2_5_repair_dispatch(project_root: Path) -> dict[str, Any]:
     dispatch_path = project_root / "plan" / "s2_5_repair_dispatch.json"
     if not dispatch_path.exists():
@@ -3627,7 +3591,8 @@ def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any]) -> dict
     return {
         "schema_version": "auto_research_trial_spec_v1",
         "direction_id": variant.get("direction_id"),
-        "direction_hash": variant.get("direction_hash"),
+        "direction_semantic_hash": variant.get("direction_semantic_hash"),
+        "direction_spec_hash": variant.get("direction_spec_hash"),
         "variant_id": variant.get("variant_id"),
         "variant_spec_hash": variant.get("variant_spec_hash"),
         "protocol": {

@@ -29,16 +29,16 @@ class S2GateValidator(StageGateValidator):
             return self.finalize()
         state = read_json(self.project_root / "meta" / "research_state.json", default={}) or {}
         tried = [item for item in state.get("method_tried_history") or [] if isinstance(item, dict)]
-        errors = contract_errors(variant, "variant_v3.schema.json")
+        errors = contract_errors(variant, "variant_v4.schema.json")
         try:
             validate_direction_identity(direction)
             validate_variant_identity(direction, variant, tried_variants=tried)
         except ValueError as exc:
             errors.append(str(exc))
         if errors:
-            self.retry_check("variant_v3", "VariantSpec v3 validation failed", artifact="plan/variant.json", details={"errors": errors[:20]})
+            self.retry_check("variant_v4", "VariantSpec v4 validation failed", artifact="plan/variant.json", details={"errors": errors[:20]})
         else:
-            self.pass_check("variant_v3", artifact="plan/variant.json", details={"variant_id": variant["variant_id"], "variant_spec_hash": variant["variant_spec_hash"]})
+            self.pass_check("variant_v4", artifact="plan/variant.json", details={"variant_id": variant["variant_id"], "variant_semantic_hash": variant["variant_semantic_hash"], "variant_spec_hash": variant["variant_spec_hash"]})
         if not isinstance(trial_spec.get("execution"), dict) or not isinstance(trial_spec.get("metrics"), list):
             self.retry_check("trial_spec", "TrialSpec must define execution and metrics", artifact="plan/trial_spec.json")
         else:

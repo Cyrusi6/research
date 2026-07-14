@@ -345,7 +345,7 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
             "lineage": {
                 "s2_run_id": "s2-test",
                 "iteration": 1,
-                "direction_spec_hash": direction["direction_hash"],
+                "direction_spec_hash": direction["direction_spec_hash"],
                 "feedback_from_attempt_ids": [],
             },
         },
@@ -368,7 +368,8 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
         {
             "schema_version": "auto_research_trial_spec_v1",
             "direction_id": direction_id,
-            "direction_hash": direction["direction_hash"],
+            "direction_semantic_hash": direction["direction_semantic_hash"],
+            "direction_spec_hash": direction["direction_spec_hash"],
             "variant_id": variant["variant_id"],
             "variant_spec_hash": variant["variant_spec_hash"],
             "metrics": [{"name": "three_dataset_mean", "primary": True}],
@@ -5498,6 +5499,13 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     variant_contract = json.loads((root / "plan/variant.json").read_text(encoding="utf-8"))
     assert variant_contract["direction_id"] == "utility_predicted_cache_routing"
     assert variant_contract["ablation"]["switch"]
+    research_state = json.loads((root / "meta/research_state.json").read_text(encoding="utf-8"))
+    standard_history = [item for item in research_state["method_tried_history"] if item.get("consumes_direction_budget")]
+    assert len(standard_history) == 5
+    assert len({item["variant_semantic_hash"] for item in standard_history}) == 5
+    aggregate = research_state["latest_direction_aggregate"]
+    assert len(aggregate["outcomes"]) == 5
+    assert research_state["directions"][aggregate["direction_semantic_hash"]]["budget"] == {"target": 5, "reserved": 0, "consumed": 5}
     debate = json.loads((root / "literature/direction_analysis.json").read_text(encoding="utf-8"))
     assert debate["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     constraints = json.loads((root / "literature/negative_constraints.json").read_text(encoding="utf-8"))

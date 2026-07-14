@@ -74,14 +74,14 @@ def build_s2_feedback_context(
     """Build planner feedback only from event-derived method outcomes."""
 
     direction_id = str(direction.get("direction_id") or "unknown_direction")
-    direction_hash = str(direction.get("direction_hash") or "")
+    direction_hash = str(direction.get("direction_semantic_hash") or "")
     registry = read_yaml(project_root / "meta" / "registry.yaml", default={}) or {}
     state = read_json(project_root / "meta" / "research_state.json", default={}) or {}
     route_outcome = read_json(project_root / "meta" / "route_outcome.json", default={}) or {}
     proxy_calibration_policy = read_json(project_root / "experiment" / "results" / "c2c_proxy_calibration_policy.json", default={}) or {}
     method_history = [
         item for item in state.get("method_tried_history") or []
-        if isinstance(item, dict) and item.get("method_evaluable") and item.get("direction_hash") == direction_hash
+        if isinstance(item, dict) and item.get("method_evaluable") and item.get("direction_semantic_hash") == direction_hash
     ]
     attempts = state.get("attempts") if isinstance(state.get("attempts"), dict) else {}
     recent_failures = []
@@ -115,7 +115,7 @@ def build_s2_feedback_context(
             "same_direction_proxy_failures": sum(1 for item in recent_failures if "proxy" in str(item.get("failure_class") or "")),
             "same_direction_full_s3_failures": sum(1 for item in recent_failures if item.get("outcome_classification") in {"rejected", "falsified"}),
             "patch_repairs": len(implementation_failures),
-            "resource_retries": sum(1 for attempt in attempts.values() if isinstance(attempt, dict) and attempt.get("direction_hash") == direction_hash and attempt.get("state") == "RESOURCE_PAUSED"),
+            "resource_retries": sum(1 for attempt in attempts.values() if isinstance(attempt, dict) and attempt.get("direction_semantic_hash") == direction_hash and attempt.get("state") == "RESOURCE_PAUSED"),
             "max_same_direction_proxy_failures": 5,
             "max_same_direction_full_s3_failures": 5,
             "max_patch_repair_attempts": None,

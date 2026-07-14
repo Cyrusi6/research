@@ -28,8 +28,16 @@ from ..s3_proxy_contracts import (
     build_c2c_proxy_decision_report,
 )
 from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, sha256_file, write_json
-from ..domain_contracts import attempt_input_hash, canonical_hash, implementation_hash, validate_direction_identity, validate_variant_identity
-from ..research_state import ResearchEventLedger, build_trial_result
+from ..domain_contracts import (
+    EXECUTION_OBSERVATION_SCHEMA_VERSION,
+    attempt_input_hash,
+    canonical_hash,
+    classify_trial_result,
+    implementation_hash,
+    validate_direction_identity,
+    validate_variant_identity,
+)
+from ..research_state import IntegrityError, ResearchEventLedger
 from .base import AgentContext
 
 
@@ -60,7 +68,7 @@ class ExperimentAgent:
         ledger = ResearchEventLedger(self.context.project_root)
         tried = [item for item in ledger.state().get("method_tried_history") or [] if isinstance(item, dict)]
         validate_variant_identity(direction, variant, tried_variants=tried)
-        ledger.select_direction(direction, event_id=f"direction:{direction['direction_hash']}")
+        ledger.select_direction(direction, event_id=f"direction:{direction['direction_spec_hash']}")
         ledger.plan_variant(
             variant,
             feedback_from_attempt_ids=list((variant.get("lineage") or {}).get("feedback_from_attempt_ids") or []),
@@ -77,13 +85,18 @@ class ExperimentAgent:
         sample_manifest = trial_spec.get("sample_manifest") if isinstance(trial_spec.get("sample_manifest"), dict) else {"datasets": trial_spec.get("datasets") or []}
         seed_values = ((trial_spec.get("statistical_testing") or {}).get("seeds") or self.context.config.get("experiment", {}).get("random_seeds") or [42])
         seeds = [int(item) for item in seed_values]
+        protocol_hash = canonical_hash(protocol)
+        sample_manifest_hash = canonical_hash(sample_manifest)
+        runtime_config = trial_spec.get("execution") if isinstance(trial_spec.get("execution"), dict) else {}
+        runtime_config_hash = canonical_hash(runtime_config)
+        evaluator_hash = canonical_hash(trial_spec.get("metrics") or variant.get("expected_metric_signature") or {})
         input_hash = attempt_input_hash(
             implementation_hash_value=implementation_hash_value,
             protocol=protocol,
             sample_manifest=sample_manifest,
             seeds=seeds,
-            runtime_config=trial_spec.get("execution") if isinstance(trial_spec.get("execution"), dict) else {},
-            evaluator_hash=canonical_hash(trial_spec.get("metrics") or variant.get("expected_metric_signature") or {}),
+            runtime_config=runtime_config,
+            evaluator_hash=evaluator_hash,
         )
         profile = str(((self.context.config.get("orchestration") or {}).get("profile") or "standard")).lower()
         attempt = ledger.reserve_attempt(
@@ -93,9 +106,12 @@ class ExperimentAgent:
             implementation_hash=implementation_hash_value,
             attempt_input_hash=input_hash,
             attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full",
-            event_id=f"attempt-reservation:{direction['direction_hash']}:{variant['variant_spec_hash']}",
+            protocol_hash=protocol_hash,
+            sample_manifest_hash=sample_manifest_hash,
+            runtime_config_hash=runtime_config_hash,
+            evaluator_hash=evaluator_hash,
+            seeds=seeds,
         )
-        ledger.transition_attempt(attempt["attempt_id"], "READY")
         plan = trial_spec
         execution = plan.get("execution", {})
         simulate = bool(self.context.config.get("experiment", {}).get("simulate"))
@@ -109,7 +125,20 @@ class ExperimentAgent:
             )
         else:
             revision_record = None
-        ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", changes={"phases": {"proxy": "RUNNING", "full": "PENDING"}})
+        if attempt["state"] == "IMPLEMENTATION_REPAIR":
+            state = ledger.state()
+            route = state.get("last_route_outcome") if isinstance(state.get("last_route_outcome"), dict) else {}
+            return {
+                "artifacts": [env_record["path"]],
+                "status": "blocked",
+                "blocked_reason": "Implementation repair produced no new frozen implementation revision.",
+                "attempt": attempt,
+                "route_outcome": route,
+            }
+        if attempt["state"] in {"READY", "RESOURCE_PAUSED"}:
+            attempt = ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
+        elif attempt["state"] != "PROXY_RUNNING":
+            raise IntegrityError(f"attempt {attempt['attempt_id']} cannot resume execution from {attempt['state']}")
 
         if execution.get("collector") == "c2c_small_loop":
             result = self._run_c2c_small_loop(plan, execution, env_record["path"], revision_record["path"] if revision_record else None)
@@ -155,71 +184,50 @@ class ExperimentAgent:
                     result = self._collect_laps_eval_results(log_path, env_record["path"], revision_record["path"] if revision_record else None)
                 else:
                     result = {"artifacts": [env_record["path"]], "status": "blocked", "blocked_reason": "No supported result collector was available."}
-        return self._finalize_trial(result, attempt=attempt, input_hash=input_hash, protocol=protocol, ledger=ledger)
+        return self._finalize_trial(result, attempt=attempt, trial_spec=trial_spec, ledger=ledger)
 
     def _finalize_trial(
         self,
         result: dict[str, Any],
         *,
         attempt: dict[str, Any],
-        input_hash: str,
-        protocol: dict[str, Any],
+        trial_spec: dict[str, Any],
         ledger: ResearchEventLedger,
     ) -> dict[str, Any]:
         main_results = read_json(self.context.project_root / "experiment" / "results" / "main_results.json", default={}) or {}
-        acceptance = main_results.get("acceptance") if isinstance(main_results.get("acceptance"), dict) else {}
-        candidate_results = [item for item in main_results.get("candidate_results") or [] if isinstance(item, dict)]
-        observations = [item.get("metrics") or item for item in candidate_results]
-        proposed = main_results.get("proposed_method") if isinstance(main_results.get("proposed_method"), dict) else {}
-        if proposed:
-            observations.append(proposed)
-        reason = str(result.get("blocked_reason") or result.get("reason") or "").lower()
-        resource_failure = any(token in reason for token in ["resource", "gpu", "oom", "out of memory"])
-        integrity_failure = any(token in reason for token in ["integrity", "identity", "hash mismatch", "safety"])
-        implementation_failure = any(token in reason for token in ["patch", "implementation", "activation", "wiring", "static validation"])
-        method_evaluable = bool(candidate_results or proposed) and not resource_failure and not integrity_failure and not implementation_failure
-        if acceptance.get("passed") is True:
-            outcome = "accepted"
-        elif method_evaluable:
-            outcome = "rejected"
-        elif resource_failure:
-            outcome = "resource_paused"
-        elif integrity_failure:
-            outcome = "integrity_blocked"
-        elif "activation" in reason or "wiring" in reason:
-            outcome = "activation_failed"
-        else:
-            outcome = "implementation_failed"
         raw_artifacts = {}
         for rel_path in result.get("artifacts") or []:
             artifact_path = self.context.project_root / rel_path
             if artifact_path.exists() and artifact_path.is_file():
                 raw_artifacts[str(rel_path)] = sha256_file(artifact_path)
-        ablations = read_json(self.context.project_root / "experiment" / "results" / "ablation_results.json", default=[]) or []
-        trial = build_trial_result(
-            attempt=attempt,
-            protocol_hash=canonical_hash(protocol),
-            input_hash=input_hash,
-            completeness="proxy" if attempt["profile"] == "bootstrap" else "full" if method_evaluable else "partial",
-            observed_datasets=[str(item) for item in main_results.get("datasets") or []],
-            raw_artifacts=raw_artifacts,
-            proxy_observations=observations if attempt["profile"] == "bootstrap" else [],
-            full_observations=observations if attempt["profile"] != "bootstrap" else [],
-            ablation_observations=[item for item in ablations if isinstance(item, dict)],
-            method_evaluable=method_evaluable,
-            outcome_classification=outcome,
-            failure_classification=None if method_evaluable else outcome,
-        )
-        trial_record = self.context.artifacts.write_json(
-            self.stage_key,
-            "results/trial_result.json",
-            trial,
-            artifact_type="trial_result",
-            summary="Canonical S3 TrialResult bound to the reserved attempt",
-            source_paths=list(raw_artifacts),
-        )
+        observations = _typed_execution_observations(main_results, trial_spec, attempt, raw_artifacts)
+        if not observations:
+            failure_class = _structured_failure_class(result, main_results)
+            completed_attempt, route = ledger.disposition_attempt(attempt["attempt_id"], failure_class=failure_class, artifact_hashes=raw_artifacts)
+            result["attempt"] = completed_attempt
+            result["route_outcome"] = route
+            return result
+        try:
+            trial = classify_trial_result(attempt=attempt, trial_spec=trial_spec, observations=observations, raw_artifacts=raw_artifacts)
+            ledger.validate_trial_precommit(trial)
+        except (ValueError, IntegrityError) as exc:
+            quarantine = self.context.artifacts.write_json(
+                self.stage_key,
+                f"quarantine/{attempt['attempt_id']}.json",
+                {"attempt_id": attempt["attempt_id"], "error": str(exc), "observations": observations, "raw_artifacts": raw_artifacts},
+                artifact_type="invalid_trial_draft",
+                summary="Rejected S3 TrialResult draft; not canonical",
+                source_paths=list(raw_artifacts),
+            )
+            result.setdefault("artifacts", []).append(quarantine["path"])
+            result["status"] = "blocked"
+            result["blocked_reason"] = f"S3 pre-commit validation failed: {exc}"
+            return result
+        if trial["completeness"] == "full":
+            ledger.transition_attempt(attempt["attempt_id"], "PROXY_COMPLETED", phase="proxy", phase_state="COMPLETED")
+            ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
         completed_attempt, route = ledger.complete_attempt(trial)
-        result.setdefault("artifacts", []).append(trial_record["path"])
+        result.setdefault("artifacts", []).append("experiment/results/trial_result.json")
         result["attempt"] = completed_attempt
         result["route_outcome"] = route
         return result
@@ -6303,3 +6311,88 @@ def _short_error(exc: Exception, *, limit: int = 500) -> str:
     if len(text) > limit:
         return text[:limit] + "...[truncated]"
     return text
+def _typed_execution_observations(
+    main_results: dict[str, Any],
+    trial_spec: dict[str, Any],
+    attempt: dict[str, Any],
+    raw_artifacts: dict[str, str],
+) -> list[dict[str, Any]]:
+    if not raw_artifacts:
+        return []
+    artifact_hash = raw_artifacts.get("experiment/results/main_results.json") or next(iter(raw_artifacts.values()))
+    datasets = []
+    sample_manifest = trial_spec.get("sample_manifest") if isinstance(trial_spec.get("sample_manifest"), dict) else {}
+    for item in sample_manifest.get("datasets") or trial_spec.get("datasets") or []:
+        value = item.get("name") if isinstance(item, dict) else item
+        if value:
+            datasets.append(str(value))
+    datasets = sorted(set(datasets))
+    if not datasets:
+        return []
+    primary = next((item for item in trial_spec.get("metrics") or [] if isinstance(item, dict) and item.get("primary")), {})
+    metric_id = str(primary.get("name") or primary.get("metric_id") or "primary_metric")
+    phase = "proxy" if attempt["attempt_kind"] in {"proxy", "bootstrap_proxy"} else "full"
+    baseline_values, candidate_values = _metric_values_by_dataset(main_results, datasets)
+    if set(candidate_values) != set(datasets):
+        return []
+    observations = []
+    for role, values in [("baseline", baseline_values), ("candidate", candidate_values)]:
+        for dataset_id, metric_value in values.items():
+            if not isinstance(metric_value, (int, float)) or isinstance(metric_value, bool):
+                return []
+            observations.append(
+                {
+                    "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+                    "phase": phase,
+                    "role": role,
+                    "command_status": "completed",
+                    "dataset_id": dataset_id,
+                    "metric_id": metric_id,
+                    "metric_value": float(metric_value),
+                    "sample_manifest_hash": attempt["sample_manifest_hash"],
+                    "evaluator_hash": attempt["evaluator_hash"],
+                    "seed": int(attempt["seeds"][0]),
+                    "raw_artifact_hash": artifact_hash,
+                }
+            )
+    return observations
+
+
+def _metric_values_by_dataset(main_results: dict[str, Any], datasets: list[str]) -> tuple[dict[str, float], dict[str, float]]:
+    baseline = main_results.get("baseline") if isinstance(main_results.get("baseline"), dict) else {}
+    best = main_results.get("best_candidate") if isinstance(main_results.get("best_candidate"), dict) else {}
+    proposed = main_results.get("proposed_method") if isinstance(main_results.get("proposed_method"), dict) else {}
+    baseline_datasets = baseline.get("datasets") if isinstance(baseline.get("datasets"), dict) else {}
+    best_metrics = best.get("metrics") if isinstance(best.get("metrics"), dict) else {}
+    candidate_datasets = best_metrics.get("datasets") if isinstance(best_metrics.get("datasets"), dict) else {}
+    if baseline_datasets and candidate_datasets:
+        return (
+            {dataset: float(baseline_datasets[dataset]) for dataset in datasets if dataset in baseline_datasets},
+            {dataset: float(candidate_datasets[dataset]) for dataset in datasets if dataset in candidate_datasets},
+        )
+    baseline_primary = baseline.get("primary_metric") if isinstance(baseline.get("primary_metric"), dict) else {}
+    proposed_primary = proposed.get("primary_metric") if isinstance(proposed.get("primary_metric"), dict) else {}
+    if isinstance(baseline_primary.get("mean"), (int, float)) and isinstance(proposed_primary.get("mean"), (int, float)):
+        return ({dataset: float(baseline_primary["mean"]) for dataset in datasets}, {dataset: float(proposed_primary["mean"]) for dataset in datasets})
+    candidate_results = [item for item in main_results.get("candidate_results") or [] if isinstance(item, dict)]
+    viable = next((item for item in candidate_results if isinstance(item.get("metrics"), dict)), None)
+    baseline_control = main_results.get("baseline_control") if isinstance(main_results.get("baseline_control"), dict) else {}
+    if viable and isinstance(viable["metrics"].get("rsum"), (int, float)) and isinstance(baseline_control.get("rsum"), (int, float)):
+        return ({dataset: float(baseline_control["rsum"]) for dataset in datasets}, {dataset: float(viable["metrics"]["rsum"]) for dataset in datasets})
+    return {}, {}
+
+
+def _structured_failure_class(result: dict[str, Any], main_results: dict[str, Any]) -> str:
+    explicit = result.get("failure_class") or result.get("failure_classification")
+    if explicit in {"resource_paused", "oom_retry", "resource_unavailable", "integrity", "safety", "identity_mismatch", "artifact_hash_mismatch", "activation_failed", "implementation_failed"}:
+        return str(explicit)
+    candidates = [item for item in main_results.get("candidate_results") or [] if isinstance(item, dict)]
+    if any(item.get("resource_retry") is True or item.get("command_status") == "resource_paused" for item in candidates):
+        return "resource_paused"
+    if any(item.get("decision") in {"patch_rejected", "proxy_repairable"} for item in candidates):
+        return "activation_failed"
+    if result.get("status") == "integrity_blocked":
+        return "integrity"
+    if result.get("status") == "resource_paused":
+        return "resource_paused"
+    return "implementation_failed"

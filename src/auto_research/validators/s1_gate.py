@@ -31,15 +31,15 @@ class S1GateValidator(StageGateValidator):
             self.retry_check("s1_authoritative_json", "S1 authoritative artifacts must be JSON objects")
             return self.finalize()
 
-        errors = contract_errors(direction, "direction_v2.schema.json")
+        errors = contract_errors(direction, "direction_v3.schema.json")
         try:
             validate_direction_identity(direction)
         except ValueError as exc:
             errors.append(str(exc))
         if errors:
-            self.retry_check("direction_v2", "DirectionSpec v2 validation failed", artifact="literature/direction.json", details={"errors": errors[:20]})
+            self.retry_check("direction_v3", "DirectionSpec v3 validation failed", artifact="literature/direction.json", details={"errors": errors[:20]})
         else:
-            self.pass_check("direction_v2", artifact="literature/direction.json", details={"direction_id": direction["direction_id"], "direction_hash": direction["direction_hash"]})
+            self.pass_check("direction_v3", artifact="literature/direction.json", details={"direction_id": direction["direction_id"], "direction_semantic_hash": direction["direction_semantic_hash"], "direction_spec_hash": direction["direction_spec_hash"]})
 
         self._schema_check("evidence_bundle", evidence, "evidence_bundle.schema.json", "literature/evidence_bundle.json")
         self._schema_check("direction_scorecard", scorecard, "direction_scorecard.schema.json", "literature/direction_scorecard.json")

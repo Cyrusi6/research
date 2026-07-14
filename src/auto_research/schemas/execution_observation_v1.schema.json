@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "phase",
+    "role",
+    "command_status",
+    "dataset_id",
+    "metric_id",
+    "metric_value",
+    "sample_manifest_hash",
+    "evaluator_hash",
+    "seed",
+    "raw_artifact_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "auto_research_execution_observation_v1"
+    },
+    "phase": {
+      "enum": [
+        "proxy",
+        "full",
+        "ablation"
+      ]
+    },
+    "role": {
+      "enum": [
+        "baseline",
+        "candidate",
+        "ablation"
+      ]
+    },
+    "command_status": {
+      "enum": [
+        "completed",
+        "failed",
+        "partial",
+        "resource_paused",
+        "integrity_blocked"
+      ]
+    },
+    "dataset_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "metric_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "metric_value": {
+      "type": "number"
+    },
+    "sample_manifest_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "evaluator_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "seed": {
+      "type": "integer"
+    },
+    "raw_artifact_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

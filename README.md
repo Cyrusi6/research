@@ -55,16 +55,16 @@ Bootstrap forces one S0→S1→S2→S2.5→S3 cheap-proxy traversal and stops af
 
 The breaking S1-S3 contract has one canonical artifact for each scientific identity:
 
-- `literature/direction.json`: `DirectionSpec v2`, containing the research question, causal invariants, falsification conditions, benchmark identity, and allowed variant space. It never embeds a fixed implementation variant.
-- `plan/variant.json`: `VariantSpec v3`, containing exactly one intervention inside the current direction's mutable axes.
-- `meta/attempts/<attempt_id>.json`: `AttemptRecord v1`, derived from the immutable event ledger and reused across crash/resume and implementation repair.
-- `experiment/results/trial_result.json`: `TrialResult v1`, the only S3 result consumed by the state machine.
-- `meta/route_outcome.json`: `RouteOutcome v1`, the only routing action contract.
-- `meta/research_events/<sequence>-<event_id>.json`: immutable events; `meta/research_state.json` is a rebuildable snapshot, not an independent truth source.
+- `literature/direction.json`: `DirectionSpec v3`, with separate scientific `direction_semantic_hash` and complete `direction_spec_hash` identities.
+- `plan/variant.json`: `VariantSpec v4`, with separate method `variant_semantic_hash` and complete `variant_spec_hash` identities.
+- `meta/attempts/<attempt_id>.json`: `AttemptRecord v2`, a rebuildable projection reused across crash/resume and implementation repair.
+- `experiment/results/trial_result.json`: `TrialResult v2`, the latest committed verified result projection.
+- `meta/route_outcome.json`: `RouteOutcome v2`, the latest deterministic route projection.
+- `meta/research_events.sqlite3`: the sole authoritative Event v2 SQLite-WAL store; snapshots, attempts, results, routes, and aggregates are rebuildable projections.
 
-The `standard` profile executes five sequential method-evaluable variants under one unchanged `direction_id` and `direction_hash` with `execution_width=1` and `stop_on_success=false`. Patch generation failures, static validation failures, activation wiring failures, resource pauses, and OOM retries release their reserved slot. A proxy or full result consumes exactly one slot only when the reducer records `method_evaluable=true`. Outcomes 1–4 route to `PROPOSE_NEXT_VARIANT`; outcome 5 routes to `FINISH_DIRECTION` when any variant meets acceptance, otherwise `START_NEW_DIRECTION`. A sixth variant cannot be reserved.
+The `standard` profile executes five sequential method-evaluable variants under one unchanged direction with `execution_width=1` and `stop_on_success=false`. Patch/static/activation failures, resource pauses, and OOM retries do not consume an outcome; their reservation remains until repair or explicit abandonment. Only an atomically committed, typed, verified TrialResult consumes one slot. Outcomes 1–4 route to `PROPOSE_NEXT_VARIANT`; outcome 5 creates an exact five-result aggregate and closes the direction. A sixth reservation, patch, run, or outcome is rejected by the reducer.
 
-Planner pools, scorecards, patch diagnostics, proxy diagnostics, and human-readable summaries remain diagnostic artifacts only. Runtime stages do not read `plan.yaml` or infer direction/variant identity from older files. Projects without the v2/v3 canonical artifacts must restart from S1; no legacy loader or automatic artifact migration is provided. See `docs/authoritative_s1_s3_contracts.md`.
+Planner pools, scorecards, patch diagnostics, proxy diagnostics, and human-readable summaries remain diagnostic artifacts only. Runtime stages do not infer identity or routing from those files. Projects without DirectionSpec v3, VariantSpec v4, and Event v2 authority must restart from S1; no dual-read or migration exists. See `docs/authoritative_s1_s3_contracts.md` and `docs/regression_test_migration.md`.
 
 ## Layout
 

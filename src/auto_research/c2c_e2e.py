@@ -30,7 +30,7 @@ C2C_REAL_SMOKE_RECORD_SCHEMA_VERSION = "c2c_real_smoke_record_v1"
 
 STAGE_ARTIFACT_REQUIREMENTS = {
     "S1_literature": [
-        ("literature/direction.json", "direction_v2.schema.json"),
+        ("literature/direction.json", "direction_v3.schema.json"),
         ("literature/c2c/evidence_request_plan.json", "s1_evidence_request_plan.schema.json"),
         ("literature/c2c/evidence_bundle.json", "s1_deterministic_evidence_bundle.schema.json"),
         ("literature/c2c/direction_candidate_scorecard.json", "s1_direction_candidate_scorecard.schema.json"),
@@ -39,7 +39,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("literature/c2c/direction_fingerprint.json", "s1_direction_fingerprint.schema.json"),
     ],
     "S2_plan": [
-        ("plan/variant.json", "variant_v3.schema.json"),
+        ("plan/variant.json", "variant_v4.schema.json"),
         ("plan/trial_spec.json", None),
         ("plan/s2_planner/candidate_pool.json", "s2_candidate_pool.schema.json"),
         ("plan/s2_planner/feedback_context.json", "s2_feedback_context.schema.json"),
@@ -54,7 +54,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("plan/code_patches/patch_gate_report.json", "s2_5_patch_gate_report.schema.json"),
     ],
     "S3_experiment": [
-        ("experiment/results/trial_result.json", "trial_result_v1.schema.json"),
+        ("experiment/results/trial_result.json", "trial_result_v2.schema.json"),
         ("experiment/results/c2c_proxy_baseline_fingerprint.json", "c2c_proxy_baseline_fingerprint.schema.json"),
         ("experiment/results/c2c_proxy_cache_report.json", "c2c_proxy_cache_report.schema.json"),
         ("experiment/results/c2c_effective_proxy_policy.json", "c2c_effective_proxy_policy.schema.json"),
@@ -63,7 +63,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("experiment/results/s3_candidate_selection.json", None),
     ],
     "orchestration": [
-        ("meta/route_outcome.json", "route_outcome_v1.schema.json"),
+        ("meta/route_outcome.json", "route_outcome_v2.schema.json"),
         ("meta/research_state.json", None),
         ("meta/iteration_trace.jsonl", None),
     ],
