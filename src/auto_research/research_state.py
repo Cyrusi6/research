@@ -894,7 +894,8 @@ def _apply_trial_to_state(state: dict[str, Any], trial: dict[str, Any]) -> dict[
     attempt["artifact_hashes"] = deepcopy(trial["raw_artifacts"])
     attempt["phases"][trial["completeness"]] = "COMPLETED"
     next_state["trial_results"][attempt["attempt_id"]] = trial
-    next_state["method_tried_history"].append({"attempt_id": attempt["attempt_id"], "profile": attempt["profile"], "consumes_direction_budget": attempt["consumes_direction_budget"], "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_id": attempt["variant_id"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "method_evaluable": True, "outcome_classification": trial["outcome_classification"], "trial_result_hash": canonical_hash(trial), "primary_metric_summary": trial["primary_metric_summary"]})
+    if attempt["consumes_direction_budget"]:
+        next_state["method_tried_history"].append({"attempt_id": attempt["attempt_id"], "profile": attempt["profile"], "consumes_direction_budget": True, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_id": attempt["variant_id"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "method_evaluable": True, "outcome_classification": trial["outcome_classification"], "trial_result_hash": canonical_hash(trial), "primary_metric_summary": trial["primary_metric_summary"]})
     return next_state
 
 

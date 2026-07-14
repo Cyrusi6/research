@@ -275,7 +275,7 @@ def test_s3_bootstrap_gate_is_repeatable_read_only_and_budget_isolated(tmp_path:
     assert committed_attempt["consumes_direction_budget"] is False
     assert committed_attempt["reserved_slot"] is False
     assert state["directions"][direction["direction_semantic_hash"]]["budget"] == {"target": 5, "reserved": 0, "consumed": 0}
-    assert not any(item.get("consumes_direction_budget") for item in state["method_tried_history"])
+    assert state["method_tried_history"] == []
     assert state["latest_direction_aggregate"] is None
     assert state["directions"][direction["direction_semantic_hash"]]["status"] == "ACTIVE"
     assert list(state["trial_results"]) == [attempt["attempt_id"]]
