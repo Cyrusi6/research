@@ -15,6 +15,7 @@ from test_authoritative_state_machine import _direction, _initialize, _reserve, 
 from test_m113_ledger_closure import _failure_evidence as _canonical_failure_evidence
 from test_m113_ledger_closure import _resume_evidence as _canonical_resume_evidence
 from test_pipeline import _mock_generic_s1_codex, _test_config
+from support.authoritative_evidence import start_attempt_phase
 
 
 def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class: str) -> dict:
@@ -33,8 +34,7 @@ def _routed_result(tmp_path: Path, *, variant_index: int = 1) -> tuple[ResearchE
     variant = _variant(direction, variant_index)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
-    ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
-    attempt = ledger.state()["attempts"][attempt["attempt_id"]]
+    attempt = start_attempt_phase(ledger, attempt, "full")
     routed_attempt, route = ledger.disposition_failure(_failure_evidence(ledger, attempt, "resource_pause"))
     source_event = next(event for event in ledger.events() if event["event_id"] == route["source"]["event_id"])
     return ledger, routed_attempt, route, source_event["sequence"]
@@ -123,8 +123,7 @@ def test_orchestrator_rejects_late_result_after_newer_attempt_route(tmp_path: Pa
     first_attempt = ledger.resume_attempt(
         _canonical_resume_evidence(tmp_path, ledger, first_attempt, resource_type="system_memory")
     )
-    ledger.transition_attempt(first_attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
-    current_attempt = ledger.state()["attempts"][first_attempt["attempt_id"]]
+    current_attempt = start_attempt_phase(ledger, first_attempt, "full")
     ledger.disposition_failure(_failure_evidence(ledger, current_attempt, "activation_failure"))
 
     with pytest.raises(IntegrityError, match="stale S3 result"):

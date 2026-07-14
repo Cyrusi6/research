@@ -1,6 +1,0 @@
-{
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "type": "object", "additionalProperties": true,
-  "required": ["schema_version", "project_id", "last_sequence", "last_event_hash", "directions", "variants", "attempts", "trial_results", "operation_events"],
-  "properties": {"schema_version": {"const": "auto_research_state_v4"}, "project_id": {"type": "string", "minLength": 1}, "last_sequence": {"type": "integer", "minimum": 0}, "last_event_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "directions": {"type": "object"}, "variants": {"type": "object"}, "attempts": {"type": "object"}, "trial_results": {"type": "object"}, "operation_events": {"type": "object"}}
-}

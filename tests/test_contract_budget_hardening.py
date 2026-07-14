@@ -21,6 +21,7 @@ from test_authoritative_state_machine import (
     _trial_spec,
     _variant,
 )
+from support.authoritative_evidence import start_attempt_phase
 
 
 def _reserve_kind(
@@ -115,10 +116,10 @@ def test_proxy_completed_requires_completed_proxy_phase(tmp_path: Path) -> None:
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve_kind(ledger, direction, variant, profile="standard", attempt_kind="proxy_full")
-    ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
+    attempt = start_attempt_phase(ledger, attempt, "proxy")
     before_events = len(ledger.events())
 
-    with pytest.raises(IntegrityError, match="proxy.*COMPLETED|phase"):
+    with pytest.raises(IntegrityError, match="PROXY_COMPLETED|phase"):
         ledger.transition_attempt(attempt["attempt_id"], "PROXY_COMPLETED")
     assert len(ledger.events()) == before_events
 
@@ -129,12 +130,11 @@ def test_terminal_phase_cannot_regress_when_entering_full(tmp_path: Path) -> Non
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve_kind(ledger, direction, variant, profile="standard", attempt_kind="proxy_full")
-    ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
-    ledger.transition_attempt(attempt["attempt_id"], "PROXY_COMPLETED", phase="proxy", phase_state="COMPLETED")
+    attempt = start_attempt_phase(ledger, attempt, "proxy")
     before_events = len(ledger.events())
 
     with pytest.raises(IntegrityError, match="phase|regress|monotonic"):
-        ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="proxy", phase_state="PENDING")
+        ledger.start_full_phase(attempt["attempt_id"], phase_execution_id="phase-full-forged", producer_run_id="producer-full-forged")
     assert len(ledger.events()) == before_events
 
 
@@ -144,7 +144,15 @@ def test_ready_attempt_cannot_finalize(tmp_path: Path) -> None:
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
-    completion = _valid_completion(ledger, attempt)
+    completion = {
+        "schema_version": "auto_research_completion_evidence_v2",
+        "attempt_id": attempt["attempt_id"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "entries": [],
+    }
     _assert_trial_rejected_without_writes(ledger, completion, match="READY|execution state|cannot finalize")
 
 
@@ -154,10 +162,9 @@ def test_failed_phase_cannot_be_overwritten_by_finalization(tmp_path: Path) -> N
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
-    ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
-    running = ledger.state()["attempts"][attempt["attempt_id"]]
+    running = start_attempt_phase(ledger, attempt, "full")
+    completion = _valid_completion(ledger, running)
     ledger.disposition_failure(_failure_evidence(ledger, running, "activation_failure"))
-    completion = _valid_completion(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
     _assert_trial_rejected_without_writes(ledger, completion, match="phase|FAILED|completed|execution state|IMPLEMENTATION_REPAIR")
 
 
@@ -167,9 +174,14 @@ def test_full_trial_requires_full_execution_state(tmp_path: Path) -> None:
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve_kind(ledger, direction, variant, profile="standard", attempt_kind="proxy_full")
-    ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
-    completion = _valid_completion(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
-    _assert_trial_rejected_without_writes(ledger, completion, match="full|phase|execution state")
+    attempt = start_attempt_phase(ledger, attempt, "proxy")
+    completion = {
+        "schema_version": "auto_research_completion_evidence_v2",
+        "attempt_id": attempt["attempt_id"], "trial_spec_hash": attempt["trial_spec_hash"],
+        "lifecycle_generation": attempt["lifecycle_generation"], "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"], "entries": [],
+    }
+    _assert_trial_rejected_without_writes(ledger, completion, match="PROXY_RUNNING|full|phase|execution state")
 
 
 def _valid_completion(ledger: ResearchEventLedger, attempt: dict) -> dict:
@@ -238,8 +250,8 @@ def test_ledger_independently_rejects_forged_trial_result(
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
-    ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
-    completion = _valid_completion(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
+    attempt = start_attempt_phase(ledger, attempt, "full")
+    completion = _valid_completion(ledger, attempt)
     assert ledger.validate_trial_precommit(completion)["outcome_classification"] == "accepted"
 
     if forgery == "unregistered_seed":

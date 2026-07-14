@@ -96,7 +96,7 @@ def _variant(direction: dict) -> dict:
     )
 
 
-def _trial_spec() -> dict:
+def _trial_spec_legacy() -> dict:
     runtime = {"device": "cpu", "batch_size": 1}
     sample_id = canonical_hash({"sample": "sample-1"})
     sample_dataset = {
@@ -193,7 +193,13 @@ def _trial_spec() -> dict:
     }
 
 
+
+def _trial_spec() -> dict:
+    from support.authoritative_evidence import upgrade_trial_spec_v4
+    return upgrade_trial_spec_v4(_trial_spec_legacy())
+
 def _running_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
+    from support.authoritative_evidence import start_attempt_phase
     ledger = ResearchEventLedger(tmp_path)
     direction = _direction()
     variant = _variant(direction)
@@ -207,88 +213,20 @@ def _running_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
         attempt_kind="full",
         trial_spec=_trial_spec(),
     )
-    attempt = ledger.transition_attempt(
-        attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING"
-    )
-    return ledger, attempt
+    return ledger, start_attempt_phase(ledger, attempt, "full")
 
 
 def _valid_completion(tmp_path: Path, attempt: dict) -> dict:
-    producer_run_id = "producer-run-1"
-    evidence_id = "evidence:main-results"
-    rows = []
-    for role, metric_value in (("baseline", 0.0), ("candidate", 1.0)):
-        rows.append(
-            {
-                "phase": "full",
-                "role": role,
-                "dataset_id": "fake",
-                "metric_id": "accuracy",
-                "seed": 7,
-                "metric_value": metric_value,
-                "command_status": "completed",
-                "attempt_id": attempt["attempt_id"],
-                "variant_semantic_hash": attempt["variant_semantic_hash"],
-                "variant_spec_hash": attempt["variant_spec_hash"],
-                "trial_spec_hash": attempt["trial_spec_hash"],
-                "sample_manifest_hash": attempt["sample_manifest_hash"],
-                "evaluator_hash": attempt["evaluator_hash"],
-                "producer_run_id": producer_run_id,
-            }
-        )
-    payload = {
-        "schema_version": "auto_research_main_results_v2",
-        "evidence_kind": "main_results",
-        "evidence_id": evidence_id,
-        "attempt_id": attempt["attempt_id"],
-        "producer_run_id": producer_run_id,
-        "direction_semantic_hash": attempt["direction_semantic_hash"],
-        "direction_spec_hash": attempt["direction_spec_hash"],
-        "variant_semantic_hash": attempt["variant_semantic_hash"],
-        "variant_spec_hash": attempt["variant_spec_hash"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "protocol_hash": attempt["protocol_hash"],
-        "sample_manifest_hash": attempt["sample_manifest_hash"],
-        "evaluator_hash": attempt["evaluator_hash"],
-        "cross_references": {},
-        "rows": rows,
-    }
-    raw = encode_canonical_evidence(payload)
-    digest = hashlib.sha256(raw).hexdigest()
-    relative_path = content_addressed_evidence_path(
-        attempt_id=attempt["attempt_id"],
-        producer_run_id=producer_run_id,
-        evidence_kind="main_results",
-        content_hash=digest,
+    from support.authoritative_evidence import build_quantitative_completion
+    return build_quantitative_completion(
+        tmp_path,
+        attempt,
+        role_values={"baseline": 0.0, "candidate": 1.0},
+        dataset_id="fake",
+        metric_id="accuracy",
+        seed=7,
+        phase="full",
     )
-    artifact_path = tmp_path / relative_path
-    artifact_path.parent.mkdir(parents=True, exist_ok=True)
-    artifact_path.write_bytes(raw)
-    return {
-        "schema_version": "auto_research_completion_evidence_v1",
-        "attempt_id": attempt["attempt_id"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "entries": [
-            {
-                "evidence_id": evidence_id,
-                "kind": "main_results",
-                "relative_path": relative_path,
-                "content_hash": digest,
-                "schema_version": "auto_research_main_results_v2",
-                "attempt_id": attempt["attempt_id"],
-                "producer_run_id": producer_run_id,
-                "direction_semantic_hash": attempt["direction_semantic_hash"],
-                "direction_spec_hash": attempt["direction_spec_hash"],
-                "variant_semantic_hash": attempt["variant_semantic_hash"],
-                "variant_spec_hash": attempt["variant_spec_hash"],
-                "trial_spec_hash": attempt["trial_spec_hash"],
-                "protocol_hash": attempt["protocol_hash"],
-                "sample_manifest_hash": attempt["sample_manifest_hash"],
-                "evaluator_hash": attempt["evaluator_hash"],
-            }
-        ],
-    }
-
 
 def _forged_trial(tmp_path: Path, attempt: dict) -> dict:
     relative_path = "experiment/results/main_results.json"
@@ -341,7 +279,7 @@ def _failure_evidence(
     if failure_class in {"resource_pause", "oom_retry"}:
         command_status = "resource_paused"
         probe = {
-            "schema_version": "auto_research_resource_probe_evidence_v1",
+            "schema_version": "auto_research_resource_probe_evidence_v2",
             "evidence_kind": "resource_probe",
             "evidence_id": f"resource-probe-{attempt['lifecycle_generation']}",
             "attempt_id": attempt["attempt_id"],
@@ -362,6 +300,12 @@ def _failure_evidence(
             "unit": "bytes",
             "probe_status": "insufficient",
             "observed_at": "2026-07-14T00:00:00Z",
+            "lifecycle_generation": attempt["lifecycle_generation"],
+            "implementation_hash": attempt["implementation_hash"],
+            "attempt_input_hash": attempt["attempt_input_hash"],
+            "phase": "full",
+            "phase_execution_id": attempt["phase_executions"]["full"]["phase_execution_id"],
+            "phase_start_event_id": attempt["phase_executions"]["full"]["phase_start_event_id"],
         }
         log_hash = _scoped_artifact(tmp_path, attempt, producer_run_id, "resource_probe", probe)
     else:
@@ -386,6 +330,9 @@ def _failure_evidence(
         "lifecycle_generation": attempt["lifecycle_generation"],
         "implementation_hash": attempt["implementation_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": source_phase,
+        "phase_execution_id": attempt["phase_executions"]["full"]["phase_execution_id"],
+        "phase_start_event_id": attempt["phase_executions"]["full"]["phase_start_event_id"],
         "source_state": attempt["state"],
         "source_phase": source_phase,
         "failure_class": failure_class,
@@ -400,7 +347,7 @@ def _failure_evidence(
 def _resume_evidence(tmp_path: Path, ledger: ResearchEventLedger, attempt: dict, *, resource_type: str) -> dict:
     producer_run_id = f"resume-producer-{attempt['lifecycle_generation']}"
     probe = {
-        "schema_version": "auto_research_resource_probe_evidence_v1", "evidence_kind": "resource_probe",
+        "schema_version": "auto_research_resource_probe_evidence_v2", "evidence_kind": "resource_probe",
         "evidence_id": f"resume-probe-{attempt['lifecycle_generation']}", "attempt_id": attempt["attempt_id"],
         "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"],
         "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"],
@@ -409,6 +356,10 @@ def _resume_evidence(tmp_path: Path, ledger: ResearchEventLedger, attempt: dict,
         "evaluator_hash": attempt["evaluator_hash"], "cross_references": {}, "resource_type": resource_type,
         "resource_id": "resource-0", "required_capacity": 10.0, "observed_capacity": 20.0, "unit": "bytes",
         "probe_status": "available", "observed_at": "2026-07-14T00:01:00Z",
+        "lifecycle_generation": attempt["lifecycle_generation"], "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"], "phase": attempt["paused_phase"],
+        "phase_execution_id": attempt["phase_executions"][attempt["paused_phase"]]["phase_execution_id"],
+        "phase_start_event_id": attempt["phase_executions"][attempt["paused_phase"]]["phase_start_event_id"],
     }
     probe_hash = _scoped_artifact(tmp_path, attempt, producer_run_id, "resource_probe", probe)
     pause_event = next(event for event in reversed(ledger.events()) if event["event_type"] == "AttemptDispositioned")
@@ -423,6 +374,11 @@ def _resume_evidence(tmp_path: Path, ledger: ResearchEventLedger, attempt: dict,
         "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"], "cross_references": {"resource_probe_hash": probe_hash},
         "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": "resume",
+        "phase_execution_id": attempt["phase_executions"][attempt["paused_phase"]]["phase_execution_id"],
+        "phase_start_event_id": attempt["phase_executions"][attempt["paused_phase"]]["phase_start_event_id"],
         "pause_event_id": pause_event["event_id"], "pause_evidence_hash": canonical_hash(pause_evidence),
         "resource_type": resource_type, "resource_id": "resource-0", "required_capacity": 10.0,
         "observed_capacity": 20.0, "unit": "bytes", "probe_status": "available",
@@ -528,18 +484,15 @@ def test_revision_cycle_back_to_prior_hash_is_not_implicit_late_replay(tmp_path:
     revision_b = ledger.revise_implementation(
         failed["attempt_id"], implementation_hash=implementation_b
     )
-    running_b = ledger.transition_attempt(
-        revision_b["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING"
-    )
+    from support.authoritative_evidence import start_attempt_phase
+    running_b = start_attempt_phase(ledger, revision_b, "full")
     failed_b, _ = ledger.disposition_failure(
         _failure_evidence(tmp_path, running_b, failure_class="activation_failure", exit_code=1)
     )
     revision_c = ledger.revise_implementation(
         failed_b["attempt_id"], implementation_hash=implementation_c
     )
-    running_c = ledger.transition_attempt(
-        revision_c["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING"
-    )
+    running_c = start_attempt_phase(ledger, revision_c, "full")
     failed_c, _ = ledger.disposition_failure(
         _failure_evidence(tmp_path, running_c, failure_class="activation_failure", exit_code=1)
     )
@@ -619,7 +572,7 @@ def test_missing_trial_spec_projection_rejects_completion_with_zero_write(tmp_pa
     completion = _valid_completion(tmp_path, attempt)
     ledger.validate_trial_precommit(completion)
     before = len(ledger.events())
-    (tmp_path / "plan" / "trial_spec.json").unlink()
+    (tmp_path / "plan" / "attempts" / attempt["attempt_id"] / "trial_spec" / f"{attempt['trial_spec_hash']}.json").unlink()
 
     with pytest.raises(IntegrityError, match="TrialSpec projection"):
         ledger.complete_attempt(completion)

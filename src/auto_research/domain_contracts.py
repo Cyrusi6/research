@@ -19,10 +19,10 @@ from .evidence import (
 
 DIRECTION_SCHEMA_VERSION = "auto_research_direction_v3"
 VARIANT_SCHEMA_VERSION = "auto_research_variant_v4"
-ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v4"
-TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v3"
-TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v4"
-ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v3"
+ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v5"
+TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v4"
+TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v5"
+ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v4"
 CONSTRAINT_RESULT_SCHEMA_VERSION = "auto_research_constraint_result_v2"
 DIRECTION_AGGREGATE_SCHEMA_VERSION = "auto_research_direction_outcome_aggregate_v1"
 
@@ -202,7 +202,7 @@ def validate_variant_identity(direction: dict[str, Any], spec: dict[str, Any], *
 
 
 def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
-    validate_contract(trial_spec, "trial_spec_v3.schema.json")
+    validate_contract(trial_spec, "trial_spec_v4.schema.json")
     datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
     manifest_datasets = {item["dataset_id"] for item in trial_spec["sample_manifest"]["datasets"]}
     if datasets != manifest_datasets:
@@ -257,19 +257,31 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
         raise ValueError("terminal phases must be required phases")
     if "full" in required_phases and "proxy" in required_phases and trial_spec["protocol"]["proxy_terminal_allowed"]:
         raise ValueError("proxy_full protocols cannot terminate at proxy")
+    phase_contracts = {item["phase"]: item for item in trial_spec["phase_contracts"]}
+    if set(phase_contracts) != required_phases:
+        raise ValueError("TrialSpec phase_contracts must exactly cover required phases")
+    known_datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
+    known_metrics = {item["metric_id"] for item in trial_spec["metrics"]}
+    for phase, contract in phase_contracts.items():
+        if not set(contract["datasets"]).issubset(known_datasets):
+            raise ValueError(f"{phase} phase contract contains unknown dataset")
+        if not set(contract["metrics"]).issubset(known_metrics):
+            raise ValueError(f"{phase} phase contract contains unknown metric")
+        if contract["terminal"] != (phase in terminal_phases):
+            raise ValueError(f"{phase} phase terminal semantics mismatch")
     expected_versions = {
-        "main_results": "auto_research_main_results_v2",
-        "ablation_results": "auto_research_ablation_results_v2",
-        "coverage_results": "auto_research_coverage_results_v2",
-        "matched_control_results": "auto_research_matched_control_results_v2",
-        "activation_evidence": "auto_research_activation_evidence_v2",
-        "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v2",
-        "proxy_cache_report": "auto_research_proxy_cache_report_v2",
-        "effective_proxy_policy": "auto_research_effective_proxy_policy_v2",
-        "proxy_calibration_policy": "auto_research_proxy_calibration_policy_v2",
-        "proxy_decision_report": "auto_research_proxy_decision_report_v2",
-        "full_s3_readiness": "auto_research_full_s3_readiness_v2",
-        "bootstrap_completion": "auto_research_bootstrap_completion_v2",
+        "main_results": "auto_research_main_results_v3",
+        "proxy_results": "auto_research_proxy_results_v1",
+        "ablation_results": "auto_research_ablation_results_v3",
+        "coverage_results": "auto_research_coverage_results_v3",
+        "matched_control_results": "auto_research_matched_control_results_v3",
+        "activation_evidence": "auto_research_activation_evidence_v3",
+        "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v3",
+        "proxy_cache_report": "auto_research_proxy_cache_report_v3",
+        "effective_proxy_policy": "auto_research_effective_proxy_policy_v3",
+        "proxy_calibration_policy": "auto_research_proxy_calibration_policy_v3",
+        "full_s3_readiness": "auto_research_full_s3_readiness_v3",
+        "bootstrap_completion": "auto_research_bootstrap_completion_v3",
     }
     for requirement in trial_spec["evidence_requirements"]:
         if requirement["schema_version"] != expected_versions[requirement["kind"]]:
@@ -284,20 +296,23 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
 
 
 def validate_execution_observation(observation: dict[str, Any]) -> None:
-    validate_contract(observation, "execution_observation_v3.schema.json")
+    validate_contract(observation, "execution_observation_v4.schema.json")
     value = observation.get("metric_value")
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
         raise ValueError("metric_value must be finite")
 
 
 def validate_evidence_manifest(manifest: dict[str, Any], *, trial_spec: dict[str, Any]) -> None:
-    validate_contract(manifest, "evidence_manifest_v2.schema.json")
+    validate_contract(manifest, "evidence_manifest_v3.schema.json")
     expected_hash = trial_spec_hash(trial_spec)
     if manifest["trial_spec_hash"] != expected_hash:
         raise ValueError("evidence manifest TrialSpec hash mismatch")
     identities = [item["evidence_id"] for item in manifest["entries"]]
     if len(set(identities)) != len(identities):
         raise ValueError("duplicate evidence manifest identity")
+    kinds = [item["kind"] for item in manifest["entries"]]
+    if len(set(kinds)) != len(kinds):
+        raise ValueError("duplicate evidence kind in one phase transaction")
 
 
 def validate_trial_evidence(
@@ -306,7 +321,7 @@ def validate_trial_evidence(
     attempt: dict[str, Any] | None = None,
     trial_spec: dict[str, Any] | None = None,
 ) -> None:
-    validate_contract(result, "trial_result_v4.schema.json")
+    validate_contract(result, "trial_result_v5.schema.json")
     observations = result["observations"]
     for observation in observations:
         validate_execution_observation(observation)
@@ -377,7 +392,7 @@ def classify_trial_result(
     observed_candidate_phases = {item["phase"] for item in candidate}
     if not observed_candidate_phases or not observed_candidate_phases.issubset(terminal_phases):
         raise ValueError("candidate observations must bind a preregistered terminal phase")
-    if any(item["phase"] not in terminal_phases | {"ablation"} for item in observations):
+    if any(item["phase"] not in set(required_phases) for item in observations):
         raise ValueError("execution observation phase is not terminally permitted")
     if any(
         item["sample_manifest_hash"] != attempt["sample_manifest_hash"]
@@ -405,11 +420,16 @@ def classify_trial_result(
         "acceptance_contract_hash": acceptance_contract_hash(trial_spec),
         "protocol_hash": attempt["protocol_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
         "completeness": completeness,
         "required_datasets": required_datasets,
         "observed_datasets": observed_datasets,
         "raw_artifacts": deepcopy(raw_artifacts),
         "evidence_manifest": deepcopy(manifest),
+        "evidence_manifest_hash": canonical_hash(manifest),
+        "proxy_outcome_event_id": (attempt.get("committed_proxy_outcome") or {}).get("event_id"),
+        "proxy_outcome_hash": (attempt.get("committed_proxy_outcome") or {}).get("outcome_hash"),
         "observations": deepcopy(observations),
         "constraint_results": constraint_results,
         "all_hard_constraints_passed": all(item["status"] == "PASS" for item in constraint_results if item["hard"]),
@@ -485,6 +505,7 @@ def _reject_pseudo_semantic_coordinates(value: Any) -> None:
 def _observation_identity(observation: dict[str, Any]) -> tuple[Any, ...]:
     return (
         observation["phase"],
+        observation["phase_execution_id"],
         observation["role"],
         observation["dataset_id"],
         observation["metric_id"],
@@ -505,6 +526,8 @@ def _validate_trial_against_attempt(result: dict[str, Any], attempt: dict[str, A
         "acceptance_contract_hash",
         "protocol_hash",
         "attempt_input_hash",
+        "lifecycle_generation",
+        "implementation_hash",
     ):
         if result.get(key) != attempt.get(key):
             raise ValueError(f"TrialResult {key} does not match Attempt")
@@ -512,6 +535,12 @@ def _validate_trial_against_attempt(result: dict[str, Any], attempt: dict[str, A
     if not seeds:
         raise ValueError("Attempt must preregister at least one seed")
     for observation in result["observations"]:
+        if observation["lifecycle_generation"] != attempt.get("lifecycle_generation"):
+            raise ValueError("observation lifecycle_generation does not match Attempt")
+        if observation["implementation_hash"] != attempt.get("implementation_hash"):
+            raise ValueError("observation implementation_hash does not match Attempt")
+        if observation["attempt_input_hash"] != attempt.get("attempt_input_hash"):
+            raise ValueError("observation attempt_input_hash does not match Attempt")
         if observation["sample_manifest_hash"] != attempt.get("sample_manifest_hash"):
             raise ValueError("observation sample_manifest_hash does not match Attempt")
         if observation["evaluator_hash"] != attempt.get("evaluator_hash"):
@@ -556,11 +585,18 @@ def _validate_required_coverage(
     observations: list[dict[str, Any]],
     evidence_manifest: dict[str, Any],
 ) -> None:
-    datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
-    seeds = set(trial_spec["statistical_testing"]["seeds"])
+    observed_phases = {item["phase"] for item in observations}
+    if len(observed_phases) != 1:
+        raise ValueError("one completion transaction must contain exactly one execution phase")
+    phase = next(iter(observed_phases))
+    phase_contract = next((item for item in trial_spec["phase_contracts"] if item["phase"] == phase), None)
+    if not isinstance(phase_contract, dict):
+        raise ValueError("observed phase is not preregistered")
+    datasets = set(phase_contract["datasets"])
+    seeds = set(phase_contract["seeds"])
     primary_metric = trial_spec["primary_metric_id"]
     require_complete_seed_coverage = trial_spec["statistical_testing"]["require_complete_seed_coverage"]
-    for role in trial_spec["required_roles"]:
+    for role in phase_contract["roles"]:
         covered = {
             (item["dataset_id"], item["seed"])
             for item in observations
@@ -572,15 +608,12 @@ def _validate_required_coverage(
             not require_complete_seed_coverage and covered_datasets != datasets
         ):
             raise ValueError(f"required {role} dataset/seed coverage is missing")
-    applicable_phases = set(trial_spec["protocol"]["required_phases"])
     manifest_kinds = {item["kind"] for item in evidence_manifest["entries"]}
-    missing_artifacts = set(trial_spec["required_artifacts"]) - manifest_kinds
+    missing_artifacts = set(phase_contract["evidence_kinds"]) - manifest_kinds
     if missing_artifacts:
         raise ValueError(f"required result artifacts are missing: {sorted(missing_artifacts)}")
     for requirement in trial_spec["evidence_requirements"]:
-        applies = "always" in requirement["applicable_phases"] or bool(
-            applicable_phases & set(requirement["applicable_phases"])
-        )
+        applies = "always" in requirement["applicable_phases"] or phase in requirement["applicable_phases"]
         if applies and requirement["required"] and requirement["kind"] not in manifest_kinds:
             raise ValueError(f"required evidence is missing: {requirement['kind']}")
 

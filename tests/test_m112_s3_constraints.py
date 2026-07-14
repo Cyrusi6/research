@@ -14,7 +14,7 @@ from auto_research.domain_contracts import (
     trial_spec_hash,
     validate_trial_spec,
 )
-from auto_research.evidence import content_addressed_evidence_path, encode_canonical_evidence
+from auto_research.evidence import EVIDENCE_SCHEMA_VERSIONS, content_addressed_evidence_path, encode_canonical_evidence
 from auto_research.s3_validation import S3ValidationError, validate_trial_precommit
 from auto_research.utils import write_json
 from test_authoritative_state_machine import _direction, _initialize, _reserve, _trial_spec, _variant
@@ -55,13 +55,13 @@ def test_trial_spec_hash_changes_for_every_authoritative_field(mutate) -> None:
     assert trial_spec_hash(changed) != trial_spec_hash(original)
 
 
-def test_trial_spec_v3_is_closed_and_old_version_is_rejected() -> None:
+def test_trial_spec_v4_is_closed_and_old_version_is_rejected() -> None:
     spec = _contract_trial_spec()
     spec["unexpected"] = True
     with pytest.raises(ValueError, match="Additional properties"):
         validate_trial_spec(spec)
     spec = _contract_trial_spec()
-    spec["schema_version"] = "auto_research_trial_spec_v2"
+    spec["schema_version"] = "auto_research_trial_spec_v3"
     with pytest.raises(ValueError, match=TRIAL_SPEC_SCHEMA_VERSION):
         validate_trial_spec(spec)
 
@@ -96,9 +96,12 @@ def _with_role_requirement(role: str, kind: str, artifact: str, threshold: float
             "kind": artifact,
             "required": True,
             "applicable_phases": ["full"],
-            "schema_version": f"auto_research_{artifact}_v2",
+            "schema_version": EVIDENCE_SCHEMA_VERSIONS[artifact],
         }
     )
+    full_contract = next(item for item in spec["phase_contracts"] if item["phase"] == "full")
+    full_contract["roles"].append(role)
+    full_contract["evidence_kinds"].append(artifact)
     validate_trial_spec(spec)
     return spec
 
@@ -113,9 +116,17 @@ def _add_role_evidence(
     value: float,
 ) -> None:
     attempt = _contract_attempt(spec)
-    producer_run_id = f"producer-{role}"
+    phase_execution = attempt["phase_executions"]["full"]
+    producer_run_id = phase_execution["producer_run_id"]
     evidence_id = f"evidence:{role}:attempt-1"
-    phase = "ablation" if kind == "ablation_results" else "full"
+    phase = "full"
+    common = {
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase_execution_id": phase_execution["phase_execution_id"],
+        "phase_start_event_id": phase_execution["phase_start_event_id"],
+    }
     row = {
         "phase": phase,
         "role": role,
@@ -131,9 +142,10 @@ def _add_role_evidence(
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
         "producer_run_id": producer_run_id,
+        **common,
     }
     payload = {
-        "schema_version": f"auto_research_{kind}_v2",
+        "schema_version": EVIDENCE_SCHEMA_VERSIONS[kind],
         "evidence_kind": kind,
         "evidence_id": evidence_id,
         "attempt_id": attempt["attempt_id"],
@@ -147,6 +159,8 @@ def _add_role_evidence(
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
         "cross_references": {},
+        **common,
+        "phase": phase,
         "rows": [row],
     }
     raw = encode_canonical_evidence(payload)
@@ -174,6 +188,8 @@ def _add_role_evidence(
             "protocol_hash": attempt["protocol_hash"],
             "sample_manifest_hash": attempt["sample_manifest_hash"],
             "evaluator_hash": attempt["evaluator_hash"],
+            **common,
+            "phase": phase,
             "cross_references": {},
         }
     )

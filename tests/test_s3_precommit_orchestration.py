@@ -17,6 +17,7 @@ from test_authoritative_state_machine import (
     _reserve,
     _variant,
 )
+from support.authoritative_evidence import start_attempt_phase
 
 
 def _prepared_attempt(tmp_path: Path, *, bootstrap: bool = False) -> tuple[ResearchEventLedger, dict, dict, dict]:
@@ -26,8 +27,7 @@ def _prepared_attempt(tmp_path: Path, *, bootstrap: bool = False) -> tuple[Resea
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant, profile="bootstrap" if bootstrap else "standard")
     phase = "proxy" if bootstrap else "full"
-    target = "PROXY_RUNNING" if bootstrap else "FULL_RUNNING"
-    attempt = ledger.transition_attempt(attempt["attempt_id"], target, phase=phase, phase_state="RUNNING")
+    attempt = start_attempt_phase(ledger, attempt, phase)
     return ledger, direction, variant, attempt
 
 
@@ -123,7 +123,7 @@ def test_direction_aggregate_selects_best_accepted_delta_not_highest_absolute_ca
         variant = _variant(direction, index)
         _initialize(ledger, direction, variant)
         attempt = _reserve(ledger, direction, variant)
-        attempt = ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+        attempt = start_attempt_phase(ledger, attempt, "full")
         completion = _completion_evidence(ledger, attempt, outcome="accepted")
         def set_measurements(payload: dict) -> None:
             for row in payload["rows"]:

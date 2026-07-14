@@ -56,6 +56,17 @@ def _attempt(trial_spec: dict) -> dict:
         "evaluator_hash": trial_spec["execution_contract"]["evaluator_hash"],
         "attempt_kind": "proxy_full",
         "seeds": [7],
+        "lifecycle_generation": 0,
+        "implementation_hash": "b" * 64,
+        "attempt_input_hash": "c" * 64,
+        "phase_executions": {
+            "proxy": None,
+            "full": {
+                "phase_execution_id": "phase-full-0001",
+                "phase_start_event_id": "phase-start-full",
+                "producer_run_id": "producer-run-1",
+            },
+        },
     }
 
 
@@ -75,6 +86,12 @@ def _measurement(attempt: dict, *, rows: list[dict] | None = None) -> dict:
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
         "cross_references": {},
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": "full",
+        "phase_execution_id": attempt["phase_executions"]["full"]["phase_execution_id"],
+        "phase_start_event_id": attempt["phase_executions"]["full"]["phase_start_event_id"],
         "rows": rows or [],
     }
 
@@ -95,6 +112,11 @@ def _row(attempt: dict, *, role: str, value: float) -> dict:
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
         "producer_run_id": "producer-run-1",
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase_execution_id": attempt["phase_executions"]["full"]["phase_execution_id"],
+        "phase_start_event_id": attempt["phase_executions"]["full"]["phase_start_event_id"],
     }
 
 
@@ -122,16 +144,13 @@ def test_only_explicit_inventory_is_staged_even_when_legacy_fixed_path_exists(tm
     legacy.parent.mkdir(parents=True, exist_ok=True)
     legacy.write_bytes(encode_canonical_evidence(_measurement(attempt, rows=[_row(attempt, role="baseline", value=0.0), _row(attempt, role="candidate", value=1.0)])))
 
-    completion = _stage_evidence_inventory(
-        project_root=tmp_path,
-        attempt=attempt,
-        trial_spec=trial_spec,
-        inventory=[],
-    )
-
-    assert set(completion) == {"schema_version", "attempt_id", "trial_spec_hash", "entries"}
-    assert completion["schema_version"] == "auto_research_completion_evidence_v1"
-    assert completion["entries"] == []
+    with pytest.raises(S3ValidationError, match="required evidence|missing"):
+        _stage_evidence_inventory(
+            project_root=tmp_path,
+            attempt=attempt,
+            trial_spec=trial_spec,
+            inventory=[],
+        )
     assert not (tmp_path / "experiment" / "attempts").exists()
 
 
@@ -151,8 +170,8 @@ def test_staged_rows_are_attempt_scoped_and_content_addressed(tmp_path: Path) ->
     )
     observations = _decode_staged_execution_observations(tmp_path, attempt, trial_spec, completion)
 
-    assert set(completion) == {"schema_version", "attempt_id", "trial_spec_hash", "entries"}
-    assert completion["schema_version"] == "auto_research_completion_evidence_v1"
+    assert set(completion) == {"schema_version", "attempt_id", "trial_spec_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "entries"}
+    assert completion["schema_version"] == "auto_research_completion_evidence_v2"
     entry = completion["entries"][0]
     assert entry["relative_path"].startswith(f"experiment/attempts/{attempt['attempt_id']}/producer-run-1/main_results/")
     assert entry["relative_path"].endswith(f"{entry['content_hash']}.json")

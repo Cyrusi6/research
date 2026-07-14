@@ -114,10 +114,17 @@ class _ResumeLedger:
         self.attempt["lifecycle_generation"] = evidence["lifecycle_generation"] + 1
         return deepcopy(self.attempt)
 
-    def transition_attempt(self, attempt_id: str, state: str, **kwargs) -> dict:
-        self.calls.append(("transition", attempt_id, state, kwargs))
-        self.attempt["state"] = state
-        self.attempt["phases"][kwargs["phase"]] = kwargs["phase_state"]
+    def start_proxy_phase(self, attempt_id: str, *, phase_execution_id: str, producer_run_id: str) -> dict:
+        self.calls.append(("start_proxy", attempt_id, phase_execution_id, producer_run_id))
+        self.attempt["state"] = "PROXY_RUNNING"
+        self.attempt["phases"]["proxy"] = "RUNNING"
+        self.attempt["phase_executions"]["proxy"] = {"phase_execution_id": phase_execution_id, "producer_run_id": producer_run_id}
+        return deepcopy(self.attempt)
+
+    def start_full_phase(self, attempt_id: str, *, phase_execution_id: str, producer_run_id: str) -> dict:
+        self.calls.append(("start_full", attempt_id, phase_execution_id, producer_run_id))
+        self.attempt["state"] = "FULL_RUNNING"
+        self.attempt["phases"]["full"] = "RUNNING"
         return deepcopy(self.attempt)
 
 
@@ -138,6 +145,8 @@ def _resume_attempt(generation: int, *, state: str = "RESOURCE_PAUSED") -> dict:
         "sample_manifest_hash": "9" * 64,
         "evaluator_hash": "a" * 64,
         "phases": {"proxy": "PENDING", "full": "PENDING"},
+        "phase_executions": {"proxy": {"phase_execution_id": "phase-proxy-pause", "phase_start_event_id": "phase-start-pause", "producer_run_id": "pause-producer"}, "full": None},
+        "paused_phase": "proxy",
     }
 
 
@@ -161,9 +170,9 @@ def test_resource_resume_precedes_execution_transition(tmp_path: Path, generatio
         project_root=tmp_path,
     )
 
-    assert [call[0] for call in ledger.calls] == ["resume", "transition"]
+    assert [call[0] for call in ledger.calls] == ["resume", "start_proxy"]
     assert ledger.calls[0][1]["lifecycle_generation"] == generation
-    assert ledger.calls[1][2] == "PROXY_RUNNING"
+    assert ledger.calls[1][0] == "start_proxy"
     assert resumed["state"] == "PROXY_RUNNING"
 
 
@@ -174,8 +183,8 @@ def test_ready_attempt_does_not_emit_resume(tmp_path: Path) -> None:
 
     ExperimentAgent._prepare_attempt_execution(ledger, attempt, resource_probe=None, project_root=tmp_path)
 
-    assert [call[0] for call in ledger.calls] == ["transition"]
-    assert ledger.calls[0][2] == "FULL_RUNNING"
+    attempt["state"] = "PROXY_COMPLETED"
+    assert [call[0] for call in ledger.calls] == ["start_full"]
 
 
 def _authoritative_direction_and_variant():
@@ -288,6 +297,7 @@ def test_real_experiment_agent_three_resource_resumes_then_single_commit(monkeyp
                 attempt=attempt,
                 producer_run_id=producer_run_id,
                 evidence_kind="resource_probe",
+                phase="full",
                 fields={
                     "resource_type": "quota",
                     "resource_id": "simulated-execution-slot",

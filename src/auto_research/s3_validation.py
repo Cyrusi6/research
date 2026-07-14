@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,8 @@ from .domain_contracts import (
     validate_trial_spec,
     validate_variant_identity,
 )
-from .evidence import decode_evidence_inventory
-from .utils import read_json, sha256_file
+from .evidence import EvidenceStore, decode_evidence_inventory
+from .utils import read_json
 
 
 class S3ValidationError(ValueError):
@@ -72,7 +73,6 @@ def validate_trial_precommit(
     _capture(errors, validate_trial_result, trial_result, attempt=attempt, trial_spec=frozen)
     _validate_attempt_contract(errors, attempt, state=state, terminal=attempt.get("state") == "METHOD_COMPLETED")
     _validate_execution_state(errors, attempt, trial_result, allow_pending_full_transition=allow_pending_full_transition)
-    _validate_raw_artifacts(errors, project_root, trial_result.get("raw_artifacts") or {})
     _validate_evidence(errors, project_root, attempt, frozen, trial_result)
     if errors:
         raise S3ValidationError("; ".join(dict.fromkeys(errors)))
@@ -130,7 +130,7 @@ def validate_failure_precommit(
         errors.append(f"unsupported structured failure_class: {failure_class}")
     if result.get("method_evaluable") is True:
         errors.append("failure disposition cannot be method_evaluable")
-    _validate_raw_artifacts(errors, project_root, artifact_hashes)
+    _validate_staged_artifacts(errors, project_root, artifact_hashes)
     explicit = result.get("failure_class") or result.get("failure_classification")
     if explicit != failure_class:
         errors.append("structured failure evidence must explicitly match failure_class")
@@ -170,7 +170,7 @@ def validate_committed_s3(
                 )
             except S3ValidationError as exc:
                 errors.append(str(exc))
-    errors.extend(contract_errors(route_outcome, "route_outcome_v3.schema.json"))
+    errors.extend(contract_errors(route_outcome, "route_outcome_v4.schema.json"))
     source = route_outcome.get("source") if isinstance(route_outcome.get("source"), dict) else {}
     if source.get("attempt_id") != attempt.get("attempt_id") or not source.get("event_id"):
         errors.append("RouteOutcome source must bind the committed attempt and event")
@@ -316,10 +316,11 @@ def _validate_evidence(errors, project_root, attempt, trial_spec, trial_result) 
             errors.append(f"evidence kind was not preregistered: {entry['kind']}")
         elif entry["schema_version"] != requirement["schema_version"]:
             errors.append(f"evidence schema version mismatch: {path}")
-        artifact_path = project_root / path
-        if artifact_path.is_file():
-            evidence_bytes[entry["evidence_id"]] = artifact_path.read_bytes()
-    applicable_phases = set(trial_spec["protocol"]["required_phases"])
+        try:
+            evidence_bytes[entry["evidence_id"]] = EvidenceStore(project_root).read_entry(entry, attempt)
+        except ValueError as exc:
+            errors.append(str(exc))
+    applicable_phases = {str(trial_result.get("completeness") or "")}
     required_kinds = {
         item["kind"]
         for item in trial_spec["evidence_requirements"]
@@ -342,23 +343,20 @@ def _validate_evidence(errors, project_root, attempt, trial_spec, trial_result) 
         errors.append(str(exc))
 
 
-def _validate_raw_artifacts(errors, project_root, artifact_hashes) -> None:
-    root = project_root.resolve()
-    for relative_path, expected_hash in artifact_hashes.items():
-        path = (project_root / relative_path).resolve()
-        try:
-            path.relative_to(root)
-        except ValueError:
-            errors.append(f"raw artifact escapes project root: {relative_path}")
-            continue
-        if not path.is_file():
-            errors.append(f"raw artifact is missing: {relative_path}")
-        elif sha256_file(path) != expected_hash:
-            errors.append(f"raw artifact hash mismatch: {relative_path}")
-
-
 def _direction_budget(state, attempt) -> dict[str, Any]:
     return dict(((state.get("directions") or {}).get(attempt.get("direction_semantic_hash")) or {}).get("budget") or {})
+
+
+def _validate_staged_artifacts(errors: list[str], project_root: Path, artifact_hashes: dict[str, str]) -> None:
+    store = EvidenceStore(project_root)
+    for relative_path, expected_hash in artifact_hashes.items():
+        try:
+            raw = store.read_staged_source(relative_path)
+        except ValueError as exc:
+            errors.append(f"raw artifact rejected: {relative_path}: {exc}")
+            continue
+        if hashlib.sha256(raw).hexdigest() != expected_hash:
+            errors.append(f"raw artifact hash mismatch: {relative_path}")
 
 
 def _capture(errors: list[str], function, *args, **kwargs) -> None:

@@ -5,34 +5,36 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import os
 import re
+import uuid
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
 from jsonschema import Draft202012Validator
 
-EXECUTION_OBSERVATION_SCHEMA_VERSION = "auto_research_execution_observation_v3"
-EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v2"
+EXECUTION_OBSERVATION_SCHEMA_VERSION = "auto_research_execution_observation_v4"
+EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v3"
 QUANTITATIVE_EVIDENCE_SCHEMA_VERSIONS = {
-    "main_results": "auto_research_main_results_v2",
-    "ablation_results": "auto_research_ablation_results_v2",
-    "coverage_results": "auto_research_coverage_results_v2",
-    "matched_control_results": "auto_research_matched_control_results_v2",
+    "main_results": "auto_research_main_results_v3",
+    "proxy_results": "auto_research_proxy_results_v1",
+    "ablation_results": "auto_research_ablation_results_v3",
+    "coverage_results": "auto_research_coverage_results_v3",
+    "matched_control_results": "auto_research_matched_control_results_v3",
 }
 EVIDENCE_SCHEMA_VERSIONS = {
     **QUANTITATIVE_EVIDENCE_SCHEMA_VERSIONS,
-    "activation_evidence": "auto_research_activation_evidence_v2",
-    "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v2",
-    "proxy_cache_report": "auto_research_proxy_cache_report_v2",
-    "effective_proxy_policy": "auto_research_effective_proxy_policy_v2",
-    "proxy_calibration_policy": "auto_research_proxy_calibration_policy_v2",
-    "proxy_decision_report": "auto_research_proxy_decision_report_v2",
-    "full_s3_readiness": "auto_research_full_s3_readiness_v2",
-    "bootstrap_completion": "auto_research_bootstrap_completion_v2",
-    "failure_evidence": "auto_research_failure_evidence_v2",
-    "resource_probe": "auto_research_resource_probe_evidence_v1",
-    "resume_evidence": "auto_research_resume_evidence_v2",
+    "activation_evidence": "auto_research_activation_evidence_v3",
+    "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v3",
+    "proxy_cache_report": "auto_research_proxy_cache_report_v3",
+    "effective_proxy_policy": "auto_research_effective_proxy_policy_v3",
+    "proxy_calibration_policy": "auto_research_proxy_calibration_policy_v3",
+    "full_s3_readiness": "auto_research_full_s3_readiness_v3",
+    "bootstrap_completion": "auto_research_bootstrap_completion_v3",
+    "failure_evidence": "auto_research_failure_evidence_v3",
+    "resource_probe": "auto_research_resource_probe_evidence_v2",
+    "resume_evidence": "auto_research_resume_evidence_v3",
 }
 
 _SCHEMA_FILES = {
@@ -40,6 +42,120 @@ _SCHEMA_FILES = {
     for kind, version in EVIDENCE_SCHEMA_VERSIONS.items()
 }
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
+_SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$")
+
+
+class EvidenceStore:
+    """Single fail-closed reader for attempt-scoped immutable evidence."""
+
+    def __init__(self, project_root: Path):
+        self.project_root = Path(project_root)
+        self.root = self.project_root / "experiment" / "attempts"
+
+    def read_entry(self, entry: Mapping[str, Any], attempt: Mapping[str, Any]) -> bytes:
+        _validate_content_addressed_path(entry, attempt)
+        relative = PurePosixPath(str(entry["relative_path"]))
+        expected_prefix = PurePosixPath("experiment") / "attempts"
+        if relative.parts[:2] != expected_prefix.parts:
+            raise ValueError("evidence path is outside the authoritative evidence root")
+        return self._read_relative(relative)
+
+    def read_staged_source(self, relative_path: str) -> bytes:
+        relative = PurePosixPath(relative_path)
+        if relative.is_absolute() or not relative.parts or "." in relative.parts or ".." in relative.parts:
+            raise ValueError("staged evidence path traversal is forbidden")
+        return self._read_relative(relative)
+
+    def write_entry(self, entry: Mapping[str, Any], attempt: Mapping[str, Any], raw: bytes) -> None:
+        _validate_content_addressed_path(entry, attempt)
+        if hashlib.sha256(raw).hexdigest() != entry["content_hash"]:
+            raise ValueError("immutable evidence bytes do not match content hash")
+        relative = PurePosixPath(str(entry["relative_path"]))
+        parent_fd = self._open_parent(relative, create=True)
+        try:
+            try:
+                existing_fd = os.open(relative.parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+            except FileNotFoundError:
+                existing_fd = None
+            if existing_fd is not None:
+                try:
+                    existing = self._read_fd(existing_fd)
+                finally:
+                    os.close(existing_fd)
+                if existing != raw:
+                    raise ValueError("content-addressed evidence collision")
+                return
+            temporary = f".{relative.parts[-1]}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            file_fd = os.open(
+                temporary,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=parent_fd,
+            )
+            try:
+                view = memoryview(raw)
+                while view:
+                    written = os.write(file_fd, view)
+                    view = view[written:]
+                os.fsync(file_fd)
+            finally:
+                os.close(file_fd)
+            os.rename(temporary, relative.parts[-1], src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        except OSError as exc:
+            raise ValueError("immutable evidence path contains a symlink or is unavailable") from exc
+        finally:
+            os.close(parent_fd)
+
+    def _read_relative(self, relative: PurePosixPath) -> bytes:
+        parent_fd: int | None = None
+        try:
+            parent_fd = self._open_parent(relative, create=False)
+            file_fd = os.open(relative.parts[-1], os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=parent_fd)
+            try:
+                return self._read_fd(file_fd)
+            finally:
+                os.close(file_fd)
+        except OSError as exc:
+            raise ValueError("evidence path contains a symlink or is unavailable") from exc
+        finally:
+            if parent_fd is not None:
+                os.close(parent_fd)
+
+    def _open_parent(self, relative: PurePosixPath, *, create: bool) -> int:
+        current_fd = os.open(self.project_root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            for component in relative.parts[:-1]:
+                if create:
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                next_fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0), dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+        except Exception:
+            os.close(current_fd)
+            raise
+
+    @staticmethod
+    def _read_fd(file_fd: int) -> bytes:
+        stat = os.fstat(file_fd)
+        if not __import__("stat").S_ISREG(stat.st_mode) or stat.st_nlink != 1:
+            raise ValueError("evidence artifact must be a unique regular file")
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(file_fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        return b"".join(chunks)
+
+
+def validate_execution_id(value: str, *, field: str) -> None:
+    if not isinstance(value, str) or not _SAFE_EXECUTION_ID.fullmatch(value):
+        raise ValueError(f"{field} must use safe execution identity characters")
 
 
 def canonical_json(value: Any) -> str:
@@ -63,7 +179,7 @@ def decode_evidence_inventory(
     that were content-addressed; this function never reopens an artifact path.
     """
 
-    _validate_schema(manifest, "evidence_manifest_v2.schema.json")
+    _validate_schema(manifest, "evidence_manifest_v3.schema.json")
     _validate_manifest_identity(attempt, trial_spec, manifest)
     entries = manifest["entries"]
     entry_ids = [entry["evidence_id"] for entry in entries]
@@ -123,15 +239,16 @@ def content_addressed_evidence_path(
         raise ValueError(f"unsupported evidence kind: {evidence_kind}")
     if not _SHA256.fullmatch(content_hash):
         raise ValueError("content hash must be lowercase SHA-256")
-    for value, label in ((attempt_id, "attempt_id"), (producer_run_id, "producer_run_id")):
-        if not value or "/" in value or "\\" in value or value in {".", ".."}:
-            raise ValueError(f"unsafe {label}")
+    if not attempt_id or "/" in attempt_id or "\\" in attempt_id or attempt_id in {".", ".."}:
+        raise ValueError("unsafe attempt_id")
+    validate_execution_id(producer_run_id, field="producer_run_id")
     return f"experiment/attempts/{attempt_id}/{producer_run_id}/{evidence_kind}/{content_hash}.json"
 
 
 def _decode_quantitative_rows(payload: Mapping[str, Any], entry: Mapping[str, Any]) -> list[dict[str, Any]]:
     allowed_roles = {
         "main_results": {"baseline", "candidate"},
+        "proxy_results": {"baseline", "candidate"},
         "ablation_results": {"ablation"},
         "coverage_results": {"coverage"},
         "matched_control_results": {"matched_control"},
@@ -145,6 +262,7 @@ def _decode_quantitative_rows(payload: Mapping[str, Any], entry: Mapping[str, An
             raise ValueError("quantitative metric_value must be a finite non-boolean number")
         identity = {
             "phase": row["phase"],
+            "phase_execution_id": row["phase_execution_id"],
             "role": row["role"],
             "dataset_id": row["dataset_id"],
             "metric_id": row["metric_id"],
@@ -163,12 +281,16 @@ def _decode_quantitative_rows(payload: Mapping[str, Any], entry: Mapping[str, An
             "sample_manifest_hash": row["sample_manifest_hash"],
             "evaluator_hash": row["evaluator_hash"],
             "producer_run_id": row["producer_run_id"],
+            "lifecycle_generation": row["lifecycle_generation"],
+            "implementation_hash": row["implementation_hash"],
+            "attempt_input_hash": row["attempt_input_hash"],
+            "phase_start_event_id": row["phase_start_event_id"],
             "evidence_id": entry["evidence_id"],
             "evidence_kind": entry["kind"],
             "raw_artifact_path": entry["relative_path"],
             "raw_artifact_hash": entry["content_hash"],
         }
-        _validate_schema(observation, "execution_observation_v3.schema.json")
+        _validate_schema(observation, "execution_observation_v4.schema.json")
         result.append(observation)
     return result
 
@@ -186,6 +308,9 @@ def _validate_manifest_identity(
         "protocol_hash": attempt["protocol_hash"],
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
     }
     for key, value in expected.items():
         if manifest.get(key) != value:
@@ -214,6 +339,12 @@ def _validate_evidence_identity(
         "protocol_hash": attempt["protocol_hash"],
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": entry["phase"],
+        "phase_execution_id": entry["phase_execution_id"],
+        "phase_start_event_id": entry["phase_start_event_id"],
     }
     for key, value in expected.items():
         entry_value = entry.get("kind") if key == "evidence_kind" else entry.get(key)
@@ -228,11 +359,19 @@ def _validate_evidence_identity(
             "trial_spec_hash",
             "sample_manifest_hash",
             "evaluator_hash",
+            "lifecycle_generation",
+            "implementation_hash",
+            "attempt_input_hash",
+            "phase",
+            "phase_execution_id",
+            "phase_start_event_id",
         ):
             if row.get(key) != expected[key]:
                 raise ValueError(f"quantitative row {key} mismatch: {entry['evidence_id']}")
     if canonical_hash(trial_spec) != payload["trial_spec_hash"]:
         raise ValueError("evidence does not bind the frozen TrialSpec")
+    validate_execution_id(entry["producer_run_id"], field="producer_run_id")
+    validate_execution_id(entry["phase_execution_id"], field="phase_execution_id")
 
 
 def _validate_content_addressed_path(entry: Mapping[str, Any], attempt: Mapping[str, Any]) -> None:
@@ -317,6 +456,7 @@ def _validate_evidence_semantics(payload: Mapping[str, Any]) -> None:
 def _observation_identity(observation: Mapping[str, Any]) -> tuple[Any, ...]:
     return (
         observation["phase"],
+        observation["phase_execution_id"],
         observation["role"],
         observation["dataset_id"],
         observation["metric_id"],

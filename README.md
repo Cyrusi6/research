@@ -57,15 +57,17 @@ The breaking S1-S3 contract has one canonical artifact for each scientific ident
 
 - `literature/direction.json`: `DirectionSpec v3`, with separate scientific `direction_semantic_hash` and complete `direction_spec_hash` identities.
 - `plan/variant.json`: `VariantSpec v4`, with separate method `variant_semantic_hash` and complete `variant_spec_hash` identities.
-- `plan/trial_spec.json`: `TrialSpec v3`, a readable integrity projection; every reservation freezes sample/evaluator provenance and the complete contract in Event v4.
-- `meta/attempts/<attempt_id>.json`: `AttemptRecord v4`, a rebuildable projection reused across crash/resume, resource resume, and implementation repair.
-- `experiment/results/trial_result.json`: `TrialResult v4`, the latest committed result deterministically decoded from immutable row-level evidence.
-- `meta/route_outcome.json`: `RouteOutcome v3`, the latest deterministic route projection.
-- `meta/research_events.sqlite3`: the sole authoritative Event v4 SQLite-WAL store; snapshots, attempts, results, routes, and aggregates are rebuildable projections.
+- `plan/attempts/<attempt_id>/trial_spec/<trial_spec_hash>.json`: the immutable `TrialSpec v4` projection frozen by the reservation; `plan/trial_spec.json` is diagnostic only.
+- `meta/attempts/<attempt_id>.json`: `AttemptRecord v5`, a rebuildable projection reused across crash/resume, resource resume, and implementation repair.
+- `experiment/results/trial_result.json`: `TrialResult v5`, the latest committed result deterministically decoded from immutable row-level evidence.
+- `meta/route_outcome.json`: `RouteOutcome v4`, the latest deterministic route projection.
+- `meta/research_events.sqlite3`: the sole authoritative Event v5 SQLite-WAL store; snapshots, attempts, results, routes, phase outcomes, and aggregates are rebuildable projections.
 
 The `standard` profile executes five sequential method-evaluable variants under one unchanged direction with `execution_width=1` and `stop_on_success=false`. Patch/static/activation failures, resource pauses, and OOM retries do not consume an outcome; their reservation remains until repair or explicit abandonment. Only an atomically committed, typed, verified TrialResult consumes one slot. Outcomes 1–4 route to `PROPOSE_NEXT_VARIANT`; outcome 5 creates an exact five-result aggregate and closes the direction. A sixth reservation, patch, run, or outcome is rejected by the reducer.
 
-Planner pools, scorecards, patch diagnostics, proxy diagnostics, and human-readable summaries remain diagnostic artifacts only. Runtime stages do not infer identity, observations, budgets, or routing from those files. Projects without DirectionSpec v3, VariantSpec v4, TrialSpec v3, and Event v4 authority must restart from S1; no dual-read or migration exists. See `docs/authoritative_s1_s3_contracts.md` and `docs/regression_test_migration.md`.
+For `proxy_full`, proxy execution is an authoritative transaction: `ProxyPhaseStarted` → immutable proxy evidence → reducer-derived `ProxyOutcome`/route → `FullPhaseStarted`. Full commands cannot run before a committed `RUN_FULL`, proxy evidence never consumes the five-outcome budget, and a repaired generation must execute proxy again. Bootstrap is a proxy-terminal transaction and never emits full-phase evidence.
+
+Planner pools, scorecards, patch diagnostics, proxy diagnostics, and human-readable summaries remain diagnostic artifacts only. Runtime stages do not infer identity, observations, budgets, or routing from those files. Projects without DirectionSpec v3, VariantSpec v4, TrialSpec v4, and Event v5 authority must restart from S1; no dual-read or migration exists. See `docs/authoritative_s1_s3_contracts.md` and `docs/regression_test_migration.md`.
 
 Attempt lifecycle operations are generation-scoped. Re-entering execution after implementation repair or resource resume creates a new `lifecycle_generation`: the same operation is idempotent within one generation, while the same transition or failure in a later generation creates a distinct event. Disposition and finalization events contain verified facts only; the reducer derives state, budget, route, direction closure, and aggregate.
 

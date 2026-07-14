@@ -2899,3 +2899,9 @@ uv run pytest -q tests/test_validators.py tests/test_c2c.py tests/test_pipeline.
 ## 2026-07-14 — M1.1.3 Attempt-scoped scientific evidence
 
 S3 now follows `execute -> explicit inventory -> immutable ingest -> shared precommit validation -> SQLite transaction -> projections -> audit`. The Common Core owns decoding and classification; adapters only produce canonical staged evidence. Sample and evaluator provenance are frozen in TrialSpec v3, and standard real runs must supply actual sample identities and evaluator source/dependency digests. Native Unified S1 producer work remains out of scope.
+
+## 2026-07-14 — M1.1.4 Authoritative phase and native evidence closure
+
+`proxy_full` is now a two-transaction state machine: proxy start, current-generation immutable evidence commit, reducer-derived proxy route, then (only for `RUN_FULL`) full start and finalization. Event v5 and AttemptRecord v5 bind phase execution identity to implementation/input generation; TrialSpec v4 registers phase-specific datasets, roles, seeds, metrics, evidence requirements, and terminal semantics. Generic external commands and the C2C adapter return explicit inventories rather than directory scans, while bootstrap produces only proxy-terminal evidence. EvidenceStore is the common secure reader/writer for content-addressed Attempt artifacts. Native Unified S1 producer/Core and real GPU training are not part of this milestone.
+
+Validation completed with `552 passed, 2 skipped` in each of the normal, proxy-cleared, and empty-HOME/no-Codex environments. The non-simulated Generic external-manifest path and C2C strict adapter use production evidence ingestion; five-variant regression loops are labeled synthetic and are not presented as real GPU or scientific results.

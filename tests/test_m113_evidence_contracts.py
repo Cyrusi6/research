@@ -23,7 +23,7 @@ from auto_research.evidence import (
 )
 
 
-def _trial_spec(*, objective: str = "maximize", datasets: tuple[str, ...] = ("d1",), seeds: tuple[int, ...] = (7,)) -> dict:
+def _trial_spec_legacy(*, objective: str = "maximize", datasets: tuple[str, ...] = ("d1",), seeds: tuple[int, ...] = (7,)) -> dict:
     sample_datasets = []
     datasets_spec = []
     for dataset_id in datasets:
@@ -59,7 +59,9 @@ def _trial_spec(*, objective: str = "maximize", datasets: tuple[str, ...] = ("d1
         "source_digest": canonical_hash({"source": "evaluator.py"}),
         "config_hash": canonical_hash({"threshold": 0.5}),
         "dependency_digest": canonical_hash({"python": "3.11"}),
+        "artifact_path": "plan/evaluator_manifest.json",
     }
+    evaluator["artifact_hash"] = canonical_hash(evaluator)
     runtime = {"device": "cpu"}
     spec = {
         "schema_version": TRIAL_SPEC_SCHEMA_VERSION,
@@ -78,35 +80,45 @@ def _trial_spec(*, objective: str = "maximize", datasets: tuple[str, ...] = ("d1
         "required_artifacts": ["main_results"],
         "evidence_requirements": [{"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_main_results_v2"}],
     }
-    validate_trial_spec(spec)
     return spec
 
 
+
+def _trial_spec(*, objective: str = "maximize", datasets: tuple[str, ...] = ("d1",), seeds: tuple[int, ...] = (7,)) -> dict:
+    from support.authoritative_evidence import upgrade_trial_spec_v4
+    return upgrade_trial_spec_v4(_trial_spec_legacy(objective=objective, datasets=datasets, seeds=seeds))
+
 def _attempt(spec: dict) -> dict:
-    return {
+    attempt = {
         "direction_id": "direction-1", "direction_semantic_hash": "1" * 64, "direction_spec_hash": "2" * 64,
         "variant_id": "variant-1", "variant_semantic_hash": "3" * 64, "variant_spec_hash": "4" * 64,
         "attempt_id": "attempt-1", "trial_spec_hash": trial_spec_hash(spec), "acceptance_contract_hash": acceptance_contract_hash(spec),
         "protocol_hash": canonical_hash(spec["protocol"]), "attempt_input_hash": "5" * 64,
+        "implementation_hash": "6" * 64, "lifecycle_generation": 0,
         "sample_manifest_hash": canonical_hash(spec["sample_manifest"]), "evaluator_hash": spec["execution_contract"]["evaluator_hash"],
         "seeds": spec["statistical_testing"]["seeds"],
     }
+    attempt["phase_executions"] = {"full": {"phase_execution_id": "phase-full-0001", "phase_start_event_id": "phase-start-full", "producer_run_id": "producer-run-1"}, "proxy": None}
+    attempt["committed_proxy_outcome"] = None
+    return attempt
 
 
 def _main_inventory(spec: dict, values: dict[tuple[str, int], tuple[float, float]]) -> tuple[dict, dict[str, bytes]]:
     attempt = _attempt(spec)
     evidence_id = "evidence:main:attempt-1"
     producer_run_id = "producer-run-1"
+    execution = attempt["phase_executions"]["full"]
+    common = {"lifecycle_generation": 0, "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"], "phase": "full", "phase_execution_id": execution["phase_execution_id"], "phase_start_event_id": execution["phase_start_event_id"]}
     rows = []
     for (dataset_id, seed), (baseline, candidate) in sorted(values.items()):
         for role, value in (("baseline", baseline), ("candidate", candidate)):
-            rows.append({"phase": "full", "role": role, "dataset_id": dataset_id, "metric_id": "score", "seed": seed, "metric_value": value, "command_status": "completed", "attempt_id": attempt["attempt_id"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "producer_run_id": producer_run_id})
-    payload = {"schema_version": "auto_research_main_results_v2", "evidence_kind": "main_results", "evidence_id": evidence_id, "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "cross_references": {}, "rows": rows}
+            rows.append({"phase": "full", "role": role, "dataset_id": dataset_id, "metric_id": "score", "seed": seed, "metric_value": value, "command_status": "completed", "attempt_id": attempt["attempt_id"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "producer_run_id": producer_run_id, **common})
+    payload = {"schema_version": EVIDENCE_SCHEMA_VERSIONS["main_results"], "evidence_kind": "main_results", "evidence_id": evidence_id, "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "cross_references": {}, **common, "rows": rows}
     raw = encode_canonical_evidence(payload)
     digest = evidence_content_hash(payload)
     path = content_addressed_evidence_path(attempt_id=attempt["attempt_id"], producer_run_id=producer_run_id, evidence_kind="main_results", content_hash=digest)
-    entry = {"evidence_id": evidence_id, "kind": "main_results", "relative_path": path, "content_hash": digest, "schema_version": payload["schema_version"], "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "cross_references": {}}
-    manifest = {"schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION, "attempt_id": attempt["attempt_id"], "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "entries": [entry]}
+    entry = {"evidence_id": evidence_id, "kind": "main_results", "relative_path": path, "content_hash": digest, "schema_version": payload["schema_version"], "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], **common, "cross_references": {}}
+    manifest = {"schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION, "attempt_id": attempt["attempt_id"], "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "lifecycle_generation": 0, "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"], "entries": [entry]}
     return manifest, {evidence_id: raw}
 
 
@@ -231,26 +243,28 @@ def _nonquantitative_payload(kind: str) -> dict:
         "variant_semantic_hash": "3" * 64, "variant_spec_hash": "4" * 64,
         "trial_spec_hash": "5" * 64, "protocol_hash": "6" * 64,
         "sample_manifest_hash": "7" * 64, "evaluator_hash": "8" * 64,
+        "lifecycle_generation": 0, "implementation_hash": "9" * 64,
+        "attempt_input_hash": "a" * 64, "phase": "proxy",
+        "phase_execution_id": "phase-proxy-0001", "phase_start_event_id": "phase-start-proxy",
         "cross_references": {},
     }
     extras = {
         "activation_evidence": {"probe_id": "forward-probe", "status": "passed", "command_status": "completed", "exit_code": 0, "implementation_surface_ids": ["src/model.py"]},
-        "proxy_baseline_fingerprint": {"baseline_hash": "9" * 64, "dataset_ids": ["d1"], "seeds": [7], "fingerprint_inputs": {"sample_manifest_hash": "7" * 64, "evaluator_hash": "8" * 64, "protocol_hash": "6" * 64}},
+        "proxy_baseline_fingerprint": {"baseline_hash": "9" * 64, "dataset_ids": ["d1"], "seeds": [7], "fingerprint_inputs": {"sample_manifest_hash": "7" * 64, "evaluator_hash": "8" * 64, "protocol_hash": "6" * 64, "phase_execution_id": "phase-proxy-0001"}},
         "proxy_cache_report": {"cross_references": {"proxy_baseline_fingerprint_hash": "a" * 64}, "cache_key": "b" * 64, "baseline_hash": "9" * 64, "cache_entry_hash": "c" * 64, "status": "hit"},
         "effective_proxy_policy": {"policy_hash": "d" * 64, "required_phases": ["proxy", "full"], "proxy_terminal_allowed": False, "decision_threshold": 0.1},
         "proxy_calibration_policy": {"cross_references": {"proxy_baseline_fingerprint_hash": "a" * 64, "effective_proxy_policy_hash": "d" * 64}, "calibration_hash": "e" * 64, "status": "calibrated", "calibration_metric": "score", "calibration_value": 0.9},
-        "proxy_decision_report": {"cross_references": {"proxy_baseline_fingerprint_hash": "a" * 64, "proxy_cache_report_hash": "b" * 64, "effective_proxy_policy_hash": "d" * 64, "proxy_calibration_policy_hash": "e" * 64, "main_results_hash": "f" * 64}, "decision": "run_full", "reason_codes": ["proxy_pass"], "observed_proxy_delta": 0.2},
-        "full_s3_readiness": {"cross_references": {"activation_evidence_hash": "a" * 64, "proxy_decision_report_hash": "b" * 64}, "ready": True, "checks": [{"check_id": "activation", "status": "PASS"}]},
-        "bootstrap_completion": {"cross_references": {"proxy_decision_report_hash": "a" * 64, "main_results_hash": "b" * 64}, "completion_status": "verified", "phase": "proxy"},
-        "failure_evidence": {"lifecycle_generation": 0, "implementation_hash": "9" * 64, "attempt_input_hash": "a" * 64, "source_state": "FULL_RUNNING", "source_phase": "full", "failure_class": "resource_pause", "command_status": "resource_paused", "exit_code": 137, "reason": "oom", "observed_at": "2026-07-14T00:00:00Z", "log_hash": "b" * 64},
+        "full_s3_readiness": {"cross_references": {"activation_evidence_hash": "a" * 64, "proxy_results_hash": "b" * 64}, "ready": True, "checks": [{"check_id": "activation", "status": "PASS"}]},
+        "bootstrap_completion": {"cross_references": {"activation_evidence_hash": "a" * 64, "proxy_results_hash": "b" * 64}, "completion_status": "verified"},
+        "failure_evidence": {"lifecycle_generation": 0, "implementation_hash": "9" * 64, "attempt_input_hash": "a" * 64, "phase": "full", "source_state": "FULL_RUNNING", "source_phase": "full", "failure_class": "resource_pause", "command_status": "resource_paused", "exit_code": 137, "reason": "oom", "observed_at": "2026-07-14T00:00:00Z", "log_hash": "b" * 64},
         "resource_probe": {"resource_type": "gpu_memory", "resource_id": "gpu:0", "required_capacity": 10, "observed_capacity": 12, "unit": "bytes", "probe_status": "available", "observed_at": "2026-07-14T00:00:00Z"},
-        "resume_evidence": {"cross_references": {"resource_probe_hash": "a" * 64}, "lifecycle_generation": 1, "pause_event_id": "event:pause:1", "pause_evidence_hash": "b" * 64, "resource_type": "gpu_memory", "resource_id": "gpu:0", "required_capacity": 10, "observed_capacity": 12, "unit": "bytes", "probe_status": "available", "observed_at": "2026-07-14T00:00:00Z"},
+        "resume_evidence": {"cross_references": {"resource_probe_hash": "a" * 64}, "lifecycle_generation": 1, "implementation_hash": "9" * 64, "attempt_input_hash": "a" * 64, "phase": "resume", "pause_event_id": "event:pause:1", "pause_evidence_hash": "b" * 64, "resource_type": "gpu_memory", "resource_id": "gpu:0", "required_capacity": 10, "observed_capacity": 12, "unit": "bytes", "probe_status": "available", "observed_at": "2026-07-14T00:00:00Z"},
     }
     base.update(extras[kind])
     return base
 
 
-@pytest.mark.parametrize("kind", sorted(set(EVIDENCE_SCHEMA_VERSIONS) - {"main_results", "ablation_results", "coverage_results", "matched_control_results"}))
+@pytest.mark.parametrize("kind", sorted(set(EVIDENCE_SCHEMA_VERSIONS) - {"main_results", "proxy_results", "ablation_results", "coverage_results", "matched_control_results"}))
 def test_nonquantitative_evidence_schema_baseline_then_version_and_extra_property_attack(kind: str) -> None:
     payload = _nonquantitative_payload(kind)
     schema_name = f"{kind}_v{payload['schema_version'].rsplit('_v', 1)[1]}.schema.json"

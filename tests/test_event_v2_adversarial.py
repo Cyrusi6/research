@@ -22,12 +22,12 @@ from test_m113_ledger_closure import (
     _failure_evidence as _canonical_failure_evidence,
     _resume_evidence,
 )
+from support.authoritative_evidence import start_attempt_phase
 
 
 def _start_execution(ledger: ResearchEventLedger, attempt: dict) -> dict:
     phase = "proxy" if attempt["attempt_kind"] in {"proxy", "bootstrap_proxy"} else "full"
-    state = "PROXY_RUNNING" if phase == "proxy" else "FULL_RUNNING"
-    return ledger.transition_attempt(attempt["attempt_id"], state, phase=phase, phase_state="RUNNING")
+    return start_attempt_phase(ledger, attempt, phase)
 
 
 def _reserve_proxy(ledger: ResearchEventLedger, direction: dict, variant: dict) -> dict:
@@ -63,7 +63,7 @@ def test_repair_revision_can_reenter_same_proxy_running_transition(tmp_path: Pat
     repaired = _repair(ledger, failed, 2)
     rerun = _start_execution(ledger, repaired)
     assert rerun["state"] == "PROXY_RUNNING"
-    transitions = [event for event in ledger.events() if event["event_type"] == "AttemptTransitioned" and event["payload"]["new_state"] == "PROXY_RUNNING"]
+    transitions = [event for event in ledger.events() if event["event_type"] == "ProxyPhaseStarted"]
     assert len(transitions) == 2
     assert transitions[0]["event_id"] != transitions[1]["event_id"]
 

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from auto_research.research_state import ResearchEventLedger
 from test_authoritative_state_machine import _complete, _direction, _failure_evidence, _initialize, _reserve, _variant
+from support.authoritative_evidence import start_attempt_phase
 
 
 def test_first_four_method_outcomes_route_to_next_variant(tmp_path: Path) -> None:
@@ -36,6 +37,6 @@ def test_resource_and_integrity_have_unified_actions(tmp_path: Path) -> None:
         variant = _variant(direction, 1)
         _initialize(ledger, direction, variant)
         attempt = _reserve(ledger, direction, variant)
-        attempt = ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+        attempt = start_attempt_phase(ledger, attempt, "full")
         _, route = ledger.disposition_failure(_failure_evidence(ledger, attempt, failure_class))
         assert route["next_action"] == expected

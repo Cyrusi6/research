@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import tempfile
+import time
 import uuid
 import fcntl
 from copy import deepcopy
@@ -28,14 +29,15 @@ from .domain_contracts import (
     validate_variant_identity,
 )
 from .s3_validation import validate_ledger_trial_precommit
+from .evidence import EvidenceStore, content_addressed_evidence_path, decode_evidence_inventory
 from .utils import ensure_dir, now_utc
 
-EVENT_SCHEMA_VERSION = "auto_research_event_v4"
-ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v4"
-STATE_SCHEMA_VERSION = "auto_research_state_v4"
-ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v3"
-FAILURE_EVIDENCE_SCHEMA_VERSION = "auto_research_failure_evidence_v2"
-RESUME_EVIDENCE_SCHEMA_VERSION = "auto_research_resume_evidence_v2"
+EVENT_SCHEMA_VERSION = "auto_research_event_v5"
+ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v5"
+STATE_SCHEMA_VERSION = "auto_research_state_v5"
+ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v4"
+FAILURE_EVIDENCE_SCHEMA_VERSION = "auto_research_failure_evidence_v3"
+RESUME_EVIDENCE_SCHEMA_VERSION = "auto_research_resume_evidence_v3"
 EVENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/\-]{0,255}$")
 ZERO_HASH = "0" * 64
 TARGET_OUTCOMES = 5
@@ -46,6 +48,9 @@ EVENT_TYPES = {
     "VariantPlanned",
     "AttemptReserved",
     "AttemptTransitioned",
+    "ProxyPhaseStarted",
+    "ProxyEvidenceCommitted",
+    "FullPhaseStarted",
     "AttemptImplementationRevised",
     "AttemptResumed",
     "AttemptAbandoned",
@@ -77,6 +82,17 @@ class IntegrityError(RuntimeError):
 
 class BreakingSchemaError(IntegrityError):
     """Raised when a v1 workspace is opened by the v2-only event store."""
+
+
+def _begin_immediate(connection: sqlite3.Connection) -> None:
+    for index in range(200):
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            return
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() or index == 199:
+                raise
+            time.sleep(0.01)
 
 
 class ResearchEventLedger:
@@ -154,7 +170,7 @@ class ResearchEventLedger:
         event = next((item for item in events if item["event_id"] == event_id), None)
         if event is None:
             raise IntegrityError(f"unknown event_id {event_id}")
-        historical = _reduce_all(self.project_root.name, events[: event["sequence"]])
+        historical = _reduce_all(self.project_root.name, events[: event["sequence"]], project_root=self.project_root)
         payload = event["payload"]
         attempt_id = _event_attempt_id(payload)
         route = historical.get("last_route_outcome")
@@ -181,19 +197,19 @@ class ResearchEventLedger:
         _validate_event_request(event_type, payload, event_id)
         payload_json = canonical_json(payload)
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            _begin_immediate(connection)
             try:
                 existing = connection.execute("SELECT * FROM events WHERE event_id = ?", (event_id,)).fetchone()
                 if existing is not None:
                     if existing["event_type"] != event_type or existing["payload_json"] != payload_json:
                         raise IntegrityError(f"event_id conflict for {event_id}")
                     events = self._validated_events(connection)
-                    state = _reduce_all(self.project_root.name, events)
+                    state = _reduce_all(self.project_root.name, events, project_root=self.project_root)
                     connection.commit()
                     event = _row_event(existing)
                 else:
                     events = self._validated_events(connection)
-                    state = _reduce_all(self.project_root.name, events)
+                    state = _reduce_all(self.project_root.name, events, project_root=self.project_root)
                     sequence = len(events) + 1
                     previous_hash = events[-1]["event_hash"] if events else ZERO_HASH
                     created_at = now_utc()
@@ -207,7 +223,9 @@ class ResearchEventLedger:
                         "payload": deepcopy(payload),
                     }
                     event["event_hash"] = _event_hash(event)
+                    state["project_root"] = str(self.project_root)
                     next_state = reduce_event(state, event)
+                    next_state.pop("project_root", None)
                     _validate_state_invariants(next_state)
                     connection.execute(
                         "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
@@ -231,18 +249,18 @@ class ResearchEventLedger:
         request_fingerprint: str | None = None,
     ) -> tuple[dict[str, Any], dict[str, Any], bool]:
         with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
+            _begin_immediate(connection)
             try:
                 events = self._validated_events(connection)
-                state = _reduce_all(self.project_root.name, events)
-                if explicit_event_id is not None:
+                state = _reduce_all(self.project_root.name, events, project_root=self.project_root)
+                if explicit_event_id is not None and request_fingerprint is not None:
                     existing = connection.execute("SELECT * FROM events WHERE event_id = ?", (explicit_event_id,)).fetchone()
                     if existing is not None:
                         event = _row_event(existing)
                         historical = event["payload"].get("request_fingerprint")
                         if historical != request_fingerprint:
                             raise IntegrityError(f"event_id request fingerprint conflict for {explicit_event_id}")
-                        event_state = _reduce_all(self.project_root.name, events[: event["sequence"]])
+                        event_state = _reduce_all(self.project_root.name, events[: event["sequence"]], project_root=self.project_root)
                         connection.commit()
                         self._write_projections(state)
                         return event, event_state, True
@@ -256,7 +274,7 @@ class ResearchEventLedger:
                     if existing["event_type"] != event_type or existing["payload_json"] != payload_json:
                         raise IntegrityError(f"event_id conflict for {event_id}")
                     event = _row_event(existing)
-                    event_state = _reduce_all(self.project_root.name, events[: event["sequence"]])
+                    event_state = _reduce_all(self.project_root.name, events[: event["sequence"]], project_root=self.project_root)
                     connection.commit()
                     replayed = True
                 else:
@@ -273,7 +291,9 @@ class ResearchEventLedger:
                         "payload": deepcopy(payload),
                     }
                     event["event_hash"] = _event_hash(event)
+                    state["project_root"] = str(self.project_root)
                     event_state = reduce_event(state, event)
+                    event_state.pop("project_root", None)
                     connection.execute(
                         "INSERT INTO events VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         (sequence, event_id, event_type, payload_json, previous_hash, event["event_hash"], created_at, EVENT_SCHEMA_VERSION),
@@ -319,6 +339,7 @@ class ResearchEventLedger:
     ) -> dict[str, Any]:
         validate_variant_identity(direction, variant)
         validate_trial_spec(trial_spec)
+        _validate_real_sample_manifest(self.project_root, trial_spec)
         frozen_trial_spec = deepcopy(trial_spec)
         spec_hash = trial_spec_hash(frozen_trial_spec)
         input_hash = _attempt_input_hash_from_spec(implementation_hash, frozen_trial_spec)
@@ -349,7 +370,7 @@ class ResearchEventLedger:
                 trial_spec=frozen_trial_spec,
                 timestamp=timestamp,
             )
-            validate_contract(attempt, "attempt_record_v4.schema.json")
+            validate_contract(attempt, "attempt_record_v5.schema.json")
             existing = state["attempts"].get(attempt_id)
             if existing is not None:
                 immutable_keys = [
@@ -370,7 +391,7 @@ class ResearchEventLedger:
         return deepcopy(state["attempts"][attempt_id])
 
     def transition_attempt(self, attempt_id: str, new_state: str, *, phase: str | None = None, phase_state: str | None = None, event_id: str | None = None) -> dict[str, Any]:
-        if new_state not in {"IMPLEMENTING", "READY", "PROXY_RUNNING", "PROXY_COMPLETED", "FULL_RUNNING"}:
+        if new_state not in {"IMPLEMENTING", "READY"}:
             raise IntegrityError(f"public transition cannot enter authoritative failure/terminal state {new_state}")
         request_fingerprint = canonical_hash({"operation": "transition", "attempt_id": attempt_id, "new_state": new_state, "phase": phase, "phase_state": phase_state})
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
@@ -382,6 +403,99 @@ class ResearchEventLedger:
             return "AttemptTransitioned", payload, event_id or _operation_event_id("transition", attempt, payload)
         _, state, _ = self._domain_transact(build, explicit_event_id=event_id, request_fingerprint=request_fingerprint if event_id else None)
         return deepcopy(state["attempts"][attempt_id])
+
+    def start_proxy_phase(
+        self,
+        attempt_id: str,
+        *,
+        phase_execution_id: str,
+        producer_run_id: str,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._start_phase(
+            attempt_id,
+            phase="proxy",
+            phase_execution_id=phase_execution_id,
+            producer_run_id=producer_run_id,
+            event_id=event_id,
+        )
+
+    def start_full_phase(
+        self,
+        attempt_id: str,
+        *,
+        phase_execution_id: str,
+        producer_run_id: str,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self._start_phase(
+            attempt_id,
+            phase="full",
+            phase_execution_id=phase_execution_id,
+            producer_run_id=producer_run_id,
+            event_id=event_id,
+        )
+
+    def _start_phase(
+        self,
+        attempt_id: str,
+        *,
+        phase: str,
+        phase_execution_id: str,
+        producer_run_id: str,
+        event_id: str | None,
+    ) -> dict[str, Any]:
+        request_fingerprint = canonical_hash({"operation": "start_phase", "attempt_id": attempt_id, "phase": phase, "phase_execution_id": phase_execution_id, "producer_run_id": producer_run_id})
+        def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
+            attempt = _attempt(state, attempt_id)
+            _validate_trial_spec_projection(self.project_root, attempt)
+            expected_state = "READY" if phase == "proxy" or attempt["attempt_kind"] == "full" else "PROXY_COMPLETED"
+            if attempt["state"] != expected_state:
+                raise IntegrityError(f"{phase} phase requires {expected_state}")
+            if phase == "full":
+                proxy = attempt.get("committed_proxy_outcome")
+                if attempt["attempt_kind"] == "proxy_full" and (not isinstance(proxy, dict) or proxy.get("decision") != "RUN_FULL"):
+                    raise IntegrityError("full phase requires committed RUN_FULL ProxyOutcome")
+            operation_id = event_id or _operation_event_id(f"{phase}-phase-started", attempt, {"phase": phase, "phase_execution_id": phase_execution_id, "producer_run_id": producer_run_id})
+            manifest = {
+                "schema_version": "auto_research_phase_execution_manifest_v1",
+                "attempt_id": attempt["attempt_id"],
+                "direction_semantic_hash": attempt["direction_semantic_hash"],
+                "direction_spec_hash": attempt["direction_spec_hash"],
+                "variant_semantic_hash": attempt["variant_semantic_hash"],
+                "variant_spec_hash": attempt["variant_spec_hash"],
+                "trial_spec_hash": attempt["trial_spec_hash"],
+                "lifecycle_generation": attempt["lifecycle_generation"],
+                "implementation_hash": attempt["implementation_hash"],
+                "attempt_input_hash": attempt["attempt_input_hash"],
+                "phase": phase,
+                "phase_execution_id": phase_execution_id,
+                "phase_start_event_id": operation_id,
+                "producer_run_id": producer_run_id,
+            }
+            validate_contract(manifest, "phase_execution_manifest_v1.schema.json")
+            payload = {"attempt_id": attempt_id, "lifecycle_generation": attempt["lifecycle_generation"], "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"], "expected_state": expected_state, "phase_execution_manifest": manifest}
+            return ("ProxyPhaseStarted" if phase == "proxy" else "FullPhaseStarted"), payload, operation_id
+        _, state, _ = self._domain_transact(build, explicit_event_id=event_id, request_fingerprint=request_fingerprint if event_id else None)
+        return deepcopy(state["attempts"][attempt_id])
+
+    def commit_proxy_evidence(self, completion_evidence: dict[str, Any], *, event_id: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+        _validate_completion_request_shape(completion_evidence)
+        request_fingerprint = canonical_hash({"operation": "commit_proxy_evidence", "completion_evidence": completion_evidence})
+        def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
+            attempt = _attempt(state, completion_evidence["attempt_id"])
+            if attempt["attempt_kind"] != "proxy_full" or attempt["state"] != "PROXY_RUNNING":
+                raise IntegrityError("ProxyEvidence commit requires a running proxy_full Attempt")
+            manifest, _observations, completion_fingerprint = _decode_phase_completion(
+                project_root=self.project_root, attempt=attempt, completion_evidence=completion_evidence, expected_phase="proxy"
+            )
+            proxy_outcome = _canonical_proxy_outcome_from_manifest(self.project_root, attempt, manifest)
+            validate_contract(proxy_outcome, "proxy_outcome_v1.schema.json")
+            payload = {"proxy_outcome": proxy_outcome, "evidence_manifest": manifest, "request_fingerprint": completion_fingerprint}
+            return "ProxyEvidenceCommitted", payload, event_id or _operation_event_id("proxy-evidence-committed", attempt, payload)
+        _, state, _ = self._domain_transact(build, explicit_event_id=event_id, request_fingerprint=request_fingerprint if event_id else None)
+        attempt = state["attempts"][completion_evidence["attempt_id"]]
+        return deepcopy(attempt), deepcopy(state["last_route_outcome"])
 
     def revise_implementation(self, attempt_id: str, *, implementation_hash: str, event_id: str | None = None) -> dict[str, Any]:
         request_fingerprint = canonical_hash({"operation": "revise_implementation", "attempt_id": attempt_id, "implementation_hash": implementation_hash})
@@ -407,7 +521,7 @@ class ResearchEventLedger:
         return deepcopy(state["attempts"][attempt_id])
 
     def disposition_failure(self, failure_evidence: dict[str, Any], *, event_id: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-        validate_contract(failure_evidence, "failure_evidence_v2.schema.json")
+        validate_contract(failure_evidence, "failure_evidence_v3.schema.json")
         request_fingerprint = canonical_hash({"operation": "disposition_failure", "evidence": failure_evidence})
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
             attempt = _attempt(state, failure_evidence["attempt_id"])
@@ -423,7 +537,7 @@ class ResearchEventLedger:
         return deepcopy(event_state["attempts"][attempt_id]), deepcopy(event_state["last_route_outcome"])
 
     def resume_attempt(self, resume_evidence: dict[str, Any], *, event_id: str | None = None) -> dict[str, Any]:
-        validate_contract(resume_evidence, "resume_evidence_v2.schema.json")
+        validate_contract(resume_evidence, "resume_evidence_v3.schema.json")
         request_fingerprint = canonical_hash({"operation": "resume_attempt", "evidence": resume_evidence})
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
             attempt = _attempt(state, resume_evidence["attempt_id"])
@@ -441,6 +555,13 @@ class ResearchEventLedger:
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
             attempt = _attempt(state, completion_evidence["attempt_id"])
             _validate_trial_spec_projection(self.project_root, attempt)
+            legal_state = (
+                attempt["state"] == "METHOD_COMPLETED"
+                or (attempt["attempt_kind"] in {"proxy", "bootstrap_proxy"} and attempt["state"] == "PROXY_RUNNING")
+                or (attempt["attempt_kind"] in {"full", "proxy_full"} and attempt["state"] == "FULL_RUNNING")
+            )
+            if not legal_state:
+                raise IntegrityError(f"attempt {attempt['attempt_id']} cannot finalize from {attempt['state']}")
             trial_result, completion_fingerprint = _classify_completion_evidence(
                 project_root=self.project_root,
                 attempt=attempt,
@@ -461,7 +582,7 @@ class ResearchEventLedger:
             return "AttemptFinalized", payload, event_id or _operation_event_id("attempt-finalized", attempt, payload)
         _, event_state, _ = self._domain_transact(
             build,
-            explicit_event_id=None,
+            explicit_event_id=event_id,
             request_fingerprint=None,
         )
         return deepcopy(event_state["attempts"][completion_evidence["attempt_id"]]), deepcopy(event_state["last_route_outcome"])
@@ -506,11 +627,11 @@ class ResearchEventLedger:
             seen_ids.add(event["event_id"])
             previous_hash = event["event_hash"]
             events.append(event)
-        _reduce_all(self.project_root.name, events)
+        _reduce_all(self.project_root.name, events, project_root=self.project_root)
         return events
 
     def _state_in_transaction(self, connection: sqlite3.Connection) -> dict[str, Any]:
-        return _reduce_all(self.project_root.name, self._validated_events(connection))
+        return _reduce_all(self.project_root.name, self._validated_events(connection), project_root=self.project_root)
 
     def _write_projections(self, state: dict[str, Any]) -> None:
         del state
@@ -533,6 +654,7 @@ class ResearchEventLedger:
                 stale.unlink()
             for attempt in latest["attempts"].values():
                 self._atomic_json(self.attempts_dir / f"{attempt['attempt_id']}.json", attempt)
+                self._atomic_json(_attempt_trial_spec_projection_path(self.project_root, attempt), attempt["frozen_trial_spec"])
             self._replace_projection(self.route_path, latest.get("last_route_outcome"))
             self._replace_projection(self.trial_path, latest.get("latest_trial_result"))
             self._replace_projection(self.aggregate_path, latest.get("latest_direction_aggregate"))
@@ -580,7 +702,7 @@ class ResearchEventLedger:
 
 
 def initial_state(project_id: str) -> dict[str, Any]:
-    return {"schema_version": STATE_SCHEMA_VERSION, "project_id": project_id, "last_sequence": 0, "last_event_hash": ZERO_HASH, "directions": {}, "excluded_direction_semantic_hashes": [], "variants": {}, "attempts": {}, "trial_results": {}, "method_tried_history": [], "implementation_history": [], "operation_events": {}, "current_direction_semantic_hash": None, "current_variant_spec_hash": None, "last_route_outcome": None, "latest_trial_result": None, "latest_direction_aggregate": None, "updated_at": None}
+    return {"schema_version": STATE_SCHEMA_VERSION, "project_id": project_id, "last_sequence": 0, "last_event_hash": ZERO_HASH, "directions": {}, "excluded_direction_semantic_hashes": [], "variants": {}, "attempts": {}, "trial_results": {}, "proxy_outcomes": {}, "method_tried_history": [], "implementation_history": [], "operation_events": {}, "current_direction_semantic_hash": None, "current_variant_spec_hash": None, "last_route_outcome": None, "latest_trial_result": None, "latest_direction_aggregate": None, "updated_at": None}
 
 
 def _attempt_input_hash_from_spec(implementation_hash: str, trial_spec: dict[str, Any]) -> str:
@@ -597,6 +719,39 @@ def _attempt_input_hash_from_spec(implementation_hash: str, trial_spec: dict[str
         evaluator_hash=trial_spec["execution_contract"]["evaluator_hash"],
         trial_spec=trial_spec,
     )
+
+
+def _validate_real_sample_manifest(project_root: Path, trial_spec: dict[str, Any]) -> None:
+    manifest = trial_spec["sample_manifest"]
+    if manifest.get("provenance_mode") != "real":
+        return
+    artifact_path = manifest.get("artifact_path")
+    artifact_hash = manifest.get("artifact_hash")
+    if not isinstance(artifact_path, str) or not isinstance(artifact_hash, str):
+        raise IntegrityError("real TrialSpec requires a content-addressed sample manifest artifact")
+    try:
+        raw = EvidenceStore(project_root).read_staged_source(artifact_path)
+        decoded = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError(f"sample manifest artifact rejected: {exc}") from exc
+    expected = {key: value for key, value in manifest.items() if key != "artifact_hash"}
+    if canonical_json(decoded) != canonical_json(expected) or canonical_hash(decoded) != artifact_hash:
+        raise IntegrityError("sample manifest artifact hash or content mismatch")
+    evaluator = trial_spec["execution_contract"]["evaluator_provenance"]
+    if evaluator.get("provenance_mode") != "real":
+        raise IntegrityError("real samples cannot be combined with synthetic evaluator provenance")
+    evaluator_path = evaluator.get("artifact_path")
+    evaluator_hash = evaluator.get("artifact_hash")
+    if not isinstance(evaluator_path, str) or not isinstance(evaluator_hash, str):
+        raise IntegrityError("real TrialSpec requires a content-addressed evaluator manifest artifact")
+    try:
+        evaluator_raw = EvidenceStore(project_root).read_staged_source(evaluator_path)
+        evaluator_decoded = json.loads(evaluator_raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError(f"evaluator manifest artifact rejected: {exc}") from exc
+    evaluator_expected = {key: value for key, value in evaluator.items() if key != "artifact_hash"}
+    if canonical_json(evaluator_decoded) != canonical_json(evaluator_expected) or canonical_hash(evaluator_decoded) != evaluator_hash:
+        raise IntegrityError("evaluator manifest artifact hash or content mismatch")
 
 
 def _canonical_attempt_id(project_id: str, identity: str) -> str:
@@ -667,6 +822,8 @@ def _build_canonical_attempt(
         "consumes_direction_budget": consumes,
         "reserved_slot": reserved,
         "phases": {"proxy": "PENDING", "full": "PENDING"},
+        "phase_executions": {"proxy": None, "full": None},
+        "committed_proxy_outcome": None,
         "paused_phase": None,
         "method_evaluable": False,
         "terminal_outcome": None,
@@ -716,7 +873,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         next_state["current_variant_spec_hash"] = variant["variant_spec_hash"]
     elif event_type == "AttemptReserved":
         attempt = payload["attempt"]
-        validate_contract(attempt, "attempt_record_v4.schema.json")
+        validate_contract(attempt, "attempt_record_v5.schema.json")
         expected_consumes, expected_reserved = _profile_budget_mapping(attempt["profile"], attempt["attempt_kind"])
         if attempt["consumes_direction_budget"] != expected_consumes or attempt["reserved_slot"] != expected_reserved:
             raise IntegrityError("attempt budget flags do not match profile/attempt_kind")
@@ -748,12 +905,12 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         _validate_frozen_trial_spec(attempt)
         if attempt["attempt_id"] in next_state["attempts"]:
             raise IntegrityError("duplicate attempt_id")
+        if _active_standard_attempts(next_state):
+            raise IntegrityError("project execution_width=1 reservation conflict")
         if attempt["reserved_slot"]:
             budget = direction["budget"]
             if budget["consumed"] + budget["reserved"] >= TARGET_OUTCOMES:
                 raise IntegrityError("direction budget exhausted before reservation")
-            if _active_standard_attempts(next_state):
-                raise IntegrityError("project execution_width=1 reservation conflict")
             budget["reserved"] += 1
         next_state["attempts"][attempt["attempt_id"]] = attempt
     elif event_type == "AttemptTransitioned":
@@ -763,6 +920,66 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
             raise IntegrityError("attempt transition source state mismatch")
         _apply_transition(attempt, payload["new_state"], payload.get("phase"), payload.get("phase_state"), event["created_at"])
         next_state["operation_events"][_transition_replay_key_from_payload(payload)] = {"event_id": event["event_id"], "payload": deepcopy(payload)}
+    elif event_type in {"ProxyPhaseStarted", "FullPhaseStarted"}:
+        attempt = _attempt(next_state, payload["attempt_id"])
+        _validate_operation_identity(attempt, payload)
+        if payload["expected_state"] != attempt["state"]:
+            raise IntegrityError("phase start source state mismatch")
+        manifest = payload["phase_execution_manifest"]
+        validate_contract(manifest, "phase_execution_manifest_v1.schema.json")
+        phase = manifest["phase"]
+        if event_type == "ProxyPhaseStarted" and phase != "proxy":
+            raise IntegrityError("ProxyPhaseStarted requires proxy manifest")
+        if event_type == "FullPhaseStarted" and phase != "full":
+            raise IntegrityError("FullPhaseStarted requires full manifest")
+        for key in ("attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash"):
+            if manifest[key] != attempt[key]:
+                raise IntegrityError(f"phase manifest {key} mismatch")
+        if manifest["phase_start_event_id"] != event["event_id"]:
+            raise IntegrityError("phase manifest source event mismatch")
+        if phase == "proxy":
+            if attempt["state"] != "READY" or attempt["phases"]["proxy"] != "PENDING":
+                raise IntegrityError("proxy start requires READY/PENDING")
+            attempt["state"] = "PROXY_RUNNING"
+        else:
+            if attempt["attempt_kind"] == "proxy_full":
+                proxy = attempt.get("committed_proxy_outcome")
+                if attempt["state"] != "PROXY_COMPLETED" or not isinstance(proxy, dict) or proxy["decision"] != "RUN_FULL":
+                    raise IntegrityError("full start requires committed RUN_FULL proxy outcome")
+            elif attempt["state"] != "READY":
+                raise IntegrityError("full start requires READY")
+            attempt["state"] = "FULL_RUNNING"
+        attempt["phases"][phase] = "RUNNING"
+        attempt["phase_executions"][phase] = deepcopy(manifest)
+        attempt["updated_at"] = event["created_at"]
+    elif event_type == "ProxyEvidenceCommitted":
+        proxy_outcome = payload["proxy_outcome"]
+        validate_contract(proxy_outcome, "proxy_outcome_v1.schema.json")
+        attempt = _attempt(next_state, proxy_outcome["attempt_id"])
+        if attempt["state"] != "PROXY_RUNNING" or attempt["phases"]["proxy"] != "RUNNING":
+            raise IntegrityError("proxy commit requires running proxy phase")
+        phase_execution = attempt["phase_executions"]["proxy"]
+        for key in ("lifecycle_generation", "implementation_hash", "attempt_input_hash", "phase_execution_id", "phase_start_event_id"):
+            if proxy_outcome[key] != phase_execution[key]:
+                raise IntegrityError(f"ProxyOutcome {key} mismatch")
+        if proxy_outcome["evidence_manifest_hash"] != canonical_hash(payload["evidence_manifest"]):
+            raise IntegrityError("ProxyOutcome evidence manifest hash mismatch")
+        project_root = next_state.get("project_root")
+        if not project_root:
+            raise IntegrityError("proxy evidence reduction requires project root")
+        expected_proxy = _canonical_proxy_outcome_from_manifest(Path(project_root), attempt, payload["evidence_manifest"])
+        if canonical_json(proxy_outcome) != canonical_json(expected_proxy):
+            raise IntegrityError("ProxyOutcome differs from immutable evidence-derived outcome")
+        attempt["phases"]["proxy"] = "COMPLETED"
+        attempt["state"] = "PROXY_COMPLETED" if proxy_outcome["decision"] == "RUN_FULL" else "ABANDONED"
+        attempt["committed_proxy_outcome"] = {"event_id": event["event_id"], "event_hash": event["event_hash"], "outcome_hash": canonical_hash(proxy_outcome), "decision": proxy_outcome["decision"]}
+        attempt["updated_at"] = event["created_at"]
+        next_state["proxy_outcomes"][attempt["attempt_id"]] = deepcopy(proxy_outcome)
+        if proxy_outcome["decision"] != "RUN_FULL" and attempt["reserved_slot"]:
+            next_state["directions"][attempt["direction_semantic_hash"]]["budget"]["reserved"] -= 1
+            attempt["reserved_slot"] = False
+        action = "RUN_FULL" if proxy_outcome["decision"] == "RUN_FULL" else proxy_outcome["decision"]
+        next_state["last_route_outcome"] = build_route_outcome(next_state, action, proxy_outcome["reason_codes"], attempt, source_event_id=event["event_id"], source_sequence=event["sequence"])
     elif event_type == "AttemptImplementationRevised":
         attempt = _attempt(next_state, payload["attempt_id"])
         _validate_operation_identity(attempt, payload, require_input=False)
@@ -778,7 +995,10 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         attempt["implementation_revisions"].append({"previous_implementation_hash": previous, "implementation_hash": payload["implementation_hash"], "attempt_input_hash": payload["attempt_input_hash"], "created_at": event["created_at"]})
         attempt["lifecycle_generation"] += 1
         attempt["state"] = "READY"
-        attempt["phases"] = {key: ("PENDING" if value == "FAILED" else value) for key, value in attempt["phases"].items()}
+        attempt["phases"] = {"proxy": "PENDING", "full": "PENDING"}
+        attempt["phase_executions"] = {"proxy": None, "full": None}
+        attempt["committed_proxy_outcome"] = None
+        next_state["proxy_outcomes"].pop(attempt["attempt_id"], None)
         attempt["failure_class"] = None
         attempt["artifact_hashes"] = {}
         attempt["updated_at"] = event["created_at"]
@@ -786,7 +1006,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         next_state["operation_events"][_revision_replay_key_from_payload(payload)] = {"event_id": event["event_id"], "payload": deepcopy(payload)}
     elif event_type == "AttemptResumed":
         evidence = payload["resume_evidence"]
-        validate_contract(evidence, "resume_evidence_v2.schema.json")
+        validate_contract(evidence, "resume_evidence_v3.schema.json")
         attempt = _attempt(next_state, evidence["attempt_id"])
         _validate_resume_identity(attempt, evidence)
         if attempt["state"] != "RESOURCE_PAUSED":
@@ -796,6 +1016,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         paused_phase = attempt.get("paused_phase")
         if paused_phase is not None and attempt["phases"][paused_phase] in {"RUNNING", "FAILED"}:
             attempt["phases"][paused_phase] = "PENDING"
+            attempt["phase_executions"][paused_phase] = None
         attempt["paused_phase"] = None
         attempt["failure_class"] = None
         attempt["artifact_hashes"] = {}
@@ -816,7 +1037,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         attempt["updated_at"] = event["created_at"]
     elif event_type == "AttemptDispositioned":
         evidence = payload["failure_evidence"]
-        validate_contract(evidence, "failure_evidence_v2.schema.json")
+        validate_contract(evidence, "failure_evidence_v3.schema.json")
         attempt = _attempt(next_state, evidence["attempt_id"])
         _validate_failure_identity(attempt, evidence)
         action, target_state = _failure_route(evidence["failure_class"])
@@ -831,6 +1052,12 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         if payload["expected_state"] != attempt["state"]:
             raise IntegrityError("attempt finalization source state mismatch")
         attempt = _validate_trial_against_state(next_state, trial)
+        project_root = next_state.get("project_root")
+        if not project_root:
+            raise IntegrityError("TrialResult reduction requires project root")
+        expected_trial = _canonical_trial_from_manifest(Path(project_root), attempt, trial["evidence_manifest"])
+        if canonical_json(trial) != canonical_json(expected_trial):
+            raise IntegrityError("TrialResult differs from immutable evidence-derived result")
         next_state = _apply_trial_to_state(next_state, trial)
         expected_aggregate = _build_direction_aggregate(next_state, attempt["direction_semantic_hash"]) if next_state["directions"][attempt["direction_semantic_hash"]]["budget"]["consumed"] == TARGET_OUTCOMES else None
         route = _route_after_verified_trial(next_state, attempt, expected_aggregate, source_event_id=event["event_id"], source_sequence=event["sequence"])
@@ -859,7 +1086,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
 def build_route_outcome(state: dict[str, Any], next_action: str, reason_codes: list[str], attempt: dict[str, Any], *, source_event_id: str | None, source_sequence: int | None) -> dict[str, Any]:
     budget = deepcopy(state["directions"][attempt["direction_semantic_hash"]]["budget"])
     route = {"schema_version": ROUTE_OUTCOME_SCHEMA_VERSION, "source": {"event_id": source_event_id, "sequence": source_sequence, "attempt_id": attempt["attempt_id"]}, "identity": {key: attempt[key] for key in ["direction_id", "direction_semantic_hash", "direction_spec_hash", "variant_id", "variant_semantic_hash", "variant_spec_hash", "attempt_id"]}, "next_action": next_action, "reason_codes": list(reason_codes), "budget_snapshot": budget, "artifact_hashes": deepcopy(attempt.get("artifact_hashes") or {}), "idempotency_key": canonical_hash({"source_event_id": source_event_id, "source_sequence": source_sequence, "attempt_id": attempt["attempt_id"], "lifecycle_generation": attempt["lifecycle_generation"], "next_action": next_action, "reason_codes": list(reason_codes), "budget": budget, "artifact_hashes": attempt.get("artifact_hashes") or {}, "variant_spec_hash": attempt["variant_spec_hash"]})}
-    validate_contract(route, "route_outcome_v3.schema.json")
+    validate_contract(route, "route_outcome_v4.schema.json")
     return route
 
 
@@ -900,14 +1127,17 @@ def _apply_trial_to_state(state: dict[str, Any], trial: dict[str, Any]) -> dict[
 
 
 def _validate_trial_against_state(state: dict[str, Any], trial: dict[str, Any]) -> dict[str, Any]:
-    validate_trial_result(trial)
     attempt = _attempt(state, trial["attempt_id"])
+    try:
+        validate_trial_result(trial, attempt=attempt, trial_spec=attempt["frozen_trial_spec"])
+    except ValueError as exc:
+        raise IntegrityError(f"AttemptFinalized canonical TrialResult mismatch: {exc}") from exc
     if attempt["state"] in TERMINAL_ATTEMPT_STATES or attempt["method_evaluable"]:
         existing = state["trial_results"].get(attempt["attempt_id"])
         if existing == trial:
             return attempt
         raise IntegrityError("attempt already finalized")
-    for key in ["direction_id", "direction_semantic_hash", "direction_spec_hash", "variant_id", "variant_semantic_hash", "variant_spec_hash", "trial_spec_hash", "acceptance_contract_hash", "attempt_input_hash", "protocol_hash"]:
+    for key in ["direction_id", "direction_semantic_hash", "direction_spec_hash", "variant_id", "variant_semantic_hash", "variant_spec_hash", "trial_spec_hash", "acceptance_contract_hash", "attempt_input_hash", "protocol_hash", "lifecycle_generation", "implementation_hash"]:
         if trial.get(key) != attempt.get(key):
             raise IntegrityError(f"TrialResult {key} mismatch")
     if not attempt["reserved_slot"] and attempt["consumes_direction_budget"]:
@@ -918,6 +1148,12 @@ def _validate_trial_against_state(state: dict[str, Any], trial: dict[str, Any]) 
         raise IntegrityError("proxy cannot be terminal for this attempt kind")
     if trial["completeness"] == "full" and attempt["attempt_kind"] not in {"full", "proxy_full"}:
         raise IntegrityError("full result cannot finalize this attempt kind")
+    if attempt["attempt_kind"] == "proxy_full":
+        proxy = attempt.get("committed_proxy_outcome")
+        if not isinstance(proxy, dict) or proxy.get("decision") != "RUN_FULL":
+            raise IntegrityError("proxy_full finalization requires committed RUN_FULL ProxyOutcome")
+        if trial.get("proxy_outcome_event_id") != proxy["event_id"] or trial.get("proxy_outcome_hash") != proxy["outcome_hash"]:
+            raise IntegrityError("TrialResult ProxyOutcome binding mismatch")
     expected_state = "FULL_RUNNING" if trial["completeness"] == "full" else {"PROXY_RUNNING", "PROXY_COMPLETED"}
     if isinstance(expected_state, str) and attempt["state"] != expected_state:
         raise IntegrityError(f"{trial['completeness']} TrialResult requires {expected_state} execution state")
@@ -934,7 +1170,8 @@ def _validate_trial_against_state(state: dict[str, Any], trial: dict[str, Any]) 
 
 def _validate_trial_observations(attempt: dict[str, Any], trial: dict[str, Any]) -> None:
     validate_trial_evidence(trial, attempt=attempt)
-    required = set(attempt["required_datasets"])
+    phase_contract = next(item for item in attempt["frozen_trial_spec"]["phase_contracts"] if item["phase"] == trial["completeness"])
+    required = set(phase_contract["datasets"])
     observed = set(trial["observed_datasets"])
     if set(trial["required_datasets"]) != required or required != observed:
         raise IntegrityError("required and observed dataset coverage mismatch")
@@ -952,11 +1189,15 @@ def _validate_trial_observations(attempt: dict[str, Any], trial: dict[str, Any])
             raise IntegrityError("observation seed is not pre-registered")
         if observation["command_status"] != "completed":
             raise IntegrityError("method-evaluable observation command status must be completed")
-        if observation["phase"] not in {trial["completeness"], "ablation"}:
+        if observation["phase"] != trial["completeness"]:
             raise IntegrityError("observation phase disagrees with TrialResult completeness")
+        phase_execution = attempt["phase_executions"][trial["completeness"]]
+        for key in ("lifecycle_generation", "implementation_hash", "attempt_input_hash", "phase_execution_id", "phase_start_event_id", "producer_run_id"):
+            if observation[key] != phase_execution[key]:
+                raise IntegrityError(f"observation {key} mismatch")
         if observation["raw_artifact_hash"] not in registered_artifacts:
             raise IntegrityError("observation references an unregistered raw artifact hash")
-        identity = (observation["phase"], observation["role"], observation["dataset_id"], observation["metric_id"], observation["seed"])
+        identity = (observation["phase"], observation["phase_execution_id"], observation["role"], observation["dataset_id"], observation["metric_id"], observation["seed"])
         if identity in identities:
             raise IntegrityError("duplicate observation identity")
         identities.add(identity)
@@ -965,12 +1206,14 @@ def _validate_trial_observations(attempt: dict[str, Any], trial: dict[str, Any])
         roles_by_dataset_seed.setdefault((observation["dataset_id"], observation["seed"]), set()).add(observation["role"])
     if observation_datasets != required:
         raise IntegrityError("observation dataset coverage mismatch")
-    if attempt["require_complete_seed_coverage"] and observed_seeds != set(attempt["seeds"]):
+    if attempt["require_complete_seed_coverage"] and observed_seeds != set(phase_contract["seeds"]):
         raise IntegrityError("observation seed coverage mismatch")
     for dataset_id in required:
-        for seed in attempt["seeds"]:
-            if attempt["require_complete_seed_coverage"] and not set(attempt["required_roles"]).issubset(roles_by_dataset_seed.get((dataset_id, seed), set())):
+        for seed in phase_contract["seeds"]:
+            if attempt["require_complete_seed_coverage"] and not set(phase_contract["roles"]).issubset(roles_by_dataset_seed.get((dataset_id, seed), set())):
                 raise IntegrityError("pre-registered role coverage is incomplete")
+    if trial["evidence_manifest_hash"] != canonical_hash(trial["evidence_manifest"]):
+        raise IntegrityError("TrialResult evidence_manifest_hash mismatch")
     if trial["completeness"] not in attempt["terminal_method_phases"]:
         raise IntegrityError("TrialResult phase is not a pre-registered terminal method phase")
 
@@ -1002,7 +1245,7 @@ def _validate_event_request(event_type: str, payload: dict[str, Any], event_id: 
         raise IntegrityError(f"invalid event_id format: {event_id}")
     if not isinstance(payload, dict):
         raise IntegrityError("event payload must be an object")
-    required = {"DirectionSelected": {"direction"}, "VariantPlanned": {"variant", "feedback_from_attempt_ids"}, "AttemptReserved": {"attempt"}, "AttemptTransitioned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "new_state", "phase", "phase_state"}, "AttemptImplementationRevised": {"attempt_id", "lifecycle_generation", "previous_implementation_hash", "previous_attempt_input_hash", "expected_state", "implementation_hash", "attempt_input_hash"}, "AttemptResumed": {"resume_evidence"}, "AttemptAbandoned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "reason"}, "AttemptDispositioned": {"failure_evidence"}, "AttemptFinalized": {"trial_result", "lifecycle_generation", "expected_state", "implementation_hash", "attempt_input_hash"}, "AuditMarker": {"index"}}[event_type]
+    required = {"DirectionSelected": {"direction"}, "VariantPlanned": {"variant", "feedback_from_attempt_ids"}, "AttemptReserved": {"attempt"}, "AttemptTransitioned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "new_state", "phase", "phase_state"}, "ProxyPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "FullPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "ProxyEvidenceCommitted": {"proxy_outcome", "evidence_manifest"}, "AttemptImplementationRevised": {"attempt_id", "lifecycle_generation", "previous_implementation_hash", "previous_attempt_input_hash", "expected_state", "implementation_hash", "attempt_input_hash"}, "AttemptResumed": {"resume_evidence"}, "AttemptAbandoned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "reason"}, "AttemptDispositioned": {"failure_evidence"}, "AttemptFinalized": {"trial_result", "lifecycle_generation", "expected_state", "implementation_hash", "attempt_input_hash"}, "AuditMarker": {"index"}}[event_type]
     actual = set(payload) - {"request_fingerprint"}
     if actual != required or ("request_fingerprint" in payload and not re.fullmatch(r"[a-f0-9]{64}", payload["request_fingerprint"])):
         raise IntegrityError(f"{event_type} payload fields must be {sorted(required)}")
@@ -1012,7 +1255,7 @@ def _validate_event(event: dict[str, Any]) -> None:
     if event.get("schema_version") != EVENT_SCHEMA_VERSION:
         raise BreakingSchemaError("invalid or unsupported Event v3 schema")
     try:
-        validate_contract(event, "event_v4.schema.json")
+        validate_contract(event, "event_v5.schema.json")
     except ValueError as exc:
         raise IntegrityError(f"invalid Event v3 schema: {exc}") from exc
     _validate_event_request(event["event_type"], event["payload"], event["event_id"])
@@ -1038,13 +1281,101 @@ def _event_attempt_id(payload: dict[str, Any]) -> str | None:
     return payload.get("attempt_id")
 
 
-def _reduce_all(project_id: str, events: list[dict[str, Any]]) -> dict[str, Any]:
+def _reduce_all(project_id: str, events: list[dict[str, Any]], *, project_root: Path | None = None) -> dict[str, Any]:
     state = initial_state(project_id)
-    state["project_root"] = None
+    state["project_root"] = str(project_root) if project_root is not None else None
     for event in events:
         state = reduce_event(state, event)
     state.pop("project_root", None)
     return state
+
+
+def _manifest_evidence_bytes(project_root: Path, attempt: dict[str, Any], manifest: dict[str, Any]) -> dict[str, bytes]:
+    store = EvidenceStore(project_root)
+    evidence_bytes: dict[str, bytes] = {}
+    for entry in manifest.get("entries") or []:
+        try:
+            evidence_bytes[entry["evidence_id"]] = store.read_entry(entry, attempt)
+        except (KeyError, ValueError) as exc:
+            raise IntegrityError(f"immutable evidence audit failed: {exc}") from exc
+    return evidence_bytes
+
+
+def _canonical_trial_from_manifest(project_root: Path, attempt: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    try:
+        return classify_trial_result(
+            attempt=attempt,
+            trial_spec=attempt["frozen_trial_spec"],
+            evidence_manifest=manifest,
+            evidence_bytes=_manifest_evidence_bytes(project_root, attempt, manifest),
+        )
+    except (ValueError, OSError) as exc:
+        raise IntegrityError(f"immutable TrialResult audit failed: {exc}") from exc
+
+
+def _canonical_proxy_outcome_from_manifest(project_root: Path, attempt: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+    evidence_bytes = _manifest_evidence_bytes(project_root, attempt, manifest)
+    try:
+        observations, decoded = decode_evidence_inventory(
+            attempt=attempt,
+            trial_spec=attempt["frozen_trial_spec"],
+            manifest=manifest,
+            evidence_bytes=evidence_bytes,
+        )
+    except ValueError as exc:
+        raise IntegrityError(f"immutable ProxyOutcome audit failed: {exc}") from exc
+    return _canonical_proxy_outcome(attempt, manifest, observations, project_root, decoded=decoded)
+
+
+def _canonical_proxy_outcome(
+    attempt: dict[str, Any],
+    manifest: dict[str, Any],
+    observations: list[dict[str, Any]],
+    project_root: Path,
+    *,
+    decoded: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    del project_root
+    paired: dict[tuple[str, int, str, str], dict[str, float]] = {}
+    for observation in observations:
+        if observation["phase"] != "proxy":
+            raise IntegrityError("proxy evidence contains a non-proxy observation")
+        key = (observation["phase_execution_id"], observation["dataset_id"], observation["seed"], observation["metric_id"])
+        paired.setdefault(key, {})[observation["role"]] = float(observation["metric_value"])
+    if not paired or any(set(values) != {"baseline", "candidate"} for values in paired.values()):
+        raise IntegrityError("proxy evidence requires paired baseline and candidate rows")
+    primary_metric = attempt["frozen_trial_spec"]["primary_metric_id"]
+    metric = next(item for item in attempt["frozen_trial_spec"]["metrics"] if item["metric_id"] == primary_metric)
+    primary_pairs = [values for key, values in paired.items() if key[3] == primary_metric]
+    if not primary_pairs:
+        raise IntegrityError("proxy evidence lacks primary metric pairs")
+    if metric["objective"] == "maximize":
+        deltas = [values["candidate"] - values["baseline"] for values in primary_pairs]
+    else:
+        deltas = [values["baseline"] - values["candidate"] for values in primary_pairs]
+    observed_delta = sum(deltas) / len(deltas)
+    if decoded is None:
+        raise IntegrityError("proxy outcome requires decoded policy evidence")
+    policy = next((payload for payload in decoded.values() if payload.get("evidence_kind") == "effective_proxy_policy"), None)
+    if not isinstance(policy, dict):
+        raise IntegrityError("proxy outcome requires effective proxy policy")
+    threshold = float(policy["decision_threshold"])
+    decision = "RUN_FULL" if observed_delta >= threshold else "PROPOSE_NEXT_VARIANT"
+    outcome = {
+        "schema_version": "auto_research_proxy_outcome_v1",
+        "attempt_id": attempt["attempt_id"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase_execution_id": attempt["phase_executions"]["proxy"]["phase_execution_id"],
+        "phase_start_event_id": attempt["phase_executions"]["proxy"]["phase_start_event_id"],
+        "evidence_manifest_hash": canonical_hash(manifest),
+        "observed_delta": observed_delta,
+        "decision": decision,
+        "reason_codes": ["proxy_threshold_pass" if decision == "RUN_FULL" else "proxy_threshold_fail"],
+    }
+    validate_contract(outcome, "proxy_outcome_v1.schema.json")
+    return outcome
 
 
 def _validate_state_invariants(state: dict[str, Any]) -> None:
@@ -1078,7 +1409,7 @@ def _validate_state_invariants(state: dict[str, Any]) -> None:
         if candidate_phases != {trial["completeness"]}:
             raise IntegrityError("TrialResult observations disagree with completeness")
     for attempt in state["attempts"].values():
-        validate_contract(attempt, "attempt_record_v4.schema.json")
+        validate_contract(attempt, "attempt_record_v5.schema.json")
         _validate_frozen_trial_spec(attempt)
         expected_consumes, expected_reserved_at_reservation = _profile_budget_mapping(attempt["profile"], attempt["attempt_kind"])
         if attempt["consumes_direction_budget"] != expected_consumes:
@@ -1103,6 +1434,12 @@ def _validate_state_invariants(state: dict[str, Any]) -> None:
             raise IntegrityError("paused_phase is only valid for RESOURCE_PAUSED")
         if attempt["attempt_kind"] == "proxy_full" and attempt["state"] == "FULL_RUNNING" and "proxy" in attempt["required_phases"] and attempt["phases"]["proxy"] != "COMPLETED":
             raise IntegrityError("proxy_full phase prerequisite invariant violated")
+        for phase in ("proxy", "full"):
+            execution = attempt["phase_executions"][phase]
+            if attempt["phases"][phase] == "RUNNING" and not isinstance(execution, dict):
+                raise IntegrityError("running phase requires PhaseExecutionManifest")
+        if attempt["state"] == "PROXY_COMPLETED" and not isinstance(attempt.get("committed_proxy_outcome"), dict):
+            raise IntegrityError("PROXY_COMPLETED requires committed ProxyOutcome")
 
 
 def _apply_transition(attempt: dict[str, Any], new_state: str, phase: str | None, phase_state: str | None, timestamp: str) -> None:
@@ -1162,7 +1499,7 @@ def _failure_route(failure_class: str) -> tuple[str, str]:
 def _active_standard_attempts(state: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         attempt for attempt in state["attempts"].values()
-        if attempt["profile"] == "standard" and attempt["reserved_slot"] and attempt["state"] in ACTIVE_ATTEMPT_STATES
+        if attempt["state"] in ACTIVE_ATTEMPT_STATES
     ]
 
 
@@ -1286,7 +1623,7 @@ def _validate_frozen_trial_spec(attempt: dict[str, Any]) -> None:
 
 
 def _validate_trial_spec_projection(project_root: Path, attempt: dict[str, Any]) -> None:
-    path = project_root / "plan" / "trial_spec.json"
+    path = _attempt_trial_spec_projection_path(project_root, attempt)
     if not path.exists():
         raise IntegrityError("canonical TrialSpec projection is missing")
     try:
@@ -1295,6 +1632,10 @@ def _validate_trial_spec_projection(project_root: Path, attempt: dict[str, Any])
         raise IntegrityError("TrialSpec projection is corrupt") from error
     if canonical_hash(projected) != attempt["trial_spec_hash"] or projected != attempt["frozen_trial_spec"]:
         raise IntegrityError("TrialSpec projection drift detected")
+
+
+def _attempt_trial_spec_projection_path(project_root: Path, attempt: dict[str, Any]) -> Path:
+    return project_root / "plan" / "attempts" / attempt["attempt_id"] / "trial_spec" / f"{attempt['trial_spec_hash']}.json"
 
 
 def _artifact_path(project_root: Path, artifact: dict[str, Any]) -> Path:
@@ -1321,10 +1662,22 @@ def _validate_failure_identity(attempt: dict[str, Any], evidence: dict[str, Any]
     }.get(attempt["state"], set())
     if evidence["source_phase"] not in expected_phases:
         raise IntegrityError("FailureEvidence source phase mismatch")
+    if evidence["phase"] != evidence["source_phase"]:
+        raise IntegrityError("FailureEvidence phase must equal source_phase")
 
 
 def _validate_failure_evidence(project_root: Path, attempt: dict[str, Any], evidence: dict[str, Any]) -> None:
     _validate_failure_identity(attempt, evidence)
+    execution_phase = evidence["source_phase"] if evidence["source_phase"] in {"proxy", "full"} else (
+        "proxy" if attempt["state"] == "PROXY_RUNNING" else "full" if attempt["state"] == "FULL_RUNNING" else None
+    )
+    if execution_phase is not None:
+        execution = attempt["phase_executions"].get(execution_phase)
+        if not isinstance(execution, dict):
+            raise IntegrityError("FailureEvidence requires an authoritative phase execution")
+        for key in ("phase_execution_id", "phase_start_event_id"):
+            if evidence[key] != execution[key]:
+                raise IntegrityError(f"FailureEvidence {key} mismatch")
     _failure_route(evidence["failure_class"])
     failure_class = evidence["failure_class"]
     command_status = evidence["command_status"]
@@ -1340,19 +1693,27 @@ def _validate_failure_evidence(project_root: Path, attempt: dict[str, Any], evid
         if command_status != "integrity_blocked" or exit_code == 0:
             raise IntegrityError("integrity failure evidence status/exit mismatch")
     _validate_trial_spec_projection(project_root, attempt)
-    path = _content_addressed_artifact_by_hash(project_root, attempt, evidence["producer_run_id"], evidence["log_hash"])
-    if path is None:
-        raise IntegrityError("FailureEvidence artifact hash mismatch")
+    kind = "resource_probe" if failure_class in {"resource_pause", "oom_retry"} else "failure_evidence"
+    raw = _read_exact_evidence(project_root, attempt, evidence["producer_run_id"], kind, evidence["log_hash"])
+    if kind == "resource_probe":
+        try:
+            probe = json.loads(raw.decode("utf-8"))
+            validate_contract(probe, "resource_probe_v2.schema.json")
+        except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+            raise IntegrityError("FailureEvidence resource probe is invalid") from exc
+        _validate_probe_identity(attempt, probe)
 
 
 def _validate_resume_identity(attempt: dict[str, Any], evidence: dict[str, Any]) -> None:
     for key in [
         "attempt_id", "direction_semantic_hash", "direction_spec_hash", "variant_semantic_hash",
         "variant_spec_hash", "trial_spec_hash", "protocol_hash", "sample_manifest_hash",
-        "evaluator_hash", "lifecycle_generation",
+        "evaluator_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash",
     ]:
         if evidence[key] != attempt[key]:
             raise IntegrityError(f"ResumeEvidence {key} mismatch")
+    if evidence["phase"] != "resume":
+        raise IntegrityError("ResumeEvidence phase mismatch")
 
 
 def _validate_resume_evidence(project_root: Path, state: dict[str, Any], attempt: dict[str, Any], evidence: dict[str, Any]) -> None:
@@ -1366,14 +1727,14 @@ def _validate_resume_evidence(project_root: Path, state: dict[str, Any], attempt
     if evidence["pause_event_id"] != pause_event_id or evidence["pause_evidence_hash"] != canonical_hash(pause_evidence):
         raise IntegrityError("resume does not bind the committed pause event")
     _validate_trial_spec_projection(project_root, attempt)
-    pause_path = _content_addressed_artifact_by_hash(project_root, attempt, pause_evidence["producer_run_id"], pause_evidence["log_hash"])
-    path = _content_addressed_artifact_by_hash(project_root, attempt, evidence["producer_run_id"], evidence["cross_references"]["resource_probe_hash"])
-    if pause_path is None or path is None:
-        raise IntegrityError("ResumeEvidence artifact hash mismatch")
-    pause_probe = json.loads(pause_path.read_text(encoding="utf-8"))
-    probe = json.loads(path.read_text(encoding="utf-8"))
-    validate_contract(pause_probe, "resource_probe_v1.schema.json")
-    validate_contract(probe, "resource_probe_v1.schema.json")
+    pause_raw = _read_exact_evidence(project_root, attempt, pause_evidence["producer_run_id"], "resource_probe", pause_evidence["log_hash"])
+    raw = _read_exact_evidence(project_root, attempt, evidence["producer_run_id"], "resource_probe", evidence["cross_references"]["resource_probe_hash"])
+    pause_probe = json.loads(pause_raw.decode("utf-8"))
+    probe = json.loads(raw.decode("utf-8"))
+    validate_contract(pause_probe, "resource_probe_v2.schema.json")
+    validate_contract(probe, "resource_probe_v2.schema.json")
+    _validate_probe_identity(attempt, pause_probe)
+    _validate_probe_identity(attempt, probe)
     for key in ["resource_type", "resource_id", "required_capacity", "observed_capacity", "unit", "probe_status"]:
         if evidence[key] != probe[key]:
             raise IntegrityError(f"ResumeEvidence {key} differs from resource probe")
@@ -1393,10 +1754,34 @@ def _latest_pause_operation(state: dict[str, Any], attempt_id: str) -> tuple[str
     return matches[-1] if matches else None
 
 
-def _content_addressed_artifact_by_hash(project_root: Path, attempt: dict[str, Any], producer_run_id: str, digest: str) -> Path | None:
-    root = project_root / "experiment" / "attempts" / attempt["attempt_id"] / producer_run_id
-    matches = [path for path in root.glob(f"*/{digest}.json") if path.is_file() and not path.is_symlink() and _sha256(path) == digest]
-    return matches[0] if len(matches) == 1 else None
+def _read_exact_evidence(project_root: Path, attempt: dict[str, Any], producer_run_id: str, kind: str, digest: str) -> bytes:
+    relative_path = content_addressed_evidence_path(
+        attempt_id=attempt["attempt_id"], producer_run_id=producer_run_id, evidence_kind=kind, content_hash=digest
+    )
+    try:
+        return EvidenceStore(project_root).read_entry(
+            {"relative_path": relative_path, "producer_run_id": producer_run_id, "kind": kind, "content_hash": digest},
+            attempt,
+        )
+    except ValueError as exc:
+        raise IntegrityError(f"{kind} artifact rejected: {exc}") from exc
+
+
+def _validate_probe_identity(attempt: dict[str, Any], probe: dict[str, Any]) -> None:
+    for key in (
+        "attempt_id", "direction_semantic_hash", "direction_spec_hash", "variant_semantic_hash",
+        "variant_spec_hash", "trial_spec_hash", "protocol_hash", "sample_manifest_hash", "evaluator_hash",
+        "lifecycle_generation", "implementation_hash", "attempt_input_hash",
+    ):
+        if probe.get(key) != attempt.get(key):
+            raise IntegrityError(f"resource probe {key} mismatch")
+    phase = probe.get("phase")
+    execution = (attempt.get("phase_executions") or {}).get(phase)
+    if not isinstance(execution, dict):
+        raise IntegrityError("resource probe phase is not active or committed")
+    for key in ("phase_execution_id", "phase_start_event_id"):
+        if probe.get(key) != execution.get(key):
+            raise IntegrityError(f"resource probe {key} mismatch")
 
 
 def _apply_failure_disposition(state: dict[str, Any], attempt: dict[str, Any], target_state: str, evidence: dict[str, Any], timestamp: str) -> None:
@@ -1428,47 +1813,30 @@ def _validate_operation_identity(attempt: dict[str, Any], payload: dict[str, Any
 
 
 def _validate_route_for_attempt(route: dict[str, Any], attempt: dict[str, Any]) -> None:
-    validate_contract(route, "route_outcome_v3.schema.json")
+    validate_contract(route, "route_outcome_v4.schema.json")
     for key in ["direction_id", "direction_semantic_hash", "direction_spec_hash", "variant_id", "variant_semantic_hash", "variant_spec_hash", "attempt_id"]:
         if route["identity"][key] != attempt[key]:
             raise IntegrityError(f"RouteOutcome {key} mismatch")
 
 
-def _sha256(path: Path) -> str:
-    import hashlib
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def _validate_trial_artifact_hashes(project_root: Path, trial: dict[str, Any]) -> None:
-    for artifact_path, expected_hash in trial["raw_artifacts"].items():
-        path = Path(artifact_path)
-        if not path.is_absolute():
-            path = project_root / path
-        if not path.exists() or not path.is_file():
-            raise IntegrityError(f"raw artifact missing: {artifact_path}")
-        if _sha256(path) != expected_hash:
-            raise IntegrityError(f"raw artifact hash mismatch: {artifact_path}")
-
-
 def _validate_completion_request_shape(completion_evidence: dict[str, Any]) -> None:
     if not isinstance(completion_evidence, dict):
         raise IntegrityError("CompletionEvidence must be an object")
-    allowed = {"schema_version", "attempt_id", "trial_spec_hash", "entries", "diagnostic_trial_result"}
+    allowed = {"schema_version", "attempt_id", "trial_spec_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "entries", "diagnostic_trial_result"}
     if set(completion_evidence) - allowed or set(completion_evidence) < {"schema_version", "attempt_id", "trial_spec_hash", "entries"}:
         raise IntegrityError("CompletionEvidence has invalid fields")
-    if completion_evidence.get("schema_version") != "auto_research_completion_evidence_v1":
+    if completion_evidence.get("schema_version") != "auto_research_completion_evidence_v2":
         raise IntegrityError("CompletionEvidence schema version mismatch")
+    for key in ("lifecycle_generation", "implementation_hash", "attempt_input_hash"):
+        if key not in completion_evidence:
+            raise IntegrityError(f"CompletionEvidence {key} is required")
     if not isinstance(completion_evidence.get("attempt_id"), str) or not completion_evidence["attempt_id"]:
         raise IntegrityError("CompletionEvidence attempt_id is required")
     if not re.fullmatch(r"[a-f0-9]{64}", str(completion_evidence.get("trial_spec_hash", ""))):
         raise IntegrityError("CompletionEvidence trial_spec_hash is invalid")
     entries = completion_evidence.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise IntegrityError("CompletionEvidence requires a non-empty evidence inventory")
+    if not isinstance(entries, list):
+        raise IntegrityError("CompletionEvidence evidence inventory must be an array")
 
 
 def _classify_completion_evidence(
@@ -1481,9 +1849,13 @@ def _classify_completion_evidence(
         raise IntegrityError("CompletionEvidence attempt identity mismatch")
     if completion_evidence["trial_spec_hash"] != attempt["trial_spec_hash"]:
         raise IntegrityError("CompletionEvidence TrialSpec identity mismatch")
+    for key in ("lifecycle_generation", "implementation_hash", "attempt_input_hash"):
+        if completion_evidence[key] != attempt[key]:
+            raise IntegrityError(f"CompletionEvidence {key} mismatch")
     evidence_bytes: dict[str, bytes] = {}
     manifest_entries: list[dict[str, Any]] = []
     seen_ids: set[str] = set()
+    store = EvidenceStore(project_root)
     for entry in completion_evidence["entries"]:
         if not isinstance(entry, dict):
             raise IntegrityError("CompletionEvidence inventory entry must be an object")
@@ -1491,7 +1863,8 @@ def _classify_completion_evidence(
             "evidence_id", "kind", "relative_path", "content_hash", "schema_version",
             "attempt_id", "producer_run_id", "direction_semantic_hash", "direction_spec_hash",
             "variant_semantic_hash", "variant_spec_hash", "trial_spec_hash", "protocol_hash",
-            "sample_manifest_hash", "evaluator_hash",
+            "sample_manifest_hash", "evaluator_hash", "lifecycle_generation", "implementation_hash",
+            "attempt_input_hash", "phase", "phase_execution_id", "phase_start_event_id",
         }
         if set(entry) != required:
             raise IntegrityError("CompletionEvidence inventory entry fields are invalid")
@@ -1499,16 +1872,10 @@ def _classify_completion_evidence(
         if evidence_id in seen_ids:
             raise IntegrityError("CompletionEvidence contains duplicate evidence_id")
         seen_ids.add(evidence_id)
-        relative = Path(entry["relative_path"])
-        if relative.is_absolute() or ".." in relative.parts or "." in relative.parts:
-            raise IntegrityError("CompletionEvidence path traversal is forbidden")
-        path = project_root / relative
-        if path.is_symlink() or not path.is_file():
-            raise IntegrityError("CompletionEvidence artifact is missing or a symlink")
-        raw = path.read_bytes()
-        digest = __import__("hashlib").sha256(raw).hexdigest()
-        if digest != entry["content_hash"]:
-            raise IntegrityError("CompletionEvidence artifact hash mismatch")
+        try:
+            raw = store.read_entry(entry, attempt)
+        except ValueError as exc:
+            raise IntegrityError(f"CompletionEvidence artifact rejected: {exc}") from exc
         try:
             payload = json.loads(raw.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1516,7 +1883,7 @@ def _classify_completion_evidence(
         manifest_entries.append({**deepcopy(entry), "cross_references": deepcopy(payload.get("cross_references", {}))})
         evidence_bytes[evidence_id] = raw
     manifest = {
-        "schema_version": "auto_research_evidence_manifest_v2",
+        "schema_version": "auto_research_evidence_manifest_v3",
         "attempt_id": attempt["attempt_id"],
         "direction_semantic_hash": attempt["direction_semantic_hash"],
         "direction_spec_hash": attempt["direction_spec_hash"],
@@ -1526,8 +1893,41 @@ def _classify_completion_evidence(
         "protocol_hash": attempt["protocol_hash"],
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
         "entries": manifest_entries,
     }
+    phases = {entry["phase"] for entry in manifest_entries}
+    executions = {entry["phase_execution_id"] for entry in manifest_entries}
+    producers = {entry["producer_run_id"] for entry in manifest_entries}
+    if len(phases) != 1 or len(executions) != 1 or len(producers) != 1:
+        raise IntegrityError("CompletionEvidence cannot mix phase executions or producers")
+    phase = next(iter(phases))
+    registered = {
+        item["kind"]
+        for item in attempt["frozen_trial_spec"]["evidence_requirements"]
+        if phase in item["applicable_phases"] or "always" in item["applicable_phases"]
+    }
+    kinds = [entry["kind"] for entry in manifest_entries]
+    if len(kinds) != len(set(kinds)):
+        raise IntegrityError("CompletionEvidence contains duplicate evidence kind")
+    if not set(kinds).issubset(registered):
+        raise IntegrityError("CompletionEvidence contains unregistered evidence kind")
+    required = {
+        item["kind"]
+        for item in attempt["frozen_trial_spec"]["evidence_requirements"]
+        if item["required"] and (phase in item["applicable_phases"] or "always" in item["applicable_phases"])
+    }
+    if not required.issubset(kinds):
+        raise IntegrityError("CompletionEvidence is missing required phase evidence")
+    phase_execution = attempt["phase_executions"].get(phase)
+    if not isinstance(phase_execution, dict):
+        raise IntegrityError("CompletionEvidence phase has not been authoritatively started")
+    for entry in manifest_entries:
+        for key in ("phase_execution_id", "phase_start_event_id", "producer_run_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash"):
+            if entry[key] != phase_execution[key]:
+                raise IntegrityError(f"CompletionEvidence {key} does not match current phase execution")
     manifest_hash = canonical_hash(manifest)
     completion_fingerprint = canonical_hash({
         "operation": "complete_attempt",
@@ -1558,6 +1958,83 @@ def _classify_completion_evidence(
     except (ValueError, OSError) as exc:
         raise IntegrityError(f"CompletionEvidence classification failed: {exc}") from exc
     return trial_result, completion_fingerprint
+
+
+def _decode_phase_completion(
+    *,
+    project_root: Path,
+    attempt: dict[str, Any],
+    completion_evidence: dict[str, Any],
+    expected_phase: str,
+) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
+    for key in ("attempt_id", "trial_spec_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash"):
+        if completion_evidence.get(key) != attempt.get(key):
+            raise IntegrityError(f"CompletionEvidence {key} mismatch")
+    phase_execution = attempt["phase_executions"].get(expected_phase)
+    if not isinstance(phase_execution, dict):
+        raise IntegrityError(f"{expected_phase} phase has not been started")
+    store = EvidenceStore(project_root)
+    evidence_bytes: dict[str, bytes] = {}
+    entries: list[dict[str, Any]] = []
+    for source in completion_evidence["entries"]:
+        entry = deepcopy(source)
+        required = {
+            "evidence_id", "kind", "relative_path", "content_hash", "schema_version", "attempt_id",
+            "producer_run_id", "direction_semantic_hash", "direction_spec_hash", "variant_semantic_hash",
+            "variant_spec_hash", "trial_spec_hash", "protocol_hash", "sample_manifest_hash", "evaluator_hash",
+            "lifecycle_generation", "implementation_hash", "attempt_input_hash", "phase", "phase_execution_id",
+            "phase_start_event_id",
+        }
+        if set(entry) != required:
+            raise IntegrityError("CompletionEvidence inventory entry fields are invalid")
+        if entry["phase"] != expected_phase:
+            raise IntegrityError("CompletionEvidence phase mismatch")
+        for key in ("producer_run_id", "phase_execution_id", "phase_start_event_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash"):
+            if entry[key] != phase_execution[key]:
+                raise IntegrityError(f"CompletionEvidence {key} does not match phase execution")
+        try:
+            raw = store.read_entry(entry, attempt)
+            payload = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise IntegrityError(f"CompletionEvidence artifact rejected: {exc}") from exc
+        entry["cross_references"] = deepcopy(payload.get("cross_references", {}))
+        entries.append(entry)
+        evidence_bytes[entry["evidence_id"]] = raw
+    kinds = [entry["kind"] for entry in entries]
+    if len(kinds) != len(set(kinds)):
+        raise IntegrityError("CompletionEvidence contains duplicate evidence kind")
+    applicable = [
+        requirement for requirement in attempt["frozen_trial_spec"]["evidence_requirements"]
+        if expected_phase in requirement["applicable_phases"] or "always" in requirement["applicable_phases"]
+    ]
+    registered = {item["kind"] for item in applicable}
+    required_kinds = {item["kind"] for item in applicable if item["required"]}
+    if not set(kinds).issubset(registered) or not required_kinds.issubset(kinds):
+        raise IntegrityError("CompletionEvidence phase inventory violates frozen TrialSpec")
+    manifest = {
+        "schema_version": "auto_research_evidence_manifest_v3",
+        "attempt_id": attempt["attempt_id"],
+        "direction_semantic_hash": attempt["direction_semantic_hash"],
+        "direction_spec_hash": attempt["direction_spec_hash"],
+        "variant_semantic_hash": attempt["variant_semantic_hash"],
+        "variant_spec_hash": attempt["variant_spec_hash"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "protocol_hash": attempt["protocol_hash"],
+        "sample_manifest_hash": attempt["sample_manifest_hash"],
+        "evaluator_hash": attempt["evaluator_hash"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "entries": entries,
+    }
+    try:
+        observations, _ = decode_evidence_inventory(
+            attempt=attempt, trial_spec=attempt["frozen_trial_spec"], manifest=manifest, evidence_bytes=evidence_bytes
+        )
+    except ValueError as exc:
+        raise IntegrityError(f"CompletionEvidence decode failed: {exc}") from exc
+    fingerprint = canonical_hash({"operation": f"commit_{expected_phase}_evidence", "attempt_id": attempt["attempt_id"], "generation": attempt["lifecycle_generation"], "manifest_hash": canonical_hash(manifest), "artifact_hashes": sorted(entry["content_hash"] for entry in entries)})
+    return manifest, observations, fingerprint
 
 
 def canonical_json(value: Any) -> str:

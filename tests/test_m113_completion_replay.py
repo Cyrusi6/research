@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+import sqlite3
 
 import pytest
 
@@ -17,7 +18,6 @@ def _ready_finalization(tmp_path: Path, *, outcome: str = "rejected"):
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
     completion = _completion_evidence(ledger, attempt, outcome=outcome)
-    ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
     completed, route = ledger.complete_attempt(completion)
     event = ledger.events()[-1]
     assert event["event_type"] == "AttemptFinalized"
@@ -62,6 +62,8 @@ def test_conflicting_completion_for_completed_attempt_is_zero_write_integrity_er
     with pytest.raises(IntegrityError, match="completion fingerprint conflict"):
         ledger.complete_attempt(conflicting)
 
+    with sqlite3.connect(ledger.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == before["event_count"]
     assert _authoritative_snapshot(ledger, direction, attempt["attempt_id"]) == before
 
 
@@ -72,12 +74,17 @@ def test_completion_replay_revalidates_immutable_evidence_before_returning_histo
     artifact = ledger.project_root / completion["entries"][0]["relative_path"]
     if attack == "missing":
         artifact.unlink()
-        match = "artifact is missing"
+        match = "artifact rejected|unavailable"
+        state_match = "immutable evidence audit failed: evidence path contains a symlink or is unavailable"
     else:
         artifact.write_bytes(artifact.read_bytes() + b"\n")
-        match = "artifact hash mismatch"
+        match = "evidence content hash mismatch"
+        state_match = "immutable TrialResult audit failed: evidence content hash mismatch"
 
     with pytest.raises(IntegrityError, match=match):
         ledger.complete_attempt(completion)
 
-    assert _authoritative_snapshot(ledger, direction, attempt["attempt_id"]) == before
+    with sqlite3.connect(ledger.db_path) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM events").fetchone()[0] == before["event_count"]
+    with pytest.raises(IntegrityError, match=state_match):
+        ledger.state()

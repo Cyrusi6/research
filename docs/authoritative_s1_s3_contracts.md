@@ -6,11 +6,11 @@
 |---|---|---|---|
 | Direction | `DirectionSpec v3` | `literature/direction.json` | Complete research-direction specification with separate semantic/spec hashes |
 | Variant | `VariantSpec v4` | `plan/variant.json` | One scientific intervention bound to the complete DirectionSpec |
-| Trial | `TrialSpec v3` | frozen in `AttemptReserved`; `plan/trial_spec.json` is a projection | Complete preregistered protocol, content-addressed samples, evaluator provenance, metrics, acceptance, roles, phases, seeds, and evidence requirements |
-| Event | `Event v4` | `meta/research_events.sqlite3` | The only authoritative S1-S3 transaction store; SQLite WAL with a hash chain |
-| Attempt | `AttemptRecord v4` | `meta/attempts/<attempt_id>.json` | Rebuildable attempt lifecycle projection |
-| Result | `TrialResult v4` | `experiment/results/trial_result.json` | Rebuildable projection derived only from immutable row-level evidence |
-| Route | `RouteOutcome v3` | `meta/route_outcome.json` | Rebuildable deterministic route projection |
+| Trial | `TrialSpec v4` | frozen in `AttemptReserved`; immutable attempt-scoped projection | Complete preregistered protocol, phase contracts, content-addressed samples, evaluator provenance, metrics, acceptance, roles, seeds, and evidence requirements |
+| Event | `Event v5` | `meta/research_events.sqlite3` | The only authoritative S1-S3 transaction store; SQLite WAL with a hash chain |
+| Attempt | `AttemptRecord v5` | `meta/attempts/<attempt_id>.json` | Rebuildable attempt lifecycle and phase-execution projection |
+| Result | `TrialResult v5` | `experiment/results/trial_result.json` | Rebuildable projection derived only from current-generation immutable row-level evidence |
+| Route | `RouteOutcome v4` | `meta/route_outcome.json` | Rebuildable deterministic route projection |
 | Aggregate | `DirectionOutcomeAggregate v1` | `meta/direction_outcome_aggregate.json` | Exactly five verified standard outcomes and deterministic selection status |
 
 `meta/research_state.json`, attempt views, TrialResult, RouteOutcome, aggregate, scorecards, Gate reports, and human-readable result files are projections or diagnostics. Deleting them does not delete authority; `ResearchEventLedger.rebuild()` reconstructs them from SQLite. Older Event/Attempt/TrialResult workspaces are rejected with a breaking-schema error and must restart from S1.
@@ -26,9 +26,13 @@
 
 Canonical JSON sorts object keys and rejects NaN/Inf. A repair keeps direction, variant, and attempt identity fixed; only a new implementation revision and its derived input hash may change.
 
+Real TrialSpecs bind immutable sample and evaluator manifest projections. Reservation rereads their bytes through the same symlink-safe store, verifies ordered sample identities/source revisions and evaluator source/config/dependency digests, and rejects drift before writing `AttemptReserved`. Synthetic provenance is explicitly marked and cannot be mixed with real samples.
+
 ## Event Transactions
 
-Every event uses `Event v4` with a strict event-type enum, type-specific payload schema, validated ID, continuous sequence, `previous_event_hash`, and `event_hash`. Append performs duplicate-ID checking, sequence allocation, schema/transition validation, reduction, invariant checking, and durable insertion under one SQLite `BEGIN IMMEDIATE` transaction.
+Every event uses `Event v5` with a strict event-type enum, type-specific payload schema, validated ID, continuous sequence, `previous_event_hash`, and `event_hash`. Append performs duplicate-ID checking, sequence allocation, schema/transition validation, reduction, invariant checking, and durable insertion under one SQLite `BEGIN IMMEDIATE` transaction.
+
+For `proxy_full`, proxy and full are separate authority transactions. `ProxyPhaseStarted` freezes the phase execution identity; `ProxyEvidenceCommitted` decodes current-generation proxy rows and derives `ProxyOutcome`, route, and `PROXY_COMPLETED` without consuming budget. Only a committed `RUN_FULL` route permits `FullPhaseStarted`. Finalization binds the committed proxy event/hash, and full evidence cannot replace or repackage proxy evidence.
 
 Rebuild rejects schema mismatch, sequence gaps/duplicates, duplicate IDs, hash-chain damage, event-hash damage, illegal transitions, and invalid state invariants with `IntegrityError`. The same event ID and same type/payload is idempotent; a conflicting payload is an integrity failure.
 

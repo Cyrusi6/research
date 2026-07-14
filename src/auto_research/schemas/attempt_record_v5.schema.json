@@ -1,0 +1,582 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "attempt_id",
+    "profile",
+    "direction_id",
+    "direction_semantic_hash",
+    "direction_spec_hash",
+    "variant_id",
+    "variant_semantic_hash",
+    "variant_spec_hash",
+    "frozen_trial_spec",
+    "trial_spec_hash",
+    "acceptance_contract_hash",
+    "implementation_hash",
+    "implementation_revisions",
+    "attempt_input_hash",
+    "protocol_hash",
+    "sample_manifest_hash",
+    "runtime_config_hash",
+    "evaluator_hash",
+    "seeds",
+    "required_datasets",
+    "required_phases",
+    "terminal_method_phases",
+    "required_roles",
+    "require_complete_seed_coverage",
+    "attempt_kind",
+    "lifecycle_generation",
+    "state",
+    "consumes_direction_budget",
+    "reserved_slot",
+    "phases",
+    "paused_phase",
+    "method_evaluable",
+    "terminal_outcome",
+    "failure_class",
+    "artifact_hashes",
+    "created_at",
+    "updated_at",
+    "phase_executions",
+    "committed_proxy_outcome"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "auto_research_attempt_v5"
+    },
+    "attempt_id": {
+      "type": "string",
+      "pattern": "^[a-f0-9-]{36}$"
+    },
+    "profile": {
+      "enum": [
+        "standard",
+        "bootstrap"
+      ]
+    },
+    "direction_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "direction_semantic_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "direction_spec_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "variant_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "variant_semantic_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "variant_spec_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "frozen_trial_spec": {
+      "type": "object"
+    },
+    "trial_spec_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "acceptance_contract_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "implementation_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "implementation_revisions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "previous_implementation_hash",
+          "implementation_hash",
+          "attempt_input_hash",
+          "created_at"
+        ],
+        "properties": {
+          "previous_implementation_hash": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/hash"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "implementation_hash": {
+            "$ref": "#/$defs/hash"
+          },
+          "attempt_input_hash": {
+            "$ref": "#/$defs/hash"
+          },
+          "created_at": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "attempt_input_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "protocol_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "sample_manifest_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "runtime_config_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "evaluator_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "seeds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "required_datasets": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "required_phases": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "proxy",
+          "full"
+        ]
+      }
+    },
+    "terminal_method_phases": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "proxy",
+          "full"
+        ]
+      }
+    },
+    "required_roles": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "baseline",
+          "candidate",
+          "ablation",
+          "matched_control",
+          "coverage"
+        ]
+      }
+    },
+    "require_complete_seed_coverage": {
+      "type": "boolean"
+    },
+    "attempt_kind": {
+      "enum": [
+        "proxy",
+        "full",
+        "proxy_full",
+        "bootstrap_proxy"
+      ]
+    },
+    "lifecycle_generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "state": {
+      "enum": [
+        "PLANNED",
+        "IMPLEMENTING",
+        "IMPLEMENTATION_REPAIR",
+        "READY",
+        "PROXY_RUNNING",
+        "PROXY_COMPLETED",
+        "FULL_RUNNING",
+        "METHOD_COMPLETED",
+        "RESOURCE_PAUSED",
+        "INTEGRITY_BLOCKED",
+        "ABANDONED"
+      ]
+    },
+    "consumes_direction_budget": {
+      "type": "boolean"
+    },
+    "reserved_slot": {
+      "type": "boolean"
+    },
+    "phases": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "proxy",
+        "full"
+      ],
+      "properties": {
+        "proxy": {
+          "$ref": "#/$defs/phase"
+        },
+        "full": {
+          "$ref": "#/$defs/phase"
+        }
+      }
+    },
+    "paused_phase": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "proxy",
+        "full",
+        null
+      ]
+    },
+    "method_evaluable": {
+      "type": "boolean"
+    },
+    "terminal_outcome": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "failure_class": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "artifact_hashes": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/hash"
+      }
+    },
+    "created_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "updated_at": {
+      "type": "string",
+      "minLength": 1
+    },
+    "phase_executions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "proxy",
+        "full"
+      ],
+      "properties": {
+        "proxy": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "schema_version",
+                "phase",
+                "phase_execution_id",
+                "phase_start_event_id",
+                "producer_run_id",
+                "lifecycle_generation",
+                "implementation_hash",
+                "attempt_input_hash",
+                "attempt_id",
+                "direction_semantic_hash",
+                "direction_spec_hash",
+                "variant_semantic_hash",
+                "variant_spec_hash",
+                "trial_spec_hash"
+              ],
+              "properties": {
+                "schema_version": {
+                  "const": "auto_research_phase_execution_manifest_v1"
+                },
+                "phase": {
+                  "enum": [
+                    "proxy",
+                    "full"
+                  ]
+                },
+                "phase_execution_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+                },
+                "phase_start_event_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
+                },
+                "producer_run_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+                },
+                "lifecycle_generation": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "implementation_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "attempt_input_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "attempt_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "direction_semantic_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "direction_spec_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "variant_semantic_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "variant_spec_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "trial_spec_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              }
+            }
+          ]
+        },
+        "full": {
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "schema_version",
+                "phase",
+                "phase_execution_id",
+                "phase_start_event_id",
+                "producer_run_id",
+                "lifecycle_generation",
+                "implementation_hash",
+                "attempt_input_hash",
+                "attempt_id",
+                "direction_semantic_hash",
+                "direction_spec_hash",
+                "variant_semantic_hash",
+                "variant_spec_hash",
+                "trial_spec_hash"
+              ],
+              "properties": {
+                "schema_version": {
+                  "const": "auto_research_phase_execution_manifest_v1"
+                },
+                "phase": {
+                  "enum": [
+                    "proxy",
+                    "full"
+                  ]
+                },
+                "phase_execution_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+                },
+                "phase_start_event_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
+                },
+                "producer_run_id": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+                },
+                "lifecycle_generation": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "implementation_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "attempt_input_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "attempt_id": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "direction_semantic_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "direction_spec_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "variant_semantic_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "variant_spec_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "trial_spec_hash": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "committed_proxy_outcome": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "event_id",
+            "event_hash",
+            "outcome_hash",
+            "decision"
+          ],
+          "properties": {
+            "event_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
+            },
+            "event_hash": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "outcome_hash": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "decision": {
+              "enum": [
+                "RUN_FULL",
+                "REPAIR_IMPLEMENTATION",
+                "PROPOSE_NEXT_VARIANT",
+                "PAUSE_RESOURCE",
+                "BLOCK_INTEGRITY",
+                "FINISH_RUN"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "bootstrap"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "attempt_kind": {
+            "const": "bootstrap_proxy"
+          },
+          "consumes_direction_budget": {
+            "const": false
+          },
+          "reserved_slot": {
+            "const": false
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "profile": {
+            "const": "standard"
+          }
+        },
+        "required": [
+          "profile"
+        ]
+      },
+      "then": {
+        "properties": {
+          "attempt_kind": {
+            "enum": [
+              "proxy",
+              "full",
+              "proxy_full"
+            ]
+          },
+          "consumes_direction_budget": {
+            "const": true
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "phase": {
+      "enum": [
+        "PENDING",
+        "RUNNING",
+        "COMPLETED",
+        "FAILED",
+        "SKIPPED"
+      ]
+    }
+  }
+}

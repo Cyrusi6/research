@@ -40,7 +40,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
     ],
     "S2_plan": [
         ("plan/variant.json", "variant_v4.schema.json"),
-        ("plan/trial_spec.json", "trial_spec_v3.schema.json"),
+        ("plan/trial_spec.json", "trial_spec_v4.schema.json"),
         ("plan/s2_planner/candidate_pool.json", "s2_candidate_pool.schema.json"),
         ("plan/s2_planner/feedback_context.json", "s2_feedback_context.schema.json"),
         ("plan/s2_planner/adaptive_policy.json", "s2_adaptive_policy.schema.json"),
@@ -54,7 +54,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("plan/code_patches/patch_gate_report.json", "s2_5_patch_gate_report.schema.json"),
     ],
     "S3_experiment": [
-        ("experiment/results/trial_result.json", "trial_result_v4.schema.json"),
+        ("experiment/results/trial_result.json", "trial_result_v5.schema.json"),
         ("experiment/results/c2c_proxy_baseline_fingerprint.json", "c2c_proxy_baseline_fingerprint.schema.json"),
         ("experiment/results/c2c_proxy_cache_report.json", "c2c_proxy_cache_report.schema.json"),
         ("experiment/results/c2c_effective_proxy_policy.json", "c2c_effective_proxy_policy.schema.json"),
@@ -63,8 +63,8 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("experiment/results/s3_candidate_selection.json", None),
     ],
     "orchestration": [
-        ("meta/route_outcome.json", "route_outcome_v3.schema.json"),
-        ("meta/research_state.json", "research_state_v4.schema.json"),
+        ("meta/route_outcome.json", "route_outcome_v4.schema.json"),
+        ("meta/research_state.json", "research_state_v5.schema.json"),
         ("meta/iteration_trace.jsonl", None),
     ],
 }

@@ -2,7 +2,7 @@
 
 ## 2026-07-14 M1.1.2 Authoritative Attempt / S3 Transaction Closure
 
-- Upgraded the breaking authority layer to Event v4, AttemptRecord v4, TrialSpec v3, ExecutionObservation v3, TrialResult v4, EvidenceManifest v2, ConstraintResult v2, and RouteOutcome v3; prior workspaces are rejected and must restart from S1.
+- Upgraded the breaking authority layer to Event v5, AttemptRecord v5, TrialSpec v4, ExecutionObservation v4, TrialResult v5, EvidenceManifest v3, ConstraintResult v2, and RouteOutcome v4; prior workspaces are rejected and must restart from S1.
 - `reserve_attempt()` now validates and freezes the complete TrialSpec, then derives protocol, sample-manifest, acceptance-contract, and attempt-input hashes inside the Ledger transaction.
 - Public attempt transitions can only advance execution states. Structured FailureEvidence exclusively derives implementation repair, resource pause, and integrity block; ResumeEvidence exclusively restores `RESOURCE_PAUSED -> READY` without changing attempt or variant identity.
 - S3 precommit, Ledger commit, and postcommit Gate share one validator over frozen TrialSpec, exact observation/result artifacts, activation/proxy/readiness evidence, roles, seeds, phases, constraints, identity, and budget.
@@ -174,3 +174,19 @@ TMPDIR=$PWD/.tmp uv run pytest -q
 - Bootstrap finalization and S3 Gate now use only committed Attempt-scoped proxy evidence. Repeated Gate audits are read-only; bootstrap leaves the standard budget at `target=5, reserved=0, consumed=0`, does not enter method history, and creates no direction aggregate.
 - Generic and C2C simulated standard pipelines each commit five unique semantic variants from strict row evidence, finish with `target=5, reserved=0, consumed=5`, and reject a sixth variant before execution.
 - Final validation: normal, proxy-cleared, and empty HOME/HF with no Codex on PATH each report `537 passed, 2 skipped`; no new skip or xfail was added.
+
+## 2026-07-14 M1.1.4 Authoritative Phase Transactions
+
+- Upgraded the breaking authority layer to Event v5, AttemptRecord v5, ResearchState v5, TrialSpec v4, EvidenceManifest v3, ExecutionObservation v4, TrialResult v5, RouteOutcome v4, FailureEvidence v3, and ResumeEvidence v3. Replaced schema readers were removed; older workspaces must restart from S1.
+- Added authoritative `ProxyPhaseStarted`, `ProxyEvidenceCommitted`, and `FullPhaseStarted` transactions. The reducer derives proxy delta, `ProxyOutcome`, route, phase state, and full eligibility; callers cannot author proxy decisions or enter completed/full states through generic transitions.
+- Bound every evidence artifact and quantitative row to lifecycle generation, implementation/input hashes, phase execution ID, phase-start event, and producer run. Repair/resume invalidates uncommitted prior-generation evidence.
+- Real reservations now verify both sample and evaluator manifests from content-addressed bytes; evaluator source/config/dependency identity cannot be replaced by a caller-supplied digest after planning.
+- Unified immutable evidence reads through the fail-closed `EvidenceStore`, including ancestor/leaf symlink rejection, content-addressed exact paths, single-read hashing/decoding, and atomic exclusive writes.
+- Added explicit non-simulated external-manifest execution for Generic projects and strict current-run C2C evidence inventories. Bootstrap now emits proxy-only evidence and finishes without standard budget/history/aggregate effects.
+- Native Unified S1 remains intentionally out of scope; local fake commands validate production components but are not reported as real scientific or GPU results.
+
+### M1.1.4 validation
+
+- Authoritative evidence/phase/resource/replay targeted groups pass, including explicit completion IDs, stale-generation rejection, reducer mutation rejection, proxy-before-full ordering, symlink-ancestor rejection, wrong-resource identity rejection, and real evaluator-manifest drift.
+- Generic non-simulated external-manifest production components commit one strict full TrialResult from a local command. C2C strict real-adapter collection is non-empty; the full five-variant Generic/C2C regression loops remain explicitly synthetic/local and finish at `target=5, reserved=0, consumed=5`.
+- Full suite passes in normal, proxy-cleared, and empty HOME/HF with Codex absent from PATH environments: `552 passed, 2 skipped`, with only the pre-existing torch/transformers dynamic skips.

@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from auto_research.agents.experiment import (
+    _c2c_strict_evidence_inventory,
     _identity_evidence_payload,
     _quantitative_evidence_payload,
     _stage_evidence_inventory,
@@ -18,16 +19,16 @@ from auto_research.research_state import IntegrityError, ResearchEventLedger
 from auto_research.utils import write_json
 from auto_research.validators import run_stage_gate
 from test_authoritative_state_machine import _attempt_inputs, _direction, _initialize, _reserve, _trial_spec, _variant
+from support.authoritative_evidence import start_attempt_phase
 
 
 _BOOTSTRAP_EVIDENCE_KINDS = (
-    "main_results",
+    "proxy_results",
     "activation_evidence",
     "proxy_baseline_fingerprint",
     "proxy_cache_report",
     "effective_proxy_policy",
     "proxy_calibration_policy",
-    "proxy_decision_report",
     "bootstrap_completion",
 )
 
@@ -67,146 +68,14 @@ def _payload_hash(payload: dict) -> str:
 
 
 def _bootstrap_inventory(root: Path, attempt: dict, trial_spec: dict) -> list[dict]:
-    producer_run_id = f"bootstrap-run-{attempt['attempt_id'][:12]}"
-    payloads: list[tuple[str, dict]] = []
-
-    main = _quantitative_evidence_payload(
+    return _c2c_strict_evidence_inventory(
+        project_root=root,
         attempt=attempt,
         trial_spec=trial_spec,
-        producer_run_id=producer_run_id,
-        evidence_kind="main_results",
-        phase="proxy",
-        role_values={"baseline": 0.0, "candidate": 1.0},
+        comparison_candidate={"metrics": {"mean": 1.0, "datasets": {"fake": 1.0}}},
+        baseline={"mean": 0.0, "datasets": {"fake": 0.0}},
+        simulate=True,
     )
-    payloads.append(("main_results", main))
-    main_hash = _payload_hash(main)
-
-    activation = _identity_evidence_payload(
-        attempt=attempt,
-        producer_run_id=producer_run_id,
-        evidence_kind="activation_evidence",
-        fields={
-            "probe_id": "bootstrap-activation-probe",
-            "status": "passed",
-            "command_status": "completed",
-            "exit_code": 0,
-            "implementation_surface_ids": ["src/router.py"],
-        },
-    )
-    payloads.append(("activation_evidence", activation))
-
-    fingerprint_inputs = {
-        "sample_manifest_hash": attempt["sample_manifest_hash"],
-        "evaluator_hash": attempt["evaluator_hash"],
-        "protocol_hash": attempt["protocol_hash"],
-    }
-    baseline = _identity_evidence_payload(
-        attempt=attempt,
-        producer_run_id=producer_run_id,
-        evidence_kind="proxy_baseline_fingerprint",
-        fields={
-            "baseline_hash": canonical_hash(fingerprint_inputs),
-            "dataset_ids": [item["dataset_id"] for item in trial_spec["datasets"]],
-            "seeds": list(trial_spec["statistical_testing"]["seeds"]),
-            "fingerprint_inputs": fingerprint_inputs,
-        },
-    )
-    payloads.append(("proxy_baseline_fingerprint", baseline))
-    baseline_hash = _payload_hash(baseline)
-
-    cache = _identity_evidence_payload(
-        attempt=attempt,
-        producer_run_id=producer_run_id,
-        evidence_kind="proxy_cache_report",
-        fields={
-            "cross_references": {"proxy_baseline_fingerprint_hash": baseline_hash},
-            "cache_key": canonical_hash({"baseline": baseline_hash, "attempt": attempt["attempt_id"]}),
-            "baseline_hash": baseline["baseline_hash"],
-            "cache_entry_hash": canonical_hash({"cache": "bootstrap", "baseline": baseline_hash}),
-            "status": "hit",
-        },
-    )
-    payloads.append(("proxy_cache_report", cache))
-    cache_hash = _payload_hash(cache)
-
-    policy_body = {
-        "required_phases": ["proxy"],
-        "proxy_terminal_allowed": True,
-        "decision_threshold": 0.05,
-    }
-    policy = _identity_evidence_payload(
-        attempt=attempt,
-        producer_run_id=producer_run_id,
-        evidence_kind="effective_proxy_policy",
-        fields={"policy_hash": canonical_hash(policy_body), **policy_body},
-    )
-    payloads.append(("effective_proxy_policy", policy))
-    policy_hash = _payload_hash(policy)
-
-    calibration_refs = {
-        "proxy_baseline_fingerprint_hash": baseline_hash,
-        "effective_proxy_policy_hash": policy_hash,
-    }
-    calibration_body = {
-        "status": "calibrated",
-        "calibration_metric": trial_spec["primary_metric_id"],
-        "calibration_value": 1.0,
-        "cross_references": calibration_refs,
-    }
-    calibration = _identity_evidence_payload(
-        attempt=attempt,
-        producer_run_id=producer_run_id,
-        evidence_kind="proxy_calibration_policy",
-        fields={"calibration_hash": canonical_hash(calibration_body), **calibration_body},
-    )
-    payloads.append(("proxy_calibration_policy", calibration))
-    calibration_hash = _payload_hash(calibration)
-
-    decision_refs = {
-        "proxy_baseline_fingerprint_hash": baseline_hash,
-        "proxy_cache_report_hash": cache_hash,
-        "effective_proxy_policy_hash": policy_hash,
-        "proxy_calibration_policy_hash": calibration_hash,
-        "main_results_hash": main_hash,
-    }
-    decision = _identity_evidence_payload(
-        attempt=attempt,
-        producer_run_id=producer_run_id,
-        evidence_kind="proxy_decision_report",
-        fields={
-            "cross_references": decision_refs,
-            "decision": "terminal_proxy",
-            "reason_codes": ["bootstrap_proxy_verified"],
-            "observed_proxy_delta": 1.0,
-        },
-    )
-    payloads.append(("proxy_decision_report", decision))
-    decision_hash = _payload_hash(decision)
-
-    completion = _identity_evidence_payload(
-        attempt=attempt,
-        producer_run_id=producer_run_id,
-        evidence_kind="bootstrap_completion",
-        fields={
-            "cross_references": {
-                "proxy_decision_report_hash": decision_hash,
-                "main_results_hash": main_hash,
-            },
-            "completion_status": "verified",
-            "phase": "proxy",
-        },
-    )
-    payloads.append(("bootstrap_completion", completion))
-
-    return [
-        _write_staged_evidence_source(
-            root,
-            producer_run_id=producer_run_id,
-            evidence_kind=kind,
-            payload=payload,
-        )
-        for kind, payload in payloads
-    ]
 
 
 def _prepare_s3_outputs(root: Path, *, bootstrap: bool = False) -> tuple[ResearchEventLedger, dict, dict, dict, dict]:
@@ -218,6 +87,7 @@ def _prepare_s3_outputs(root: Path, *, bootstrap: bool = False) -> tuple[Researc
     _initialize(ledger, direction, variant)
     if bootstrap:
         attempt, trial_spec = _reserve_bootstrap(ledger, direction, variant)
+        attempt = start_attempt_phase(ledger, attempt, "proxy")
         inventory = _bootstrap_inventory(root, attempt, trial_spec)
         completion = _stage_evidence_inventory(
             project_root=root,
@@ -225,7 +95,6 @@ def _prepare_s3_outputs(root: Path, *, bootstrap: bool = False) -> tuple[Researc
             trial_spec=trial_spec,
             inventory=inventory,
         )
-        ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
         ledger.complete_attempt(completion)
     else:
         attempt = _reserve(ledger, direction, variant)
@@ -293,6 +162,7 @@ def test_bootstrap_missing_preregistered_evidence_is_zero_write(tmp_path: Path, 
     ledger = ResearchEventLedger(tmp_path)
     _initialize(ledger, direction, variant)
     attempt, trial_spec = _reserve_bootstrap(ledger, direction, variant)
+    attempt = start_attempt_phase(ledger, attempt, "proxy")
     inventory = _bootstrap_inventory(tmp_path, attempt, trial_spec)
     completion = _stage_evidence_inventory(
         project_root=tmp_path,
@@ -300,7 +170,6 @@ def test_bootstrap_missing_preregistered_evidence_is_zero_write(tmp_path: Path, 
         trial_spec=trial_spec,
         inventory=inventory,
     )
-    ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
     invalid = deepcopy(completion)
     invalid["entries"] = [entry for entry in invalid["entries"] if entry["kind"] != missing_kind]
     before_events = ledger.events()

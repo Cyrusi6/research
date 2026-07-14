@@ -18,6 +18,7 @@ from test_m113_ledger_closure import (
     _failure_evidence as _canonical_failure_evidence,
     _resume_evidence as _canonical_resume_evidence,
 )
+from support.authoritative_evidence import start_attempt_phase
 
 
 def _direction(name: str) -> dict:
@@ -87,7 +88,7 @@ def test_public_transition_cannot_forge_authoritative_states(tmp_path: Path, for
 def test_three_resource_pause_resume_cycles_preserve_attempt_and_reservation(tmp_path: Path) -> None:
     ledger, attempt = _reserved(tmp_path)
     for index in range(3):
-        attempt = ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+        attempt = start_attempt_phase(ledger, attempt, "full")
         paused, route = ledger.disposition_failure(_failure(tmp_path, attempt, index))
         assert paused["state"] == "RESOURCE_PAUSED" and paused["phases"]["full"] == "RUNNING"
         assert route["next_action"] == "PAUSE_RESOURCE" and route["source"]["sequence"] == ledger.events()[-1]["sequence"]
@@ -102,7 +103,7 @@ def test_three_resource_pause_resume_cycles_preserve_attempt_and_reservation(tmp
 
 def test_explicit_disposition_event_id_late_replay_returns_historical_result(tmp_path: Path) -> None:
     ledger, attempt = _reserved(tmp_path)
-    attempt = ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+    attempt = start_attempt_phase(ledger, attempt, "full")
     evidence = _failure(tmp_path, attempt, 1)
     historical_attempt, historical_route = ledger.disposition_failure(evidence, event_id="pause-explicit-1")
     historical_query = ledger.query_operation_result("pause-explicit-1")
@@ -110,7 +111,7 @@ def test_explicit_disposition_event_id_late_replay_returns_historical_result(tmp
     assert historical_query["route_outcome"] == historical_route
     assert historical_query["state_sequence"] == historical_route["source"]["sequence"]
     resumed = ledger.resume_attempt(_resume(tmp_path, ledger, historical_attempt, 1))
-    ledger.transition_attempt(resumed["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+    start_attempt_phase(ledger, resumed, "full")
     before = len(ledger.events())
     replay_attempt, replay_route = ledger.disposition_failure(evidence, event_id="pause-explicit-1")
     assert len(ledger.events()) == before

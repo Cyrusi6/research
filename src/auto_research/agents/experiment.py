@@ -42,6 +42,7 @@ from ..domain_contracts import (
 from ..evidence import (
     EVIDENCE_SCHEMA_VERSIONS,
     EVIDENCE_MANIFEST_SCHEMA_VERSION as STAGED_EVIDENCE_MANIFEST_SCHEMA_VERSION,
+    EvidenceStore,
     content_addressed_evidence_path,
     decode_evidence_inventory,
     encode_canonical_evidence,
@@ -132,7 +133,7 @@ class ExperimentAgent:
                 "attempt": attempt,
                 "route_outcome": route,
             }
-        if attempt["state"] in {"READY", "RESOURCE_PAUSED"}:
+        if attempt["state"] in {"READY", "RESOURCE_PAUSED", "PROXY_COMPLETED"}:
             attempt = self._prepare_attempt_execution(
                 ledger,
                 attempt,
@@ -159,13 +160,23 @@ class ExperimentAgent:
                 attempt=attempt,
                 trial_spec=trial_spec,
             )
-        elif execution.get("mode") == "reuse" and execution.get("collector") == "reused_runs":
-            result = self._collect_reused_run_results(execution, env_record["path"], revision_record["path"] if revision_record else None)
-        elif execution.get("collector") == "itr_quick_screen":
-            result = self._run_itr_quick_screen(execution, env_record["path"], revision_record["path"] if revision_record else None)
+        elif execution.get("collector") in {"reused_runs", "itr_quick_screen", "laps_eval"}:
+            result = {
+                "artifacts": [env_record["path"]],
+                "status": "blocked",
+                "failure_class": "integrity_failure",
+                "blocked_reason": f"collector {execution.get('collector')} does not implement the strict external evidence protocol",
+            }
         else:
             commands = execution.get("commands") or []
-            if not commands:
+            if execution.get("collector") != "external_manifest":
+                result = {
+                    "artifacts": [env_record["path"]],
+                    "status": "blocked",
+                    "failure_class": "integrity_failure",
+                    "blocked_reason": "Non-simulated generic execution requires collector=external_manifest.",
+                }
+            elif not commands:
                 blocked_reason = execution.get("blocked_reason") or "No execution commands defined."
                 self.context.artifacts.write_text(
                     self.stage_key,
@@ -178,6 +189,7 @@ class ExperimentAgent:
             else:
                 execution_workdir = Path(execution.get("workdir") or self.context.project_root)
                 log_path = self.context.project_root / "experiment" / "logs" / "command_runs.json"
+                ensure_dir(log_path.parent)
                 run_result = self.runner.run_plan_commands(commands, execution_workdir, log_path)
                 log_record = self.context.artifacts.copy_into_stage(
                     self.stage_key,
@@ -205,11 +217,24 @@ class ExperimentAgent:
                             "reason": "Experiment command returned a non-zero exit code.",
                         },
                     }
-                elif execution.get("collector") == "laps_eval":
-                    result = self._collect_laps_eval_results(log_path, env_record["path"], revision_record["path"] if revision_record else None)
                 else:
-                    result = {"artifacts": [env_record["path"]], "status": "blocked", "blocked_reason": "No supported result collector was available."}
-        return self._finalize_trial(result, attempt=attempt, trial_spec=trial_spec, ledger=ledger)
+                    try:
+                        inventory = _generic_external_evidence_inventory(
+                            project_root=self.context.project_root,
+                            attempt=attempt,
+                            execution=execution,
+                        )
+                        result = {
+                            "artifacts": [env_record["path"], log_record["path"], *[item["source_path"] for item in inventory]],
+                            "status": "completed",
+                            "evidence_inventory": inventory,
+                        }
+                    except S3ValidationError as exc:
+                        result = {"artifacts": [env_record["path"], log_record["path"]], "status": "blocked", "failure_class": "integrity_failure", "blocked_reason": str(exc)}
+        finalized = self._finalize_trial(result, attempt=attempt, trial_spec=trial_spec, ledger=ledger)
+        if ((finalized.get("route_outcome") or {}).get("next_action") == "RUN_FULL"):
+            return self.run(mode=mode, revisions=revisions)
+        return finalized
 
     def _finalize_trial(
         self,
@@ -267,6 +292,14 @@ class ExperimentAgent:
                 trial_spec=trial_spec,
                 inventory=inventory,
             )
+            if attempt["state"] == "PROXY_RUNNING" and attempt["attempt_kind"] == "proxy_full":
+                committed_attempt, route = ledger.commit_proxy_evidence(completion_evidence)
+                result["attempt"] = committed_attempt
+                result["route_outcome"] = route
+                result["committed_event_id"] = route["source"]["event_id"]
+                result["committed_event_sequence"] = route["source"]["sequence"]
+                result["committed_attempt_id"] = committed_attempt["attempt_id"]
+                return result
             trial = ledger.validate_trial_precommit(completion_evidence)
             validate_trial_precommit(
                 project_root=self.context.project_root,
@@ -276,15 +309,10 @@ class ExperimentAgent:
                 trial_spec=trial_spec,
                 trial_result=trial,
                 state=ledger.state(),
-                allow_pending_full_transition=True,
+                allow_pending_full_transition=False,
             )
         except (ValueError, IntegrityError, S3ValidationError) as exc:
             return self._quarantine_invalid_s3(result, attempt, exc, [], raw_artifacts)
-        if trial["completeness"] == "full":
-            current = ledger.state()["attempts"][attempt["attempt_id"]]
-            if current["state"] == "PROXY_RUNNING":
-                ledger.transition_attempt(attempt["attempt_id"], "PROXY_COMPLETED", phase="proxy", phase_state="COMPLETED")
-                ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
         completed_attempt, route = ledger.complete_attempt(completion_evidence)
         result.setdefault("artifacts", []).append("experiment/results/trial_result.json")
         result["attempt"] = completed_attempt
@@ -314,6 +342,7 @@ class ExperimentAgent:
                 attempt=current,
                 producer_run_id=producer_run_id,
                 evidence_kind="resource_probe",
+                phase=str(current.get("paused_phase") or "proxy"),
                 fields={
                     "resource_type": resource_probe.get("resource_type"),
                     "resource_id": resource_probe.get("resource_id"),
@@ -324,22 +353,28 @@ class ExperimentAgent:
                     "observed_at": resource_probe.get("observed_at") or now_utc(),
                 },
             )
-            validate_contract(probe_payload, "resource_probe_v1.schema.json")
+            validate_contract(probe_payload, "resource_probe_v2.schema.json")
             probe_bytes = encode_canonical_evidence(probe_payload)
             probe_hash = hashlib.sha256(probe_bytes).hexdigest()
-            probe_path = project_root / content_addressed_evidence_path(
+            probe_relative_path = content_addressed_evidence_path(
                 attempt_id=current["attempt_id"],
                 producer_run_id=producer_run_id,
                 evidence_kind="resource_probe",
                 content_hash=probe_hash,
             )
-            ensure_dir(probe_path.parent)
-            if probe_path.exists() and probe_path.read_bytes() != probe_bytes:
-                raise IntegrityError("resource probe content-addressed collision")
-            if not probe_path.exists():
-                temporary = probe_path.with_name(f".{probe_path.name}.{os.getpid()}.tmp")
-                temporary.write_bytes(probe_bytes)
-                os.replace(temporary, probe_path)
+            try:
+                EvidenceStore(project_root).write_entry(
+                    {
+                        "relative_path": probe_relative_path,
+                        "producer_run_id": producer_run_id,
+                        "kind": "resource_probe",
+                        "content_hash": probe_hash,
+                    },
+                    current,
+                    probe_bytes,
+                )
+            except ValueError as exc:
+                raise IntegrityError(f"resource probe immutable write failed: {exc}") from exc
             pause_event = next(
                 (
                     event for event in reversed(ledger.events())
@@ -353,7 +388,7 @@ class ExperimentAgent:
                 raise IntegrityError("resource resume requires a committed pause event")
             pause_evidence = pause_event["payload"]["failure_evidence"]
             resume_evidence = {
-                "schema_version": "auto_research_resume_evidence_v2",
+                "schema_version": "auto_research_resume_evidence_v3",
                 "evidence_kind": "resume_evidence",
                 "evidence_id": f"resume-evidence-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}",
                 "attempt_id": current["attempt_id"],
@@ -368,6 +403,11 @@ class ExperimentAgent:
                 "evaluator_hash": current["evaluator_hash"],
                 "cross_references": {"resource_probe_hash": probe_hash},
                 "lifecycle_generation": current["lifecycle_generation"],
+                "implementation_hash": current["implementation_hash"],
+                "attempt_input_hash": current["attempt_input_hash"],
+                "phase": "resume",
+                "phase_execution_id": probe_payload["phase_execution_id"],
+                "phase_start_event_id": probe_payload["phase_start_event_id"],
                 "pause_event_id": pause_event["event_id"],
                 "pause_evidence_hash": canonical_hash(pause_evidence),
                 "resource_type": probe_payload["resource_type"],
@@ -379,14 +419,17 @@ class ExperimentAgent:
                 "observed_at": probe_payload["observed_at"],
             }
             current = ledger.resume_attempt(resume_evidence)
-        if current["state"] != "READY":
+        if current["state"] not in {"READY", "PROXY_COMPLETED"}:
             raise IntegrityError(f"attempt {current['attempt_id']} cannot enter execution from {current['state']}")
         proxy_state = (current.get("phases") or {}).get("proxy")
+        phase = "full" if (current["attempt_kind"] == "full" or (proxy_state == "COMPLETED" and current["attempt_kind"] == "proxy_full")) else "proxy"
+        phase_execution_id = f"{phase}-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}"
+        producer_run_id = f"run-{phase}-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}"
         if proxy_state == "COMPLETED" and current["attempt_kind"] == "proxy_full":
-            return ledger.transition_attempt(current["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+            return ledger.start_full_phase(current["attempt_id"], phase_execution_id=phase_execution_id, producer_run_id=producer_run_id)
         if current["attempt_kind"] == "full":
-            return ledger.transition_attempt(current["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
-        return ledger.transition_attempt(current["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
+            return ledger.start_full_phase(current["attempt_id"], phase_execution_id=phase_execution_id, producer_run_id=producer_run_id)
+        return ledger.start_proxy_phase(current["attempt_id"], phase_execution_id=phase_execution_id, producer_run_id=producer_run_id)
 
     def _quarantine_invalid_s3(
         self,
@@ -556,14 +599,18 @@ class ExperimentAgent:
             ablation_table["path"],
             figure_record["path"],
         ]
-        producer_run_id = f"simulate-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}"
         phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
+        phase_execution = (attempt.get("phase_executions") or {}).get(phase)
+        if not isinstance(phase_execution, dict):
+            raise S3ValidationError("synthetic execution requires PhaseExecutionManifest")
+        producer_run_id = phase_execution["producer_run_id"]
         inventory = []
+        main_kind = "proxy_results" if phase == "proxy" else "main_results"
         main_payload = _quantitative_evidence_payload(
             attempt=attempt,
             trial_spec=trial_spec,
             producer_run_id=producer_run_id,
-            evidence_kind="main_results",
+            evidence_kind=main_kind,
             phase=phase,
             role_values={"baseline": 78.4, "candidate": 80.1},
         )
@@ -571,7 +618,7 @@ class ExperimentAgent:
             _write_staged_evidence_source(
                 self.context.project_root,
                 producer_run_id=producer_run_id,
-                evidence_kind="main_results",
+                evidence_kind=main_kind,
                 payload=main_payload,
             )
         )
@@ -586,7 +633,7 @@ class ExperimentAgent:
                         trial_spec=trial_spec,
                         producer_run_id=producer_run_id,
                         evidence_kind="ablation_results",
-                        phase="ablation",
+                        phase="full",
                         role_values={"ablation": 78.9},
                     ),
                 )
@@ -600,6 +647,7 @@ class ExperimentAgent:
                     attempt=attempt,
                     producer_run_id=producer_run_id,
                     evidence_kind="activation_evidence",
+                    phase=phase,
                     fields={
                         "probe_id": "synthetic-forward-probe",
                         "status": "passed",
@@ -6663,16 +6711,18 @@ def _failure_evidence_from_result(
     artifact_path = str(supplied.get("artifact_path") or "")
     if not artifact_path or artifact_path not in raw_artifacts:
         return None
-    absolute_path = project_root / artifact_path
-    if not absolute_path.is_file() or sha256_file(absolute_path) != raw_artifacts[artifact_path]:
+    try:
+        raw_bytes = EvidenceStore(project_root).read_staged_source(artifact_path)
+    except ValueError:
         return None
-    raw_bytes = absolute_path.read_bytes()
+    if hashlib.sha256(raw_bytes).hexdigest() != raw_artifacts[artifact_path]:
+        return None
     producer_run_id = str(supplied.get("producer_run_id") or f"failure-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}")
     evidence_kind = "resource_probe" if failure_class in {"resource_pause", "oom_retry"} else "failure_evidence"
     if evidence_kind == "resource_probe":
         try:
             probe_payload = json.loads(raw_bytes.decode("utf-8"))
-            validate_contract(probe_payload, "resource_probe_v1.schema.json")
+            validate_contract(probe_payload, "resource_probe_v2.schema.json")
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return None
         for key in [
@@ -6684,26 +6734,36 @@ def _failure_evidence_from_result(
         if probe_payload.get("producer_run_id") != producer_run_id or probe_payload.get("probe_status") != "insufficient":
             return None
     log_hash = hashlib.sha256(raw_bytes).hexdigest()
-    scoped_path = project_root / content_addressed_evidence_path(
+    scoped_relative_path = content_addressed_evidence_path(
         attempt_id=attempt["attempt_id"],
         producer_run_id=producer_run_id,
         evidence_kind=evidence_kind,
         content_hash=log_hash,
     )
-    ensure_dir(scoped_path.parent)
-    if scoped_path.exists() and scoped_path.read_bytes() != raw_bytes:
+    try:
+        EvidenceStore(project_root).write_entry(
+            {
+                "relative_path": scoped_relative_path,
+                "producer_run_id": producer_run_id,
+                "kind": evidence_kind,
+                "content_hash": log_hash,
+            },
+            attempt,
+            raw_bytes,
+        )
+    except ValueError:
         return None
-    if not scoped_path.exists():
-        temporary = scoped_path.with_name(f".{scoped_path.name}.{os.getpid()}.tmp")
-        temporary.write_bytes(raw_bytes)
-        os.replace(temporary, scoped_path)
     source_phase = "full" if (attempt.get("phases") or {}).get("full") == "RUNNING" else "proxy"
     if failure_class == "activation_failure":
         source_phase = "activation"
     elif failure_class == "implementation_failure":
         source_phase = "implementation"
+    execution_phase = "full" if source_phase == "full" else "proxy"
+    phase_execution = (attempt.get("phase_executions") or {}).get(execution_phase)
+    if not isinstance(phase_execution, dict):
+        return None
     evidence = {
-        "schema_version": "auto_research_failure_evidence_v2",
+        "schema_version": "auto_research_failure_evidence_v3",
         "evidence_kind": "failure_evidence",
         "evidence_id": f"failure-evidence-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}",
         "attempt_id": attempt["attempt_id"],
@@ -6720,6 +6780,9 @@ def _failure_evidence_from_result(
         "lifecycle_generation": attempt["lifecycle_generation"],
         "implementation_hash": attempt["implementation_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": source_phase,
+        "phase_execution_id": phase_execution["phase_execution_id"],
+        "phase_start_event_id": phase_execution["phase_start_event_id"],
         "source_state": attempt["state"],
         "source_phase": source_phase,
         "failure_class": failure_class,
@@ -6748,13 +6811,8 @@ def _stage_evidence_inventory(
     if not isinstance(inventory, list):
         raise S3ValidationError("staged evidence inventory must be an array")
     if not inventory:
-        return {
-            "schema_version": "auto_research_completion_evidence_v1",
-            "attempt_id": str(attempt["attempt_id"]),
-            "trial_spec_hash": str(attempt["trial_spec_hash"]),
-            "entries": [],
-        }
-    root = project_root.resolve()
+        raise S3ValidationError("required evidence inventory is missing")
+    store = EvidenceStore(project_root)
     entries: list[dict[str, Any]] = []
     evidence_bytes: dict[str, bytes] = {}
     seen_kinds: set[str] = set()
@@ -6772,17 +6830,10 @@ def _stage_evidence_inventory(
         )
         if not isinstance(requirement, dict):
             raise S3ValidationError(f"evidence kind was not preregistered: {kind}")
-        source = project_root / source_path
-        if source.is_symlink():
-            raise S3ValidationError(f"staged evidence source cannot be a symlink: {source_path}")
-        resolved = source.resolve()
         try:
-            resolved.relative_to(root)
+            raw_bytes = store.read_staged_source(source_path)
         except ValueError as exc:
-            raise S3ValidationError(f"staged evidence source escapes project root: {source_path}") from exc
-        if not resolved.is_file():
-            raise S3ValidationError(f"staged evidence source is missing: {source_path}")
-        raw_bytes = resolved.read_bytes()
+            raise S3ValidationError(f"staged evidence source rejected: {source_path}: {exc}") from exc
         content_hash = hashlib.sha256(raw_bytes).hexdigest()
         try:
             payload = json.loads(raw_bytes.decode("utf-8"))
@@ -6813,6 +6864,12 @@ def _stage_evidence_inventory(
             "protocol_hash": str(attempt["protocol_hash"]),
             "sample_manifest_hash": str(attempt["sample_manifest_hash"]),
             "evaluator_hash": str(attempt["evaluator_hash"]),
+            "lifecycle_generation": payload.get("lifecycle_generation"),
+            "implementation_hash": payload.get("implementation_hash"),
+            "attempt_input_hash": payload.get("attempt_input_hash"),
+            "phase": payload.get("phase"),
+            "phase_execution_id": payload.get("phase_execution_id"),
+            "phase_start_event_id": payload.get("phase_start_event_id"),
             "cross_references": dict(payload.get("cross_references") or {}),
         }
         entries.append(entry)
@@ -6829,6 +6886,9 @@ def _stage_evidence_inventory(
         "protocol_hash": str(attempt["protocol_hash"]),
         "sample_manifest_hash": str(attempt["sample_manifest_hash"]),
         "evaluator_hash": str(attempt["evaluator_hash"]),
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
         "entries": entries,
     }
     try:
@@ -6841,20 +6901,18 @@ def _stage_evidence_inventory(
     except ValueError as exc:
         raise S3ValidationError(str(exc)) from exc
     for entry in entries:
-        target = project_root / entry["relative_path"]
-        ensure_dir(target.parent)
         raw_bytes = evidence_bytes[entry["evidence_id"]]
-        if target.exists():
-            if target.is_symlink() or target.read_bytes() != raw_bytes:
-                raise S3ValidationError(f"content-addressed evidence collision: {entry['relative_path']}")
-            continue
-        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
-        temporary.write_bytes(raw_bytes)
-        os.replace(temporary, target)
+        try:
+            store.write_entry(entry, attempt, raw_bytes)
+        except ValueError as exc:
+            raise S3ValidationError(str(exc)) from exc
     return {
-        "schema_version": "auto_research_completion_evidence_v1",
+        "schema_version": "auto_research_completion_evidence_v2",
         "attempt_id": str(attempt["attempt_id"]),
         "trial_spec_hash": str(attempt["trial_spec_hash"]),
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
         "entries": [
             {key: deepcopy(value) for key, value in entry.items() if key != "cross_references"}
             for entry in entries
@@ -6867,8 +6925,12 @@ def _identity_evidence_payload(
     attempt: dict[str, Any],
     producer_run_id: str,
     evidence_kind: str,
+    phase: str,
     fields: dict[str, Any],
 ) -> dict[str, Any]:
+    phase_execution = (attempt.get("phase_executions") or {}).get(phase)
+    if not isinstance(phase_execution, dict):
+        raise S3ValidationError(f"{phase} evidence requires an authoritative PhaseExecutionManifest")
     evidence_id = f"evidence:{evidence_kind}:{producer_run_id}"
     return {
         "schema_version": EVIDENCE_SCHEMA_VERSIONS[evidence_kind],
@@ -6884,6 +6946,12 @@ def _identity_evidence_payload(
         "protocol_hash": attempt["protocol_hash"],
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": phase,
+        "phase_execution_id": phase_execution["phase_execution_id"],
+        "phase_start_event_id": phase_execution["phase_start_event_id"],
         "cross_references": {},
         **fields,
     }
@@ -6902,6 +6970,7 @@ def _quantitative_evidence_payload(
         attempt=attempt,
         producer_run_id=producer_run_id,
         evidence_kind=evidence_kind,
+        phase=phase,
         fields={},
     )
     rows = []
@@ -6924,6 +6993,11 @@ def _quantitative_evidence_payload(
                         "sample_manifest_hash": attempt["sample_manifest_hash"],
                         "evaluator_hash": attempt["evaluator_hash"],
                         "producer_run_id": producer_run_id,
+                        "lifecycle_generation": attempt["lifecycle_generation"],
+                        "implementation_hash": attempt["implementation_hash"],
+                        "attempt_input_hash": attempt["attempt_input_hash"],
+                        "phase_execution_id": payload["phase_execution_id"],
+                        "phase_start_event_id": payload["phase_start_event_id"],
                     }
                 )
     payload["rows"] = rows
@@ -6939,98 +7013,90 @@ def _c2c_strict_evidence_inventory(
     baseline: dict[str, Any],
     simulate: bool,
 ) -> list[dict[str, str]]:
-    if not simulate or not isinstance(comparison_candidate, dict):
+    if not isinstance(comparison_candidate, dict):
         return []
-    producer_run_id = f"c2c-simulate-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}"
-    seeds = trial_spec["statistical_testing"]["seeds"]
+    phase = "proxy" if attempt.get("state") == "PROXY_RUNNING" else "full" if attempt.get("state") == "FULL_RUNNING" else None
+    if phase is None:
+        raise S3ValidationError("C2C evidence collection requires an authoritatively running phase")
+    phase_execution = (attempt.get("phase_executions") or {}).get(phase)
+    if not isinstance(phase_execution, dict):
+        raise S3ValidationError("C2C evidence collection requires PhaseExecutionManifest")
+    producer_run_id = phase_execution["producer_run_id"]
+    seeds = next(item["seeds"] for item in trial_spec["phase_contracts"] if item["phase"] == phase)
     metric_id = trial_spec["primary_metric_id"]
+    phase_contract = next(item for item in trial_spec["phase_contracts"] if item["phase"] == phase)
+    dataset_ids = list(phase_contract["datasets"])
     candidate_datasets = ((comparison_candidate.get("metrics") or {}).get("datasets") or {})
     baseline_datasets = baseline.get("datasets") if isinstance(baseline.get("datasets"), dict) else {}
     ablation_datasets = ((((comparison_candidate.get("ablation") or {}).get("metrics") or {}).get("datasets")) or {})
     matched_datasets = ((comparison_candidate.get("matched_control_metrics") or {}).get("datasets") or {})
     coverage_datasets = ((comparison_candidate.get("coverage_metrics") or {}).get("datasets") or {})
-    dataset_ids = [dataset["dataset_id"] for dataset in trial_spec["datasets"]]
-    sources: list[dict[str, str]] = []
 
-    def quantitative(kind: str, phase: str, values: dict[str, dict[str, float]]) -> dict[str, Any]:
-        payload = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind=kind, fields={})
+    def quantitative(kind: str, values: dict[str, dict[str, float]]) -> dict[str, Any]:
+        payload = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind=kind, phase=phase, fields={})
         rows = []
         for dataset_id in dataset_ids:
             for seed in seeds:
                 for role, role_values in values.items():
-                    value = role_values.get(dataset_id)
+                    dataset_value = role_values.get(dataset_id)
+                    if len(seeds) > 1:
+                        if not isinstance(dataset_value, dict):
+                            raise S3ValidationError(
+                                f"C2C evidence lacks per-seed {kind} rows for {role}/{dataset_id}"
+                            )
+                        value = dataset_value.get(seed, dataset_value.get(str(seed)))
+                    else:
+                        value = dataset_value
                     if not isinstance(value, (int, float)) or isinstance(value, bool):
-                        raise S3ValidationError(f"C2C simulated evidence lacks {kind} row for {role}/{dataset_id}/{seed}")
-                    rows.append(
-                        {
-                            "phase": phase,
-                            "role": role,
-                            "dataset_id": dataset_id,
-                            "metric_id": metric_id,
-                            "seed": seed,
-                            "metric_value": float(value),
-                            "command_status": "completed",
-                            "attempt_id": attempt["attempt_id"],
-                            "variant_semantic_hash": attempt["variant_semantic_hash"],
-                            "variant_spec_hash": attempt["variant_spec_hash"],
-                            "trial_spec_hash": attempt["trial_spec_hash"],
-                            "sample_manifest_hash": attempt["sample_manifest_hash"],
-                            "evaluator_hash": attempt["evaluator_hash"],
-                            "producer_run_id": producer_run_id,
-                        }
-                    )
+                        raise S3ValidationError(f"C2C evidence lacks {kind} row for {role}/{dataset_id}/{seed}")
+                    rows.append({
+                        "phase": phase, "role": role, "dataset_id": dataset_id, "metric_id": metric_id,
+                        "seed": seed, "metric_value": float(value), "command_status": "completed",
+                        "attempt_id": attempt["attempt_id"], "variant_semantic_hash": attempt["variant_semantic_hash"],
+                        "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"],
+                        "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"],
+                        "producer_run_id": producer_run_id, "lifecycle_generation": attempt["lifecycle_generation"],
+                        "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"],
+                        "phase_execution_id": phase_execution["phase_execution_id"],
+                        "phase_start_event_id": phase_execution["phase_start_event_id"],
+                    })
         payload["rows"] = rows
         return payload
 
-    payloads: dict[str, dict[str, Any]] = {
-        "main_results": quantitative("main_results", "full", {"baseline": baseline_datasets, "candidate": candidate_datasets}),
-        "ablation_results": quantitative("ablation_results", "ablation", {"ablation": ablation_datasets}),
-        "matched_control_results": quantitative("matched_control_results", "full", {"matched_control": matched_datasets}),
-        "coverage_results": quantitative("coverage_results", "full", {"coverage": coverage_datasets}),
-    }
-    hashes = {kind: hashlib.sha256(encode_canonical_evidence(payload)).hexdigest() for kind, payload in payloads.items()}
-    fingerprint_inputs = {"sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "protocol_hash": attempt["protocol_hash"]}
-    baseline_hash = canonical_hash(fingerprint_inputs)
-    payloads["activation_evidence"] = _identity_evidence_payload(
-        attempt=attempt,
-        producer_run_id=producer_run_id,
-        evidence_kind="activation_evidence",
-        fields={"probe_id": "c2c-simulated-forward-probe", "status": "passed", "command_status": "completed", "exit_code": 0, "implementation_surface_ids": list((read_json(project_root / "plan/variant.json", default={}) or {}).get("implementation_surface_ids") or ["c2c-simulated-surface"])},
-    )
-    hashes["activation_evidence"] = hashlib.sha256(encode_canonical_evidence(payloads["activation_evidence"])).hexdigest()
-    payloads["proxy_baseline_fingerprint"] = _identity_evidence_payload(
-        attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_baseline_fingerprint",
-        fields={"baseline_hash": baseline_hash, "dataset_ids": dataset_ids, "seeds": seeds, "fingerprint_inputs": fingerprint_inputs},
-    )
-    hashes["proxy_baseline_fingerprint"] = hashlib.sha256(encode_canonical_evidence(payloads["proxy_baseline_fingerprint"])).hexdigest()
-    payloads["proxy_cache_report"] = _identity_evidence_payload(
-        attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_cache_report",
-        fields={"cross_references": {"proxy_baseline_fingerprint_hash": hashes["proxy_baseline_fingerprint"]}, "cache_key": canonical_hash({"attempt": attempt["attempt_id"], "producer": producer_run_id}), "baseline_hash": baseline_hash, "cache_entry_hash": baseline_hash, "status": "created"},
-    )
-    payloads["effective_proxy_policy"] = _identity_evidence_payload(
-        attempt=attempt, producer_run_id=producer_run_id, evidence_kind="effective_proxy_policy",
-        fields={"policy_hash": canonical_hash({"required_phases": trial_spec["protocol"]["required_phases"], "proxy_terminal_allowed": trial_spec["protocol"]["proxy_terminal_allowed"], "decision_threshold": 0.0}), "required_phases": trial_spec["protocol"]["required_phases"], "proxy_terminal_allowed": trial_spec["protocol"]["proxy_terminal_allowed"], "decision_threshold": 0.0},
-    )
-    hashes.update({kind: hashlib.sha256(encode_canonical_evidence(payloads[kind])).hexdigest() for kind in ("proxy_cache_report", "effective_proxy_policy")})
-    payloads["proxy_calibration_policy"] = _identity_evidence_payload(
-        attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_calibration_policy",
-        fields={"cross_references": {"proxy_baseline_fingerprint_hash": hashes["proxy_baseline_fingerprint"], "effective_proxy_policy_hash": hashes["effective_proxy_policy"]}, "calibration_hash": canonical_hash({"status": "calibrated", "calibration_metric": metric_id, "calibration_value": 1.0, "cross_references": {"proxy_baseline_fingerprint_hash": hashes["proxy_baseline_fingerprint"], "effective_proxy_policy_hash": hashes["effective_proxy_policy"]}}), "status": "calibrated", "calibration_metric": metric_id, "calibration_value": 1.0},
-    )
-    hashes["proxy_calibration_policy"] = hashlib.sha256(encode_canonical_evidence(payloads["proxy_calibration_policy"])).hexdigest()
-    mean_delta = float((comparison_candidate.get("metrics") or {}).get("mean", 0.0)) - float(baseline.get("mean", 0.0))
-    payloads["proxy_decision_report"] = _identity_evidence_payload(
-        attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_decision_report",
-        fields={"cross_references": {"proxy_baseline_fingerprint_hash": hashes["proxy_baseline_fingerprint"], "proxy_cache_report_hash": hashes["proxy_cache_report"], "effective_proxy_policy_hash": hashes["effective_proxy_policy"], "proxy_calibration_policy_hash": hashes["proxy_calibration_policy"], "main_results_hash": hashes["main_results"]}, "decision": "run_full", "reason_codes": ["simulated_proxy_verified"], "observed_proxy_delta": mean_delta},
-    )
-    hashes["proxy_decision_report"] = hashlib.sha256(encode_canonical_evidence(payloads["proxy_decision_report"])).hexdigest()
-    payloads["full_s3_readiness"] = _identity_evidence_payload(
-        attempt=attempt, producer_run_id=producer_run_id, evidence_kind="full_s3_readiness",
-        fields={"cross_references": {"activation_evidence_hash": hashes["activation_evidence"], "proxy_decision_report_hash": hashes["proxy_decision_report"]}, "ready": True, "checks": [{"check_id": "simulated-c2c-proxy-full-ready", "status": "PASS"}]},
-    )
-    for kind, payload in payloads.items():
-        sources.append(_write_staged_evidence_source(project_root, producer_run_id=producer_run_id, evidence_kind=kind, payload=payload))
-    return sources
-
+    payloads: dict[str, dict[str, Any]] = {}
+    if phase == "proxy":
+        payloads["proxy_results"] = quantitative("proxy_results", {"baseline": baseline_datasets, "candidate": candidate_datasets})
+        fingerprint_inputs = {"sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "protocol_hash": attempt["protocol_hash"], "phase_execution_id": phase_execution["phase_execution_id"]}
+        baseline_hash = canonical_hash(fingerprint_inputs)
+        payloads["activation_evidence"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="activation_evidence", phase="proxy", fields={"probe_id": "c2c-forward-probe", "status": "passed", "command_status": "completed", "exit_code": 0, "implementation_surface_ids": list((read_json(project_root / "plan/variant.json", default={}) or {}).get("implementation_surface_ids") or ["c2c-surface"])})
+        payloads["proxy_baseline_fingerprint"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_baseline_fingerprint", phase="proxy", fields={"baseline_hash": baseline_hash, "dataset_ids": dataset_ids, "seeds": seeds, "fingerprint_inputs": fingerprint_inputs})
+        baseline_fingerprint_hash = hashlib.sha256(encode_canonical_evidence(payloads["proxy_baseline_fingerprint"])).hexdigest()
+        payloads["proxy_cache_report"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_cache_report", phase="proxy", fields={"cross_references": {"proxy_baseline_fingerprint_hash": baseline_fingerprint_hash}, "cache_key": canonical_hash({"attempt": attempt["attempt_id"], "phase_execution": phase_execution["phase_execution_id"]}), "baseline_hash": baseline_hash, "cache_entry_hash": baseline_hash, "status": "created"})
+        policy_body = {"required_phases": trial_spec["protocol"]["required_phases"], "proxy_terminal_allowed": trial_spec["protocol"]["proxy_terminal_allowed"], "decision_threshold": 0.0}
+        payloads["effective_proxy_policy"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="effective_proxy_policy", phase="proxy", fields={"policy_hash": canonical_hash(policy_body), **policy_body})
+        effective_hash = hashlib.sha256(encode_canonical_evidence(payloads["effective_proxy_policy"])).hexdigest()
+        calibration_body = {"cross_references": {"proxy_baseline_fingerprint_hash": baseline_fingerprint_hash, "effective_proxy_policy_hash": effective_hash}, "status": "calibrated", "calibration_metric": metric_id, "calibration_value": 1.0}
+        payloads["proxy_calibration_policy"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_calibration_policy", phase="proxy", fields={"calibration_hash": canonical_hash(calibration_body), **calibration_body})
+        activation_hash = hashlib.sha256(encode_canonical_evidence(payloads["activation_evidence"])).hexdigest()
+        proxy_results_hash = hashlib.sha256(encode_canonical_evidence(payloads["proxy_results"])).hexdigest()
+        proxy_references = {"activation_evidence_hash": activation_hash, "proxy_results_hash": proxy_results_hash}
+        if attempt["profile"] == "bootstrap":
+            payloads["bootstrap_completion"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="bootstrap_completion", phase="proxy", fields={"cross_references": proxy_references, "completion_status": "verified"})
+        else:
+            payloads["full_s3_readiness"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="full_s3_readiness", phase="proxy", fields={"cross_references": proxy_references, "ready": True, "checks": [{"check_id": "proxy-ready-for-full", "status": "PASS"}]})
+    else:
+        payloads["main_results"] = quantitative("main_results", {"baseline": baseline_datasets, "candidate": candidate_datasets})
+        required_kinds = set(phase_contract["evidence_kinds"])
+        if "ablation_results" in required_kinds:
+            payloads["ablation_results"] = quantitative("ablation_results", {"ablation": ablation_datasets})
+        if "matched_control_results" in required_kinds:
+            payloads["matched_control_results"] = quantitative("matched_control_results", {"matched_control": matched_datasets})
+        if "coverage_results" in required_kinds:
+            payloads["coverage_results"] = quantitative("coverage_results", {"coverage": coverage_datasets})
+    return [
+        _write_staged_evidence_source(project_root, producer_run_id=producer_run_id, evidence_kind=kind, payload=payload)
+        for kind, payload in payloads.items()
+    ]
 
 def _write_staged_evidence_source(
     project_root: Path,
@@ -7046,6 +7112,58 @@ def _write_staged_evidence_source(
     return {"kind": evidence_kind, "source_path": relative_path, "producer_run_id": producer_run_id}
 
 
+def _generic_external_evidence_inventory(
+    *,
+    project_root: Path,
+    attempt: dict[str, Any],
+    execution: dict[str, Any],
+) -> list[dict[str, str]]:
+    manifest_path = execution.get("phase_manifest_path")
+    if not isinstance(manifest_path, str) or not manifest_path:
+        raise S3ValidationError("external_manifest collector requires phase_manifest_path")
+    try:
+        raw = EvidenceStore(project_root).read_staged_source(manifest_path)
+        manifest = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise S3ValidationError(f"external phase manifest rejected: {exc}") from exc
+    validate_contract(manifest, "phase_execution_manifest_v1.schema.json")
+    phase = "proxy" if attempt["state"] == "PROXY_RUNNING" else "full" if attempt["state"] == "FULL_RUNNING" else None
+    phase_execution = (attempt.get("phase_executions") or {}).get(phase) if phase else None
+    if not isinstance(phase_execution, dict):
+        raise S3ValidationError("external phase manifest requires an authoritative running phase")
+    expected = {
+        "attempt_id": attempt["attempt_id"],
+        "direction_semantic_hash": attempt["direction_semantic_hash"],
+        "direction_spec_hash": attempt["direction_spec_hash"],
+        "variant_semantic_hash": attempt["variant_semantic_hash"],
+        "variant_spec_hash": attempt["variant_spec_hash"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": phase,
+        "phase_execution_id": phase_execution["phase_execution_id"],
+        "phase_start_event_id": phase_execution["phase_start_event_id"],
+        "producer_run_id": phase_execution["producer_run_id"],
+    }
+    for key, value in expected.items():
+        if manifest.get(key) != value:
+            raise S3ValidationError(f"external phase manifest {key} mismatch")
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        raise S3ValidationError("external phase manifest must declare produced artifacts")
+    inventory: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for artifact in artifacts:
+        if artifact["producer_run_id"] != phase_execution["producer_run_id"]:
+            raise S3ValidationError("external artifact producer_run_id mismatch")
+        if artifact["kind"] in seen:
+            raise S3ValidationError(f"duplicate external evidence kind: {artifact['kind']}")
+        seen.add(artifact["kind"])
+        inventory.append({key: str(artifact[key]) for key in ("kind", "source_path", "producer_run_id")})
+    return inventory
+
+
 def _decode_staged_execution_observations(
     project_root: Path,
     attempt: dict[str, Any],
@@ -7056,11 +7174,12 @@ def _decode_staged_execution_observations(
 
     evidence_bytes: dict[str, bytes] = {}
     manifest_entries: list[dict[str, Any]] = []
+    store = EvidenceStore(project_root)
     for entry in completion_evidence.get("entries") or []:
-        path = project_root / str(entry["relative_path"])
-        raw_bytes = path.read_bytes()
-        if hashlib.sha256(raw_bytes).hexdigest() != entry["content_hash"]:
-            raise S3ValidationError(f"staged evidence hash drift: {entry['relative_path']}")
+        try:
+            raw_bytes = store.read_entry(entry, attempt)
+        except ValueError as exc:
+            raise S3ValidationError(f"staged evidence rejected: {entry['relative_path']}: {exc}") from exc
         payload = json.loads(raw_bytes.decode("utf-8"))
         manifest_entries.append({**deepcopy(entry), "cross_references": deepcopy(payload.get("cross_references") or {})})
         evidence_bytes[entry["evidence_id"]] = raw_bytes
@@ -7075,6 +7194,9 @@ def _decode_staged_execution_observations(
         "protocol_hash": str(attempt["protocol_hash"]),
         "sample_manifest_hash": str(attempt["sample_manifest_hash"]),
         "evaluator_hash": str(attempt["evaluator_hash"]),
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
         "entries": manifest_entries,
     }
     try:

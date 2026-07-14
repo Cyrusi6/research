@@ -40,13 +40,13 @@ class S2GateValidator(StageGateValidator):
             self.retry_check("variant_v4", "VariantSpec v4 validation failed", artifact="plan/variant.json", details={"errors": errors[:20]})
         else:
             self.pass_check("variant_v4", artifact="plan/variant.json", details={"variant_id": variant["variant_id"], "variant_semantic_hash": variant["variant_semantic_hash"], "variant_spec_hash": variant["variant_spec_hash"]})
-        trial_errors = contract_errors(trial_spec, "trial_spec_v3.schema.json")
+        trial_errors = contract_errors(trial_spec, "trial_spec_v4.schema.json")
         try:
             validate_trial_spec(trial_spec)
         except ValueError as exc:
             trial_errors.append(str(exc))
         if trial_errors:
-            self.retry_check("trial_spec", "TrialSpec v2 validation failed", artifact="plan/trial_spec.json", details={"errors": trial_errors[:20]})
+            self.retry_check("trial_spec", "TrialSpec v4 validation failed", artifact="plan/trial_spec.json", details={"errors": trial_errors[:20]})
         else:
             self.pass_check("trial_spec", artifact="plan/trial_spec.json")
 

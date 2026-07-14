@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "observation_id",
+    "phase",
+    "role",
+    "command_status",
+    "dataset_id",
+    "metric_id",
+    "metric_value",
+    "attempt_id",
+    "variant_semantic_hash",
+    "variant_spec_hash",
+    "trial_spec_hash",
+    "sample_manifest_hash",
+    "evaluator_hash",
+    "seed",
+    "producer_run_id",
+    "evidence_id",
+    "evidence_kind",
+    "raw_artifact_path",
+    "raw_artifact_hash",
+    "lifecycle_generation",
+    "implementation_hash",
+    "attempt_input_hash",
+    "phase_execution_id",
+    "phase_start_event_id"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "auto_research_execution_observation_v4"
+    },
+    "observation_id": {
+      "type": "string",
+      "pattern": "^obs:[a-f0-9]{64}$"
+    },
+    "phase": {
+      "enum": [
+        "activation",
+        "proxy",
+        "full",
+        "resource",
+        "resume"
+      ]
+    },
+    "role": {
+      "enum": [
+        "baseline",
+        "candidate",
+        "ablation",
+        "matched_control",
+        "coverage"
+      ]
+    },
+    "command_status": {
+      "const": "completed"
+    },
+    "dataset_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "metric_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "metric_value": {
+      "type": "number"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "variant_semantic_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "variant_spec_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "trial_spec_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "sample_manifest_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "evaluator_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "seed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "producer_run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "evidence_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+    },
+    "evidence_kind": {
+      "enum": [
+        "main_results",
+        "ablation_results",
+        "coverage_results",
+        "matched_control_results",
+        "proxy_results"
+      ]
+    },
+    "raw_artifact_path": {
+      "type": "string",
+      "pattern": "^experiment/attempts/[^/]+/[^/]+/[^/]+/[a-f0-9]{64}\\.json$"
+    },
+    "raw_artifact_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "lifecycle_generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "implementation_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "attempt_input_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "phase_execution_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "phase_start_event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
+    }
+  }
+}

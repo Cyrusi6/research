@@ -88,12 +88,17 @@ def _variant(direction: dict, index: int, feedback: list[str] | None = None) -> 
     )
 
 
+
+def _trial_spec(attempt: dict | None = None, *, profile: str = "standard", attempt_kind: str | None = None) -> dict:
+    from support.authoritative_evidence import upgrade_trial_spec_v4
+    return upgrade_trial_spec_v4(_trial_spec_legacy(attempt, profile=profile, attempt_kind=attempt_kind))
+
 def _initialize(ledger: ResearchEventLedger, direction: dict, variant: dict) -> None:
     ledger.select_direction(direction)
     ledger.plan_variant(variant, feedback_from_attempt_ids=(variant.get("lineage") or {}).get("feedback_from_attempt_ids") or [])
 
 
-def _trial_spec(attempt: dict | None = None, *, profile: str = "standard", attempt_kind: str | None = None) -> dict:
+def _trial_spec_legacy(attempt: dict | None = None, *, profile: str = "standard", attempt_kind: str | None = None) -> dict:
     kind = attempt_kind or ((attempt or {}).get("attempt_kind")) or ("bootstrap_proxy" if profile == "bootstrap" else "full")
     phase = "proxy" if kind in {"proxy", "bootstrap_proxy"} else "full"
     runtime = {"batch": 1, "device": "cpu"}
@@ -183,9 +188,15 @@ def _reserve(ledger: ResearchEventLedger, direction: dict, variant: dict, *, pro
 
 
 def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class: str, *, suffix: str = "1") -> dict:
+    from support.authoritative_evidence import start_attempt_phase
     aliases = {"resource_paused": "resource_pause", "integrity": "integrity_failure", "activation_failed": "activation_failure"}
     failure_class = aliases.get(failure_class, failure_class)
     is_resource = failure_class in {"resource_pause", "oom_retry"}
+    current = ledger.state()["attempts"][attempt["attempt_id"]]
+    execution_phase = "proxy" if current["attempt_kind"] in {"proxy", "bootstrap_proxy", "proxy_full"} else "full"
+    if not isinstance(current["phase_executions"][execution_phase], dict) and failure_class != "implementation_failure":
+        current = start_attempt_phase(ledger, current, execution_phase)
+    attempt = current
     producer_run_id = f"failure-producer-{attempt['lifecycle_generation']}-{suffix}"
     phase = next((name for name, status in attempt["phases"].items() if status == "RUNNING"), None)
     if failure_class == "implementation_failure":
@@ -194,7 +205,7 @@ def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class:
         phase = "activation"
     if is_resource:
         artifact_payload = {
-            "schema_version": "auto_research_resource_probe_evidence_v1",
+            "schema_version": "auto_research_resource_probe_evidence_v2",
             "evidence_kind": "resource_probe",
             "evidence_id": f"resource-probe-{attempt['lifecycle_generation']}-{suffix}",
             "attempt_id": attempt["attempt_id"],
@@ -208,13 +219,19 @@ def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class:
             "sample_manifest_hash": attempt["sample_manifest_hash"],
             "evaluator_hash": attempt["evaluator_hash"],
             "cross_references": {},
-            "resource_type": "memory",
+            "resource_type": "system_memory",
             "resource_id": "memory-0",
             "required_capacity": 10.0,
             "observed_capacity": 1.0,
             "unit": "bytes",
             "probe_status": "insufficient",
             "observed_at": "2026-01-01T00:00:00Z",
+            "lifecycle_generation": attempt["lifecycle_generation"],
+            "implementation_hash": attempt["implementation_hash"],
+            "attempt_input_hash": attempt["attempt_input_hash"],
+            "phase": execution_phase,
+            "phase_execution_id": attempt["phase_executions"][execution_phase]["phase_execution_id"],
+            "phase_start_event_id": attempt["phase_executions"][execution_phase]["phase_start_event_id"],
         }
         artifact_kind = "resource_probe"
     else:
@@ -236,6 +253,10 @@ def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class:
     artifact = ledger.project_root / relative_path
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(artifact_bytes)
+    execution = attempt["phase_executions"].get(execution_phase) or {
+        "phase_execution_id": f"implementation-{attempt['attempt_id'][:12]}",
+        "phase_start_event_id": next(event["event_id"] for event in ledger.events() if event["event_type"] == "AttemptReserved" and event["payload"]["attempt"]["attempt_id"] == attempt["attempt_id"]),
+    }
     return {
         "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION,
         "evidence_kind": "failure_evidence",
@@ -254,6 +275,9 @@ def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class:
         "lifecycle_generation": attempt["lifecycle_generation"],
         "implementation_hash": attempt["implementation_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": phase,
+        "phase_execution_id": execution["phase_execution_id"],
+        "phase_start_event_id": execution["phase_start_event_id"],
         "source_state": attempt["state"],
         "source_phase": phase,
         "failure_class": failure_class,
@@ -271,11 +295,15 @@ def _completion_evidence(
     *,
     outcome: str,
 ) -> dict:
+    from support.authoritative_evidence import start_attempt_phase
     phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
+    current = ledger.state()["attempts"][attempt["attempt_id"]]
+    if not isinstance(current["phase_executions"][phase], dict):
+        current = start_attempt_phase(ledger, current, phase)
     candidate = 0.7 if outcome == "accepted" else 0.51
     return build_quantitative_completion(
         ledger.project_root,
-        attempt,
+        current,
         role_values={"baseline": 0.5, "candidate": candidate},
         dataset_id="fake",
         metric_id="accuracy",
@@ -296,8 +324,6 @@ def _complete(
         current = ledger.state()["attempts"][attempt["attempt_id"]]
         return ledger.disposition_failure(_failure_evidence(ledger, current, failure or "implementation_failure"))
     completion = _completion_evidence(ledger, attempt, outcome=outcome)
-    phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
-    ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING" if phase == "proxy" else "FULL_RUNNING", phase=phase, phase_state="RUNNING")
     return ledger.complete_attempt(completion)
 
 
@@ -432,11 +458,9 @@ def test_trial_identity_mismatch_writes_nothing(tmp_path: Path) -> None:
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
-    ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
-    attempt = ledger.state()["attempts"][attempt["attempt_id"]]
+    completion = _completion_evidence(ledger, attempt, outcome="accepted")
     before_events = len(ledger.events())
     before_state = ledger.state()
-    completion = _completion_evidence(ledger, attempt, outcome="accepted")
     completion["trial_spec_hash"] = "f" * 64
     with pytest.raises(IntegrityError, match="TrialSpec identity mismatch"):
         ledger.complete_attempt(completion)
@@ -556,8 +580,6 @@ def test_bootstrap_failures_never_finish_run(tmp_path: Path, failure_class: str,
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant, profile="bootstrap")
-    if failure_class in {"resource_pause", "oom_retry"}:
-        attempt = ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
     failed, route = ledger.disposition_failure(_failure_evidence(ledger, attempt, failure_class))
     assert route["next_action"] == expected_action
     assert route["next_action"] != "FINISH_RUN"

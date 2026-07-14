@@ -3708,7 +3708,7 @@ def _trial_spec_from_plan(
     required_phases = ["proxy"] if proxy_terminal else (["proxy", "full"] if c2c_proxy_full else ["full"])
     terminal_phases = ["proxy"] if proxy_terminal else ["full"]
     required_roles = ["baseline", "candidate"]
-    if ablations:
+    if ablations and not proxy_terminal:
         required_roles.append("ablation")
     constraints = []
     minimum_delta = acceptance.get("minimum_mean_delta")
@@ -3736,7 +3736,7 @@ def _trial_spec_from_plan(
                 "objective": primary[0]["objective"],
             }
         )
-    if ablations:
+    if ablations and not proxy_terminal:
         constraints.append(
             {
                 "constraint_id": "required-ablation-contrast",
@@ -3747,7 +3747,7 @@ def _trial_spec_from_plan(
                 "objective": primary[0]["objective"],
             }
         )
-    if acceptance.get("matched_coverage_ablation_required"):
+    if acceptance.get("matched_coverage_ablation_required") and not proxy_terminal:
         required_roles.extend(["matched_control", "coverage"])
         constraints.extend(
             [
@@ -3755,18 +3755,23 @@ def _trial_spec_from_plan(
                 {"constraint_id": "coverage", "kind": "coverage_constraint", "hard": True, "metric_id": primary_metric_id, "threshold": 1.0, "objective": "maximize"},
             ]
         )
-    required_artifacts = ["main_results"]
-    if ablations:
+    required_artifacts = ["proxy_results"] if "proxy" in required_phases else []
+    if "full" in required_phases:
+        required_artifacts.append("main_results")
+    if ablations and not proxy_terminal:
         required_artifacts.append("ablation_results")
     if "coverage" in required_roles:
         required_artifacts.append("coverage_results")
     if "matched_control" in required_roles:
         required_artifacts.append("matched_control_results")
     evidence_requirements = [
-        {"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": list(terminal_phases), "schema_version": EVIDENCE_SCHEMA_VERSIONS["main_results"]},
-        {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["always"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["activation_evidence"]},
+        {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["proxy" if "proxy" in required_phases else "full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["activation_evidence"]},
     ]
-    if ablations:
+    if "proxy" in required_phases:
+        evidence_requirements.append({"requirement_id": "proxy-results", "kind": "proxy_results", "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["proxy_results"]})
+    if "full" in required_phases:
+        evidence_requirements.append({"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["main_results"]})
+    if ablations and not proxy_terminal:
         evidence_requirements.append({"requirement_id": "ablation-results", "kind": "ablation_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["ablation_results"]})
     if "coverage" in required_roles:
         evidence_requirements.append({"requirement_id": "coverage-results", "kind": "coverage_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["coverage_results"]})
@@ -3778,7 +3783,6 @@ def _trial_spec_from_plan(
             ("proxy-cache", "proxy_cache_report"),
             ("effective-policy", "effective_proxy_policy"),
             ("calibration-policy", "proxy_calibration_policy"),
-            ("proxy-decision", "proxy_decision_report"),
         ]
         evidence_requirements.extend(
             {"requirement_id": requirement_id, "kind": kind, "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS[kind]}
@@ -3787,7 +3791,7 @@ def _trial_spec_from_plan(
         if proxy_terminal:
             evidence_requirements.append({"requirement_id": "bootstrap-completion", "kind": "bootstrap_completion", "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["bootstrap_completion"]})
         else:
-            evidence_requirements.append({"requirement_id": "full-readiness", "kind": "full_s3_readiness", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["full_s3_readiness"]})
+            evidence_requirements.append({"requirement_id": "full-readiness", "kind": "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["full_s3_readiness"]})
     runtime_config = deepcopy(execution)
     provenance_mode = "synthetic" if execution.get("mode") == "simulate" else "real"
     if provenance_mode == "real":
@@ -3806,6 +3810,9 @@ def _trial_spec_from_plan(
         "config_hash": canonical_hash({"metrics": metrics, "runtime": execution}),
         "dependency_digest": str(execution.get("dependency_digest") or canonical_hash({"dependencies": execution.get("dependencies") or [], "mode": provenance_mode})),
     }
+    if provenance_mode == "real":
+        evaluator_identity["artifact_path"] = "plan/evaluator_manifest.json"
+        evaluator_identity["artifact_hash"] = canonical_hash(evaluator_identity)
     command_contract = deepcopy(execution.get("commands") or [])
     dataset_ids = [item["dataset_id"] for item in datasets]
     sample_manifest_datasets = []
@@ -3874,6 +3881,23 @@ def _trial_spec_from_plan(
         },
         "required_artifacts": required_artifacts,
         "evidence_requirements": evidence_requirements,
+        "phase_contracts": [
+            {
+                "phase": phase,
+                "datasets": dataset_ids,
+                "seeds": seeds,
+                "roles": ["baseline", "candidate"] if phase == "proxy" else list(dict.fromkeys(required_roles)),
+                "metrics": [item["metric_id"] for item in metrics],
+                "evidence_kinds": [
+                    item["kind"]
+                    for item in evidence_requirements
+                    if phase in item["applicable_phases"] or "always" in item["applicable_phases"]
+                ],
+                "terminal": phase in terminal_phases,
+                "consumes_direction_budget": profile == "standard" and phase in terminal_phases,
+            }
+            for phase in required_phases
+        ],
     }
     validate_trial_spec(trial_spec)
     if project_root is not None:
@@ -3881,6 +3905,12 @@ def _trial_spec_from_plan(
         ensure_dir(sample_path.parent)
         sample_body = {key: value for key, value in trial_spec["sample_manifest"].items() if key != "artifact_hash"}
         sample_path.write_text(canonical_json(sample_body), encoding="utf-8")
+        evaluator = trial_spec["execution_contract"]["evaluator_provenance"]
+        if evaluator["provenance_mode"] == "real":
+            evaluator_path = project_root / evaluator["artifact_path"]
+            ensure_dir(evaluator_path.parent)
+            evaluator_body = {key: value for key, value in evaluator.items() if key != "artifact_hash"}
+            evaluator_path.write_text(canonical_json(evaluator_body), encoding="utf-8")
     return trial_spec
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:

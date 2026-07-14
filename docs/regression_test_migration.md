@@ -1,6 +1,6 @@
-# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.3
+# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.4
 
-The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M1.1.3 does not restore their legacy readers, route policy, schemas, or artifact mirrors. Valid behavior is covered through the current canonical contracts and SQLite Event v4 state layer.
+The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M1.1.4 does not restore their legacy readers, route policy, schemas, or artifact mirrors. Valid behavior is covered through the current canonical contracts and SQLite Event v5 state layer.
 
 ## Migration Classes
 
@@ -11,9 +11,9 @@ The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M
 | Proxy/full execution, all-zero/neutral proxy, ablation, paired baseline, readiness, artifact lock | Yes | Existing C2C proxy, hook, manifest, Gate, and pipeline tests plus strict TrialResult tests | Retained as execution/Gate evidence. Routing authority moved from mutable proxy/main-results files to the committed attempt transaction. |
 | Codex S2/S2.5 session persistence and duplicate session recovery | Yes | Existing C2C planner and code-patch persistence tests in `tests/test_c2c.py` | Retained. A repeated scientific variant is rejected; IDs can no longer disguise duplication. |
 | Snapshot pollution, replay, stale route-invalidated artifacts | Yes | Event tamper, crash-before-projection, rebuild, audit, and replay tests | Replaced mutable snapshot authority with hash-chained SQLite events and rebuildable projections. |
-| S1/S2/S3 negative Gate paths and strict falsifiability/ablation fields | Yes | `tests/test_validators.py`, `tests/test_stage_contracts.py`, strict schema tests | Rewritten against DirectionSpec v3, VariantSpec v4, TrialSpec v3, TrialResult v4, immutable evidence, and pre-agent missing-input blocking. |
+| S1/S2/S3 negative Gate paths and strict falsifiability/ablation fields | Yes | `tests/test_validators.py`, `tests/test_stage_contracts.py`, strict schema tests | Rewritten against DirectionSpec v3, VariantSpec v4, TrialSpec v4, TrialResult v5, immutable evidence, and pre-agent missing-input blocking. |
 | Feedback attribution and adaptive history | Yes | State-machine semantic duplicate tests and existing `tests/test_s2_feedback_policy.py` | Method history reads only verified standard outcomes; implementation/resource history and planner feedback remain separate. |
-| Legacy `route_policy` branch-by-branch decisions | No | Unified reducer route tests | Obsolete because multiple route authorities caused conflicting counters and non-atomic decisions. `RouteOutcome v3` is reducer-derived. |
+| Legacy `route_policy` branch-by-branch decisions | No | Unified reducer route tests | Obsolete because multiple route authorities caused conflicting counters and non-atomic decisions. `RouteOutcome v4` is reducer-derived. |
 | Legacy direction/idea fallback, v1 variant loading, candidate/next-variant execution inputs | No | Runtime `rg` assertion in `tests/test_authoritative_state_machine.py` | Obsolete under the breaking canonical switch. Old workspaces must rerun from S1. |
 | C2C debate timeout/fallback and compatibility-generated candidates | No | None | Obsolete because the legacy debate execution path and compatibility candidate source were removed. Restoring these tests would require forbidden legacy producers/readers. |
 | Old result-summary routing and archived-route fallback | No | TrialResult/RouteOutcome transaction tests | Obsolete because `main_results.json`, proxy decisions, and route projections are not authorities. |
@@ -130,7 +130,7 @@ git diff --unified=0 71d38750a9bf193f24556222776fff3030a18bee..80d6b7ec38c61f8e1
 | 97 | `tests/test_validators.py::test_s3_gate_fails_below_acceptance_threshold` | Canonical replacement | `tests/test_route_policy.py::test_first_four_method_outcomes_route_to_next_variant` and aggregate outcome selection in `tests/test_s3_precommit_orchestration.py::test_direction_aggregate_selects_best_accepted_delta_not_highest_absolute_candidate`. Gates are not weakened. |
 | 98 | `tests/test_validators.py::test_s3_gate_fails_when_s2_5_artifact_lock_changes` | Canonical replacement | `tests/test_s3_precommit_orchestration.py::test_s3_precommit_rejects_invalid_trial_without_finalization_or_budget_change`, `tests/test_c2c.py::test_frozen_patch_guard_requires_sha_and_restores_added_files`. |
 
-The M1.1.3 full suite is the migration acceptance criterion. Tests are neither skipped nor weakened to preserve old artifacts; assertions target Event v4 transactions, lifecycle generations, semantic/spec identity, evidence-derived observations, strict precommit Gate behavior, exact completion replay, bootstrap isolation, and the five-outcome reducer invariant.
+The M1.1.4 full suite is the migration acceptance criterion. Tests are neither skipped nor weakened to preserve old artifacts; assertions target Event v5 phase transactions, lifecycle generations, semantic/spec identity, evidence-derived observations, strict precommit Gate behavior, exact completion replay, bootstrap isolation, and the five-outcome reducer invariant.
 
 ## M1.1.2 RouteOutcome authority and hermetic audit
 
@@ -146,3 +146,7 @@ Tests that previously constructed `ExecutionObservation` or a completed `TrialRe
 ## M1.1.3 final fixture migration
 
 `tests/support/authoritative_evidence.py` is the shared production-like quantitative evidence builder. It writes canonical row-level bytes into the same Attempt-scoped content-addressed layout used by production and returns only `CompletionEvidence`; it never constructs observations, constraints, summaries, or outcomes. Completion replay is covered by `tests/test_m113_completion_replay.py`; bootstrap isolation and missing-evidence attacks are covered by `tests/test_s3_proxy_gate.py`; Generic/C2C five-variant raw-row reconstruction is covered by `tests/test_pipeline.py` and `tests/test_c2c.py`.
+
+## M1.1.4 phase-transaction migration
+
+The existing 98-name mapping remains authoritative. Its canonical replacements now run on Event v5, AttemptRecord v5, TrialSpec v4, EvidenceManifest v3, ExecutionObservation v4, and TrialResult v5. Proxy/full regressions additionally map to `tests/test_m114_authoritative_phase_transactions.py`: current-generation binding, reducer-derived proxy decisions, full-command gating, bootstrap proxy-only evidence, symlink-ancestor rejection, explicit completion event IDs, exact historical replay, global execution width, and strict Generic external manifests. No removed fixed-path reader or TrialResult completion overload was restored.

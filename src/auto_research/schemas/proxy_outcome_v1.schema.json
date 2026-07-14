@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "attempt_id",
+    "lifecycle_generation",
+    "implementation_hash",
+    "attempt_input_hash",
+    "phase_execution_id",
+    "phase_start_event_id",
+    "evidence_manifest_hash",
+    "observed_delta",
+    "decision",
+    "reason_codes"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "auto_research_proxy_outcome_v1"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "lifecycle_generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "implementation_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "attempt_input_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "phase_execution_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "phase_start_event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
+    },
+    "evidence_manifest_hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "observed_delta": {
+      "type": "number"
+    },
+    "decision": {
+      "enum": [
+        "RUN_FULL",
+        "REPAIR_IMPLEMENTATION",
+        "PROPOSE_NEXT_VARIANT",
+        "PAUSE_RESOURCE",
+        "BLOCK_INTEGRITY",
+        "FINISH_RUN"
+      ]
+    },
+    "reason_codes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    }
+  }
+}

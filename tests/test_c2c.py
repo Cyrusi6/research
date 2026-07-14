@@ -5528,7 +5528,7 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
             for dataset_id in ("mmlu-redux", "ai2-arc", "openbookqa")
         }
         for artifact_path, artifact_hash in trial_result["raw_artifacts"].items():
-            assert artifact_path.startswith(f"experiment/attempts/{attempt_id}/c2c-simulate-")
+            assert artifact_path.startswith(f"experiment/attempts/{attempt_id}/run-full-")
             immutable_path = root / artifact_path
             assert immutable_path.is_file()
             assert immutable_path.stem == artifact_hash
