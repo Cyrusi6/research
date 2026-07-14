@@ -28,6 +28,7 @@ from .llm import ModelClient
 from .method_memory import append_shared_c2c_method_failure
 from .orchestration_state import OrchestrationStateManager
 from .reporting import build_project_report
+from .research_state import IntegrityError
 from .s0_enrichment import DeepSeekS0SemanticEnricher
 from .registry import begin_stage, block_stage, complete_stage, fail_stage, increment_judge_retry, invalidate_from, load_registry, pause_stage_retryable, save_registry, set_review_outcome
 from .stage_contracts import StageContractManager
@@ -339,7 +340,15 @@ class Orchestrator:
                 result = PlanAgent(context).run()
                 gate_report = gate_s2(project_root, config)
             elif stage_key == "S3_experiment":
-                result = ExperimentAgent(context).run()
+                try:
+                    result = ExperimentAgent(context).run()
+                except IntegrityError as exc:
+                    reason = f"S3 authoritative state rejected execution before commit: {exc}"
+                    block_stage(registry, stage_key, reason)
+                    save_registry(registry_path, registry)
+                    state.stage_blocked(registry, stage_key, reason)
+                    contracts.stage_stopped(stage_key, status="blocked", reason=reason, config=config, iteration=registry.get("iteration"))
+                    return {"status": "blocked", "stage": stage_key, "reason": reason}
                 gate_report = gate_s3(project_root, config)
                 ok, reason = gate_report.legacy_tuple()
                 gate_record = self._write_gate_report(context.artifacts, stage_key, gate_report)
@@ -357,13 +366,6 @@ class Orchestrator:
                     contracts.stage_stopped(stage_key, status="blocked", reason=reason, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
                     return {"status": "blocked", "stage": stage_key, "reason": reason, "route_outcome": route_outcome}
                 next_action = route_outcome.get("next_action")
-                if result.get("status") == "blocked":
-                    reason = result.get("blocked_reason") or "S3 attempt is blocked"
-                    block_stage(registry, stage_key, reason)
-                    save_registry(registry_path, registry)
-                    state.stage_blocked(registry, stage_key, reason)
-                    contracts.stage_stopped(stage_key, status="blocked", reason=reason, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
-                    return {"status": "blocked", "stage": stage_key, "reason": reason, "route_outcome": route_outcome}
                 if next_action in {"PROPOSE_NEXT_VARIANT", "REPAIR_IMPLEMENTATION"}:
                     complete_stage(registry, stage_key, artifacts=result.get("artifacts", []))
                     invalidate_from(registry, "S2_plan", invalidated_by=f"route_outcome:{next_action}")

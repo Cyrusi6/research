@@ -3,13 +3,8 @@
 from __future__ import annotations
 
 from auto_research.config import bootstrap_profile_enabled
-from auto_research.domain_contracts import (
-    contract_errors,
-    validate_direction_identity,
-    validate_trial_result,
-    validate_variant_identity,
-)
 from auto_research.research_state import IntegrityError, ResearchEventLedger
+from auto_research.s3_validation import S3ValidationError, validate_committed_s3
 from auto_research.utils import read_json
 
 from .base import StageGateValidator, load_schema, validate_min_schema
@@ -23,15 +18,17 @@ class S3GateValidator(StageGateValidator):
         required = ["literature/direction.json", "plan/variant.json"]
         if not all(self.require_file(path, retry=True) for path in required):
             return self.finalize()
+        if not self.require_file("plan/trial_spec.json", retry=True):
+            self.retry_check("s3_authoritative_transaction", "S3 pre/post-commit audit requires canonical plan/trial_spec.json")
+            return self.finalize()
         direction = self.read_json_artifact("literature/direction.json")
         variant = self.read_json_artifact("plan/variant.json")
-        if not isinstance(direction, dict) or not isinstance(variant, dict):
-            self.retry_check("s3_authoritative_json", "DirectionSpec and VariantSpec must be JSON objects")
+        trial_spec = self.read_json_artifact("plan/trial_spec.json")
+        if not isinstance(direction, dict) or not isinstance(variant, dict) or not isinstance(trial_spec, dict):
+            self.retry_check("s3_authoritative_json", "DirectionSpec, VariantSpec, and TrialSpec must be JSON objects")
             return self.finalize()
         errors: list[str] = []
         try:
-            validate_direction_identity(direction)
-            validate_variant_identity(direction, variant)
             state = ResearchEventLedger(self.project_root).rebuild()
         except (ValueError, IntegrityError) as exc:
             errors.append(str(exc))
@@ -39,39 +36,23 @@ class S3GateValidator(StageGateValidator):
         route = state.get("last_route_outcome") if isinstance(state, dict) else None
         attempt_id = ((route or {}).get("source") or {}).get("attempt_id") if isinstance(route, dict) else None
         attempt = ((state.get("attempts") or {}).get(attempt_id)) if attempt_id else None
+        trial = (state.get("trial_results") or {}).get(attempt_id) if isinstance(attempt, dict) else None
         if not isinstance(route, dict) or not isinstance(attempt, dict):
             errors.append("S3 requires one reducer-committed RouteOutcome bound to an attempt")
         else:
-            errors.extend(contract_errors(route, "route_outcome_v2.schema.json"))
-            for key in ["direction_id", "direction_semantic_hash", "direction_spec_hash"]:
-                if route.get("identity", {}).get(key) != direction.get(key):
-                    errors.append(f"RouteOutcome {key} mismatch")
-            for key in ["variant_id", "variant_semantic_hash", "variant_spec_hash"]:
-                if route.get("identity", {}).get(key) != variant.get(key):
-                    errors.append(f"RouteOutcome {key} mismatch")
-            budget = ((state.get("directions") or {}).get(attempt.get("direction_semantic_hash")) or {}).get("budget") or {}
-            if budget.get("consumed", 0) < 0 or budget.get("reserved", 0) < 0 or budget.get("consumed", 0) + budget.get("reserved", 0) > 5:
-                errors.append("direction budget invariant violated")
-
-        trial = (state.get("trial_results") or {}).get(attempt_id) if isinstance(attempt, dict) else None
-        if attempt and attempt.get("method_evaluable"):
-            if not isinstance(trial, dict):
-                errors.append("method-evaluable attempt is missing canonical TrialResult")
-            else:
-                try:
-                    validate_trial_result(trial)
-                except ValueError as exc:
-                    errors.append(str(exc))
-                errors.extend(contract_errors(trial, "trial_result_v2.schema.json"))
-                for key in [
-                    "direction_id", "direction_semantic_hash", "direction_spec_hash",
-                    "variant_id", "variant_semantic_hash", "variant_spec_hash", "attempt_id",
-                    "attempt_input_hash", "protocol_hash",
-                ]:
-                    if trial.get(key) != attempt.get(key):
-                        errors.append(f"TrialResult {key} mismatch")
-        elif trial is not None:
-            errors.append("non-evaluable attempt cannot own a canonical TrialResult")
+            try:
+                validate_committed_s3(
+                    project_root=self.project_root,
+                    direction=direction,
+                    variant=variant,
+                    state=state,
+                    attempt=attempt,
+                    route_outcome=route,
+                    trial_spec=trial_spec,
+                    trial_result=trial,
+                )
+            except S3ValidationError as exc:
+                errors.append(str(exc))
 
         if errors:
             self.retry_check("s3_authoritative_transaction", "S3 authoritative state validation failed", details={"errors": errors[:20]})

@@ -2879,3 +2879,11 @@ uv run pytest -q tests/test_validators.py tests/test_c2c.py tests/test_pipeline.
 - S3 now validates typed ExecutionObservation drafts before committing. TrialResult, terminal attempt state, reservation/budget mutation, route, and the fifth-outcome aggregate are one atomic domain event.
 - The reducer enforces continuous hash-chained events, explicit attempt transitions, repair revision history, retained reservations, explicit abandonment, standard `consumed + reserved <= 5`, and no reopening of closed semantic directions.
 - Standard deterministic generic and C2C simulation generate five scientifically distinct intervention configurations. Bootstrap remains one verified non-budget proxy and cannot collide with standard attempt identity.
+
+# 2026-07-14 M1.1.1 Event v2 / S3 Hardening
+
+- **S2.5 → S3 repair:** the same attempt and VariantSpec survive repeated implementation repairs; each implementation revision advances `lifecycle_generation`, updates implementation/input hashes, and preserves one reservation.
+- **S3 precommit:** ExperimentAgent builds a pending typed result, runs the shared complete S3 validator, then asks the Ledger to repeat validation and atomically finalize. Invalid drafts are quarantined and cannot change events, budget, route, history, aggregate, or canonical TrialResult.
+- **Reducer authority:** failure class uniquely determines repair/pause/integrity disposition; verified finalization uniquely determines budget and route. Caller-provided derived decisions are not accepted.
+- **Orchestration:** RouteOutcome is interpreted before diagnostic `result.status`; repair, resource pause, integrity block, next variant, new direction, finish direction, and finish run have explicit fail-closed branches.
+- **Projection:** research state, attempt views, latest route, TrialResult, and aggregate are synchronized projections of one SQLite sequence and can be rebuilt after deletion or a commit-before-projection crash.

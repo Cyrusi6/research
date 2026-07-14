@@ -15,6 +15,7 @@ from .domain_contracts import (
     build_variant_spec,
     variant_spec_hash,
 )
+from .research_state import ResearchEventLedger
 
 
 DIRECTION_SCORECARD_SCHEMA_VERSION = "auto_research_direction_scorecard_v1"
@@ -513,7 +514,7 @@ def build_variant_contract(
             "feedback_from_attempt_ids": [str(item) for item in _as_list(lineage.get("feedback_from_attempt_ids")) or _as_list(variant.get("feedback_from_attempt_ids"))],
         },
     }
-    tried = read_json(Path(plan.get("project_root")) / "meta" / "research_state.json", default={}) if plan.get("project_root") else {}
+    tried = ResearchEventLedger(Path(plan.get("project_root"))).state() if plan.get("project_root") else {}
     history = tried.get("method_tried_history") if isinstance(tried, dict) else []
     return build_variant_spec(direction, payload, tried_variants=history if isinstance(history, list) else [])
 

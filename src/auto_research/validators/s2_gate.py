@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from auto_research.domain_contracts import contract_errors, validate_direction_identity, validate_variant_identity
+from auto_research.research_state import ResearchEventLedger
 from auto_research.utils import read_json
 
 from .base import StageGateValidator
@@ -27,7 +28,7 @@ class S2GateValidator(StageGateValidator):
         if not isinstance(direction, dict) or not isinstance(variant, dict) or not isinstance(trial_spec, dict):
             self.retry_check("s2_authoritative_json", "DirectionSpec, VariantSpec, and TrialSpec must be JSON objects")
             return self.finalize()
-        state = read_json(self.project_root / "meta" / "research_state.json", default={}) or {}
+        state = ResearchEventLedger(self.project_root).state()
         tried = [item for item in state.get("method_tried_history") or [] if isinstance(item, dict)]
         errors = contract_errors(variant, "variant_v4.schema.json")
         try:

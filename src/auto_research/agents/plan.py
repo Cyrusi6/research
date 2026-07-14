@@ -60,7 +60,7 @@ class PlanAgent:
         direction = load_direction(self.context.project_root)
         ideas = [direction_planner_seed(direction)]
         selected = next((idea for idea in ideas if idea.get("selected")), ideas[0])
-        research_state = read_json(self.context.project_root / "meta" / "research_state.json", default={}) or {}
+        research_state = ResearchEventLedger(self.context.project_root).state()
         direction_budget = (((research_state.get("directions") or {}).get(direction.get("direction_semantic_hash")) or {}).get("budget") or {})
         variant_index = int(direction_budget.get("consumed", 0)) + 1
         selected = dict(selected)
@@ -517,7 +517,7 @@ class PlanAgent:
         _sanitize_c2c_variant_expected_files(selected, s1_direction, self.context.config)
         _ensure_c2c_s2_config_overrides(selected)
         if bool((self.context.config.get("experiment") or {}).get("simulate")):
-            research_state = read_json(self.context.project_root / "meta" / "research_state.json", default={}) or {}
+            research_state = ResearchEventLedger(self.context.project_root).state()
             budget = (((research_state.get("directions") or {}).get(s1_direction.get("direction_semantic_hash")) or {}).get("budget") or {})
             ordinal = int(budget.get("consumed", 0)) + 1
             selected = deepcopy(selected)
@@ -1948,7 +1948,7 @@ class PlanAgent:
         return {"status": "ok", "ideas": selected_ideas, "variant_selection": variant_selection, "metadata": metadata}
 
     def _load_c2c_s2_planner_memory(self) -> dict[str, Any]:
-        state = read_json(self.context.project_root / "meta" / "research_state.json", default={}) or {}
+        state = ResearchEventLedger(self.context.project_root).state()
         variants = state.get("variants") if isinstance(state.get("variants"), dict) else {}
         entries = []
         for outcome in state.get("method_tried_history") or []:

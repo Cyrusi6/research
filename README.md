@@ -66,6 +66,10 @@ The `standard` profile executes five sequential method-evaluable variants under 
 
 Planner pools, scorecards, patch diagnostics, proxy diagnostics, and human-readable summaries remain diagnostic artifacts only. Runtime stages do not infer identity or routing from those files. Projects without DirectionSpec v3, VariantSpec v4, and Event v2 authority must restart from S1; no dual-read or migration exists. See `docs/authoritative_s1_s3_contracts.md` and `docs/regression_test_migration.md`.
 
+Attempt lifecycle operations are generation-scoped. Re-entering execution after implementation repair or resource resume creates a new `lifecycle_generation`: the same operation is idempotent within one generation, while the same transition or failure in a later generation creates a distinct event. Disposition and finalization events contain verified facts only; the reducer derives state, budget, route, direction closure, and aggregate.
+
+S3 runs one shared pure validation layer before commit and again as a post-commit audit. Invalid identity, TrialSpec, phase/dataset/seed/role coverage, proxy/bootstrap evidence, or artifact hash produces zero authoritative writes. Projection writers lock and reread the newest SQLite state before writing, so a delayed writer cannot roll JSON views back to an older sequence.
+
 ## Layout
 
 ```text

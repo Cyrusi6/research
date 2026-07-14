@@ -136,3 +136,14 @@ Validation:
 TMPDIR=$PWD/.tmp uv run pytest -q
 326 passed, 2 skipped
 ```
+
+## 2026-07-14 M1.1.1 Event v2 对抗封口
+
+- Attempt 增加 `lifecycle_generation`。implementation revision 与 resource resume 进入新世代；transition/disposition/finalization 的幂等键绑定世代、implementation/input identity、expected state、operation/failure 与 phase。
+- 业务事件只能通过受约束的 Ledger domain API 创建；公开低层 `append()` 仅允许 `AuditMarker`。Disposition/Finalization 事件只存事实，状态、预算、RouteOutcome、方向关闭和 aggregate 全由 reducer 推导。
+- late replay 返回原事件对应的 attempt/route/aggregate，不再返回全局 `last_route_outcome`。
+- profile × attempt kind × reservation/budget 映射在 schema、domain API、reducer 和 invariant 四层校验；standard 不存在免预算 method outcome。
+- Variant 科学语义 hash 排除 ID、lineage、iteration、nonce 与展示 coordinate metadata；只有 intervention/configuration/operations/controls/ablation/surfaces/metric/hypothesis/falsification 等真实方法内容参与去重。
+- S3 precommit 与 postcommit Gate 共用纯验证器；Ledger 在 `BEGIN IMMEDIATE` 内再次校验 TrialResult、typed observations、artifact hash、phase/dataset/seed/role coverage、proxy/bootstrap evidence 和预算后才原子提交。
+- Projection 写入加独占锁并在锁内重读 SQLite 最新 sequence，阻止乱序写回旧 snapshot。
+- 新增 lifecycle replay、伪造事件、profile/kind、语义 nonce、phase、TrialResult 防伪、Gate-before-commit、路由权威、三轮 repair 和并发 execution-width 对抗测试。

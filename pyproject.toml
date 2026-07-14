@@ -27,6 +27,11 @@ dev = [
   "pytest>=8.0.0",
 ]
 
+[dependency-groups]
+dev = [
+  "pytest>=8.0.0",
+]
+
 [project.scripts]
 auto-research = "auto_research.cli:main"
 

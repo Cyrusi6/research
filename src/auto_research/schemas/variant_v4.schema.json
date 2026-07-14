@@ -1,6 +1,26 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
+  "$defs": {
+    "coordinateValue": {
+      "oneOf": [
+        {"type": ["string", "number", "boolean", "null"]},
+        {
+          "type": "array",
+          "items": {"$ref": "#/$defs/coordinateValue"}
+        },
+        {
+          "type": "object",
+          "propertyNames": {
+            "not": {
+              "pattern": "^(?:id|variant_id|variant_nonce|nonce|ordinal|iteration|run_id)$"
+            }
+          },
+          "additionalProperties": {"$ref": "#/$defs/coordinateValue"}
+        }
+      ]
+    }
+  },
   "additionalProperties": false,
   "required": [
     "schema_version",
@@ -55,7 +75,13 @@
     },
     "variation_coordinates": {
       "type": "object",
-      "minProperties": 1
+      "minProperties": 1,
+      "propertyNames": {
+        "not": {
+          "pattern": "^(?:id|variant_id|variant_nonce|nonce|ordinal|iteration|run_id)$"
+        }
+      },
+      "additionalProperties": {"$ref": "#/$defs/coordinateValue"}
     },
     "intervention": {
       "type": "object",

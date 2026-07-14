@@ -50,11 +50,14 @@ def direction_spec_hash(payload: dict[str, Any]) -> str:
 
 
 def variant_semantic_hash(payload: dict[str, Any]) -> str:
+    intervention = payload.get("intervention") if isinstance(payload.get("intervention"), dict) else {}
     return canonical_hash(
         {
             "direction_semantic_hash": payload.get("direction_semantic_hash"),
-            "variation_coordinates": payload.get("variation_coordinates"),
-            "intervention": payload.get("intervention"),
+            "intervention": {
+                "algorithm_operations": intervention.get("algorithm_operations"),
+                "configuration": intervention.get("configuration"),
+            },
             "hypothesis": payload.get("hypothesis"),
             "null_hypothesis": payload.get("null_hypothesis"),
             "alternative_hypothesis": payload.get("alternative_hypothesis"),
@@ -180,6 +183,55 @@ def validate_execution_observation(observation: dict[str, Any]) -> None:
         raise ValueError("metric_value must be finite")
 
 
+def validate_trial_evidence(
+    result: dict[str, Any],
+    *,
+    attempt: dict[str, Any] | None = None,
+    trial_spec: dict[str, Any] | None = None,
+) -> None:
+    """Pure validation for a method-evaluable TrialResult and its evidence."""
+    validate_contract(result, "trial_result_v2.schema.json")
+    observations = result["observations"]
+    for observation in observations:
+        validate_execution_observation(observation)
+
+    identities = [_observation_identity(item) for item in observations]
+    if len(set(identities)) != len(identities):
+        raise ValueError("duplicate execution observation identity")
+    if any(item["command_status"] != "completed" for item in observations):
+        raise ValueError("method-evaluable observations must all have completed command status")
+
+    registered_hashes = set(result["raw_artifacts"].values())
+    if any(item["raw_artifact_hash"] not in registered_hashes for item in observations):
+        raise ValueError("observation raw_artifact_hash is not registered")
+
+    required_datasets = set(result["required_datasets"])
+    observed_datasets = set(result["observed_datasets"])
+    observation_datasets = {item["dataset_id"] for item in observations}
+    candidate_datasets = {item["dataset_id"] for item in observations if item["role"] == "candidate"}
+    baseline_datasets = {item["dataset_id"] for item in observations if item["role"] == "baseline"}
+    if required_datasets != observed_datasets or required_datasets != observation_datasets:
+        raise ValueError("required, observed, and observation dataset coverage mismatch")
+    if candidate_datasets != required_datasets or baseline_datasets != required_datasets:
+        raise ValueError("baseline and candidate role coverage must match required datasets")
+
+    expected_phase = result["completeness"]
+    if any(item["phase"] != expected_phase for item in observations if item["role"] != "ablation"):
+        raise ValueError("observation phase does not match TrialResult completeness")
+    if any(item["role"] == "ablation" and item["phase"] != "ablation" for item in observations):
+        raise ValueError("ablation observations must use the ablation phase")
+
+    if result["failure_classification"] is not None:
+        raise ValueError("evaluable TrialResult failure_classification must be null")
+    if not result["observed_datasets"] or not observations or not result["raw_artifacts"]:
+        raise ValueError("evaluable TrialResult requires datasets, observations, and raw artifacts")
+
+    if attempt is not None:
+        _validate_trial_against_attempt(result, attempt)
+    if trial_spec is not None:
+        _validate_trial_against_spec(result, trial_spec, attempt=attempt)
+
+
 def classify_trial_result(
     *,
     attempt: dict[str, Any],
@@ -189,8 +241,10 @@ def classify_trial_result(
 ) -> dict[str, Any]:
     for observation in observations:
         validate_execution_observation(observation)
-    if len({(item["phase"], item["role"], item["dataset_id"], item["metric_id"], item["seed"]) for item in observations}) != len(observations):
+    if len({_observation_identity(item) for item in observations}) != len(observations):
         raise ValueError("duplicate execution observation identity")
+    if any(item["command_status"] != "completed" for item in observations):
+        raise ValueError("method-evaluable observations must all have completed command status")
     if any(item["raw_artifact_hash"] not in set(raw_artifacts.values()) for item in observations):
         raise ValueError("observation raw_artifact_hash is not registered")
     sample_manifest = trial_spec.get("sample_manifest") if isinstance(trial_spec.get("sample_manifest"), dict) else {}
@@ -199,8 +253,8 @@ def classify_trial_result(
     if not required_phases:
         required_phases = ["proxy"] if attempt["attempt_kind"] in {"proxy", "bootstrap_proxy"} else ["full"]
     allowed_terminal = set(((trial_spec.get("protocol") or {}).get("terminal_method_phases") or required_phases))
-    actual_phases = {item["phase"] for item in observations if item["role"] == "candidate" and item["command_status"] == "completed"}
-    candidate = [item for item in observations if item["role"] == "candidate" and item["command_status"] == "completed"]
+    actual_phases = {item["phase"] for item in observations if item["role"] == "candidate"}
+    candidate = [item for item in observations if item["role"] == "candidate"]
     observed_datasets = sorted({item["dataset_id"] for item in candidate})
     coverage_ok = bool(required_datasets) and set(required_datasets) == set(observed_datasets)
     phases_ok = set(required_phases).issubset(actual_phases) and actual_phases.issubset(allowed_terminal)
@@ -209,8 +263,11 @@ def classify_trial_result(
         and item["evaluator_hash"] == attempt["evaluator_hash"]
         for item in observations
     )
-    commands_ok = bool(candidate) and all(item["command_status"] == "completed" for item in candidate)
-    method_evaluable = coverage_ok and phases_ok and hashes_ok and commands_ok and bool(raw_artifacts)
+    roles_ok = all(
+        {item["dataset_id"] for item in observations if item["role"] == role} == set(required_datasets)
+        for role in ("baseline", "candidate")
+    )
+    method_evaluable = coverage_ok and phases_ok and hashes_ok and bool(candidate) and roles_ok and bool(raw_artifacts)
     if not method_evaluable:
         raise ValueError("execution observations do not satisfy method-evaluable protocol coverage")
     outcome, primary_summary = _classify_outcome(trial_spec, observations)
@@ -236,23 +293,17 @@ def classify_trial_result(
         "failure_classification": None,
         "primary_metric_summary": primary_summary,
     }
-    validate_trial_result(result)
+    validate_trial_evidence(result, attempt=attempt, trial_spec=trial_spec)
     return result
 
 
-def validate_trial_result(result: dict[str, Any]) -> None:
-    validate_contract(result, "trial_result_v2.schema.json")
-    for observation in result["observations"]:
-        validate_execution_observation(observation)
-    if result["method_evaluable"]:
-        if result["failure_classification"] is not None:
-            raise ValueError("evaluable TrialResult failure_classification must be null")
-        if result["completeness"] not in {"proxy", "full"}:
-            raise ValueError("evaluable TrialResult must be proxy or full completeness")
-        if not result["observed_datasets"] or not result["observations"] or not result["raw_artifacts"]:
-            raise ValueError("evaluable TrialResult requires datasets, observations, and raw artifacts")
-        if set(result["required_datasets"]) != set(result["observed_datasets"]):
-            raise ValueError("required and observed dataset coverage mismatch")
+def validate_trial_result(
+    result: dict[str, Any],
+    *,
+    attempt: dict[str, Any] | None = None,
+    trial_spec: dict[str, Any] | None = None,
+) -> None:
+    validate_trial_evidence(result, attempt=attempt, trial_spec=trial_spec)
 
 
 def validate_contract(payload: Any, schema_name: str) -> None:
@@ -279,6 +330,7 @@ def _validate_variant_axes(direction: dict[str, Any], variant: dict[str, Any]) -
     mutable = set(space.get("mutable_axes") or [])
     immutable = set(space.get("immutable_axes") or [])
     coordinates = variant.get("variation_coordinates") or {}
+    _reject_pseudo_semantic_coordinates(coordinates)
     changed = set(coordinates)
     disallowed = changed - mutable
     if disallowed:
@@ -288,6 +340,105 @@ def _validate_variant_axes(direction: dict[str, Any], variant: dict[str, Any]) -
     for combination in space.get("forbidden_combinations") or []:
         if isinstance(combination, dict) and all(coordinates.get(key) == value for key, value in combination.items()):
             raise ValueError(f"variant matches forbidden combination: {combination}")
+
+
+def _reject_pseudo_semantic_coordinates(value: Any) -> None:
+    if isinstance(value, dict):
+        forbidden = {"id", "variant_id", "variant_nonce", "nonce", "ordinal", "iteration", "run_id"}
+        matches = sorted(key for key in value if str(key).lower() in forbidden)
+        if matches:
+            raise ValueError(f"variation_coordinates contain non-scientific identity metadata: {matches}")
+        for nested in value.values():
+            _reject_pseudo_semantic_coordinates(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _reject_pseudo_semantic_coordinates(nested)
+
+
+def _observation_identity(observation: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        observation["phase"],
+        observation["role"],
+        observation["dataset_id"],
+        observation["metric_id"],
+        observation["seed"],
+    )
+
+
+def _validate_trial_against_attempt(result: dict[str, Any], attempt: dict[str, Any]) -> None:
+    for key in (
+        "direction_id",
+        "direction_semantic_hash",
+        "direction_spec_hash",
+        "variant_id",
+        "variant_semantic_hash",
+        "variant_spec_hash",
+        "attempt_id",
+        "protocol_hash",
+        "attempt_input_hash",
+    ):
+        if result.get(key) != attempt.get(key):
+            raise ValueError(f"TrialResult {key} does not match Attempt")
+    seeds = set(attempt.get("seeds") or [])
+    if not seeds:
+        raise ValueError("Attempt must preregister at least one seed")
+    for observation in result["observations"]:
+        if observation["sample_manifest_hash"] != attempt.get("sample_manifest_hash"):
+            raise ValueError("observation sample_manifest_hash does not match Attempt")
+        if observation["evaluator_hash"] != attempt.get("evaluator_hash"):
+            raise ValueError("observation evaluator_hash does not match Attempt")
+        if observation["seed"] not in seeds:
+            raise ValueError("observation seed is not preregistered by Attempt")
+
+
+def _validate_trial_against_spec(
+    result: dict[str, Any],
+    trial_spec: dict[str, Any],
+    *,
+    attempt: dict[str, Any] | None,
+) -> None:
+    sample_manifest = trial_spec.get("sample_manifest") if isinstance(trial_spec.get("sample_manifest"), dict) else {}
+    required_datasets = set(_dataset_ids(sample_manifest.get("datasets") or trial_spec.get("datasets") or []))
+    if required_datasets != set(result["required_datasets"]):
+        raise ValueError("TrialResult dataset coverage does not match TrialSpec")
+
+    protocol = trial_spec.get("protocol") if isinstance(trial_spec.get("protocol"), dict) else {}
+    required_phases = set(protocol.get("required_phases") or [])
+    if not required_phases and attempt is not None:
+        required_phases = {"proxy"} if attempt.get("attempt_kind") in {"proxy", "bootstrap_proxy"} else {"full"}
+    expected_completeness = "proxy" if required_phases == {"proxy"} else "full"
+    if result["completeness"] != expected_completeness:
+        raise ValueError("TrialResult completeness does not match TrialSpec required phases")
+
+    required_roles = set(protocol.get("required_roles") or ["baseline", "candidate"])
+    actual_roles = {item["role"] for item in result["observations"]}
+    if not required_roles.issubset(actual_roles):
+        raise ValueError("TrialResult does not satisfy TrialSpec role coverage")
+
+    primary = next((item for item in trial_spec.get("metrics") or [] if isinstance(item, dict) and item.get("primary")), None)
+    primary_metric = str((primary or {}).get("name") or (primary or {}).get("metric_id") or "primary_metric")
+    for role in required_roles & {"baseline", "candidate"}:
+        covered = {
+            item["dataset_id"]
+            for item in result["observations"]
+            if item["role"] == role and item["metric_id"] == primary_metric
+        }
+        if covered != required_datasets:
+            raise ValueError(f"{role} primary metric coverage does not match TrialSpec datasets")
+
+    require_seed_coverage = bool(protocol.get("require_seed_coverage") or protocol.get("required_seed_coverage"))
+    if require_seed_coverage:
+        registered_seeds = set((attempt or {}).get("seeds") or ((trial_spec.get("statistical_testing") or {}).get("seeds") or []))
+        for role in required_roles & {"baseline", "candidate"}:
+            observed_seeds = {item["seed"] for item in result["observations"] if item["role"] == role}
+            if observed_seeds != registered_seeds:
+                raise ValueError(f"{role} seed coverage does not match preregistered seeds")
+
+    expected_outcome, expected_summary = _classify_outcome(trial_spec, result["observations"])
+    if result["outcome_classification"] != expected_outcome:
+        raise ValueError("TrialResult outcome_classification does not match deterministic classifier")
+    if canonical_json(result["primary_metric_summary"]) != canonical_json(expected_summary):
+        raise ValueError("TrialResult primary_metric_summary does not match deterministic classifier")
 
 
 def _dataset_ids(items: list[Any]) -> list[str]:

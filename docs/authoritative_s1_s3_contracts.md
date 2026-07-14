@@ -66,3 +66,12 @@ Bootstrap performs exactly one cached-S0 cheap proxy with `attempt_kind=bootstra
 ## Removed Contracts
 
 There is no v1 dual-read, mirror, migration, fallback, or inference from `ideas`, `plan.yaml`, mutable summaries, or route files. Removed runtime authorities include `literature/ideas.json`, both `direction_decision.json` paths, `plan/candidate_ideas.json`, both `next_variant.json` paths, legacy direction/variant readers, legacy route fallback, legacy attempt ledger, and C2C debate execution. Missing v3/v4 authority requires rerunning from S1.
+
+## M1.1.1 Lifecycle and Commit Hardening
+
+- Every attempt carries `lifecycle_generation`. Implementation revision and resource resume advance the generation while preserving attempt, direction, and variant identity.
+- Transition and disposition identities bind attempt ID, generation, implementation/input hashes, expected source state, requested operation or failure, and phase. Replays are idempotent only for the same generation and operation.
+- `AttemptDispositioned` stores structured failure facts; `AttemptFinalized` stores a validated TrialResult. Callers cannot supply target state, budget changes, route actions, aggregate, or direction status.
+- The reducer independently derives all RouteOutcome fields and late replay returns the route associated with the original event, never the global latest route.
+- TrialResult validation is repeated inside the same `BEGIN IMMEDIATE` transaction that appends finalization. Identity, frozen TrialSpec, observations, seeds, datasets, roles, phases, raw artifacts, protocol evidence, budget, and duplicate semantic variants are checked again.
+- Projection writers take a project-level exclusive lock, reread the latest committed SQLite state, and never publish an older sequence.

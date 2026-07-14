@@ -90,6 +90,9 @@
     "raw_artifacts": {
       "type": "object",
       "minProperties": 1,
+      "propertyNames": {
+        "minLength": 1
+      },
       "additionalProperties": {
         "type": "string",
         "pattern": "^[a-f0-9]{64}$"
@@ -133,13 +136,7 @@
             ]
           },
           "command_status": {
-            "enum": [
-              "completed",
-              "failed",
-              "partial",
-              "resource_paused",
-              "integrity_blocked"
-            ]
+            "const": "completed"
           },
           "dataset_id": {
             "type": "string",
@@ -167,7 +164,17 @@
             "type": "string",
             "pattern": "^[a-f0-9]{64}$"
           }
-        }
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"role": {"const": "ablation"}}, "required": ["role"]},
+            "then": {"properties": {"phase": {"const": "ablation"}}}
+          },
+          {
+            "if": {"properties": {"phase": {"const": "ablation"}}, "required": ["phase"]},
+            "then": {"properties": {"role": {"const": "ablation"}}}
+          }
+        ]
       }
     },
     "method_evaluable": {

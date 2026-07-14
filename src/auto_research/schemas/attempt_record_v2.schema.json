@@ -20,7 +20,13 @@
     "runtime_config_hash",
     "evaluator_hash",
     "seeds",
+    "required_datasets",
+    "required_phases",
+    "terminal_method_phases",
+    "required_roles",
+    "require_complete_seed_coverage",
     "attempt_kind",
+    "lifecycle_generation",
     "state",
     "consumes_direction_budget",
     "reserved_slot",
@@ -137,6 +143,31 @@
         "type": "integer"
       }
     },
+    "required_datasets": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"type": "string", "minLength": 1}
+    },
+    "required_phases": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"enum": ["proxy", "full", "ablation"]}
+    },
+    "terminal_method_phases": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"enum": ["proxy", "full", "ablation"]}
+    },
+    "required_roles": {
+      "type": "array",
+      "minItems": 2,
+      "uniqueItems": true,
+      "items": {"enum": ["baseline", "candidate", "ablation"]}
+    },
+    "require_complete_seed_coverage": {"type": "boolean"},
     "attempt_kind": {
       "enum": [
         "proxy",
@@ -144,6 +175,10 @@
         "proxy_full",
         "bootstrap_proxy"
       ]
+    },
+    "lifecycle_generation": {
+      "type": "integer",
+      "minimum": 0
     },
     "state": {
       "enum": [
@@ -225,5 +260,26 @@
       "type": "string",
       "minLength": 1
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"profile": {"const": "bootstrap"}}, "required": ["profile"]},
+      "then": {
+        "properties": {
+          "attempt_kind": {"const": "bootstrap_proxy"},
+          "consumes_direction_budget": {"const": false},
+          "reserved_slot": {"const": false}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"profile": {"const": "standard"}}, "required": ["profile"]},
+      "then": {
+        "properties": {
+          "attempt_kind": {"enum": ["proxy", "full", "proxy_full"]},
+          "consumes_direction_budget": {"const": true}
+        }
+      }
+    }
+  ]
 }

@@ -76,8 +76,7 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             {
                 "when": "iteration > 1",
                 "paths": [
-                    "meta/research_state.json",
-                    "meta/route_outcome.json",
+                    "meta/research_events.sqlite3",
                 ],
             },
             {

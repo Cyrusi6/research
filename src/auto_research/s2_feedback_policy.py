@@ -7,6 +7,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .research_state import ResearchEventLedger
 from .utils import now_utc, read_json, read_yaml
 
 
@@ -76,8 +77,8 @@ def build_s2_feedback_context(
     direction_id = str(direction.get("direction_id") or "unknown_direction")
     direction_hash = str(direction.get("direction_semantic_hash") or "")
     registry = read_yaml(project_root / "meta" / "registry.yaml", default={}) or {}
-    state = read_json(project_root / "meta" / "research_state.json", default={}) or {}
-    route_outcome = read_json(project_root / "meta" / "route_outcome.json", default={}) or {}
+    state = ResearchEventLedger(project_root).state()
+    route_outcome = state.get("last_route_outcome") or {}
     proxy_calibration_policy = read_json(project_root / "experiment" / "results" / "c2c_proxy_calibration_policy.json", default={}) or {}
     method_history = [
         item for item in state.get("method_tried_history") or []

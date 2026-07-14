@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from auto_research.config import bootstrap_profile_enabled
 from auto_research.domain_contracts import contract_errors, validate_direction_identity
+from auto_research.research_state import ResearchEventLedger
 
 from .base import StageGateValidator, load_schema, validate_min_schema
 
@@ -36,6 +37,9 @@ class S1GateValidator(StageGateValidator):
             validate_direction_identity(direction)
         except ValueError as exc:
             errors.append(str(exc))
+        excluded = set(ResearchEventLedger(self.project_root).state().get("excluded_direction_semantic_hashes") or [])
+        if direction.get("direction_semantic_hash") in excluded:
+            errors.append("DirectionSpec semantic identity is excluded by a closed direction outcome")
         if errors:
             self.retry_check("direction_v3", "DirectionSpec v3 validation failed", artifact="literature/direction.json", details={"errors": errors[:20]})
         else:

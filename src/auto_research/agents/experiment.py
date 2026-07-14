@@ -38,6 +38,7 @@ from ..domain_contracts import (
     validate_variant_identity,
 )
 from ..research_state import IntegrityError, ResearchEventLedger
+from ..s3_validation import S3ValidationError, validate_failure_precommit, validate_trial_precommit
 from .base import AgentContext
 
 
@@ -99,6 +100,14 @@ class ExperimentAgent:
             evaluator_hash=evaluator_hash,
         )
         profile = str(((self.context.config.get("orchestration") or {}).get("profile") or "standard")).lower()
+        default_terminal_phase = "proxy" if profile == "bootstrap" else "full"
+        protocol_required_phases = sorted(str(item) for item in (protocol.get("required_phases") or [default_terminal_phase])) if isinstance(protocol, dict) else [default_terminal_phase]
+        protocol_required_roles = sorted(str(item) for item in (protocol.get("required_roles") or ["baseline", "candidate"])) if isinstance(protocol, dict) else ["baseline", "candidate"]
+        required_datasets = sorted(
+            str(item.get("name") if isinstance(item, dict) else item)
+            for item in (sample_manifest.get("datasets") or [])
+            if (item.get("name") if isinstance(item, dict) else item)
+        )
         attempt = ledger.reserve_attempt(
             profile=profile,
             direction=direction,
@@ -111,6 +120,11 @@ class ExperimentAgent:
             runtime_config_hash=runtime_config_hash,
             evaluator_hash=evaluator_hash,
             seeds=seeds,
+            required_datasets=required_datasets,
+            required_phases=protocol_required_phases,
+            terminal_method_phases=sorted(str(item) for item in (protocol.get("terminal_method_phases") or protocol_required_phases)) if isinstance(protocol, dict) else protocol_required_phases,
+            required_roles=protocol_required_roles,
+            require_complete_seed_coverage=bool(protocol.get("require_complete_seed_coverage", protocol.get("require_seed_coverage", False))) if isinstance(protocol, dict) else False,
         )
         plan = trial_spec
         execution = plan.get("execution", {})
@@ -203,26 +217,35 @@ class ExperimentAgent:
         observations = _typed_execution_observations(main_results, trial_spec, attempt, raw_artifacts)
         if not observations:
             failure_class = _structured_failure_class(result, main_results)
+            try:
+                validate_failure_precommit(
+                    project_root=self.context.project_root,
+                    attempt=attempt,
+                    failure_class=failure_class,
+                    result=result,
+                    artifact_hashes=raw_artifacts,
+                    state=ledger.state(),
+                )
+            except S3ValidationError as exc:
+                return self._quarantine_invalid_s3(result, attempt, exc, [], raw_artifacts)
             completed_attempt, route = ledger.disposition_attempt(attempt["attempt_id"], failure_class=failure_class, artifact_hashes=raw_artifacts)
             result["attempt"] = completed_attempt
             result["route_outcome"] = route
             return result
         try:
             trial = classify_trial_result(attempt=attempt, trial_spec=trial_spec, observations=observations, raw_artifacts=raw_artifacts)
-            ledger.validate_trial_precommit(trial)
-        except (ValueError, IntegrityError) as exc:
-            quarantine = self.context.artifacts.write_json(
-                self.stage_key,
-                f"quarantine/{attempt['attempt_id']}.json",
-                {"attempt_id": attempt["attempt_id"], "error": str(exc), "observations": observations, "raw_artifacts": raw_artifacts},
-                artifact_type="invalid_trial_draft",
-                summary="Rejected S3 TrialResult draft; not canonical",
-                source_paths=list(raw_artifacts),
+            validate_trial_precommit(
+                project_root=self.context.project_root,
+                direction=read_json(self.context.project_root / "literature" / "direction.json", default={}) or {},
+                variant=read_json(self.context.project_root / "plan" / "variant.json", default={}) or {},
+                attempt=attempt,
+                trial_spec=trial_spec,
+                trial_result=trial,
+                state=ledger.state(),
+                allow_pending_full_transition=True,
             )
-            result.setdefault("artifacts", []).append(quarantine["path"])
-            result["status"] = "blocked"
-            result["blocked_reason"] = f"S3 pre-commit validation failed: {exc}"
-            return result
+        except (ValueError, IntegrityError, S3ValidationError) as exc:
+            return self._quarantine_invalid_s3(result, attempt, exc, observations, raw_artifacts)
         if trial["completeness"] == "full":
             ledger.transition_attempt(attempt["attempt_id"], "PROXY_COMPLETED", phase="proxy", phase_state="COMPLETED")
             ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
@@ -230,6 +253,27 @@ class ExperimentAgent:
         result.setdefault("artifacts", []).append("experiment/results/trial_result.json")
         result["attempt"] = completed_attempt
         result["route_outcome"] = route
+        return result
+
+    def _quarantine_invalid_s3(
+        self,
+        result: dict[str, Any],
+        attempt: dict[str, Any],
+        error: Exception,
+        observations: list[dict[str, Any]],
+        raw_artifacts: dict[str, str],
+    ) -> dict[str, Any]:
+        quarantine = self.context.artifacts.write_json(
+            self.stage_key,
+            f"quarantine/{attempt['attempt_id']}.json",
+            {"attempt_id": attempt["attempt_id"], "error": str(error), "observations": observations, "raw_artifacts": raw_artifacts},
+            artifact_type="invalid_trial_draft",
+            summary="Rejected S3 draft; not canonical",
+            source_paths=list(raw_artifacts),
+        )
+        result.setdefault("artifacts", []).append(quarantine["path"])
+        result["status"] = "blocked"
+        result["blocked_reason"] = f"S3 pre-commit validation failed: {error}"
         return result
 
     def _scaffold_code(self) -> None:

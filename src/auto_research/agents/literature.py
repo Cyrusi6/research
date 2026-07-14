@@ -26,6 +26,7 @@ from ..direction_contracts import (
     build_s1_evidence_retrieval_trace,
     normalize_novelty_audit,
 )
+from ..research_state import ResearchEventLedger
 from ..evidence_refs import (
     direction_bundle_ref_errors_for_repair,
     evidence_ref_errors_for_repair,
@@ -1047,6 +1048,7 @@ class LiteratureAgent:
                 theme_map_path=theme_map_path,
                 resources=discover_local_mm_resources(self.context.config),
                 config=self.context.config,
+                excluded_direction_semantic_hashes=ResearchEventLedger(self.context.project_root).state().get("excluded_direction_semantic_hashes") or [],
             ),
             max_repairs=int(cfg.get("max_json_repairs") or 2),
             timeout_seconds=int(cfg.get("timeout_seconds") or (self.context.config.get("llm", {}) or {}).get("timeout_seconds") or 1800),
@@ -2200,6 +2202,7 @@ def _generic_s1_codex_evidence_prompt(
     theme_map_path: str | None,
     resources: dict[str, Any],
     config: dict[str, Any],
+    excluded_direction_semantic_hashes: list[str] | None = None,
 ) -> str:
     shared_method_memory = shared_method_memory_for_prompt(
         config,
@@ -2236,6 +2239,7 @@ def _generic_s1_codex_evidence_prompt(
         "theme_map_path": theme_map_path,
         "local_resources": _compact_json_value(resources, max_chars=6000),
         "shared_method_failure_memory": _compact_json_value(shared_method_memory, max_chars=7000),
+        "excluded_direction_semantic_hashes": list(excluded_direction_semantic_hashes or []),
     }
     output_contract = {
         "schema_version": "generic_s1_codex_direction_v1",

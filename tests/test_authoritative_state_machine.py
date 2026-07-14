@@ -25,6 +25,7 @@ from auto_research.domain_contracts import (
     variant_spec_hash,
 )
 from auto_research.research_state import IntegrityError, ResearchEventLedger
+from auto_research.utils import write_json
 
 
 def _direction() -> dict:
@@ -117,11 +118,27 @@ def _attempt_inputs(variant: dict) -> dict:
         "runtime_config_hash": canonical_hash(runtime_config),
         "evaluator_hash": evaluator,
         "seeds": [1],
+        "required_datasets": ["fake"],
+        "required_phases": ["full"],
+        "terminal_method_phases": ["full"],
+        "required_roles": ["baseline", "candidate"],
+        "require_complete_seed_coverage": False,
     }
 
 
 def _reserve(ledger: ResearchEventLedger, direction: dict, variant: dict, *, profile: str = "standard") -> dict:
     values = _attempt_inputs(variant)
+    phase = "proxy" if profile == "bootstrap" else "full"
+    write_json(
+        ledger.project_root / "plan" / "trial_spec.json",
+        {
+            "protocol": {"required_phases": [phase], "terminal_method_phases": [phase]},
+            "sample_manifest": {"datasets": ["fake"]},
+            "datasets": ["fake"],
+            "metrics": [{"name": "accuracy", "primary": True, "higher_is_better": True}],
+            "acceptance_criteria": {"minimum_mean_delta": 0.05},
+        },
+    )
     if profile == "bootstrap":
         protocol = {"required_phases": ["proxy"], "terminal_method_phases": ["proxy"]}
         values["protocol_hash"] = canonical_hash(protocol)
@@ -133,6 +150,8 @@ def _reserve(ledger: ResearchEventLedger, direction: dict, variant: dict, *, pro
             runtime_config={"batch": 1},
             evaluator_hash=values["evaluator_hash"],
         )
+        values["required_phases"] = ["proxy"]
+        values["terminal_method_phases"] = ["proxy"]
     return ledger.reserve_attempt(
         profile=profile,
         direction=direction,
@@ -193,6 +212,14 @@ def _complete(
         raw_artifacts={str(artifact.relative_to(ledger.project_root)): artifact_hash},
     )
     if phase == "proxy":
+        write_json(
+            ledger.project_root / "experiment" / "results" / "bootstrap_proxy_completion.json",
+            {
+                "bootstrap_proxy_complete": True,
+                "full_train_executed": False,
+                "full_eval_executed": False,
+            },
+        )
         ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
     else:
         ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
@@ -217,6 +244,44 @@ def test_five_outcomes_keep_direction_identity_and_never_create_sixth(tmp_path: 
     assert len({item["variant_semantic_hash"] for item in state["method_tried_history"]}) == 5
     with pytest.raises(IntegrityError, match="closed direction"):
         ledger.select_direction(direction, event_id="direction:reopen")
+
+
+@pytest.mark.parametrize("adapter", ["generic", "c2c"])
+def test_all_rejected_standard_direction_starts_new_direction_without_s2_deadlock(tmp_path: Path, adapter: str) -> None:
+    ledger = ResearchEventLedger(tmp_path / adapter)
+    direction = _direction()
+    final_route = None
+    for index in range(1, 6):
+        variant = _variant(direction, index)
+        _initialize(ledger, direction, variant)
+        attempt = _reserve(ledger, direction, variant)
+        _, final_route = _complete(ledger, attempt, outcome="rejected")
+
+    assert final_route and final_route["next_action"] == "START_NEW_DIRECTION"
+    state = ledger.state()
+    assert direction["direction_semantic_hash"] in state["excluded_direction_semantic_hashes"]
+    with pytest.raises(IntegrityError, match="closed direction"):
+        ledger.select_direction(direction, event_id=f"direction:reopen:{adapter}")
+
+    payload = deepcopy(direction)
+    payload.pop("schema_version", None)
+    payload.pop("direction_semantic_hash", None)
+    payload.pop("direction_spec_hash", None)
+    payload["direction_id"] = f"direction-beta-{adapter}"
+    payload["research_question"] = f"Does a new {adapter} mediator improve the benchmark outcome?"
+    payload["mechanism_invariants"] = {
+        **payload["mechanism_invariants"],
+        "causal_hypothesis": f"A distinct {adapter} intervention changes a new mediator.",
+        "target_mediator": f"{adapter}_new_mediator",
+    }
+    payload["lineage"] = {**payload["lineage"], "iteration": 2, "s1_run_id": f"s1-{adapter}-2"}
+    new_direction = build_direction_spec(payload)
+    ledger.select_direction(new_direction)
+    new_variant = _variant(new_direction, 1)
+    ledger.plan_variant(new_variant)
+    new_attempt = _reserve(ledger, new_direction, new_variant)
+    assert new_attempt["direction_semantic_hash"] != direction["direction_semantic_hash"]
+    assert ledger.state()["directions"][new_direction["direction_semantic_hash"]]["budget"] == {"target": 5, "reserved": 1, "consumed": 0}
 
 
 def test_same_scientific_variant_with_new_id_and_lineage_is_duplicate(tmp_path: Path) -> None:
@@ -292,20 +357,25 @@ def test_trial_identity_mismatch_writes_nothing(tmp_path: Path) -> None:
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
+    ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+    attempt = ledger.state()["attempts"][attempt["attempt_id"]]
     before_events = len(ledger.events())
     before_state = ledger.state()
     artifact = tmp_path / "raw.json"
     artifact.write_text("{}", encoding="utf-8")
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    observation = {
-        "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
-        "phase": "full", "role": "candidate", "command_status": "completed", "dataset_id": "fake",
-        "metric_id": "accuracy", "metric_value": 0.7, "sample_manifest_hash": attempt["sample_manifest_hash"],
-        "evaluator_hash": attempt["evaluator_hash"], "seed": 1, "raw_artifact_hash": digest,
-    }
-    trial = classify_trial_result(attempt=attempt, trial_spec=_trial_spec(attempt), observations=[observation], raw_artifacts={"raw.json": digest})
+    observations = [
+        {
+            "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+            "phase": "full", "role": role, "command_status": "completed", "dataset_id": "fake",
+            "metric_id": "accuracy", "metric_value": value, "sample_manifest_hash": attempt["sample_manifest_hash"],
+            "evaluator_hash": attempt["evaluator_hash"], "seed": 1, "raw_artifact_hash": digest,
+        }
+        for role, value in (("baseline", 0.5), ("candidate", 0.7))
+    ]
+    trial = classify_trial_result(attempt=attempt, trial_spec=_trial_spec(attempt), observations=observations, raw_artifacts={"raw.json": digest})
     trial["attempt_input_hash"] = "f" * 64
-    with pytest.raises(IntegrityError, match="attempt_input_hash mismatch"):
+    with pytest.raises((IntegrityError, ValueError), match="attempt_input_hash mismatch"):
         ledger.complete_attempt(trial)
     assert len(ledger.events()) == before_events
     after_state = ledger.state()
