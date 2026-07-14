@@ -57,15 +57,15 @@ The breaking S1-S3 contract has one canonical artifact for each scientific ident
 
 - `literature/direction.json`: `DirectionSpec v3`, with separate scientific `direction_semantic_hash` and complete `direction_spec_hash` identities.
 - `plan/variant.json`: `VariantSpec v4`, with separate method `variant_semantic_hash` and complete `variant_spec_hash` identities.
-- `plan/trial_spec.json`: `TrialSpec v2`, a readable projection; every reservation freezes the complete validated TrialSpec in Event v3.
-- `meta/attempts/<attempt_id>.json`: `AttemptRecord v3`, a rebuildable projection reused across crash/resume, resource resume, and implementation repair.
-- `experiment/results/trial_result.json`: `TrialResult v3`, the latest committed verified result projection with typed constraints and evidence.
+- `plan/trial_spec.json`: `TrialSpec v3`, a readable integrity projection; every reservation freezes sample/evaluator provenance and the complete contract in Event v4.
+- `meta/attempts/<attempt_id>.json`: `AttemptRecord v4`, a rebuildable projection reused across crash/resume, resource resume, and implementation repair.
+- `experiment/results/trial_result.json`: `TrialResult v4`, the latest committed result deterministically decoded from immutable row-level evidence.
 - `meta/route_outcome.json`: `RouteOutcome v3`, the latest deterministic route projection.
-- `meta/research_events.sqlite3`: the sole authoritative Event v3 SQLite-WAL store; snapshots, attempts, results, routes, and aggregates are rebuildable projections.
+- `meta/research_events.sqlite3`: the sole authoritative Event v4 SQLite-WAL store; snapshots, attempts, results, routes, and aggregates are rebuildable projections.
 
 The `standard` profile executes five sequential method-evaluable variants under one unchanged direction with `execution_width=1` and `stop_on_success=false`. Patch/static/activation failures, resource pauses, and OOM retries do not consume an outcome; their reservation remains until repair or explicit abandonment. Only an atomically committed, typed, verified TrialResult consumes one slot. Outcomes 1–4 route to `PROPOSE_NEXT_VARIANT`; outcome 5 creates an exact five-result aggregate and closes the direction. A sixth reservation, patch, run, or outcome is rejected by the reducer.
 
-Planner pools, scorecards, patch diagnostics, proxy diagnostics, and human-readable summaries remain diagnostic artifacts only. Runtime stages do not infer identity or routing from those files. Projects without DirectionSpec v3, VariantSpec v4, TrialSpec v2, and Event v3 authority must restart from S1; no dual-read or migration exists. See `docs/authoritative_s1_s3_contracts.md` and `docs/regression_test_migration.md`.
+Planner pools, scorecards, patch diagnostics, proxy diagnostics, and human-readable summaries remain diagnostic artifacts only. Runtime stages do not infer identity, observations, budgets, or routing from those files. Projects without DirectionSpec v3, VariantSpec v4, TrialSpec v3, and Event v4 authority must restart from S1; no dual-read or migration exists. See `docs/authoritative_s1_s3_contracts.md` and `docs/regression_test_migration.md`.
 
 Attempt lifecycle operations are generation-scoped. Re-entering execution after implementation repair or resource resume creates a new `lifecycle_generation`: the same operation is idempotent within one generation, while the same transition or failure in a later generation creates a distinct event. Disposition and finalization events contain verified facts only; the reducer derives state, budget, route, direction closure, and aggregate.
 
@@ -106,3 +106,7 @@ workspace/<project_id>/
 - Required stage inputs are checked before the agent runs or writes any artifact.
 - S2.5 persistent Codex sessions keep metadata/events in `workspace/<project_id>/plan/code_worktrees/`, but new Git worktree repos are stored outside the repo by default via `code_patch.worktree_storage_root` or `AUTO_RESEARCH_WORKTREE_ROOT`.
 - It is designed to be honest. If a stage lacks the data or execution hooks needed to proceed, the registry is marked blocked or failed instead of fabricating artifacts.
+
+## Authoritative Scientific Evidence
+
+M1.1.3 makes S3 evidence Attempt-scoped and content-addressed. Experiment adapters submit only the explicit immutable inventory produced by the current command. The SQLite ledger reads each artifact once, verifies SHA-256/schema/identity, decodes row-level measurements, computes constraints and outcome, then atomically commits TrialResult, budget, RouteOutcome, and aggregate. Caller-authored observations, summaries, or outcomes are diagnostic only and cannot authorize a method result.

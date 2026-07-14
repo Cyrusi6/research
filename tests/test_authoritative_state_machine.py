@@ -10,13 +10,10 @@ from pathlib import Path
 import pytest
 
 from auto_research.domain_contracts import (
-    EVIDENCE_MANIFEST_SCHEMA_VERSION,
-    EXECUTION_OBSERVATION_SCHEMA_VERSION,
     TRIAL_SPEC_SCHEMA_VERSION,
     build_direction_spec,
     build_variant_spec,
     canonical_hash,
-    classify_trial_result,
     direction_spec_hash,
     implementation_hash,
     validate_contract,
@@ -25,6 +22,8 @@ from auto_research.domain_contracts import (
     variant_semantic_hash,
     variant_spec_hash,
 )
+from auto_research.evidence import content_addressed_evidence_path, encode_canonical_evidence
+from support.authoritative_evidence import build_quantitative_completion
 from auto_research.research_state import FAILURE_EVIDENCE_SCHEMA_VERSION, IntegrityError, ResearchEventLedger
 from auto_research.utils import write_json
 
@@ -98,7 +97,27 @@ def _trial_spec(attempt: dict | None = None, *, profile: str = "standard", attem
     kind = attempt_kind or ((attempt or {}).get("attempt_kind")) or ("bootstrap_proxy" if profile == "bootstrap" else "full")
     phase = "proxy" if kind in {"proxy", "bootstrap_proxy"} else "full"
     runtime = {"batch": 1, "device": "cpu"}
-    manifest_body = {"manifest_id": "fake-v1", "datasets": ["fake"]}
+    sample_id = canonical_hash({"sample": "fake-1"})
+    sample_dataset = {
+        "dataset_id": "fake", "source_revision": "synthetic-v1", "split": "test",
+        "sample_count": 1, "ordered_sample_ids": [sample_id],
+    }
+    sample_dataset["content_hash"] = canonical_hash({
+        "dataset_id": "fake", "source_revision": "synthetic-v1", "split": "test",
+        "ordered_sample_ids": [sample_id],
+    })
+    sample_manifest = {
+        "schema_version": "auto_research_sample_manifest_v1", "manifest_id": "fake-v1",
+        "provenance_mode": "synthetic", "datasets": [sample_dataset],
+        "artifact_path": "plan/sample_manifest.json",
+    }
+    sample_manifest["artifact_hash"] = canonical_hash(sample_manifest)
+    evaluator = {
+        "schema_version": "auto_research_evaluator_provenance_v1", "provenance_mode": "synthetic",
+        "evaluator_id": "fake-evaluator", "source_digest": canonical_hash({"source": "fake"}),
+        "config_hash": canonical_hash({"metric": "accuracy"}),
+        "dependency_digest": canonical_hash({"dependencies": []}),
+    }
     return {
         "schema_version": TRIAL_SPEC_SCHEMA_VERSION,
         "protocol": {
@@ -108,8 +127,8 @@ def _trial_spec(attempt: dict | None = None, *, profile: str = "standard", attem
             "proxy_terminal_allowed": phase == "proxy",
             "aggregation": "mean",
         },
-        "sample_manifest": {**manifest_body, "content_hash": canonical_hash(manifest_body)},
-        "datasets": [{"dataset_id": "fake", "split": "test", "sample_count": 1, "sample_hash": canonical_hash({"sample": 1})}],
+        "sample_manifest": sample_manifest,
+        "datasets": [{"dataset_id": "fake", "split": "test", "sample_count": 1, "sample_hash": sample_dataset["content_hash"]}],
         "metrics": [{"metric_id": "accuracy", "objective": "maximize", "aggregation": "mean", "role": "primary"}],
         "primary_metric_id": "accuracy",
         "statistical_testing": {"method": "none", "seeds": [1], "require_complete_seed_coverage": True},
@@ -125,7 +144,8 @@ def _trial_spec(attempt: dict | None = None, *, profile: str = "standard", attem
         "execution_contract": {
             "runtime_config": runtime,
             "runtime_config_hash": canonical_hash(runtime),
-            "evaluator_hash": canonical_hash({"evaluator": 1}),
+            "evaluator_provenance": evaluator,
+            "evaluator_hash": canonical_hash(evaluator),
             "command_contract_hash": canonical_hash({"command": phase}),
         },
         "required_artifacts": ["main_results"],
@@ -134,7 +154,7 @@ def _trial_spec(attempt: dict | None = None, *, profile: str = "standard", attem
             "kind": "main_results",
             "required": True,
             "applicable_phases": [phase],
-            "schema_version": "auto_research_main_results_v1",
+            "schema_version": "auto_research_main_results_v2",
         }],
     }
 
@@ -165,19 +185,72 @@ def _reserve(ledger: ResearchEventLedger, direction: dict, variant: dict, *, pro
 def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class: str, *, suffix: str = "1") -> dict:
     aliases = {"resource_paused": "resource_pause", "integrity": "integrity_failure", "activation_failed": "activation_failure"}
     failure_class = aliases.get(failure_class, failure_class)
-    artifact = ledger.project_root / "experiment" / "raw" / f"failure-{attempt['attempt_id']}-{suffix}.log"
-    artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_text(f"{failure_class}:{suffix}\n", encoding="utf-8")
     is_resource = failure_class in {"resource_pause", "oom_retry"}
-    details = {"resource_type": "memory", "available": False} if is_resource else {}
-    if failure_class == "activation_failure":
-        details["activation_probe"] = "forward-probe"
-    if failure_class == "safety_failure":
-        details["safety_check"] = "policy-check"
+    producer_run_id = f"failure-producer-{attempt['lifecycle_generation']}-{suffix}"
     phase = next((name for name, status in attempt["phases"].items() if status == "RUNNING"), None)
+    if failure_class == "implementation_failure":
+        phase = "implementation"
+    elif failure_class == "activation_failure" or phase is None:
+        phase = "activation"
+    if is_resource:
+        artifact_payload = {
+            "schema_version": "auto_research_resource_probe_evidence_v1",
+            "evidence_kind": "resource_probe",
+            "evidence_id": f"resource-probe-{attempt['lifecycle_generation']}-{suffix}",
+            "attempt_id": attempt["attempt_id"],
+            "producer_run_id": producer_run_id,
+            "direction_semantic_hash": attempt["direction_semantic_hash"],
+            "direction_spec_hash": attempt["direction_spec_hash"],
+            "variant_semantic_hash": attempt["variant_semantic_hash"],
+            "variant_spec_hash": attempt["variant_spec_hash"],
+            "trial_spec_hash": attempt["trial_spec_hash"],
+            "protocol_hash": attempt["protocol_hash"],
+            "sample_manifest_hash": attempt["sample_manifest_hash"],
+            "evaluator_hash": attempt["evaluator_hash"],
+            "cross_references": {},
+            "resource_type": "memory",
+            "resource_id": "memory-0",
+            "required_capacity": 10.0,
+            "observed_capacity": 1.0,
+            "unit": "bytes",
+            "probe_status": "insufficient",
+            "observed_at": "2026-01-01T00:00:00Z",
+        }
+        artifact_kind = "resource_probe"
+    else:
+        artifact_payload = {
+            "attempt_id": attempt["attempt_id"],
+            "failure_class": failure_class,
+            "producer_run_id": producer_run_id,
+            "suffix": suffix,
+        }
+        artifact_kind = "failure_evidence"
+    artifact_bytes = encode_canonical_evidence(artifact_payload)
+    artifact_hash = hashlib.sha256(artifact_bytes).hexdigest()
+    relative_path = content_addressed_evidence_path(
+        attempt_id=attempt["attempt_id"],
+        producer_run_id=producer_run_id,
+        evidence_kind=artifact_kind,
+        content_hash=artifact_hash,
+    )
+    artifact = ledger.project_root / relative_path
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_bytes(artifact_bytes)
     return {
         "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION,
+        "evidence_kind": "failure_evidence",
+        "evidence_id": f"failure-evidence-{attempt['lifecycle_generation']}-{suffix}",
         "attempt_id": attempt["attempt_id"],
+        "producer_run_id": producer_run_id,
+        "direction_semantic_hash": attempt["direction_semantic_hash"],
+        "direction_spec_hash": attempt["direction_spec_hash"],
+        "variant_semantic_hash": attempt["variant_semantic_hash"],
+        "variant_spec_hash": attempt["variant_spec_hash"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "protocol_hash": attempt["protocol_hash"],
+        "sample_manifest_hash": attempt["sample_manifest_hash"],
+        "evaluator_hash": attempt["evaluator_hash"],
+        "cross_references": {},
         "lifecycle_generation": attempt["lifecycle_generation"],
         "implementation_hash": attempt["implementation_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
@@ -186,12 +259,29 @@ def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class:
         "failure_class": failure_class,
         "command_status": "resource_paused" if is_resource else ("integrity_blocked" if failure_class in {"integrity_failure", "safety_failure"} else "failed"),
         "exit_code": 137 if is_resource else 1,
-        "validator_check": None if is_resource else f"{failure_class}-check",
-        "artifact": {"path": str(artifact.relative_to(ledger.project_root)), "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()},
-        "details": details,
         "reason": f"verified {failure_class}",
         "observed_at": "2026-01-01T00:00:00Z",
+        "log_hash": artifact_hash,
     }
+
+
+def _completion_evidence(
+    ledger: ResearchEventLedger,
+    attempt: dict,
+    *,
+    outcome: str,
+) -> dict:
+    phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
+    candidate = 0.7 if outcome == "accepted" else 0.51
+    return build_quantitative_completion(
+        ledger.project_root,
+        attempt,
+        role_values={"baseline": 0.5, "candidate": candidate},
+        dataset_id="fake",
+        metric_id="accuracy",
+        seed=1,
+        phase=phase,
+    )
 
 
 def _complete(
@@ -205,57 +295,10 @@ def _complete(
     if not evaluable:
         current = ledger.state()["attempts"][attempt["attempt_id"]]
         return ledger.disposition_failure(_failure_evidence(ledger, current, failure or "implementation_failure"))
-    artifact = ledger.project_root / "experiment" / "raw" / f"main-{attempt['attempt_id']}.json"
-    artifact.parent.mkdir(parents=True, exist_ok=True)
-    write_json(artifact, {"schema_version": "auto_research_main_results_v1", "attempt_id": attempt["attempt_id"]})
-    artifact_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
+    completion = _completion_evidence(ledger, attempt, outcome=outcome)
     phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
-    candidate = 0.7 if outcome == "accepted" else 0.51
-    observations = []
-    for role, value in [("baseline", 0.5), ("candidate", candidate)]:
-        observations.append(
-            {
-                "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
-                "observation_id": f"obs:{attempt['attempt_id'][:8]}:{role}:1",
-                "phase": phase,
-                "role": role,
-                "command_status": "completed",
-                "dataset_id": "fake",
-                "metric_id": "accuracy",
-                "metric_value": value,
-                "sample_manifest_hash": attempt["sample_manifest_hash"],
-                "evaluator_hash": attempt["evaluator_hash"],
-                "seed": 1,
-                "raw_artifact_path": str(artifact.relative_to(ledger.project_root)),
-                "raw_artifact_hash": artifact_hash,
-            }
-        )
-    trial_spec = attempt["frozen_trial_spec"]
-    evidence_manifest = {
-        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "attempt_id": attempt["attempt_id"],
-        "entries": [{
-            "evidence_id": f"evidence:{attempt['attempt_id'][:8]}:main",
-            "kind": "main_results",
-            "relative_path": str(artifact.relative_to(ledger.project_root)),
-            "content_hash": artifact_hash,
-            "schema_version": "auto_research_main_results_v1",
-            "attempt_id": attempt["attempt_id"],
-            "variant_spec_hash": attempt["variant_spec_hash"],
-            "trial_spec_hash": attempt["trial_spec_hash"],
-            "cross_references": {},
-        }],
-    }
-    trial = classify_trial_result(
-        attempt=attempt,
-        trial_spec=trial_spec,
-        observations=observations,
-        raw_artifacts={str(artifact.relative_to(ledger.project_root)): artifact_hash},
-        evidence_manifest=evidence_manifest,
-    )
     ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING" if phase == "proxy" else "FULL_RUNNING", phase=phase, phase_state="RUNNING")
-    return ledger.complete_attempt(trial)
+    return ledger.complete_attempt(completion)
 
 
 def test_five_outcomes_keep_direction_identity_and_never_create_sixth(tmp_path: Path) -> None:
@@ -393,39 +436,10 @@ def test_trial_identity_mismatch_writes_nothing(tmp_path: Path) -> None:
     attempt = ledger.state()["attempts"][attempt["attempt_id"]]
     before_events = len(ledger.events())
     before_state = ledger.state()
-    artifact = tmp_path / "raw.json"
-    artifact.write_text("{}", encoding="utf-8")
-    digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    observations = [
-        {
-            "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
-            "observation_id": f"obs:identity:{role}:1",
-            "phase": "full", "role": role, "command_status": "completed", "dataset_id": "fake",
-            "metric_id": "accuracy", "metric_value": value, "sample_manifest_hash": attempt["sample_manifest_hash"],
-            "evaluator_hash": attempt["evaluator_hash"], "seed": 1, "raw_artifact_path": "raw.json", "raw_artifact_hash": digest,
-        }
-        for role, value in (("baseline", 0.5), ("candidate", 0.7))
-    ]
-    manifest = {
-        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "attempt_id": attempt["attempt_id"],
-        "entries": [{
-            "evidence_id": "evidence:identity:main",
-            "kind": "main_results",
-            "relative_path": "raw.json",
-            "content_hash": digest,
-            "schema_version": "auto_research_main_results_v1",
-            "attempt_id": attempt["attempt_id"],
-            "variant_spec_hash": attempt["variant_spec_hash"],
-            "trial_spec_hash": attempt["trial_spec_hash"],
-            "cross_references": {},
-        }],
-    }
-    trial = classify_trial_result(attempt=attempt, trial_spec=_trial_spec(attempt), observations=observations, raw_artifacts={"raw.json": digest}, evidence_manifest=manifest)
-    trial["attempt_input_hash"] = "f" * 64
-    with pytest.raises((IntegrityError, ValueError), match="attempt_input_hash mismatch"):
-        ledger.complete_attempt(trial)
+    completion = _completion_evidence(ledger, attempt, outcome="accepted")
+    completion["trial_spec_hash"] = "f" * 64
+    with pytest.raises(IntegrityError, match="TrialSpec identity mismatch"):
+        ledger.complete_attempt(completion)
     assert len(ledger.events()) == before_events
     after_state = ledger.state()
     assert after_state["directions"] == before_state["directions"]

@@ -115,7 +115,7 @@ def _mock_generic_s1_codex(monkeypatch):
     original_subprocess_run = literature_module.subprocess.run
 
     def fake_run(command, **kwargs):
-        if not command or command[0] != "codex":
+        if not command or Path(command[0]).name != "codex":
             return original_subprocess_run(command, **kwargs)
         output_path = Path(command[command.index("--output-last-message") + 1])
         output_path.write_text(json.dumps(_generic_s1_codex_payload()), encoding="utf-8")
@@ -131,12 +131,29 @@ def test_simulated_pipeline_runs_to_completion(monkeypatch, tmp_path: Path) -> N
     monkeypatch.setattr(LiteratureProvider, "search", lambda self, topic: [])
     monkeypatch.setattr(LiteratureProvider, "download_pdf", lambda self, url: None)
     _mock_generic_s1_codex(monkeypatch)
+    plan_calls = []
+    experiment_calls = []
+    original_plan_run = orchestrator_module.PlanAgent.run
+    original_experiment_run = orchestrator_module.ExperimentAgent.run
+
+    def tracked_plan_run(self):
+        result = original_plan_run(self)
+        plan_calls.append(result)
+        return result
+
+    def tracked_experiment_run(self, *args, **kwargs):
+        result = original_experiment_run(self, *args, **kwargs)
+        experiment_calls.append(result)
+        return result
+
+    monkeypatch.setattr(orchestrator_module.PlanAgent, "run", tracked_plan_run)
+    monkeypatch.setattr(orchestrator_module.ExperimentAgent, "run", tracked_experiment_run)
 
     orchestrator = Orchestrator()
     project_id = orchestrator.init_project("retrieval benchmark", project_id="proj_pipeline", simulate=True)
     result = orchestrator.start(project_id)
 
-    assert result["status"] == "completed"
+    assert result["status"] == "completed", result
     review_dispatch = tmp_path / project_id / "review" / "revision_dispatch.yaml"
     assert review_dispatch.exists()
     registry = (tmp_path / project_id / "meta" / "registry.yaml").read_text(encoding="utf-8")
@@ -187,6 +204,60 @@ def test_simulated_pipeline_runs_to_completion(monkeypatch, tmp_path: Path) -> N
     aggregate = research_state["latest_direction_aggregate"]
     assert aggregate["outcomes"] and len(aggregate["outcomes"]) == 5
     assert research_state["directions"][aggregate["direction_semantic_hash"]]["budget"] == {"target": 5, "reserved": 0, "consumed": 5}
+    assert len(plan_calls) == 5
+    assert len(experiment_calls) == 5
+    assert len({item["attempt"]["attempt_id"] for item in experiment_calls}) == 5
+
+
+def test_orchestrator_rejects_sixth_variant_before_plan_agent(monkeypatch, tmp_path: Path) -> None:
+    plan_called = False
+
+    class ClosedBudgetLedger:
+        def __init__(self, project_root):
+            self.project_root = project_root
+
+        def state(self):
+            return {
+                "current_direction_semantic_hash": "direction-semantic",
+                "directions": {
+                    "direction-semantic": {
+                        "status": "ACTIVE",
+                        "budget": {"target": 5, "reserved": 0, "consumed": 5},
+                    }
+                },
+                "last_route_outcome": {"next_action": "FINISH_DIRECTION"},
+            }
+
+    def forbidden_plan(*args, **kwargs):
+        nonlocal plan_called
+        plan_called = True
+        raise AssertionError("PlanAgent must not run after the fifth outcome")
+
+    monkeypatch.setattr(orchestrator_module, "ResearchEventLedger", ClosedBudgetLedger)
+    monkeypatch.setattr(orchestrator_module.PlanAgent, "run", forbidden_plan)
+
+    with pytest.raises(orchestrator_module.IntegrityError, match="no capacity"):
+        Orchestrator._assert_s2_planning_allowed(tmp_path)
+
+    assert plan_called is False
+
+
+def test_orchestrator_rejects_closed_direction_before_plan_agent(monkeypatch, tmp_path: Path) -> None:
+    class ClosedDirectionLedger:
+        def __init__(self, project_root):
+            self.project_root = project_root
+
+        def state(self):
+            return {
+                "current_direction_semantic_hash": None,
+                "directions": {},
+                "last_route_outcome": {"next_action": "FINISH_DIRECTION"},
+            }
+
+    monkeypatch.setattr(orchestrator_module, "ResearchEventLedger", ClosedDirectionLedger)
+
+    with pytest.raises(orchestrator_module.IntegrityError, match="S1 must select a new direction"):
+        Orchestrator._assert_s2_planning_allowed(tmp_path)
 
 
 def test_real_mode_blocks_at_experiment_stage(monkeypatch, tmp_path: Path) -> None:
@@ -280,7 +351,7 @@ def test_generic_s1_codex_repairs_invalid_json(monkeypatch, tmp_path: Path) -> N
     prompts = []
 
     def fake_run(command, **kwargs):
-        if not command or command[0] != "codex":
+        if not command or Path(command[0]).name != "codex":
             return original_subprocess_run(command, **kwargs)
         commands.append(command)
         prompts.append(kwargs.get("input") or "")
@@ -299,7 +370,7 @@ def test_generic_s1_codex_repairs_invalid_json(monkeypatch, tmp_path: Path) -> N
     result = Orchestrator().start(project_id)
     root = tmp_path / project_id
 
-    assert result["status"] == "completed"
+    assert result["status"] == "completed", result
     session = json.loads((root / "literature" / "evidence_session.json").read_text(encoding="utf-8"))
     assert session["repair_count"] == 1
     assert len(session["attempts"]) == 2

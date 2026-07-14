@@ -11,15 +11,19 @@ from typing import Any
 
 from jsonschema import Draft202012Validator
 
+from .evidence import (
+    EVIDENCE_MANIFEST_SCHEMA_VERSION,
+    EXECUTION_OBSERVATION_SCHEMA_VERSION,
+    decode_evidence_inventory,
+)
+
 DIRECTION_SCHEMA_VERSION = "auto_research_direction_v3"
 VARIANT_SCHEMA_VERSION = "auto_research_variant_v4"
-ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v3"
-TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v2"
-TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v3"
+ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v4"
+TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v3"
+TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v4"
 ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v3"
-EXECUTION_OBSERVATION_SCHEMA_VERSION = "auto_research_execution_observation_v2"
-CONSTRAINT_RESULT_SCHEMA_VERSION = "auto_research_constraint_result_v1"
-EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v1"
+CONSTRAINT_RESULT_SCHEMA_VERSION = "auto_research_constraint_result_v2"
 DIRECTION_AGGREGATE_SCHEMA_VERSION = "auto_research_direction_outcome_aggregate_v1"
 
 
@@ -198,11 +202,35 @@ def validate_variant_identity(direction: dict[str, Any], spec: dict[str, Any], *
 
 
 def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
-    validate_contract(trial_spec, "trial_spec_v2.schema.json")
+    validate_contract(trial_spec, "trial_spec_v3.schema.json")
     datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
-    manifest_datasets = set(trial_spec["sample_manifest"]["datasets"])
+    manifest_datasets = {item["dataset_id"] for item in trial_spec["sample_manifest"]["datasets"]}
     if datasets != manifest_datasets:
         raise ValueError("TrialSpec datasets must exactly match sample_manifest.datasets")
+    if len(datasets) != len(trial_spec["datasets"]) or len(manifest_datasets) != len(trial_spec["sample_manifest"]["datasets"]):
+        raise ValueError("TrialSpec dataset identities must be unique")
+    manifest_by_id = {item["dataset_id"]: item for item in trial_spec["sample_manifest"]["datasets"]}
+    for dataset in trial_spec["datasets"]:
+        provenance = manifest_by_id[dataset["dataset_id"]]
+        if dataset["split"] != provenance["split"] or dataset["sample_count"] != provenance["sample_count"]:
+            raise ValueError("TrialSpec dataset metadata must match sample provenance")
+        if len(provenance["ordered_sample_ids"]) != provenance["sample_count"]:
+            raise ValueError("sample_count must equal ordered sample identity count")
+        if len(set(provenance["ordered_sample_ids"])) != len(provenance["ordered_sample_ids"]):
+            raise ValueError("ordered sample identities must be unique")
+        expected_content_hash = canonical_hash(
+            {
+                "dataset_id": provenance["dataset_id"],
+                "source_revision": provenance["source_revision"],
+                "split": provenance["split"],
+                "ordered_sample_ids": provenance["ordered_sample_ids"],
+            }
+        )
+        if provenance["content_hash"] != expected_content_hash or dataset["sample_hash"] != expected_content_hash:
+            raise ValueError("sample content provenance hash mismatch")
+    manifest_body = _without(trial_spec["sample_manifest"], "artifact_hash")
+    if trial_spec["sample_manifest"]["artifact_hash"] != canonical_hash(manifest_body):
+        raise ValueError("sample manifest artifact hash mismatch")
     metrics = {item["metric_id"]: item for item in trial_spec["metrics"]}
     if trial_spec["primary_metric_id"] not in metrics:
         raise ValueError("TrialSpec primary_metric_id is not registered")
@@ -218,6 +246,34 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
         metric_id = constraint.get("metric_id")
         if metric_id is not None and metric_id not in metrics:
             raise ValueError(f"constraint references unknown metric: {metric_id}")
+    runtime = trial_spec["execution_contract"]
+    if runtime["runtime_config_hash"] != canonical_hash(runtime["runtime_config"]):
+        raise ValueError("runtime_config_hash mismatch")
+    if runtime["evaluator_hash"] != canonical_hash(runtime["evaluator_provenance"]):
+        raise ValueError("evaluator_hash must bind complete evaluator provenance")
+    required_phases = set(trial_spec["protocol"]["required_phases"])
+    terminal_phases = set(trial_spec["protocol"]["terminal_phases"])
+    if not terminal_phases.issubset(required_phases):
+        raise ValueError("terminal phases must be required phases")
+    if "full" in required_phases and "proxy" in required_phases and trial_spec["protocol"]["proxy_terminal_allowed"]:
+        raise ValueError("proxy_full protocols cannot terminate at proxy")
+    expected_versions = {
+        "main_results": "auto_research_main_results_v2",
+        "ablation_results": "auto_research_ablation_results_v2",
+        "coverage_results": "auto_research_coverage_results_v2",
+        "matched_control_results": "auto_research_matched_control_results_v2",
+        "activation_evidence": "auto_research_activation_evidence_v2",
+        "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v2",
+        "proxy_cache_report": "auto_research_proxy_cache_report_v2",
+        "effective_proxy_policy": "auto_research_effective_proxy_policy_v2",
+        "proxy_calibration_policy": "auto_research_proxy_calibration_policy_v2",
+        "proxy_decision_report": "auto_research_proxy_decision_report_v2",
+        "full_s3_readiness": "auto_research_full_s3_readiness_v2",
+        "bootstrap_completion": "auto_research_bootstrap_completion_v2",
+    }
+    for requirement in trial_spec["evidence_requirements"]:
+        if requirement["schema_version"] != expected_versions[requirement["kind"]]:
+            raise ValueError(f"evidence requirement schema mismatch: {requirement['kind']}")
     if not any(
         item["kind"] == "minimum_mean_delta"
         and item.get("metric_id") == trial_spec["primary_metric_id"]
@@ -228,14 +284,14 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
 
 
 def validate_execution_observation(observation: dict[str, Any]) -> None:
-    validate_contract(observation, "execution_observation_v2.schema.json")
+    validate_contract(observation, "execution_observation_v3.schema.json")
     value = observation.get("metric_value")
     if not isinstance(value, (int, float)) or isinstance(value, bool) or not math.isfinite(float(value)):
         raise ValueError("metric_value must be finite")
 
 
 def validate_evidence_manifest(manifest: dict[str, Any], *, trial_spec: dict[str, Any]) -> None:
-    validate_contract(manifest, "evidence_manifest_v1.schema.json")
+    validate_contract(manifest, "evidence_manifest_v2.schema.json")
     expected_hash = trial_spec_hash(trial_spec)
     if manifest["trial_spec_hash"] != expected_hash:
         raise ValueError("evidence manifest TrialSpec hash mismatch")
@@ -250,7 +306,7 @@ def validate_trial_evidence(
     attempt: dict[str, Any] | None = None,
     trial_spec: dict[str, Any] | None = None,
 ) -> None:
-    validate_contract(result, "trial_result_v3.schema.json")
+    validate_contract(result, "trial_result_v4.schema.json")
     observations = result["observations"]
     for observation in observations:
         validate_execution_observation(observation)
@@ -286,33 +342,31 @@ def validate_trial_evidence(
             raise ValueError("TrialResult outcome_classification does not match deterministic classifier")
         if canonical_json(result["primary_metric_summary"]) != canonical_json(expected_summary):
             raise ValueError("TrialResult primary_metric_summary does not match deterministic classifier")
+        expected_hard = all(item["status"] == "PASS" for item in expected_constraints if item["hard"])
+        if result["all_hard_constraints_passed"] != expected_hard:
+            raise ValueError("TrialResult all_hard_constraints_passed does not match deterministic classifier")
 
 
 def classify_trial_result(
     *,
     attempt: dict[str, Any],
     trial_spec: dict[str, Any],
-    observations: list[dict[str, Any]],
-    raw_artifacts: dict[str, str],
-    evidence_manifest: dict[str, Any] | None = None,
+    evidence_manifest: dict[str, Any],
+    evidence_bytes: dict[str, bytes],
+    diagnostic_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     validate_trial_spec(trial_spec)
-    for observation in observations:
-        validate_execution_observation(observation)
-    if len({_observation_identity(item) for item in observations}) != len(observations):
-        raise ValueError("duplicate execution observation identity")
-    if any(item["command_status"] != "completed" for item in observations):
-        raise ValueError("method-evaluable observations must all have completed command status")
-    for observation in observations:
-        if raw_artifacts.get(observation["raw_artifact_path"]) != observation["raw_artifact_hash"]:
-            raise ValueError("observation must bind the exact registered result artifact")
-    manifest = evidence_manifest or {
-        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
-        "trial_spec_hash": trial_spec_hash(trial_spec),
-        "attempt_id": attempt["attempt_id"],
-        "entries": [],
-    }
+    manifest = deepcopy(evidence_manifest)
     validate_evidence_manifest(manifest, trial_spec=trial_spec)
+    observations, _decoded = decode_evidence_inventory(
+        attempt=attempt,
+        trial_spec=trial_spec,
+        manifest=manifest,
+        evidence_bytes=evidence_bytes,
+    )
+    if not observations:
+        raise ValueError("raw quantitative evidence contains no measurement rows")
+    raw_artifacts = {entry["relative_path"]: entry["content_hash"] for entry in manifest["entries"]}
     required_datasets = sorted(item["dataset_id"] for item in trial_spec["datasets"])
     required_phases = trial_spec["protocol"]["required_phases"]
     terminal_phases = set(trial_spec["protocol"]["terminal_phases"])
@@ -365,6 +419,8 @@ def classify_trial_result(
         "primary_metric_summary": primary_summary,
     }
     validate_trial_evidence(result, attempt=attempt, trial_spec=trial_spec)
+    if diagnostic_result is not None and canonical_json(diagnostic_result) != canonical_json(result):
+        raise ValueError("caller diagnostic TrialResult differs from canonical evidence-derived result")
     return result
 
 
@@ -556,7 +612,7 @@ def classify_acceptance(
             "observation_ids": sorted(bindings[0]),
             "evidence_ids": sorted(bindings[1]),
         }
-        validate_contract(result, "constraint_result_v1.schema.json")
+        validate_contract(result, "constraint_result_v2.schema.json")
         results.append(result)
     missing_hard = [item["constraint_id"] for item in results if item["hard"] and item["status"] == "MISSING"]
     if missing_hard:
@@ -621,13 +677,16 @@ def _evaluate_constraint(
 
 
 def _metric_summary(observations: list[dict[str, Any]], metric_id: str, objective: str) -> dict[str, Any]:
-    candidates = [float(item["metric_value"]) for item in observations if item["role"] == "candidate" and item["metric_id"] == metric_id]
-    baselines = [float(item["metric_value"]) for item in observations if item["role"] == "baseline" and item["metric_id"] == metric_id]
-    candidate_mean = sum(candidates) / len(candidates) if candidates else None
-    baseline_mean = sum(baselines) / len(baselines) if baselines else None
-    delta = None
-    if candidate_mean is not None and baseline_mean is not None:
-        delta = candidate_mean - baseline_mean if objective == "maximize" else baseline_mean - candidate_mean
+    pairs = _paired_role_values(observations, metric_id, "candidate", "baseline")
+    candidates = [left for left, _right in pairs.values()]
+    baselines = [right for _left, right in pairs.values()]
+    candidate_mean = sum(candidates) / len(candidates) if pairs else None
+    baseline_mean = sum(baselines) / len(baselines) if pairs else None
+    improvements = {
+        f"{dataset_id}:{seed}": (left - right if objective == "maximize" else right - left)
+        for (dataset_id, seed), (left, right) in pairs.items()
+    }
+    delta = sum(improvements.values()) / len(improvements) if improvements else None
     return {
         "metric_id": metric_id,
         "objective": objective,
@@ -635,28 +694,44 @@ def _metric_summary(observations: list[dict[str, Any]], metric_id: str, objectiv
         "candidate_mean": candidate_mean,
         "baseline_mean": baseline_mean,
         "delta": delta,
+        "paired_count": len(pairs),
+        "paired_improvements": improvements,
     }
 
 
 def _dataset_deltas(observations: list[dict[str, Any]], metric_id: str, objective: str) -> dict[str, float]:
-    datasets = sorted({item["dataset_id"] for item in observations if item["metric_id"] == metric_id})
-    result: dict[str, float] = {}
-    for dataset_id in datasets:
-        candidate = [float(item["metric_value"]) for item in observations if item["dataset_id"] == dataset_id and item["metric_id"] == metric_id and item["role"] == "candidate"]
-        baseline = [float(item["metric_value"]) for item in observations if item["dataset_id"] == dataset_id and item["metric_id"] == metric_id and item["role"] == "baseline"]
-        if candidate and baseline:
-            raw = sum(candidate) / len(candidate) - sum(baseline) / len(baseline)
-            result[dataset_id] = raw if objective == "maximize" else -raw
-    return result
+    pairs = _paired_role_values(observations, metric_id, "candidate", "baseline")
+    grouped: dict[str, list[float]] = {}
+    for (dataset_id, _seed), (candidate, baseline) in pairs.items():
+        improvement = candidate - baseline if objective == "maximize" else baseline - candidate
+        grouped.setdefault(dataset_id, []).append(improvement)
+    return {dataset_id: sum(values) / len(values) for dataset_id, values in sorted(grouped.items())}
 
 
 def _role_delta(observations: list[dict[str, Any]], metric_id: str, left_role: str, right_role: str, objective: str) -> float | None:
-    left = [float(item["metric_value"]) for item in observations if item["metric_id"] == metric_id and item["role"] == left_role]
-    right = [float(item["metric_value"]) for item in observations if item["metric_id"] == metric_id and item["role"] == right_role]
-    if not left or not right:
+    pairs = _paired_role_values(observations, metric_id, left_role, right_role)
+    if not pairs:
         return None
-    raw = sum(left) / len(left) - sum(right) / len(right)
-    return raw if objective == "maximize" else -raw
+    improvements = [left - right if objective == "maximize" else right - left for left, right in pairs.values()]
+    return sum(improvements) / len(improvements)
+
+
+def _paired_role_values(
+    observations: list[dict[str, Any]], metric_id: str, left_role: str, right_role: str
+) -> dict[tuple[str, int], tuple[float, float]]:
+    left = {
+        (item["dataset_id"], item["seed"]): float(item["metric_value"])
+        for item in observations
+        if item["metric_id"] == metric_id and item["role"] == left_role
+    }
+    right = {
+        (item["dataset_id"], item["seed"]): float(item["metric_value"])
+        for item in observations
+        if item["metric_id"] == metric_id and item["role"] == right_role
+    }
+    if set(left) != set(right):
+        return {}
+    return {key: (left[key], right[key]) for key in sorted(left)}
 
 
 def _threshold_status(value: float | None, threshold: float | None, mode: str) -> str:

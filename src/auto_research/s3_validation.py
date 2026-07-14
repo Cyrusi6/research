@@ -18,6 +18,7 @@ from .domain_contracts import (
     validate_trial_spec,
     validate_variant_identity,
 )
+from .evidence import decode_evidence_inventory
 from .utils import read_json, sha256_file
 
 
@@ -34,14 +35,6 @@ _IDENTITY_FIELDS = (
     "variant_spec_hash",
     "attempt_id",
 )
-
-_KNOWN_EVIDENCE_SCHEMAS = {
-    "proxy_baseline_fingerprint": "c2c_proxy_baseline_fingerprint.schema.json",
-    "proxy_cache_report": "c2c_proxy_cache_report.schema.json",
-    "effective_proxy_policy": "c2c_effective_proxy_policy.schema.json",
-    "proxy_calibration_policy": "c2c_proxy_calibration_policy.schema.json",
-    "proxy_decision_report": "c2c_proxy_decision_report.schema.json",
-}
 
 _FAILURE_ROUTES = {
     "activation_failure": ("IMPLEMENTATION_REPAIR", "REPAIR_IMPLEMENTATION"),
@@ -217,6 +210,7 @@ def _frozen_trial_spec(attempt: dict[str, Any]) -> dict[str, Any]:
 def _validate_trial_spec_projection_drift(errors: list[str], project_root: Path, frozen: dict[str, Any]) -> None:
     path = project_root / "plan" / "trial_spec.json"
     if not path.exists():
+        errors.append("canonical TrialSpec projection is missing")
         return
     projected = read_json(path, default=None)
     if not isinstance(projected, dict) or canonical_json(projected) != canonical_json(frozen):
@@ -288,7 +282,8 @@ def _validate_execution_state(errors, attempt, trial_result, *, allow_pending_fu
         if state not in {"FULL_RUNNING", "METHOD_COMPLETED"} and not (allow_pending_full_transition and state == "PROXY_RUNNING"):
             errors.append("full TrialResult requires full execution state")
         frozen = _frozen_trial_spec(attempt)
-        if "proxy" in frozen["protocol"]["required_phases"] and phases.get("proxy") != "COMPLETED":
+        pending_proxy_completion = allow_pending_full_transition and state == "PROXY_RUNNING" and phases.get("proxy") == "RUNNING"
+        if "proxy" in frozen["protocol"]["required_phases"] and phases.get("proxy") != "COMPLETED" and not pending_proxy_completion:
             errors.append("full TrialResult requires completed preregistered proxy phase")
     if state == "METHOD_COMPLETED" and phases.get(completeness) != "COMPLETED":
         errors.append("METHOD_COMPLETED phase is inconsistent with TrialResult")
@@ -305,6 +300,7 @@ def _validate_evidence(errors, project_root, attempt, trial_spec, trial_result) 
         errors.append("evidence manifest attempt identity mismatch")
     raw_artifacts = trial_result.get("raw_artifacts") or {}
     requirements = {item["kind"]: item for item in trial_spec["evidence_requirements"]}
+    evidence_bytes: dict[str, bytes] = {}
     for entry in manifest["entries"]:
         path = entry["relative_path"]
         if raw_artifacts.get(path) != entry["content_hash"]:
@@ -320,18 +316,30 @@ def _validate_evidence(errors, project_root, attempt, trial_spec, trial_result) 
             errors.append(f"evidence kind was not preregistered: {entry['kind']}")
         elif entry["schema_version"] != requirement["schema_version"]:
             errors.append(f"evidence schema version mismatch: {path}")
-        artifact = read_json(project_root / path, default=None)
-        if not isinstance(artifact, dict):
-            errors.append(f"evidence artifact is not a JSON object: {path}")
-            continue
-        if artifact.get("schema_version") != entry["schema_version"]:
-            errors.append(f"evidence content schema version mismatch: {path}")
-        schema_name = _KNOWN_EVIDENCE_SCHEMAS.get(entry["kind"])
-        if schema_name:
-            errors.extend(f"{path}: {message}" for message in contract_errors(artifact, schema_name))
-        for field, expected_hash in entry["cross_references"].items():
-            if artifact.get(field) != expected_hash:
-                errors.append(f"evidence cross-reference mismatch: {path}:{field}")
+        artifact_path = project_root / path
+        if artifact_path.is_file():
+            evidence_bytes[entry["evidence_id"]] = artifact_path.read_bytes()
+    applicable_phases = set(trial_spec["protocol"]["required_phases"])
+    required_kinds = {
+        item["kind"]
+        for item in trial_spec["evidence_requirements"]
+        if item["required"] and ("always" in item["applicable_phases"] or applicable_phases.intersection(item["applicable_phases"]))
+    }
+    present_kinds = {item["kind"] for item in manifest["entries"]}
+    missing = sorted(required_kinds - present_kinds)
+    if missing:
+        errors.append(f"required preregistered evidence is missing: {', '.join(missing)}")
+    try:
+        observations, _ = decode_evidence_inventory(
+            attempt=attempt,
+            trial_spec=trial_spec,
+            manifest=manifest,
+            evidence_bytes=evidence_bytes,
+        )
+        if canonical_json(observations) != canonical_json(trial_result.get("observations") or []):
+            errors.append("TrialResult observations differ from deterministic evidence decoding")
+    except (TypeError, ValueError) as exc:
+        errors.append(str(exc))
 
 
 def _validate_raw_artifacts(errors, project_root, artifact_hashes) -> None:

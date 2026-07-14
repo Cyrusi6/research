@@ -42,7 +42,8 @@ from ..s2_feedback_policy import (
     build_s2_score_adjustment_report,
 )
 from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, write_yaml
-from ..domain_contracts import TRIAL_SPEC_SCHEMA_VERSION, canonical_hash, validate_trial_spec
+from ..domain_contracts import TRIAL_SPEC_SCHEMA_VERSION, canonical_hash, canonical_json, validate_trial_spec
+from ..evidence import EVIDENCE_SCHEMA_VERSIONS
 from ..research_state import ResearchEventLedger
 from .base import AgentContext
 
@@ -232,7 +233,7 @@ class PlanAgent:
         plan_record = self.context.artifacts.write_json(
             self.stage_key,
             "trial_spec.json",
-            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config)),
+            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config), project_root=self.context.project_root),
             artifact_type="plan",
             summary="Structured experiment plan",
             source_paths=["literature/direction.json", "literature/direction.json"],
@@ -324,19 +325,34 @@ class PlanAgent:
             selected["experiment_contract"]["expected_files"] = list(selected.get("expected_files") or [])
         min_delta = float(small_loop_cfg.get("min_delta_to_pass", 0.1))
         max_regression = float(small_loop_cfg.get("max_dataset_regression", 2.0))
-        datasets = [
-            {
+        c2c_config = self.context.config.get("c2c", {})
+        simulate = bool((self.context.config.get("experiment") or {}).get("simulate"))
+        sample_provenance = c2c_config.get("sample_provenance") if isinstance(c2c_config.get("sample_provenance"), dict) else {}
+        datasets = []
+        for name in c2c_config.get("datasets", ["mmlu-redux", "ai2-arc", "openbookqa"]):
+            provenance = sample_provenance.get(name) if isinstance(sample_provenance.get(name), dict) else {}
+            dataset = {
                 "name": name,
                 "domain": "LLM benchmark",
                 "split": "C2C unified_evaluator configured split",
                 "metric": "overall_accuracy",
                 "reason": "Part of the configured original C2C three-dataset small-loop protocol.",
             }
-            for name in self.context.config.get("c2c", {}).get("datasets", ["mmlu-redux", "ai2-arc", "openbookqa"])
-        ]
+            if simulate:
+                dataset["sample_count"] = int(provenance.get("sample_count") or 1)
+            else:
+                dataset.update(
+                    {
+                        "source_revision": provenance.get("source_revision"),
+                        "ordered_sample_ids": deepcopy(provenance.get("ordered_sample_ids")),
+                        "sample_count": provenance.get("sample_count"),
+                    }
+                )
+            datasets.append(dataset)
+        evaluator_provenance = _c2c_evaluator_provenance(adapter.repo_root, c2c_config, simulate=simulate)
         short_loop = {
             "collector": "c2c_small_loop",
-            "mode": "small_loop",
+            "mode": "simulate" if simulate else "small_loop",
             "workdir": str(adapter.repo_root),
             "python": adapter.env_python,
             "baseline": baseline,
@@ -354,6 +370,7 @@ class PlanAgent:
             "reviewer_concerns": concern_matrix.get("top_concerns", []),
             "blocked_patterns": (negative_memory.get("blocked_idea_patterns") or [])[:8],
             "failure_feedback_count": len(feedback),
+            **evaluator_provenance,
         }
         plan = {
             "selected_idea": selected,
@@ -748,7 +765,7 @@ class PlanAgent:
         plan_record = self.context.artifacts.write_json(
             self.stage_key,
             "trial_spec.json",
-            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config)),
+            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config), project_root=self.context.project_root),
             artifact_type="plan",
             summary="C2C structured small-loop experiment plan",
             source_paths=["literature/direction.json", "literature/c2c/baseline_evidence.json"],
@@ -1112,7 +1129,7 @@ class PlanAgent:
         plan_record = self.context.artifacts.write_json(
             self.stage_key,
             "trial_spec.json",
-            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config)),
+            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config), project_root=self.context.project_root),
             artifact_type="plan",
             summary="C2C plan updated after S2.5-only implementation repair",
             source_paths=["plan/performance_feedback.json", "plan/s2_planner/candidate_pool.json", "plan/code_patches/patch_manifest.json"],
@@ -1442,7 +1459,7 @@ class PlanAgent:
         plan_record = self.context.artifacts.write_json(
             self.stage_key,
             "trial_spec.json",
-            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config)),
+            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config), project_root=self.context.project_root),
             artifact_type="plan",
             summary="C2C S2.5-only implementation repair blocked",
             source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json"],
@@ -3595,7 +3612,50 @@ def _execution_profile(config: dict[str, Any]) -> str:
     return str(((config.get("orchestration") or {}).get("profile") or "standard")).lower()
 
 
-def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any], *, profile: str = "standard") -> dict[str, Any]:
+def _c2c_evaluator_provenance(repo_root: Path, c2c_config: dict[str, Any], *, simulate: bool) -> dict[str, Any]:
+    if simulate:
+        return {
+            "evaluator_id": "c2c-small-loop-synthetic-evaluator",
+            "evaluator_source_digest": canonical_hash({"adapter": "c2c_small_loop", "mode": "synthetic"}),
+            "dependency_digest": canonical_hash({"dependencies": [], "mode": "synthetic"}),
+        }
+    configured = c2c_config.get("evaluator_provenance") if isinstance(c2c_config.get("evaluator_provenance"), dict) else {}
+    evaluator_paths = configured.get("source_paths") or ["script/evaluation", "rosetta/model"]
+    source_entries: list[dict[str, str]] = []
+    for relative in evaluator_paths:
+        candidate = (repo_root / str(relative)).resolve()
+        try:
+            candidate.relative_to(repo_root.resolve())
+        except ValueError as exc:
+            raise ValueError("C2C evaluator provenance source path escapes target repository") from exc
+        paths = [candidate] if candidate.is_file() else sorted(path for path in candidate.rglob("*") if path.is_file()) if candidate.is_dir() else []
+        for path in paths:
+            source_entries.append(
+                {
+                    "path": path.relative_to(repo_root).as_posix(),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            )
+    if not source_entries:
+        raise ValueError("real C2C TrialSpec requires readable evaluator source files")
+    dependency_manifest = configured.get("dependencies")
+    if not isinstance(dependency_manifest, list) or not dependency_manifest:
+        raise ValueError("real C2C TrialSpec requires explicit evaluator dependency provenance")
+    return {
+        "evaluator_id": str(configured.get("evaluator_id") or "c2c-unified-evaluator"),
+        "evaluator_source_digest": canonical_hash(source_entries),
+        "dependency_digest": canonical_hash(dependency_manifest),
+        "dependencies": deepcopy(dependency_manifest),
+    }
+
+
+def _trial_spec_from_plan(
+    plan: dict[str, Any],
+    variant: dict[str, Any],
+    *,
+    profile: str = "standard",
+    project_root: Path | None = None,
+) -> dict[str, Any]:
     raw_datasets = deepcopy(plan.get("datasets") or [])
     raw_metrics = deepcopy(plan.get("metrics") or [])
     statistical = deepcopy(plan.get("statistical_testing") or {})
@@ -3644,7 +3704,8 @@ def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any], *, prof
     if not seeds:
         raise ValueError("TrialSpec requires pre-registered seeds")
     proxy_terminal = profile == "bootstrap"
-    required_phases = ["proxy"] if proxy_terminal else ["full"]
+    c2c_proxy_full = execution.get("collector") == "c2c_small_loop" and not proxy_terminal
+    required_phases = ["proxy"] if proxy_terminal else (["proxy", "full"] if c2c_proxy_full else ["full"])
     terminal_phases = ["proxy"] if proxy_terminal else ["full"]
     required_roles = ["baseline", "candidate"]
     if ablations:
@@ -3672,7 +3733,7 @@ def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any], *, prof
                 "hard": True,
                 "metric_id": primary_metric_id,
                 "threshold": float(maximum_regression),
-                "objective": "minimize",
+                "objective": primary[0]["objective"],
             }
         )
     if ablations:
@@ -3702,41 +3763,88 @@ def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any], *, prof
     if "matched_control" in required_roles:
         required_artifacts.append("matched_control_results")
     evidence_requirements = [
-        {"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": list(terminal_phases), "schema_version": "auto_research_main_results_v1"},
-        {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["always"], "schema_version": "auto_research_patch_gate_v1"},
+        {"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": list(terminal_phases), "schema_version": EVIDENCE_SCHEMA_VERSIONS["main_results"]},
+        {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["always"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["activation_evidence"]},
     ]
     if ablations:
-        evidence_requirements.append({"requirement_id": "ablation-results", "kind": "ablation_results", "required": True, "applicable_phases": ["ablation"], "schema_version": "auto_research_ablation_results_v1"})
+        evidence_requirements.append({"requirement_id": "ablation-results", "kind": "ablation_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["ablation_results"]})
     if "coverage" in required_roles:
-        evidence_requirements.append({"requirement_id": "coverage-results", "kind": "coverage_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_coverage_results_v1"})
+        evidence_requirements.append({"requirement_id": "coverage-results", "kind": "coverage_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["coverage_results"]})
     if "matched_control" in required_roles:
-        evidence_requirements.append({"requirement_id": "matched-control-results", "kind": "matched_control_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_matched_control_results_v1"})
+        evidence_requirements.append({"requirement_id": "matched-control-results", "kind": "matched_control_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["matched_control_results"]})
     if execution.get("collector") == "c2c_small_loop":
-        evidence_requirements[0]["schema_version"] = "c2c_main_results_v1"
-        evidence_requirements[1]["schema_version"] = "c2c_s2_5_patch_gate_report_v1"
-        for requirement in evidence_requirements:
-            if requirement["kind"] == "ablation_results":
-                requirement["schema_version"] = "c2c_ablation_results_v1"
         proxy_evidence = [
-            ("proxy-baseline", "proxy_baseline_fingerprint", "c2c_proxy_baseline_fingerprint_v1"),
-            ("proxy-cache", "proxy_cache_report", "c2c_proxy_cache_report_v1"),
-            ("effective-policy", "effective_proxy_policy", "c2c_effective_proxy_policy_v1"),
-            ("calibration-policy", "proxy_calibration_policy", "c2c_proxy_calibration_policy_v1"),
-            ("proxy-decision", "proxy_decision_report", "c2c_proxy_decision_report_v1"),
+            ("proxy-baseline", "proxy_baseline_fingerprint"),
+            ("proxy-cache", "proxy_cache_report"),
+            ("effective-policy", "effective_proxy_policy"),
+            ("calibration-policy", "proxy_calibration_policy"),
+            ("proxy-decision", "proxy_decision_report"),
         ]
         evidence_requirements.extend(
-            {"requirement_id": requirement_id, "kind": kind, "required": True, "applicable_phases": ["proxy"], "schema_version": version}
-            for requirement_id, kind, version in proxy_evidence
+            {"requirement_id": requirement_id, "kind": kind, "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS[kind]}
+            for requirement_id, kind in proxy_evidence
         )
         if proxy_terminal:
-            evidence_requirements.append({"requirement_id": "bootstrap-completion", "kind": "bootstrap_completion", "required": True, "applicable_phases": ["proxy"], "schema_version": "bootstrap_proxy_completion_v1"})
+            evidence_requirements.append({"requirement_id": "bootstrap-completion", "kind": "bootstrap_completion", "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["bootstrap_completion"]})
         else:
-            evidence_requirements.append({"requirement_id": "full-readiness", "kind": "full_s3_readiness", "required": True, "applicable_phases": ["full"], "schema_version": "c2c_proxy_to_full_readiness_v1"})
+            evidence_requirements.append({"requirement_id": "full-readiness", "kind": "full_s3_readiness", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["full_s3_readiness"]})
     runtime_config = deepcopy(execution)
-    evaluator_identity = {"metrics": metrics, "datasets": datasets, "collector": execution.get("collector")}
+    provenance_mode = "synthetic" if execution.get("mode") == "simulate" else "real"
+    if provenance_mode == "real":
+        missing_evaluator = [
+            field
+            for field in ("evaluator_id", "evaluator_source_digest", "dependency_digest")
+            if not execution.get(field)
+        ]
+        if missing_evaluator:
+            raise ValueError(f"real TrialSpec requires explicit evaluator provenance: {', '.join(missing_evaluator)}")
+    evaluator_identity = {
+        "schema_version": "auto_research_evaluator_provenance_v1",
+        "provenance_mode": provenance_mode,
+        "evaluator_id": str(execution.get("evaluator_id") or execution.get("collector") or "synthetic-evaluator"),
+        "source_digest": str(execution.get("evaluator_source_digest") or canonical_hash({"collector": execution.get("collector"), "mode": provenance_mode})),
+        "config_hash": canonical_hash({"metrics": metrics, "runtime": execution}),
+        "dependency_digest": str(execution.get("dependency_digest") or canonical_hash({"dependencies": execution.get("dependencies") or [], "mode": provenance_mode})),
+    }
     command_contract = deepcopy(execution.get("commands") or [])
     dataset_ids = [item["dataset_id"] for item in datasets]
-    sample_manifest_body = {"manifest_id": f"{variant.get('variant_id')}:sample-manifest", "datasets": dataset_ids}
+    sample_manifest_datasets = []
+    for source, dataset in zip(raw_datasets, datasets):
+        source = source if isinstance(source, dict) else {}
+        if provenance_mode == "real" and (not source.get("source_revision") or not source.get("ordered_sample_ids")):
+            raise ValueError(f"real TrialSpec dataset {dataset['dataset_id']} requires source_revision and ordered_sample_ids")
+        sample_ids = source.get("ordered_sample_ids") or [
+            canonical_hash({"dataset_id": dataset["dataset_id"], "split": dataset["split"], "ordinal": ordinal, "mode": provenance_mode})
+            for ordinal in range(dataset["sample_count"])
+        ]
+        if len(sample_ids) != dataset["sample_count"]:
+            raise ValueError(f"TrialSpec dataset {dataset['dataset_id']} sample IDs must match sample_count")
+        provenance = {
+            "dataset_id": dataset["dataset_id"],
+            "source_revision": str(source.get("source_revision") or ("synthetic-v1" if provenance_mode == "synthetic" else "registered-revision")),
+            "split": dataset["split"],
+            "ordered_sample_ids": sample_ids,
+        }
+        content_hash = canonical_hash(provenance)
+        dataset["sample_hash"] = content_hash
+        sample_manifest_datasets.append(
+            {
+                **provenance,
+                "sample_count": dataset["sample_count"],
+                "content_hash": content_hash,
+            }
+        )
+    sample_manifest_identity = {
+        "schema_version": "auto_research_sample_manifest_v1",
+        "manifest_id": f"{variant.get('variant_id')}:sample-manifest",
+        "provenance_mode": provenance_mode,
+        "datasets": sample_manifest_datasets,
+        "artifact_path": "plan/sample_manifest.json",
+    }
+    sample_manifest_body = {
+        **sample_manifest_identity,
+        "artifact_hash": canonical_hash(sample_manifest_identity),
+    }
     trial_spec = {
         "schema_version": TRIAL_SPEC_SCHEMA_VERSION,
         "protocol": {
@@ -3746,20 +3854,21 @@ def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any], *, prof
             "proxy_terminal_allowed": proxy_terminal,
             "aggregation": "mean",
         },
-        "sample_manifest": {**sample_manifest_body, "content_hash": canonical_hash(sample_manifest_body)},
+        "sample_manifest": sample_manifest_body,
         "datasets": datasets,
         "metrics": metrics,
         "primary_metric_id": primary_metric_id,
         "statistical_testing": {
             "method": "paired" if len(seeds) > 1 else "none",
             "seeds": seeds,
-            "require_complete_seed_coverage": bool(statistical.get("require_complete_seed_coverage", False)),
+            "require_complete_seed_coverage": True,
         },
         "required_roles": list(dict.fromkeys(required_roles)),
         "acceptance_constraints": constraints,
         "execution_contract": {
             "runtime_config": runtime_config,
             "runtime_config_hash": canonical_hash(runtime_config),
+            "evaluator_provenance": evaluator_identity,
             "evaluator_hash": canonical_hash(evaluator_identity),
             "command_contract_hash": canonical_hash(command_contract),
         },
@@ -3767,6 +3876,11 @@ def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any], *, prof
         "evidence_requirements": evidence_requirements,
     }
     validate_trial_spec(trial_spec)
+    if project_root is not None:
+        sample_path = project_root / trial_spec["sample_manifest"]["artifact_path"]
+        ensure_dir(sample_path.parent)
+        sample_body = {key: value for key, value in trial_spec["sample_manifest"].items() if key != "artifact_hash"}
+        sample_path.write_text(canonical_json(sample_body), encoding="utf-8")
     return trial_spec
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:

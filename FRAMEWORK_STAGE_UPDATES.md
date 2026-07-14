@@ -2890,8 +2890,12 @@ uv run pytest -q tests/test_validators.py tests/test_c2c.py tests/test_pipeline.
 
 # 2026-07-14 M1.1.2 Authoritative Attempt / S3 Transaction Closure
 
-- Event v3 is the only S1-S3 authority. AttemptRecord v3 freezes TrialSpec v2 and all derived hashes at reservation; TrialResult v3, RouteOutcome v3, ConstraintResult v1, EvidenceManifest v1, FailureEvidence v1, and ResumeEvidence v1 are breaking contracts.
+- Event v4 is the only S1-S3 authority. AttemptRecord v4 freezes TrialSpec v3 and all derived hashes at reservation; TrialResult v4, RouteOutcome v3, ConstraintResult v2, EvidenceManifest v2, FailureEvidence v2, and ResumeEvidence v2 are breaking contracts.
 - Attempt failure/terminal states are no longer reachable through the generic transition API. Failure disposition validates structured evidence and artifact hashes in the same SQLite transaction; resource resume retains the same reservation and only resets the interrupted phase.
 - Shared S3 validation runs before commit, again inside the Ledger transaction, and as postcommit audit. Any TrialSpec drift, identity/hash mismatch, malformed evidence, missing role/phase/seed coverage, or invalid constraint evidence produces zero authoritative writes.
 - Orchestrator queries the committed operation result from SQLite and fails closed on stale, conflicting, missing, or unknown routes. Projection JSON is never a runtime control source.
 - The project-wide standard execution width is one. The fifth verified outcome creates the exact aggregate; no sixth reservation can reach planning, patching, or execution.
+
+## 2026-07-14 — M1.1.3 Attempt-scoped scientific evidence
+
+S3 now follows `execute -> explicit inventory -> immutable ingest -> shared precommit validation -> SQLite transaction -> projections -> audit`. The Common Core owns decoding and classification; adapters only produce canonical staged evidence. Sample and evaluator provenance are frozen in TrialSpec v3, and standard real runs must supply actual sample identities and evaluator source/dependency digests. Native Unified S1 producer work remains out of scope.

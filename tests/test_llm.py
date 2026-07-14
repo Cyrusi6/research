@@ -2,7 +2,9 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 
-from auto_research.llm import ModelClient, codex_subprocess_env
+import pytest
+
+from auto_research.llm import ModelClient, ProviderUnavailableError, codex_subprocess_env
 
 
 def test_openai_api_key_rotation_prefers_base_key_then_numbered(monkeypatch) -> None:
@@ -221,6 +223,13 @@ def test_codex_cli_provider_persists_session(monkeypatch, tmp_path: Path) -> Non
     meta_dir.mkdir(parents=True)
     (meta_dir / "codex_sessions.yaml").write_text("sessions: {}\n", encoding="utf-8")
 
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_codex = fake_bin / "codex"
+    fake_codex.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    fake_codex.chmod(0o755)
+    monkeypatch.setattr("auto_research.llm.shutil.which", lambda name: str(fake_codex) if name == "codex" else None)
+
     def fake_run(command, capture_output, text, cwd, timeout, env=None):
         output_path = Path(command[command.index("--output-last-message") + 1])
         output_path.write_text('{"value": 1}\n', encoding="utf-8")
@@ -251,3 +260,49 @@ def test_codex_cli_provider_persists_session(monkeypatch, tmp_path: Path) -> Non
     assert payload == {"value": 1}
     assert "literature-agent" in sessions
     assert "123e4567-e89b-12d3-a456-426614174000" in sessions
+
+
+def test_codex_cli_missing_executable_is_typed_provider_unavailable(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("auto_research.llm.shutil.which", lambda name: None)
+    client = ModelClient(
+        {
+            "experiment": {"simulate": False},
+            "llm": {
+                "provider": "codex_cli",
+                "reasoning_provider": "codex_cli",
+                "use_real_api": True,
+            },
+        },
+        project_root=tmp_path,
+    )
+
+    with pytest.raises(ProviderUnavailableError) as exc_info:
+        client.generate(
+            instructions="Return JSON.",
+            prompt='Return {"accepted": true}',
+            agent_name="literature-agent",
+        )
+
+    assert exc_info.value.provider == "codex_cli"
+    assert exc_info.value.reason == "executable_not_found"
+    assert exc_info.value.status == "provider_unavailable"
+
+
+def test_simulation_explicitly_uses_mock_when_codex_is_missing(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr("auto_research.llm.shutil.which", lambda name: None)
+    client = ModelClient(
+        {
+            "experiment": {"simulate": True},
+            "llm": {
+                "provider": "codex_cli",
+                "reasoning_provider": "codex_cli",
+                "use_real_api": True,
+            },
+        },
+        project_root=tmp_path,
+    )
+
+    result = client.generate(instructions="Return JSON.", prompt='Return {"accepted": true}')
+
+    assert result.text.startswith("Mock generation based on:")
+    assert result.raw == {"provider": "mock", "policy": "simulate"}

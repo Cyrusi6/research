@@ -1,7 +1,7 @@
 from pathlib import Path
 
 from auto_research.research_state import ResearchEventLedger
-from test_authoritative_state_machine import _complete, _direction, _initialize, _reserve, _variant
+from test_authoritative_state_machine import _complete, _direction, _failure_evidence, _initialize, _reserve, _variant
 
 
 def test_first_four_method_outcomes_route_to_next_variant(tmp_path: Path) -> None:
@@ -26,9 +26,9 @@ def test_fifth_without_acceptance_routes_to_new_direction(tmp_path: Path) -> Non
 
 
 def test_resource_and_integrity_have_unified_actions(tmp_path: Path) -> None:
-    for outcome, failure, expected in [
-        ("resource_paused", "oom_retry", "PAUSE_RESOURCE"),
-        ("integrity_blocked", "integrity", "BLOCK_INTEGRITY"),
+    for failure_class, expected in [
+        ("oom_retry", "PAUSE_RESOURCE"),
+        ("integrity_failure", "BLOCK_INTEGRITY"),
     ]:
         root = tmp_path / expected
         ledger = ResearchEventLedger(root)
@@ -36,6 +36,6 @@ def test_resource_and_integrity_have_unified_actions(tmp_path: Path) -> None:
         variant = _variant(direction, 1)
         _initialize(ledger, direction, variant)
         attempt = _reserve(ledger, direction, variant)
-        ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
-        _, route = _complete(ledger, attempt, outcome=outcome, evaluable=False, failure=failure)
+        attempt = ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+        _, route = ledger.disposition_failure(_failure_evidence(ledger, attempt, failure_class))
         assert route["next_action"] == expected

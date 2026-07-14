@@ -1,23 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
-from auto_research.domain_contracts import (
-    EVIDENCE_MANIFEST_SCHEMA_VERSION,
-    EXECUTION_OBSERVATION_SCHEMA_VERSION,
-    canonical_hash,
-    classify_trial_result,
-    variant_semantic_hash,
-    variant_spec_hash,
-)
+from auto_research.domain_contracts import canonical_hash, variant_semantic_hash, variant_spec_hash
+from auto_research.evidence import content_addressed_evidence_path, encode_canonical_evidence
 from auto_research.research_state import IntegrityError, ResearchEventLedger
 from test_authoritative_state_machine import (
     _attempt_inputs,
     _complete,
+    _completion_evidence,
     _direction,
     _failure_evidence,
     _initialize,
@@ -148,8 +144,8 @@ def test_ready_attempt_cannot_finalize(tmp_path: Path) -> None:
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
-    trial = _valid_trial(ledger, attempt)
-    _assert_trial_rejected_without_writes(ledger, trial, match="READY|execution state|cannot finalize")
+    completion = _valid_completion(ledger, attempt)
+    _assert_trial_rejected_without_writes(ledger, completion, match="READY|execution state|cannot finalize")
 
 
 def test_failed_phase_cannot_be_overwritten_by_finalization(tmp_path: Path) -> None:
@@ -161,8 +157,8 @@ def test_failed_phase_cannot_be_overwritten_by_finalization(tmp_path: Path) -> N
     ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
     running = ledger.state()["attempts"][attempt["attempt_id"]]
     ledger.disposition_failure(_failure_evidence(ledger, running, "activation_failure"))
-    trial = _valid_trial(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
-    _assert_trial_rejected_without_writes(ledger, trial, match="phase|FAILED|completed|execution state|IMPLEMENTATION_REPAIR")
+    completion = _valid_completion(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
+    _assert_trial_rejected_without_writes(ledger, completion, match="phase|FAILED|completed|execution state|IMPLEMENTATION_REPAIR")
 
 
 def test_full_trial_requires_full_execution_state(tmp_path: Path) -> None:
@@ -172,62 +168,36 @@ def test_full_trial_requires_full_execution_state(tmp_path: Path) -> None:
     _initialize(ledger, direction, variant)
     attempt = _reserve_kind(ledger, direction, variant, profile="standard", attempt_kind="proxy_full")
     ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
-    trial = _valid_trial(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
-    _assert_trial_rejected_without_writes(ledger, trial, match="full|phase|execution state")
+    completion = _valid_completion(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
+    _assert_trial_rejected_without_writes(ledger, completion, match="full|phase|execution state")
 
 
-def _valid_trial(ledger: ResearchEventLedger, attempt: dict) -> dict:
-    artifact = ledger.project_root / "experiment" / "raw" / f"{attempt['attempt_id']}.json"
-    artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_text('{"schema_version":"auto_research_main_results_v1"}\n', encoding="utf-8")
-    artifact_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
-    phase = "proxy" if attempt["attempt_kind"] in {"proxy", "bootstrap_proxy"} else "full"
-    observations = [
-        {
-            "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
-            "observation_id": f"obs:{attempt['attempt_id'][:8]}:{role}:1",
-            "phase": phase,
-            "role": role,
-            "command_status": "completed",
-            "dataset_id": "fake",
-            "metric_id": "accuracy",
-            "metric_value": value,
-            "sample_manifest_hash": attempt["sample_manifest_hash"],
-            "evaluator_hash": attempt["evaluator_hash"],
-            "seed": 1,
-            "raw_artifact_path": str(artifact.relative_to(ledger.project_root)),
-            "raw_artifact_hash": artifact_hash,
-        }
-        for role, value in (("baseline", 0.5), ("candidate", 0.7))
-    ]
-    evidence_manifest = {
-        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "attempt_id": attempt["attempt_id"],
-        "entries": [{
-            "evidence_id": f"evidence:{attempt['attempt_id'][:8]}:main",
-            "kind": "main_results",
-            "relative_path": str(artifact.relative_to(ledger.project_root)),
-            "content_hash": artifact_hash,
-            "schema_version": "auto_research_main_results_v1",
-            "attempt_id": attempt["attempt_id"],
-            "variant_spec_hash": attempt["variant_spec_hash"],
-            "trial_spec_hash": attempt["trial_spec_hash"],
-            "cross_references": {},
-        }],
-    }
-    return classify_trial_result(
-        attempt=attempt,
-        trial_spec=attempt["frozen_trial_spec"],
-        observations=observations,
-        raw_artifacts={str(artifact.relative_to(ledger.project_root)): artifact_hash},
-        evidence_manifest=evidence_manifest,
+def _valid_completion(ledger: ResearchEventLedger, attempt: dict) -> dict:
+    return _completion_evidence(ledger, attempt, outcome="accepted")
+
+
+def _rewrite_completion_artifact(ledger: ResearchEventLedger, completion: dict, mutate) -> None:
+    entry = completion["entries"][0]
+    payload = json.loads((ledger.project_root / entry["relative_path"]).read_text(encoding="utf-8"))
+    mutate(payload)
+    raw = encode_canonical_evidence(payload)
+    digest = hashlib.sha256(raw).hexdigest()
+    relative_path = content_addressed_evidence_path(
+        attempt_id=entry["attempt_id"],
+        producer_run_id=entry["producer_run_id"],
+        evidence_kind=entry["kind"],
+        content_hash=digest,
     )
+    path = ledger.project_root / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    entry["relative_path"] = relative_path
+    entry["content_hash"] = digest
 
 
 def _assert_trial_rejected_without_writes(
     ledger: ResearchEventLedger,
-    trial: dict,
+    completion: dict,
     *,
     match: str,
 ) -> None:
@@ -236,7 +206,7 @@ def _assert_trial_rejected_without_writes(
     before_trial = ledger.trial_path.read_bytes() if ledger.trial_path.exists() else None
 
     with pytest.raises((IntegrityError, ValueError), match=match):
-        ledger.complete_attempt(trial)
+        ledger.complete_attempt(completion)
 
     assert ledger.events() == before_events
     assert ledger.state() == before_state
@@ -269,37 +239,47 @@ def test_ledger_independently_rejects_forged_trial_result(
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
     ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
-    trial = _valid_trial(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
+    completion = _valid_completion(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
+    assert ledger.validate_trial_precommit(completion)["outcome_classification"] == "accepted"
 
     if forgery == "unregistered_seed":
-        trial["observations"][1]["seed"] = 999
+        _rewrite_completion_artifact(ledger, completion, lambda payload: payload["rows"][1].__setitem__("seed", 999))
     elif forgery == "sample_manifest_hash":
-        trial["observations"][1]["sample_manifest_hash"] = "a" * 64
+        _rewrite_completion_artifact(ledger, completion, lambda payload: payload["rows"][1].__setitem__("sample_manifest_hash", "a" * 64))
     elif forgery == "evaluator_hash":
-        trial["observations"][1]["evaluator_hash"] = "b" * 64
+        _rewrite_completion_artifact(ledger, completion, lambda payload: payload["rows"][1].__setitem__("evaluator_hash", "b" * 64))
     elif forgery == "dataset_contract":
-        for observation in trial["observations"]:
-            observation["dataset_id"] = "unregistered-dataset"
-        trial["required_datasets"] = ["unregistered-dataset"]
-        trial["observed_datasets"] = ["unregistered-dataset"]
+        _rewrite_completion_artifact(
+            ledger,
+            completion,
+            lambda payload: [row.__setitem__("dataset_id", "unregistered-dataset") for row in payload["rows"]],
+        )
     elif forgery == "duplicate_observation":
-        trial["observations"].append(deepcopy(trial["observations"][1]))
+        _rewrite_completion_artifact(ledger, completion, lambda payload: payload["rows"].append(deepcopy(payload["rows"][1])))
     elif forgery == "unregistered_raw_artifact":
-        trial["observations"][1]["raw_artifact_hash"] = "c" * 64
+        completion["entries"][0]["content_hash"] = "c" * 64
     elif forgery in {
         "failed_command",
         "partial_command",
         "resource_paused_command",
         "integrity_blocked_command",
     }:
-        trial["observations"][1]["command_status"] = forgery.removesuffix("_command")
+        _rewrite_completion_artifact(
+            ledger,
+            completion,
+            lambda payload: payload["rows"][1].__setitem__("command_status", forgery.removesuffix("_command")),
+        )
     elif forgery == "missing_baseline_role":
-        trial["observations"] = [item for item in trial["observations"] if item["role"] != "baseline"]
+        _rewrite_completion_artifact(
+            ledger,
+            completion,
+            lambda payload: payload.__setitem__("rows", [row for row in payload["rows"] if row["role"] != "baseline"]),
+        )
     else:  # pragma: no cover - parameter list is exhaustive
         raise AssertionError(f"unknown forgery {forgery}")
 
     _assert_trial_rejected_without_writes(
         ledger,
-        trial,
+        completion,
         match="seed|hash|dataset|duplicate|artifact|command|status|role|coverage|observation",
     )

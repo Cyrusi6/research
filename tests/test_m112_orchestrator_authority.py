@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from copy import deepcopy
-import hashlib
 from pathlib import Path
 
 import pytest
@@ -12,44 +11,20 @@ from auto_research.agents import literature as literature_module
 from auto_research.adapters.literature import LiteratureProvider
 from auto_research.orchestrator import Orchestrator
 from auto_research.research_state import IntegrityError, ResearchEventLedger
-from auto_research.utils import now_utc
 from test_authoritative_state_machine import _direction, _initialize, _reserve, _variant
+from test_m113_ledger_closure import _failure_evidence as _canonical_failure_evidence
+from test_m113_ledger_closure import _resume_evidence as _canonical_resume_evidence
 from test_pipeline import _mock_generic_s1_codex, _test_config
 
 
-def _artifact(project_root: Path, name: str, payload: str) -> dict:
-    path = project_root / "experiment" / "logs" / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(payload, encoding="utf-8")
-    return {
-        "path": str(path.relative_to(project_root)),
-        "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-    }
-
-
 def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class: str) -> dict:
-    details = {"resource_type": "execution_capacity", "available": False}
-    validator_check = None
-    if failure_class == "activation_failure":
-        details = {"activation_probe": "forward_probe"}
-        validator_check = "forward_probe"
-    return {
-        "schema_version": "auto_research_failure_evidence_v1",
-        "attempt_id": attempt["attempt_id"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
-        "source_state": attempt["state"],
-        "source_phase": "full",
-        "failure_class": failure_class,
-        "command_status": "resource_paused" if failure_class == "resource_pause" else "failed",
-        "exit_code": 75 if failure_class == "resource_pause" else 1,
-        "validator_check": validator_check,
-        "artifact": _artifact(ledger.project_root, f"{attempt['attempt_id']}-{failure_class}.json", '{"verified": true}\n'),
-        "details": details,
-        "reason": f"verified {failure_class}",
-        "observed_at": now_utc(),
-    }
+    return _canonical_failure_evidence(
+        ledger.project_root,
+        attempt,
+        failure_class=failure_class,
+        exit_code=137 if failure_class == "resource_pause" else 1,
+        resource_type="system_memory",
+    )
 
 
 def _routed_result(tmp_path: Path, *, variant_index: int = 1) -> tuple[ResearchEventLedger, dict, dict, int]:
@@ -145,19 +120,8 @@ def test_orchestrator_rejects_wrong_committed_sequence(tmp_path: Path) -> None:
 
 def test_orchestrator_rejects_late_result_after_newer_attempt_route(tmp_path: Path) -> None:
     ledger, first_attempt, first_route, first_sequence = _routed_result(tmp_path)
-    resume_artifact = _artifact(tmp_path, "resource-resume.json", '{"available": true}\n')
     first_attempt = ledger.resume_attempt(
-        {
-            "schema_version": "auto_research_resume_evidence_v1",
-            "attempt_id": first_attempt["attempt_id"],
-            "lifecycle_generation": first_attempt["lifecycle_generation"],
-                "implementation_hash": first_attempt["implementation_hash"],
-                "attempt_input_hash": first_attempt["attempt_input_hash"],
-                "resource_type": "execution_capacity",
-                "probe_status": "available",
-                "artifact": resume_artifact,
-                "observed_at": now_utc(),
-        }
+        _canonical_resume_evidence(tmp_path, ledger, first_attempt, resource_type="system_memory")
     )
     ledger.transition_attempt(first_attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
     current_attempt = ledger.state()["attempts"][first_attempt["attempt_id"]]
@@ -190,7 +154,7 @@ def test_real_simulated_pipeline_uses_ledger_route_not_result_control(
     project_id = orchestrator.init_project("M1.1.2 route authority", project_id="m112-route-e2e", simulate=True)
     result = orchestrator.start(project_id)
 
-    assert result["status"] == "completed"
+    assert result["status"] == "completed", result
     project_root = tmp_path / project_id
     ledger = ResearchEventLedger(project_root)
     state = ledger.state()

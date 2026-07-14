@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 from copy import deepcopy
@@ -11,10 +10,13 @@ import pytest
 from auto_research.domain_contracts import build_direction_spec, build_variant_spec, canonical_hash
 from auto_research.research_state import (
     BreakingSchemaError,
-    FAILURE_EVIDENCE_SCHEMA_VERSION,
-    RESUME_EVIDENCE_SCHEMA_VERSION,
     IntegrityError,
     ResearchEventLedger,
+)
+from test_authoritative_state_machine import _trial_spec
+from test_m113_ledger_closure import (
+    _failure_evidence as _canonical_failure_evidence,
+    _resume_evidence as _canonical_resume_evidence,
 )
 
 
@@ -49,23 +51,6 @@ def _variant(direction: dict, name: str) -> dict:
     })
 
 
-def _trial_spec() -> dict:
-    runtime = {"device": "cpu", "batch_size": 1}
-    return {
-        "schema_version": "auto_research_trial_spec_v2",
-        "protocol": {"protocol_id": "full-v1", "required_phases": ["full"], "terminal_phases": ["full"], "proxy_terminal_allowed": False, "aggregation": "mean"},
-        "sample_manifest": {"manifest_id": "fake-v1", "datasets": ["fake"], "content_hash": canonical_hash({"samples": [1]})},
-        "datasets": [{"dataset_id": "fake", "split": "test", "sample_count": 1, "sample_hash": canonical_hash({"sample": 1})}],
-        "metrics": [{"metric_id": "accuracy", "objective": "maximize", "aggregation": "mean", "role": "primary"}],
-        "primary_metric_id": "accuracy",
-        "statistical_testing": {"method": "none", "seeds": [1], "require_complete_seed_coverage": True},
-        "required_roles": ["baseline", "candidate"],
-        "acceptance_constraints": [{"constraint_id": "primary-delta", "kind": "minimum_mean_delta", "hard": True, "metric_id": "accuracy", "threshold": 0.01, "objective": "maximize"}],
-        "execution_contract": {"runtime_config": runtime, "runtime_config_hash": canonical_hash(runtime), "evaluator_hash": canonical_hash({"evaluator": 1}), "command_contract_hash": canonical_hash({"command": "run"})},
-        "required_artifacts": ["main_results"], "evidence_requirements": [],
-    }
-
-
 def _reserved(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
     ledger = ResearchEventLedger(tmp_path)
     direction = _direction("direction-a")
@@ -76,31 +61,18 @@ def _reserved(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
     return ledger, attempt
 
 
-def _artifact(root: Path, name: str) -> dict:
-    path = root / "logs" / name
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(name, encoding="utf-8")
-    return {"path": str(path.relative_to(root)), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-
-
 def _failure(root: Path, attempt: dict, index: int, *, failure_class: str = "resource_pause") -> dict:
-    return {
-        "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION, "attempt_id": attempt["attempt_id"],
-        "lifecycle_generation": attempt["lifecycle_generation"], "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"],
-        "source_state": attempt["state"], "source_phase": "full", "failure_class": failure_class,
-        "command_status": "resource_paused", "exit_code": 137, "validator_check": None,
-        "artifact": _artifact(root, f"pause-{index}.log"), "details": {"resource_type": "memory", "available": False},
-        "reason": "resource unavailable", "observed_at": f"2026-01-01T00:00:0{index}Z",
-    }
+    return _canonical_failure_evidence(
+        root,
+        attempt,
+        failure_class=failure_class,
+        exit_code=137,
+        resource_type="system_memory",
+    )
 
 
-def _resume(root: Path, attempt: dict, index: int) -> dict:
-    return {
-        "schema_version": RESUME_EVIDENCE_SCHEMA_VERSION, "attempt_id": attempt["attempt_id"],
-        "lifecycle_generation": attempt["lifecycle_generation"], "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"],
-        "resource_type": "memory", "probe_status": "available", "artifact": _artifact(root, f"resume-{index}.json"),
-        "observed_at": f"2026-01-01T00:01:0{index}Z",
-    }
+def _resume(root: Path, ledger: ResearchEventLedger, attempt: dict, index: int) -> dict:
+    return _canonical_resume_evidence(root, ledger, attempt, resource_type="system_memory")
 
 
 @pytest.mark.parametrize("forged", ["IMPLEMENTATION_REPAIR", "RESOURCE_PAUSED", "INTEGRITY_BLOCKED", "ABANDONED", "METHOD_COMPLETED"])
@@ -119,7 +91,7 @@ def test_three_resource_pause_resume_cycles_preserve_attempt_and_reservation(tmp
         paused, route = ledger.disposition_failure(_failure(tmp_path, attempt, index))
         assert paused["state"] == "RESOURCE_PAUSED" and paused["phases"]["full"] == "RUNNING"
         assert route["next_action"] == "PAUSE_RESOURCE" and route["source"]["sequence"] == ledger.events()[-1]["sequence"]
-        attempt = ledger.resume_attempt(_resume(tmp_path, paused, index))
+        attempt = ledger.resume_attempt(_resume(tmp_path, ledger, paused, index))
         assert attempt["state"] == "READY" and attempt["phases"]["full"] == "PENDING"
     state = ledger.state()
     assert attempt["attempt_id"] in state["attempts"]
@@ -137,7 +109,7 @@ def test_explicit_disposition_event_id_late_replay_returns_historical_result(tmp
     assert historical_query["attempt"] == historical_attempt
     assert historical_query["route_outcome"] == historical_route
     assert historical_query["state_sequence"] == historical_route["source"]["sequence"]
-    resumed = ledger.resume_attempt(_resume(tmp_path, historical_attempt, 1))
+    resumed = ledger.resume_attempt(_resume(tmp_path, ledger, historical_attempt, 1))
     ledger.transition_attempt(resumed["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
     before = len(ledger.events())
     replay_attempt, replay_route = ledger.disposition_failure(evidence, event_id="pause-explicit-1")

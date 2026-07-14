@@ -18,6 +18,10 @@ from test_authoritative_state_machine import (
     _trial_spec,
     _variant,
 )
+from test_m113_ledger_closure import (
+    _failure_evidence as _canonical_failure_evidence,
+    _resume_evidence,
+)
 
 
 def _start_execution(ledger: ResearchEventLedger, attempt: dict) -> dict:
@@ -90,8 +94,9 @@ def test_late_finalize_replay_returns_original_attempt_route(tmp_path: Path) -> 
     _initialize(ledger, direction, second_variant)
     second = _reserve(ledger, direction, second_variant)
     _complete(ledger, second, outcome="rejected")
-    trial = ledger.state()["trial_results"][first["attempt_id"]]
-    replayed_attempt, replayed_route = ledger.complete_attempt(trial)
+    historical = ledger.query_operation_result(first_route["source"]["event_id"])
+    replayed_attempt = historical["attempt"]
+    replayed_route = historical["route_outcome"]
     assert replayed_attempt == first_completed
     assert replayed_route == first_route
     assert replayed_route != ledger.state()["last_route_outcome"]
@@ -103,24 +108,15 @@ def test_late_disposition_replay_returns_original_attempt_route(tmp_path: Path) 
     _initialize(ledger, direction, _variant(direction, 1))
     first = _reserve(ledger, direction, _variant(direction, 1))
     running = _start_execution(ledger, first)
-    evidence = _failure_evidence(ledger, running, "resource_pause", suffix="first")
+    evidence = _canonical_failure_evidence(
+        tmp_path,
+        running,
+        failure_class="resource_pause",
+        exit_code=137,
+        resource_type="system_memory",
+    )
     historical_attempt, historical_route = ledger.disposition_failure(evidence, event_id="pause:first")
-    resumed_artifact = tmp_path / "resume.json"
-    resumed_artifact.write_text("available", encoding="utf-8")
-    resume = {
-        "schema_version": "auto_research_resume_evidence_v1",
-        "attempt_id": historical_attempt["attempt_id"],
-        "lifecycle_generation": historical_attempt["lifecycle_generation"],
-        "implementation_hash": historical_attempt["implementation_hash"],
-        "attempt_input_hash": historical_attempt["attempt_input_hash"],
-        "resource_type": "memory",
-        "probe_status": "available",
-        "artifact": {"path": "resume.json", "sha256": canonical_hash("available")},
-        "observed_at": "2026-01-01T00:01:00Z",
-    }
-    import hashlib
-    resume["artifact"]["sha256"] = hashlib.sha256(resumed_artifact.read_bytes()).hexdigest()
-    ledger.resume_attempt(resume)
+    ledger.resume_attempt(_resume_evidence(tmp_path, ledger, historical_attempt, resource_type="system_memory"))
     before = len(ledger.events())
     replayed_attempt, replayed_route = ledger.disposition_failure(evidence, event_id="pause:first")
     assert len(ledger.events()) == before

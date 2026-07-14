@@ -5,7 +5,6 @@ from __future__ import annotations
 from auto_research.config import bootstrap_profile_enabled
 from auto_research.research_state import IntegrityError, ResearchEventLedger
 from auto_research.s3_validation import S3ValidationError, validate_committed_s3
-from auto_research.utils import read_json
 
 from .base import StageGateValidator
 
@@ -60,15 +59,29 @@ class S3GateValidator(StageGateValidator):
             self.pass_check("s3_authoritative_transaction", artifact="meta/research_events.sqlite3")
 
         if bootstrap_profile_enabled(self.config) and isinstance(attempt, dict):
-            completion = read_json(self.project_root / "experiment" / "results" / "bootstrap_proxy_completion.json", default={}) or {}
+            budget = dict((((state.get("directions") or {}).get(attempt.get("direction_semantic_hash")) or {}).get("budget") or {}))
+            manifest = trial.get("evidence_manifest") if isinstance(trial, dict) else None
+            evidence_kinds = {
+                entry.get("kind")
+                for entry in (manifest or {}).get("entries") or []
+                if isinstance(entry, dict)
+            }
             if (
-                attempt.get("method_evaluable") is True
+                attempt.get("profile") == "bootstrap"
+                and attempt.get("method_evaluable") is True
+                and attempt.get("state") == "METHOD_COMPLETED"
                 and attempt.get("attempt_kind") == "bootstrap_proxy"
                 and attempt.get("consumes_direction_budget") is False
+                and attempt.get("reserved_slot") is False
+                and isinstance(trial, dict)
+                and trial.get("attempt_id") == attempt.get("attempt_id")
+                and trial.get("method_evaluable") is True
+                and trial.get("completeness") == "proxy"
+                and "bootstrap_completion" in evidence_kinds
                 and route.get("next_action") == "FINISH_RUN"
-                and completion.get("bootstrap_proxy_complete") is True
+                and budget == {"target": 5, "reserved": 0, "consumed": 0}
             ):
-                self.pass_check("bootstrap_proxy_complete", artifact="experiment/results/bootstrap_proxy_completion.json")
+                self.pass_check("bootstrap_proxy_complete", artifact="meta/research_events.sqlite3")
             elif route.get("next_action") in {"PAUSE_RESOURCE", "REPAIR_IMPLEMENTATION", "BLOCK_INTEGRITY"}:
                 self.pass_check("bootstrap_failure_route")
             else:

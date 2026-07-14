@@ -28,6 +28,23 @@ class GenerationResult:
     raw: Any = None
 
 
+class ProviderUnavailableError(RuntimeError):
+    def __init__(self, *, provider: str, purpose: str, reason: str):
+        self.provider = provider
+        self.purpose = purpose
+        self.reason = reason
+        self.status = "provider_unavailable"
+        super().__init__(f"{provider} provider unavailable for {purpose}: {reason}")
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "status": self.status,
+            "provider": self.provider,
+            "purpose": self.purpose,
+            "reason": self.reason,
+        }
+
+
 class ModelClient:
     def __init__(self, config: dict[str, Any], project_root: Path | None = None):
         llm_config = config.get("llm", {})
@@ -70,13 +87,15 @@ class ModelClient:
             or os.environ.get("OPENAI_DEFAULT_HEADERS")
         )
         self._openai_client_kwargs = self._build_openai_client_kwargs()
-        self._codex_available = bool(shutil.which("codex"))
+        self.simulate = bool(config.get("experiment", {}).get("simulate"))
+        self._codex_executable = shutil.which("codex")
+        self._codex_available = bool(self._codex_executable)
         self._openai_clients = self._build_openai_clients()
         self._openai_client = self._openai_clients[0] if self._openai_clients else None
         self._openai_client_cursor = 0
         self.use_real_api = self._provider_can_use(self.reasoning_provider)
         self.use_real_execution_api = self._provider_can_use(self.execution_provider)
-        if config.get("experiment", {}).get("simulate"):
+        if self.simulate:
             self.use_real_api = False
             self.use_real_execution_api = False
         if not llm_config.get("use_real_api", True):
@@ -98,7 +117,18 @@ class ModelClient:
         if temperature is None:
             temperature = agent_settings.get("temperature", self.temperature)
         provider = self._provider_for_purpose(purpose)
-        if provider == "codex_cli" and self._provider_can_use(provider):
+        if provider == "codex_cli" and self.simulate:
+            return GenerationResult(
+                text=self._mock_text(prompt),
+                raw={"provider": "mock", "policy": "simulate"},
+            )
+        if provider == "codex_cli" and not self._codex_executable:
+            raise ProviderUnavailableError(
+                provider=provider,
+                purpose=purpose,
+                reason="executable_not_found",
+            )
+        if provider == "codex_cli":
             return self._generate_via_codex_cli(instructions=instructions, prompt=prompt, agent_name=agent_name)
         if provider != "openai" or not self.use_real_api or not self._provider_can_use(provider):
             return GenerationResult(text=self._mock_text(prompt))
@@ -249,7 +279,13 @@ class ModelClient:
         working_root = self.project_root.resolve() if self.project_root else Path.cwd()
         with tempfile.NamedTemporaryFile("w+", delete=False, encoding="utf-8") as handle:
             output_path = Path(handle.name)
-        command = ["codex"]
+        if not self._codex_executable:
+            raise ProviderUnavailableError(
+                provider="codex_cli",
+                purpose="execution",
+                reason="executable_not_found",
+            )
+        command = [self._codex_executable]
         sandbox = self.codex_cli_config.get("sandbox")
         approval_policy = self.codex_cli_config.get("approval_policy")
         if sandbox:

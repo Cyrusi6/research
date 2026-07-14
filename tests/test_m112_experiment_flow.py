@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from auto_research.agents.experiment import ExperimentAgent, _typed_execution_observations
+from auto_research.agents import experiment as experiment_module
+from auto_research.agents.experiment import ExperimentAgent
 from auto_research.agents.plan import _trial_spec_from_plan
 from auto_research.domain_contracts import TRIAL_SPEC_SCHEMA_VERSION, validate_trial_spec
 
@@ -68,7 +69,9 @@ def test_plan_builds_complete_frozen_trial_spec() -> None:
         "per_dataset_maximum_regression",
         "required_ablation_contrast",
     }
-    assert trial_spec["sample_manifest"]["datasets"] == ["dataset-a"]
+    assert [item["dataset_id"] for item in trial_spec["sample_manifest"]["datasets"]] == ["dataset-a"]
+    assert trial_spec["sample_manifest"]["datasets"][0]["ordered_sample_ids"]
+    assert trial_spec["sample_manifest"]["datasets"][0]["content_hash"]
     assert trial_spec["datasets"][0]["dataset_id"] == "dataset-a"
     assert trial_spec["required_artifacts"] == ["main_results", "ablation_results"]
     assert {item["kind"] for item in trial_spec["evidence_requirements"]} >= {"main_results", "activation_evidence", "ablation_results"}
@@ -85,73 +88,76 @@ def test_trial_spec_authoritative_fields_are_deep_copied() -> None:
     assert trial_spec["statistical_testing"]["seeds"] == [7, 11]
 
 
-def test_typed_observations_require_exact_main_result_artifact_binding() -> None:
-    plan = _plan()
-    plan["ablation_matrix"] = []
-    trial_spec = _trial_spec_from_plan(plan, _variant())
-    attempt = _attempt(trial_spec)
-    results = {
-        "baseline": {"datasets": {"dataset-a": 0.7}},
-        "best_candidate": {"metrics": {"datasets": {"dataset-a": 0.8}}},
-    }
-
-    assert _typed_execution_observations(
-        results,
-        trial_spec,
-        attempt,
-        {"experiment/env_report.md": "9" * 64},
-    ) == []
-
-    observations = _typed_execution_observations(
-        results,
-        trial_spec,
-        attempt,
-        {"experiment/results/main_results.json": "a" * 64, "experiment/env_report.md": "9" * 64},
-    )
-    assert observations
-    assert {item["raw_artifact_hash"] for item in observations} == {"a" * 64}
+def test_callers_cannot_construct_typed_observations_from_summary_results() -> None:
+    assert not hasattr(experiment_module, "_typed_execution_observations")
 
 
 class _ResumeLedger:
-    def __init__(self) -> None:
+    def __init__(self, attempt: dict) -> None:
         self.calls: list[tuple] = []
+        self.attempt = deepcopy(attempt)
+
+    def state(self) -> dict:
+        return {"attempts": {self.attempt["attempt_id"]: deepcopy(self.attempt)}}
+
+    def events(self) -> list[dict]:
+        pause_evidence = {
+            "attempt_id": self.attempt["attempt_id"],
+            "failure_class": "resource_pause",
+            "producer_run_id": f"pause-{self.attempt['lifecycle_generation']}",
+        }
+        return [{"event_id": f"event:pause:{self.attempt['lifecycle_generation']}", "event_type": "AttemptDispositioned", "payload": {"failure_evidence": pause_evidence}}]
 
     def resume_attempt(self, evidence: dict) -> dict:
         self.calls.append(("resume", deepcopy(evidence)))
-        return {
-            "attempt_id": evidence["attempt_id"],
-            "attempt_kind": "proxy_full",
-            "state": "READY",
-            "lifecycle_generation": evidence["lifecycle_generation"] + 1,
-            "implementation_hash": evidence["implementation_hash"],
-            "attempt_input_hash": evidence["attempt_input_hash"],
-            "phases": {"proxy": "PENDING", "full": "PENDING"},
-        }
+        self.attempt["state"] = "READY"
+        self.attempt["lifecycle_generation"] = evidence["lifecycle_generation"] + 1
+        return deepcopy(self.attempt)
 
     def transition_attempt(self, attempt_id: str, state: str, **kwargs) -> dict:
         self.calls.append(("transition", attempt_id, state, kwargs))
-        return {"attempt_id": attempt_id, "attempt_kind": "proxy_full", "state": state, "phases": {"proxy": "RUNNING", "full": "PENDING"}}
+        self.attempt["state"] = state
+        self.attempt["phases"][kwargs["phase"]] = kwargs["phase_state"]
+        return deepcopy(self.attempt)
+
+
+def _resume_attempt(generation: int, *, state: str = "RESOURCE_PAUSED") -> dict:
+    return {
+        "attempt_id": "attempt-1",
+        "attempt_kind": "proxy_full",
+        "state": state,
+        "lifecycle_generation": generation,
+        "implementation_hash": "1" * 64,
+        "attempt_input_hash": "2" * 64,
+        "direction_semantic_hash": "3" * 64,
+        "direction_spec_hash": "4" * 64,
+        "variant_semantic_hash": "5" * 64,
+        "variant_spec_hash": "6" * 64,
+        "trial_spec_hash": "7" * 64,
+        "protocol_hash": "8" * 64,
+        "sample_manifest_hash": "9" * 64,
+        "evaluator_hash": "a" * 64,
+        "phases": {"proxy": "PENDING", "full": "PENDING"},
+    }
 
 
 @pytest.mark.parametrize("generation", [0, 1, 2])
 def test_resource_resume_precedes_execution_transition(tmp_path: Path, generation: int) -> None:
-    log_path = tmp_path / "resource-probe.json"
-    log_path.write_text('{"available": true}', encoding="utf-8")
-    ledger = _ResumeLedger()
-    attempt = {
-        "attempt_id": "attempt-1",
-        "attempt_kind": "proxy_full",
-        "state": "RESOURCE_PAUSED",
-        "lifecycle_generation": generation,
-        "implementation_hash": "1" * 64,
-        "attempt_input_hash": "2" * 64,
-        "phases": {"proxy": "PENDING", "full": "PENDING"},
-    }
+    attempt = _resume_attempt(generation)
+    ledger = _ResumeLedger(attempt)
 
     resumed = ExperimentAgent._prepare_attempt_execution(
         ledger,
         attempt,
-        resource_probe_path=log_path,
+        resource_probe={
+            "resource_type": "quota",
+            "resource_id": "test-quota",
+            "required_capacity": 1,
+            "observed_capacity": 2,
+            "unit": "count",
+            "probe_status": "available",
+            "observed_at": "2026-07-14T00:00:00Z",
+        },
         project_root=tmp_path,
     )
 
@@ -162,18 +168,11 @@ def test_resource_resume_precedes_execution_transition(tmp_path: Path, generatio
 
 
 def test_ready_attempt_does_not_emit_resume(tmp_path: Path) -> None:
-    ledger = _ResumeLedger()
-    attempt = {
-        "attempt_id": "attempt-1",
-        "attempt_kind": "proxy_full",
-        "state": "READY",
-        "lifecycle_generation": 3,
-        "implementation_hash": "1" * 64,
-        "attempt_input_hash": "2" * 64,
-        "phases": {"proxy": "COMPLETED", "full": "PENDING"},
-    }
+    attempt = _resume_attempt(3, state="READY")
+    attempt["phases"]["proxy"] = "COMPLETED"
+    ledger = _ResumeLedger(attempt)
 
-    ExperimentAgent._prepare_attempt_execution(ledger, attempt, resource_probe_path=None, project_root=tmp_path)
+    ExperimentAgent._prepare_attempt_execution(ledger, attempt, resource_probe=None, project_root=tmp_path)
 
     assert [call[0] for call in ledger.calls] == ["transition"]
     assert ledger.calls[0][2] == "FULL_RUNNING"
@@ -260,17 +259,49 @@ def test_real_experiment_agent_three_resource_resumes_then_single_commit(monkeyp
     artifacts = ArtifactManager(project_root)
     context = AgentContext(project_root, config, artifacts, ModelClient(config, project_root=project_root))
     agent = ExperimentAgent(context)
-    monkeypatch.setattr(agent.runner, "env_report", lambda: {"python": "test", "tmux": False, "gpu": []})
+    monkeypatch.setattr(
+        agent.runner,
+        "env_report",
+        lambda: {
+            "python": "test",
+            "tmux": False,
+            "gpu": [],
+            "resource_probe": {
+                "resource_type": "quota",
+                "resource_id": "simulated-execution-slot",
+                "required_capacity": 1,
+                "observed_capacity": 1,
+                "unit": "count",
+                "probe_status": "available",
+                "observed_at": "2026-07-14T00:01:00Z",
+            },
+        },
+    )
     original_simulated = agent._run_simulated
     calls = {"count": 0}
 
-    def resource_then_success(self, plan_payload, env_source, revision_source):
+    def resource_then_success(self, plan_payload, env_source, revision_source, *, attempt, trial_spec):
         calls["count"] += 1
         if calls["count"] <= 3:
+            producer_run_id = f"resource-pause-{calls['count']}-{attempt['attempt_id'][:12]}"
+            probe = experiment_module._identity_evidence_payload(
+                attempt=attempt,
+                producer_run_id=producer_run_id,
+                evidence_kind="resource_probe",
+                fields={
+                    "resource_type": "quota",
+                    "resource_id": "simulated-execution-slot",
+                    "required_capacity": 1,
+                    "observed_capacity": 0,
+                    "unit": "count",
+                    "probe_status": "insufficient",
+                    "observed_at": f"2026-07-14T00:00:0{calls['count']}Z",
+                },
+            )
             record = artifacts.write_json(
                 self.stage_key,
                 f"results/resource_pause_{calls['count']}.json",
-                {"schema_version": "auto_research_resource_failure_v1", "status": "resource_paused", "round": calls["count"]},
+                probe,
                 artifact_type="resource_failure",
                 summary="Hermetic resource pause evidence",
             )
@@ -282,10 +313,17 @@ def test_real_experiment_agent_three_resource_resumes_then_single_commit(monkeyp
                     "command_status": "resource_paused",
                     "exit_code": 137,
                     "artifact_path": record["path"],
+                    "producer_run_id": producer_run_id,
                     "reason": "Hermetic resource probe reported temporary exhaustion.",
                 },
             }
-        return original_simulated(plan_payload, env_source, revision_source)
+        return original_simulated(
+            plan_payload,
+            env_source,
+            revision_source,
+            attempt=attempt,
+            trial_spec=trial_spec,
+        )
 
     agent._run_simulated = MethodType(resource_then_success, agent)
     results = [agent.run() for _ in range(4)]

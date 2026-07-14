@@ -6,10 +6,10 @@
 |---|---|---|---|
 | Direction | `DirectionSpec v3` | `literature/direction.json` | Complete research-direction specification with separate semantic/spec hashes |
 | Variant | `VariantSpec v4` | `plan/variant.json` | One scientific intervention bound to the complete DirectionSpec |
-| Trial | `TrialSpec v2` | frozen in `AttemptReserved`; `plan/trial_spec.json` is a projection | Complete preregistered protocol, samples, metrics, acceptance, execution, roles, phases, seeds, and evidence requirements |
-| Event | `Event v3` | `meta/research_events.sqlite3` | The only authoritative S1-S3 transaction store; SQLite WAL with a hash chain |
-| Attempt | `AttemptRecord v3` | `meta/attempts/<attempt_id>.json` | Rebuildable attempt lifecycle projection |
-| Result | `TrialResult v3` | `experiment/results/trial_result.json` | Rebuildable projection of the latest committed verified result |
+| Trial | `TrialSpec v3` | frozen in `AttemptReserved`; `plan/trial_spec.json` is a projection | Complete preregistered protocol, content-addressed samples, evaluator provenance, metrics, acceptance, roles, phases, seeds, and evidence requirements |
+| Event | `Event v4` | `meta/research_events.sqlite3` | The only authoritative S1-S3 transaction store; SQLite WAL with a hash chain |
+| Attempt | `AttemptRecord v4` | `meta/attempts/<attempt_id>.json` | Rebuildable attempt lifecycle projection |
+| Result | `TrialResult v4` | `experiment/results/trial_result.json` | Rebuildable projection derived only from immutable row-level evidence |
 | Route | `RouteOutcome v3` | `meta/route_outcome.json` | Rebuildable deterministic route projection |
 | Aggregate | `DirectionOutcomeAggregate v1` | `meta/direction_outcome_aggregate.json` | Exactly five verified standard outcomes and deterministic selection status |
 
@@ -28,7 +28,7 @@ Canonical JSON sorts object keys and rejects NaN/Inf. A repair keeps direction, 
 
 ## Event Transactions
 
-Every event uses `Event v3` with a strict event-type enum, type-specific payload schema, validated ID, continuous sequence, `previous_event_hash`, and `event_hash`. Append performs duplicate-ID checking, sequence allocation, schema/transition validation, reduction, invariant checking, and durable insertion under one SQLite `BEGIN IMMEDIATE` transaction.
+Every event uses `Event v4` with a strict event-type enum, type-specific payload schema, validated ID, continuous sequence, `previous_event_hash`, and `event_hash`. Append performs duplicate-ID checking, sequence allocation, schema/transition validation, reduction, invariant checking, and durable insertion under one SQLite `BEGIN IMMEDIATE` transaction.
 
 Rebuild rejects schema mismatch, sequence gaps/duplicates, duplicate IDs, hash-chain damage, event-hash damage, illegal transitions, and invalid state invariants with `IntegrityError`. The same event ID and same type/payload is idempotent; a conflicting payload is an integrity failure.
 
@@ -80,7 +80,13 @@ There is no v1 dual-read, mirror, migration, fallback, or inference from `ideas`
 ## M1.1.2 Frozen Trial and Route Authority
 
 - Reservation accepts the complete TrialSpec and freezes it in the event. Protocol, sample manifest, acceptance contract, evaluator, runtime, seeds, and derived hashes cannot drift during repair or resume.
-- `FailureEvidence v1` is the only entry to repair, resource pause, or integrity block. `ResumeEvidence v1` is the only entry from resource pause to ready. Both validate generation, source state/phase, input identity, and real artifact hashes transactionally.
-- `ConstraintResult v1` is classifier-owned. Missing required evidence is non-evaluable and zero-write; a complete hard-constraint failure is a budget-consuming rejected outcome; accepted requires the primary criterion and every hard constraint to pass.
+- `FailureEvidence v2` is the only entry to repair, resource pause, or integrity block. `ResumeEvidence v2` is the only entry from resource pause to ready. Both validate generation, source state/phase, input identity, and real artifact hashes transactionally.
+- `ConstraintResult v2` is classifier-owned. Missing required evidence is non-evaluable and zero-write; a complete hard-constraint failure is a budget-consuming rejected outcome; accepted requires the primary criterion and every hard constraint to pass.
 - The Orchestrator queries the historical operation result bound to the committed event ID and sequence. Mutable result and route projections cannot override SQLite control authority.
 - Standard execution width is project-global. An active standard reservation prevents selecting or reserving another direction until it is finalized or explicitly abandoned.
+
+## Completion Replay and Evidence Scope
+
+`CompletionEvidence v1` contains only the current Attempt identity, frozen TrialSpec hash, and an explicit inventory of immutable Attempt-scoped artifacts. Finalization computes a fingerprint over the lifecycle generation, implementation/input identities, producer run IDs, EvidenceManifest hash, and all content hashes. An exact replay revalidates the immutable bytes and returns the historical TrialResult, RouteOutcome, and aggregate without a new event. A different fingerprint, missing bytes, or hash drift is an integrity failure with zero writes.
+
+Generic and C2C adapters may still emit human-readable diagnostic summaries, but those files use diagnostic schema names and never enter the authoritative inventory unless independently emitted in the strict evidence contract. Gate, budget, replay, and routing query SQLite and the committed content-addressed evidence only.

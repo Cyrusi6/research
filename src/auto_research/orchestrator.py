@@ -338,6 +338,7 @@ class Orchestrator:
                 gate_report = gate_s1(project_root, config)
             elif stage_key == "S2_plan":
                 try:
+                    self._assert_s2_planning_allowed(project_root)
                     result = PlanAgent(context).run()
                 except (ValueError, IntegrityError) as exc:
                     reason = f"S2 authoritative TrialSpec planning rejected before reservation: {exc}"
@@ -556,6 +557,30 @@ class Orchestrator:
         state.mark_completed(registry)
         self._finalize_c2c_e2e_run(project_root, config, registry)
         return {"status": registry["status"], "project_id": registry["project_id"]}
+
+    @staticmethod
+    def _assert_s2_planning_allowed(project_root: Path) -> None:
+        ledger = ResearchEventLedger(project_root)
+        state = ledger.state()
+        current_semantic = state.get("current_direction_semantic_hash")
+        if current_semantic is None:
+            latest_route = state.get("last_route_outcome") or {}
+            if latest_route.get("next_action") in {"FINISH_DIRECTION", "START_NEW_DIRECTION"}:
+                raise IntegrityError("closed direction cannot enter S2 planning; S1 must select a new direction")
+            return
+        direction = (state.get("directions") or {}).get(current_semantic)
+        if not isinstance(direction, dict):
+            raise IntegrityError("current direction is missing from authoritative state")
+        if direction.get("status") in {"FINISHED", "EXHAUSTED"}:
+            raise IntegrityError("closed direction cannot enter S2 planning")
+        budget = direction.get("budget") or {}
+        target = budget.get("target")
+        consumed = budget.get("consumed")
+        reserved = budget.get("reserved")
+        if not all(isinstance(value, int) for value in (target, consumed, reserved)):
+            raise IntegrityError("direction budget is malformed")
+        if consumed + reserved >= target:
+            raise IntegrityError("direction budget has no capacity for another variant")
 
     @staticmethod
     def _authoritative_s3_route(project_root: Path, result: dict[str, Any]) -> dict[str, Any]:

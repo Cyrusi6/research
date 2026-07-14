@@ -1,3 +1,4 @@
+import hashlib
 import json
 import shutil
 import subprocess
@@ -21,7 +22,7 @@ from auto_research.adapters.runner import ExperimentRunner
 from auto_research.agents.debate import MultiAgentReasoningService
 from auto_research.agents.experiment import ExperimentAgent
 from auto_research.agents.intake import IntakeAgent, _c2c_evidence_brief, _c2c_static_bundle_validity
-from auto_research.agents.plan import PlanAgent
+from auto_research.agents.plan import PlanAgent, _trial_spec_from_plan
 from auto_research.agents.base import AgentContext
 from auto_research.failure_log import build_c2c_feedback_bundle, load_c2c_feedback_bundle
 from auto_research.artifacts import ArtifactManager
@@ -375,59 +376,18 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
     write_json(project / "plan" / "variant.json", variant)
     write_json(
         project / "plan" / "trial_spec.json",
-        {
-            "schema_version": "auto_research_trial_spec_v2",
-            "protocol": {
-                "protocol_id": "wrapper-utility-proxy",
-                "required_phases": ["proxy"],
-                "terminal_phases": ["proxy"],
-                "proxy_terminal_allowed": True,
-                "aggregation": "mean",
+        _trial_spec_from_plan(
+            {
+                "datasets": [{"name": "mmlu-redux", "split": "test", "sample_count": 1}],
+                "metrics": [{"name": "three_dataset_mean", "primary": True, "higher_is_better": True}],
+                "statistical_testing": {"seeds": [42], "require_complete_seed_coverage": True},
+                "acceptance_criteria": {"minimum_mean_delta": 0.0},
+                "ablation_matrix": [],
+                "execution": {"mode": "simulate", "collector": "c2c_small_loop", "commands": []},
             },
-            "sample_manifest": {
-                "manifest_id": "wrapper-utility-samples",
-                "datasets": ["mmlu-redux"],
-                "content_hash": canonical_hash({"datasets": ["mmlu-redux"]}),
-            },
-            "datasets": [
-                {
-                    "dataset_id": "mmlu-redux",
-                    "split": "test",
-                    "sample_count": 1,
-                    "sample_hash": canonical_hash({"dataset": "mmlu-redux", "split": "test", "sample_count": 1}),
-                }
-            ],
-            "metrics": [{"metric_id": "three_dataset_mean", "objective": "maximize", "aggregation": "mean", "role": "primary"}],
-            "primary_metric_id": "three_dataset_mean",
-            "statistical_testing": {"method": "none", "seeds": [42], "require_complete_seed_coverage": True},
-            "required_roles": ["baseline", "candidate"],
-            "acceptance_constraints": [
-                {
-                    "constraint_id": "minimum-mean-delta",
-                    "kind": "minimum_mean_delta",
-                    "hard": True,
-                    "metric_id": "three_dataset_mean",
-                    "threshold": 0.0,
-                    "objective": "maximize",
-                }
-            ],
-            "execution_contract": {
-                "runtime_config": {"collector": "c2c_small_loop"},
-                "runtime_config_hash": canonical_hash({"collector": "c2c_small_loop"}),
-                "evaluator_hash": canonical_hash({"metric": "three_dataset_mean"}),
-                "command_contract_hash": canonical_hash({"collector": "c2c_small_loop", "phase": "proxy"}),
-            },
-            "required_artifacts": ["main_results"],
-            "evidence_requirements": [
-                {
-                    "requirement_id": "main-results",
-                    "kind": "main_results",
-                    "required": True,
-                    "applicable_phases": ["proxy"],
-                    "schema_version": "auto_research_main_results_v1",
-                }
-            ],
-        },
+            variant,
+            profile="bootstrap",
+        ),
     )
     write_json(
         project / "plan" / "code_patches" / "implementation_contract.json",
@@ -5476,7 +5436,7 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     result = orchestrator.start(project_id)
     root = tmp_path / "workspace" / project_id
 
-    assert result["status"] == "completed"
+    assert result["status"] == "completed", result
     main_results = json.loads((root / "experiment/results/main_results.json").read_text(encoding="utf-8"))
     assert main_results["best_candidate"]["decision"] == "candidate_win"
     assert main_results["acceptance"]["passed"] is True
@@ -5559,6 +5519,22 @@ def test_c2c_pipeline_runs_to_s3_with_mock_small_loop(monkeypatch, tmp_path: Pat
     aggregate = research_state["latest_direction_aggregate"]
     assert len(aggregate["outcomes"]) == 5
     assert research_state["directions"][aggregate["direction_semantic_hash"]]["budget"] == {"target": 5, "reserved": 0, "consumed": 5}
+    assert len(research_state["trial_results"]) == 5
+    for attempt_id, trial_result in research_state["trial_results"].items():
+        main_observations = [item for item in trial_result["observations"] if item["evidence_kind"] == "main_results"]
+        assert {(item["role"], item["dataset_id"], item["seed"]) for item in main_observations} == {
+            (role, dataset_id, 42)
+            for role in ("baseline", "candidate")
+            for dataset_id in ("mmlu-redux", "ai2-arc", "openbookqa")
+        }
+        for artifact_path, artifact_hash in trial_result["raw_artifacts"].items():
+            assert artifact_path.startswith(f"experiment/attempts/{attempt_id}/c2c-simulate-")
+            immutable_path = root / artifact_path
+            assert immutable_path.is_file()
+            assert immutable_path.stem == artifact_hash
+            assert hashlib.sha256(immutable_path.read_bytes()).hexdigest() == artifact_hash
+        for observation in trial_result["observations"]:
+            assert trial_result["raw_artifacts"][observation["raw_artifact_path"]] == observation["raw_artifact_hash"]
     debate = json.loads((root / "literature/direction_analysis.json").read_text(encoding="utf-8"))
     assert debate["used_shared_memory_refs"] == ["mem_s1_avoid_hard_gate"]
     constraints = json.loads((root / "literature/negative_constraints.json").read_text(encoding="utf-8"))

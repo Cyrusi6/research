@@ -2,7 +2,7 @@
 
 ## 2026-07-14 M1.1.2 Authoritative Attempt / S3 Transaction Closure
 
-- Upgraded the breaking authority layer to Event v3, AttemptRecord v3, TrialSpec v2, ExecutionObservation v2, TrialResult v3, and RouteOutcome v3; prior workspaces are rejected and must restart from S1.
+- Upgraded the breaking authority layer to Event v4, AttemptRecord v4, TrialSpec v3, ExecutionObservation v3, TrialResult v4, EvidenceManifest v2, ConstraintResult v2, and RouteOutcome v3; prior workspaces are rejected and must restart from S1.
 - `reserve_attempt()` now validates and freezes the complete TrialSpec, then derives protocol, sample-manifest, acceptance-contract, and attempt-input hashes inside the Ledger transaction.
 - Public attempt transitions can only advance execution states. Structured FailureEvidence exclusively derives implementation repair, resource pause, and integrity block; ResumeEvidence exclusively restores `RESOURCE_PAUSED -> READY` without changing attempt or variant identity.
 - S3 precommit, Ledger commit, and postcommit Gate share one validator over frozen TrialSpec, exact observation/result artifacts, activation/proxy/readiness evidence, roles, seeds, phases, constraints, identity, and budget.
@@ -158,3 +158,19 @@ TMPDIR=$PWD/.tmp uv run pytest -q
 - S3 precommit 与 postcommit Gate 共用纯验证器；Ledger 在 `BEGIN IMMEDIATE` 内再次校验 TrialResult、typed observations、artifact hash、phase/dataset/seed/role coverage、proxy/bootstrap evidence 和预算后才原子提交。
 - Projection 写入加独占锁并在锁内重读 SQLite 最新 sequence，阻止乱序写回旧 snapshot。
 - 新增 lifecycle replay、伪造事件、profile/kind、语义 nonce、phase、TrialResult 防伪、Gate-before-commit、路由权威、三轮 repair 和并发 execution-width 对抗测试。
+
+## 2026-07-14 M1.1.3 Scientific Evidence Provenance Closure
+
+- Upgraded Event, Attempt, and State to v4; TrialSpec to v3; TrialResult to v4; ExecutionObservation to v3; EvidenceManifest and ConstraintResult to v2.
+- Replaced caller-authored TrialResult finalization with CompletionEvidence containing only the current Attempt's explicit staged inventory.
+- Added immutable attempt-scoped content-addressed evidence paths and strict schemas for quantitative rows, activation, proxy policies/reports, readiness, bootstrap completion, failure, and resource/resume probes.
+- Ledger finalization now reads each evidence artifact once, verifies bytes/hash/schema/identity, deterministically decodes observations and paired constraints, and commits result/budget/route/aggregate atomically.
+- Removed fixed-path evidence discovery and arbitrary-artifact observation binding; stale files from another Attempt cannot authorize a result.
+- Made non-simulated Codex CLI absence a typed provider-unavailable failure and kept simulation explicitly synthetic.
+
+### M1.1.3 final migration closure
+
+- Completion finalization stores a fingerprint binding Attempt/generation, frozen TrialSpec, implementation/input identity, producer runs, EvidenceManifest, and immutable artifact hashes. Exact replay returns the historical operation result without writes; conflicting, missing, or corrupted evidence fails with zero state/budget change.
+- Bootstrap finalization and S3 Gate now use only committed Attempt-scoped proxy evidence. Repeated Gate audits are read-only; bootstrap leaves the standard budget at `target=5, reserved=0, consumed=0`, does not enter method history, and creates no direction aggregate.
+- Generic and C2C simulated standard pipelines each commit five unique semantic variants from strict row evidence, finish with `target=5, reserved=0, consumed=5`, and reject a sixth variant before execution.
+- Final validation: normal, proxy-cleared, and empty HOME/HF with no Codex on PATH each report `537 passed, 2 skipped`; no new skip or xfail was added.
