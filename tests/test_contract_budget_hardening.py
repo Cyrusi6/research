@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from auto_research.domain_contracts import (
+    EVIDENCE_MANIFEST_SCHEMA_VERSION,
     EXECUTION_OBSERVATION_SCHEMA_VERSION,
     canonical_hash,
     classify_trial_result,
@@ -18,6 +19,7 @@ from test_authoritative_state_machine import (
     _attempt_inputs,
     _complete,
     _direction,
+    _failure_evidence,
     _initialize,
     _reserve,
     _trial_spec,
@@ -34,16 +36,13 @@ def _reserve_kind(
     attempt_kind: str,
 ) -> dict:
     values = _attempt_inputs(variant)
-    if attempt_kind in {"proxy", "bootstrap_proxy"}:
-        protocol = {"required_phases": ["proxy"], "terminal_method_phases": ["proxy"]}
-        values["protocol_hash"] = canonical_hash(protocol)
-        values["required_phases"] = ["proxy"]
-        values["terminal_method_phases"] = ["proxy"]
+    trial_spec = _trial_spec(profile=profile, attempt_kind=attempt_kind)
     return ledger.reserve_attempt(
         profile=profile,
         direction=direction,
         variant=variant,
         attempt_kind=attempt_kind,
+        trial_spec=trial_spec,
         **values,
     )
 
@@ -160,9 +159,10 @@ def test_failed_phase_cannot_be_overwritten_by_finalization(tmp_path: Path) -> N
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
     ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
-    ledger.transition_attempt(attempt["attempt_id"], "IMPLEMENTATION_REPAIR", phase="full", phase_state="FAILED")
+    running = ledger.state()["attempts"][attempt["attempt_id"]]
+    ledger.disposition_failure(_failure_evidence(ledger, running, "activation_failure"))
     trial = _valid_trial(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
-    _assert_trial_rejected_without_writes(ledger, trial, match="phase|FAILED|completed|execution state")
+    _assert_trial_rejected_without_writes(ledger, trial, match="phase|FAILED|completed|execution state|IMPLEMENTATION_REPAIR")
 
 
 def test_full_trial_requires_full_execution_state(tmp_path: Path) -> None:
@@ -170,7 +170,7 @@ def test_full_trial_requires_full_execution_state(tmp_path: Path) -> None:
     direction = _direction()
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
-    attempt = _reserve(ledger, direction, variant)
+    attempt = _reserve_kind(ledger, direction, variant, profile="standard", attempt_kind="proxy_full")
     ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
     trial = _valid_trial(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
     _assert_trial_rejected_without_writes(ledger, trial, match="full|phase|execution state")
@@ -179,12 +179,13 @@ def test_full_trial_requires_full_execution_state(tmp_path: Path) -> None:
 def _valid_trial(ledger: ResearchEventLedger, attempt: dict) -> dict:
     artifact = ledger.project_root / "experiment" / "raw" / f"{attempt['attempt_id']}.json"
     artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_text('{"verified": true}\n', encoding="utf-8")
+    artifact.write_text('{"schema_version":"auto_research_main_results_v1"}\n', encoding="utf-8")
     artifact_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
     phase = "proxy" if attempt["attempt_kind"] in {"proxy", "bootstrap_proxy"} else "full"
     observations = [
         {
             "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+            "observation_id": f"obs:{attempt['attempt_id'][:8]}:{role}:1",
             "phase": phase,
             "role": role,
             "command_status": "completed",
@@ -194,15 +195,33 @@ def _valid_trial(ledger: ResearchEventLedger, attempt: dict) -> dict:
             "sample_manifest_hash": attempt["sample_manifest_hash"],
             "evaluator_hash": attempt["evaluator_hash"],
             "seed": 1,
+            "raw_artifact_path": str(artifact.relative_to(ledger.project_root)),
             "raw_artifact_hash": artifact_hash,
         }
         for role, value in (("baseline", 0.5), ("candidate", 0.7))
     ]
+    evidence_manifest = {
+        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "attempt_id": attempt["attempt_id"],
+        "entries": [{
+            "evidence_id": f"evidence:{attempt['attempt_id'][:8]}:main",
+            "kind": "main_results",
+            "relative_path": str(artifact.relative_to(ledger.project_root)),
+            "content_hash": artifact_hash,
+            "schema_version": "auto_research_main_results_v1",
+            "attempt_id": attempt["attempt_id"],
+            "variant_spec_hash": attempt["variant_spec_hash"],
+            "trial_spec_hash": attempt["trial_spec_hash"],
+            "cross_references": {},
+        }],
+    }
     return classify_trial_result(
         attempt=attempt,
-        trial_spec=_trial_spec(attempt),
+        trial_spec=attempt["frozen_trial_spec"],
         observations=observations,
         raw_artifacts={str(artifact.relative_to(ledger.project_root)): artifact_hash},
+        evidence_manifest=evidence_manifest,
     )
 
 

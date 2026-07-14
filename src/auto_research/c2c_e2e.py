@@ -40,7 +40,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
     ],
     "S2_plan": [
         ("plan/variant.json", "variant_v4.schema.json"),
-        ("plan/trial_spec.json", None),
+        ("plan/trial_spec.json", "trial_spec_v2.schema.json"),
         ("plan/s2_planner/candidate_pool.json", "s2_candidate_pool.schema.json"),
         ("plan/s2_planner/feedback_context.json", "s2_feedback_context.schema.json"),
         ("plan/s2_planner/adaptive_policy.json", "s2_adaptive_policy.schema.json"),
@@ -54,7 +54,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("plan/code_patches/patch_gate_report.json", "s2_5_patch_gate_report.schema.json"),
     ],
     "S3_experiment": [
-        ("experiment/results/trial_result.json", "trial_result_v2.schema.json"),
+        ("experiment/results/trial_result.json", "trial_result_v3.schema.json"),
         ("experiment/results/c2c_proxy_baseline_fingerprint.json", "c2c_proxy_baseline_fingerprint.schema.json"),
         ("experiment/results/c2c_proxy_cache_report.json", "c2c_proxy_cache_report.schema.json"),
         ("experiment/results/c2c_effective_proxy_policy.json", "c2c_effective_proxy_policy.schema.json"),
@@ -63,8 +63,8 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("experiment/results/s3_candidate_selection.json", None),
     ],
     "orchestration": [
-        ("meta/route_outcome.json", "route_outcome_v2.schema.json"),
-        ("meta/research_state.json", None),
+        ("meta/route_outcome.json", "route_outcome_v3.schema.json"),
+        ("meta/research_state.json", "research_state_v3.schema.json"),
         ("meta/iteration_trace.jsonl", None),
     ],
 }
@@ -462,8 +462,8 @@ def build_c2c_replay_plan(project_root: Path, *, replay_from: str = "S3_experime
     """Freeze immutable event hashes for deterministic reducer replay."""
 
     ledger = ResearchEventLedger(project_root)
-    event_paths = sorted((project_root / "meta" / "research_events").glob("*.json"))
-    frozen_inputs = [str(path.relative_to(project_root)) for path in event_paths]
+    ledger.events()
+    frozen_inputs = ["meta/research_events.sqlite3"]
     input_hashes = {rel: _sha_or_none(project_root / rel) for rel in frozen_inputs}
     state = ledger.state()
     normalized = _normalize_research_state(state)
@@ -476,7 +476,7 @@ def build_c2c_replay_plan(project_root: Path, *, replay_from: str = "S3_experime
         "input_hashes": input_hashes,
         "actions": ["replay_immutable_events", "rebuild_research_state", "compare_state_hash"],
         "expected_decision_hashes": {"research_state": _stable_hash(normalized)},
-        "expected_decision_source": "meta/research_events",
+        "expected_decision_source": "meta/research_events.sqlite3",
         "expected_decision_summary": {
             "last_sequence": state.get("last_sequence"),
             "next_action": ((state.get("last_route_outcome") or {}).get("next_action") if isinstance(state.get("last_route_outcome"), dict) else None),
@@ -506,7 +506,7 @@ def build_c2c_replay_result(project_root: Path, replay_plan: dict[str, Any] | No
         "project_id": project_root.name,
         "status": "match" if not mismatches else "mismatch",
         "replayed_decisions": {"route_decision": route.get("next_action"), "hash": actual_hash},
-        "expected_decisions": {"route_decision": (plan.get("expected_decision_summary") or {}).get("next_action"), "hash": expected_hash, "source": "meta/research_events"},
+        "expected_decisions": {"route_decision": (plan.get("expected_decision_summary") or {}).get("next_action"), "hash": expected_hash, "source": "meta/research_events.sqlite3"},
         "mismatches": mismatches,
     }
 
@@ -534,7 +534,7 @@ def build_c2c_real_smoke_record(project_root: Path, config: dict[str, Any] | Non
     planner_gate = read_json(project_root / "plan" / "s2_planner" / "planner_gate_report.json", default={}) or {}
     patch_gate = read_json(project_root / "plan" / "code_patches" / "patch_gate_report.json", default={}) or {}
     proxy_decision = read_json(project_root / "experiment" / "results" / "c2c_proxy_decision_report.json", default={}) or {}
-    route_decision = read_json(project_root / "meta" / "route_outcome.json", default={}) or {}
+    route_decision = ResearchEventLedger(project_root).state().get("last_route_outcome") or {}
 
     blocking_reasons = _smoke_blocking_reasons(registry, readiness, execution_hooks, audit, replay)
     return {
@@ -1046,98 +1046,9 @@ def _optional_artifact_checks(project_root: Path, *, require_schema: bool) -> li
 
 
 def _stale_artifacts_after_route(project_root: Path) -> list[dict[str, Any]]:
-    route_path = project_root / "meta" / "route_outcome.json"
-    route = read_json(route_path, default={}) or {}
-    if not isinstance(route, dict) or not route_path.exists():
-        return []
-    invalidated = ((route.get("artifact_effects") or {}).get("invalidate_artifacts") or []) if isinstance(route.get("artifact_effects"), dict) else []
-    if not isinstance(invalidated, list):
-        return []
-    invalidate_from = ((route.get("artifact_effects") or {}).get("invalidate_from") if isinstance(route.get("artifact_effects"), dict) else None)
-    if route.get("trigger_stage") and route.get("trigger_stage") == invalidate_from:
-        return []
-    route_mtime = route_path.stat().st_mtime
-    stale = []
-    for rel in invalidated:
-        if not isinstance(rel, str):
-            continue
-        path = project_root / rel
-        if path.exists() and path.stat().st_mtime <= route_mtime:
-            stale.append({"path": rel, "reason": "artifact older than route_decision but listed for invalidation"})
-    return stale
-
-
-def _route_decision_for_replay(project_root: Path, replay_from: str) -> tuple[dict[str, Any], str | None]:
-    replay_from = str(replay_from or "")
-    latest = read_json(project_root / "meta" / "route_outcome.json", default={}) or {}
-    if isinstance(latest, dict) and latest.get("trigger_stage") == replay_from:
-        return latest, "latest_route_decision"
-    archived = _archived_route_decision_for_replay(project_root, replay_from)
-    if archived:
-        return archived, "route_decision_archive"
-    trace = _route_trace_decision_for_replay(project_root, replay_from)
-    if trace:
-        return trace, "iteration_trace"
-    if isinstance(latest, dict) and latest:
-        return latest, "latest_route_decision"
-    return {}, None
-
-
-def _archived_route_decision_for_replay(project_root: Path, replay_from: str) -> dict[str, Any]:
-    archive_dir = project_root / "meta" / "route_decisions"
-    if not archive_dir.exists():
-        return {}
-    candidates: list[tuple[float, dict[str, Any]]] = []
-    for path in archive_dir.glob("*.json"):
-        payload = read_json(path, default={}) or {}
-        if isinstance(payload, dict) and payload.get("trigger_stage") == replay_from:
-            candidates.append((path.stat().st_mtime, payload))
-    if not candidates:
-        return {}
-    candidates.sort(key=lambda item: item[0])
-    return candidates[-1][1]
-
-
-def _route_trace_decision_for_replay(project_root: Path, replay_from: str) -> dict[str, Any]:
-    trace_path = project_root / "meta" / "iteration_trace.jsonl"
-    if not trace_path.exists():
-        return {}
-    selected: dict[str, Any] = {}
-    for line in trace_path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if payload.get("event") == "route_decision" and payload.get("from_stage") == replay_from:
-            selected = payload
-    if not selected:
-        return {}
-    return {
-        "trigger_stage": selected.get("from_stage"),
-        "failure_class": selected.get("failure_class"),
-        "decision": selected.get("decision"),
-        "next_stage": selected.get("to_stage"),
-        "reason_codes": selected.get("reason_codes") or [],
-    }
-
-
-def _prepare_replay_route_context(route_context: dict[str, Any], replay_from: str, expected: dict[str, Any] | None = None) -> None:
-    if replay_from != "S3_experiment" or not isinstance(route_context, dict):
-        return
-    # Later retries may overwrite S2/S2.5 gate artifacts after the S3 route.
-    # Replay-from-S3 isolates the proxy route inputs.
-    if isinstance(route_context.get("s2"), dict):
-        route_context["s2"]["planner_gate"] = "pass"
-    if isinstance(route_context.get("s2_5"), dict):
-        route_context["s2_5"]["patch_gate"] = "pass"
-    reason_codes = set((expected or {}).get("reason_codes") or [])
-    budgets = route_context.get("budgets") if isinstance(route_context.get("budgets"), dict) else {}
-    if "same_direction_budget_remaining" in reason_codes and isinstance(budgets, dict):
-        max_failures = int(budgets.get("max_same_direction_proxy_failures") or 0)
-        if max_failures > 0:
-            budgets["same_direction_proxy_failures"] = min(int(budgets.get("same_direction_proxy_failures") or 0), max_failures - 1)
+    if (project_root / "meta" / "research_events.sqlite3").exists():
+        ResearchEventLedger(project_root).state()
+    return []
 
 
 def _route_decision_summary(decision: dict[str, Any]) -> dict[str, Any]:

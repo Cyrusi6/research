@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "trial_spec_hash", "attempt_id", "entries"],
+  "properties": {
+    "schema_version": {"const": "auto_research_evidence_manifest_v1"},
+    "trial_spec_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "entries": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["evidence_id", "kind", "relative_path", "content_hash", "schema_version", "attempt_id", "variant_spec_hash", "trial_spec_hash", "cross_references"],
+        "properties": {
+          "evidence_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"},
+          "kind": {"enum": ["proxy_baseline_fingerprint", "proxy_cache_report", "effective_proxy_policy", "proxy_calibration_policy", "proxy_decision_report", "full_s3_readiness", "activation_evidence", "bootstrap_completion", "main_results", "ablation_results", "coverage_results", "matched_control_results"]},
+          "relative_path": {"type": "string", "minLength": 1, "pattern": "^(?!/).+$"},
+          "content_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "schema_version": {"type": "string", "minLength": 1},
+          "attempt_id": {"type": "string", "minLength": 1},
+          "variant_spec_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "trial_spec_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "policy_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "baseline_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+          "cross_references": {"type": "object", "additionalProperties": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+        }
+      }
+    }
+  }
+}

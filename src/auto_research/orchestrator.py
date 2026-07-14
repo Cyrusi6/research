@@ -28,7 +28,7 @@ from .llm import ModelClient
 from .method_memory import append_shared_c2c_method_failure
 from .orchestration_state import OrchestrationStateManager
 from .reporting import build_project_report
-from .research_state import IntegrityError
+from .research_state import IntegrityError, ResearchEventLedger
 from .s0_enrichment import DeepSeekS0SemanticEnricher
 from .registry import begin_stage, block_stage, complete_stage, fail_stage, increment_judge_retry, invalidate_from, load_registry, pause_stage_retryable, save_registry, set_review_outcome
 from .stage_contracts import StageContractManager
@@ -337,7 +337,15 @@ class Orchestrator:
                     return {"status": "blocked", "stage": stage_key, "reason": registry["blocked_reason"]}
                 gate_report = gate_s1(project_root, config)
             elif stage_key == "S2_plan":
-                result = PlanAgent(context).run()
+                try:
+                    result = PlanAgent(context).run()
+                except (ValueError, IntegrityError) as exc:
+                    reason = f"S2 authoritative TrialSpec planning rejected before reservation: {exc}"
+                    block_stage(registry, stage_key, reason)
+                    save_registry(registry_path, registry)
+                    state.stage_blocked(registry, stage_key, reason)
+                    contracts.stage_stopped(stage_key, status="blocked", reason=reason, config=config, iteration=registry.get("iteration"))
+                    return {"status": "blocked", "stage": stage_key, "reason": reason}
                 gate_report = gate_s2(project_root, config)
             elif stage_key == "S3_experiment":
                 try:
@@ -357,14 +365,22 @@ class Orchestrator:
                 gate_payload["report_path"] = gate_record["path"]
                 state.gate_recorded(registry, stage_key, passed=ok, reason=reason, report=gate_payload)
                 contracts.gate_recorded(stage_key, gate_payload, report_path=gate_record["path"])
-                route_outcome = result.get("route_outcome") if isinstance(result.get("route_outcome"), dict) else {}
                 if not ok:
                     reason = reason or "S3 strict gate rejected TrialResult or event-derived state"
                     block_stage(registry, stage_key, reason)
                     save_registry(registry_path, registry)
                     state.stage_blocked(registry, stage_key, reason)
                     contracts.stage_stopped(stage_key, status="blocked", reason=reason, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
-                    return {"status": "blocked", "stage": stage_key, "reason": reason, "route_outcome": route_outcome}
+                    return {"status": "blocked", "stage": stage_key, "reason": reason, "route_outcome": result.get("route_outcome")}
+                try:
+                    route_outcome = self._authoritative_s3_route(project_root, result)
+                except IntegrityError as exc:
+                    reason = f"S3 RouteOutcome integrity conflict: {exc}"
+                    block_stage(registry, stage_key, reason)
+                    save_registry(registry_path, registry)
+                    state.stage_blocked(registry, stage_key, reason)
+                    contracts.stage_stopped(stage_key, status="blocked", reason=reason, artifacts=result.get("artifacts", []), config=config, iteration=registry.get("iteration"))
+                    return {"status": "blocked", "stage": stage_key, "reason": reason}
                 next_action = route_outcome.get("next_action")
                 if next_action in {"PROPOSE_NEXT_VARIANT", "REPAIR_IMPLEMENTATION"}:
                     complete_stage(registry, stage_key, artifacts=result.get("artifacts", []))
@@ -540,6 +556,76 @@ class Orchestrator:
         state.mark_completed(registry)
         self._finalize_c2c_e2e_run(project_root, config, registry)
         return {"status": registry["status"], "project_id": registry["project_id"]}
+
+    @staticmethod
+    def _authoritative_s3_route(project_root: Path, result: dict[str, Any]) -> dict[str, Any]:
+        diagnostic_route = result.get("route_outcome")
+        result_attempt = result.get("attempt")
+        attempt_id = result_attempt.get("attempt_id") if isinstance(result_attempt, dict) else None
+        committed = result.get("committed_event") if isinstance(result.get("committed_event"), dict) else {}
+        source_event_id = result.get("committed_event_id") or committed.get("event_id")
+        source_sequence = result.get("committed_event_sequence") or committed.get("sequence")
+        committed_attempt_id = result.get("committed_attempt_id") or committed.get("attempt_id") or attempt_id
+        if not isinstance(attempt_id, str) or not attempt_id:
+            raise IntegrityError("ExperimentAgent result is missing committed attempt identity")
+        if not isinstance(source_event_id, str) or not source_event_id:
+            raise IntegrityError("ExperimentAgent result is missing committed event identity")
+        if not isinstance(source_sequence, int) or source_sequence < 1:
+            raise IntegrityError("ExperimentAgent result is missing committed event sequence")
+        if committed_attempt_id != attempt_id:
+            raise IntegrityError("committed event attempt does not match result attempt")
+
+        ledger = ResearchEventLedger(project_root)
+        query_operation_result = getattr(ledger, "query_operation_result", None)
+        if not callable(query_operation_result):
+            raise IntegrityError("Ledger query_operation_result API is required for authoritative S3 routing")
+        operation_result = query_operation_result(source_event_id)
+        if not isinstance(operation_result, dict):
+            raise IntegrityError("committed event has no authoritative OperationResult")
+        if operation_result.get("event_id") != source_event_id:
+            raise IntegrityError("OperationResult event identity mismatch")
+        if operation_result.get("sequence") != source_sequence:
+            raise IntegrityError("OperationResult sequence mismatch")
+        if operation_result.get("attempt_id") != attempt_id:
+            raise IntegrityError("OperationResult belongs to another attempt")
+        authoritative_route = operation_result.get("route_outcome")
+        if not isinstance(authoritative_route, dict):
+            raise IntegrityError("committed operation did not deterministically produce a RouteOutcome")
+        authoritative_source = authoritative_route.get("source") or {}
+        if authoritative_source.get("event_id") != source_event_id:
+            raise IntegrityError("authoritative RouteOutcome event identity mismatch")
+        if authoritative_source.get("sequence") != source_sequence:
+            raise IntegrityError("authoritative RouteOutcome sequence mismatch")
+        if authoritative_source.get("attempt_id") != attempt_id:
+            raise IntegrityError("authoritative RouteOutcome attempt identity mismatch")
+        if diagnostic_route is not None and not isinstance(diagnostic_route, dict):
+            raise IntegrityError("diagnostic RouteOutcome must be an object when present")
+        if isinstance(diagnostic_route, dict) and authoritative_route != diagnostic_route:
+            raise IntegrityError("diagnostic RouteOutcome conflicts with the event-derived RouteOutcome")
+
+        latest_state = ledger.state()
+        latest_route = latest_state.get("last_route_outcome")
+        if not isinstance(latest_route, dict) or latest_route != authoritative_route:
+            raise IntegrityError("stale S3 result does not reference the latest committed RouteOutcome")
+        latest_source = latest_route.get("source") or {}
+        if (
+            latest_source.get("event_id") != source_event_id
+            or latest_source.get("sequence") != source_sequence
+            or latest_source.get("attempt_id") != attempt_id
+        ):
+            raise IntegrityError("latest RouteOutcome source identity is inconsistent")
+        allowed_actions = {
+            "REPAIR_IMPLEMENTATION",
+            "PROPOSE_NEXT_VARIANT",
+            "START_NEW_DIRECTION",
+            "FINISH_DIRECTION",
+            "FINISH_RUN",
+            "PAUSE_RESOURCE",
+            "BLOCK_INTEGRITY",
+        }
+        if latest_route.get("next_action") not in allowed_actions:
+            raise IntegrityError(f"unknown or illegal authoritative RouteOutcome action: {latest_route.get('next_action')!r}")
+        return latest_route
 
     def _prepare_c2c_e2e_run(
         self,

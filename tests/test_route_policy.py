@@ -35,5 +35,7 @@ def test_resource_and_integrity_have_unified_actions(tmp_path: Path) -> None:
         direction = _direction()
         variant = _variant(direction, 1)
         _initialize(ledger, direction, variant)
-        _, route = _complete(ledger, _reserve(ledger, direction, variant), outcome=outcome, evaluable=False, failure=failure)
+        attempt = _reserve(ledger, direction, variant)
+        ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+        _, route = _complete(ledger, attempt, outcome=outcome, evaluable=False, failure=failure)
         assert route["next_action"] == expected

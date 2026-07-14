@@ -11,6 +11,7 @@ import re
 import time
 from pathlib import Path
 from typing import Any
+from copy import deepcopy
 
 
 from ..c2c import C2CAdapter, DEFAULT_BASELINE, c2c_candidate_config_overrides, c2c_proxy_screen_config, default_c2c_ideas
@@ -29,11 +30,11 @@ from ..s3_proxy_contracts import (
 )
 from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, sha256_file, write_json
 from ..domain_contracts import (
+    EVIDENCE_MANIFEST_SCHEMA_VERSION,
     EXECUTION_OBSERVATION_SCHEMA_VERSION,
-    attempt_input_hash,
-    canonical_hash,
     classify_trial_result,
     implementation_hash,
+    trial_spec_hash,
     validate_direction_identity,
     validate_variant_identity,
 )
@@ -82,52 +83,17 @@ class ExperimentAgent:
             files=_implementation_file_hashes(self.context.project_root, patch_manifest),
             manifest=implementation_contract,
         )
-        protocol = trial_spec.get("protocol") if isinstance(trial_spec.get("protocol"), dict) else trial_spec
-        sample_manifest = trial_spec.get("sample_manifest") if isinstance(trial_spec.get("sample_manifest"), dict) else {"datasets": trial_spec.get("datasets") or []}
-        seed_values = ((trial_spec.get("statistical_testing") or {}).get("seeds") or self.context.config.get("experiment", {}).get("random_seeds") or [42])
-        seeds = [int(item) for item in seed_values]
-        protocol_hash = canonical_hash(protocol)
-        sample_manifest_hash = canonical_hash(sample_manifest)
-        runtime_config = trial_spec.get("execution") if isinstance(trial_spec.get("execution"), dict) else {}
-        runtime_config_hash = canonical_hash(runtime_config)
-        evaluator_hash = canonical_hash(trial_spec.get("metrics") or variant.get("expected_metric_signature") or {})
-        input_hash = attempt_input_hash(
-            implementation_hash_value=implementation_hash_value,
-            protocol=protocol,
-            sample_manifest=sample_manifest,
-            seeds=seeds,
-            runtime_config=runtime_config,
-            evaluator_hash=evaluator_hash,
-        )
         profile = str(((self.context.config.get("orchestration") or {}).get("profile") or "standard")).lower()
-        default_terminal_phase = "proxy" if profile == "bootstrap" else "full"
-        protocol_required_phases = sorted(str(item) for item in (protocol.get("required_phases") or [default_terminal_phase])) if isinstance(protocol, dict) else [default_terminal_phase]
-        protocol_required_roles = sorted(str(item) for item in (protocol.get("required_roles") or ["baseline", "candidate"])) if isinstance(protocol, dict) else ["baseline", "candidate"]
-        required_datasets = sorted(
-            str(item.get("name") if isinstance(item, dict) else item)
-            for item in (sample_manifest.get("datasets") or [])
-            if (item.get("name") if isinstance(item, dict) else item)
-        )
         attempt = ledger.reserve_attempt(
             profile=profile,
             direction=direction,
             variant=variant,
             implementation_hash=implementation_hash_value,
-            attempt_input_hash=input_hash,
             attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full",
-            protocol_hash=protocol_hash,
-            sample_manifest_hash=sample_manifest_hash,
-            runtime_config_hash=runtime_config_hash,
-            evaluator_hash=evaluator_hash,
-            seeds=seeds,
-            required_datasets=required_datasets,
-            required_phases=protocol_required_phases,
-            terminal_method_phases=sorted(str(item) for item in (protocol.get("terminal_method_phases") or protocol_required_phases)) if isinstance(protocol, dict) else protocol_required_phases,
-            required_roles=protocol_required_roles,
-            require_complete_seed_coverage=bool(protocol.get("require_complete_seed_coverage", protocol.get("require_seed_coverage", False))) if isinstance(protocol, dict) else False,
+            trial_spec=deepcopy(trial_spec),
         )
-        plan = trial_spec
-        execution = plan.get("execution", {})
+        plan = _trial_execution_view(trial_spec)
+        execution = plan["execution"]
         simulate = bool(self.context.config.get("experiment", {}).get("simulate"))
         if revisions:
             revision_record = self.context.artifacts.write_text(
@@ -150,7 +116,12 @@ class ExperimentAgent:
                 "route_outcome": route,
             }
         if attempt["state"] in {"READY", "RESOURCE_PAUSED"}:
-            attempt = ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
+            attempt = self._prepare_attempt_execution(
+                ledger,
+                attempt,
+                resource_probe_path=self.context.project_root / env_record["path"] if attempt["state"] == "RESOURCE_PAUSED" else None,
+                project_root=self.context.project_root,
+            )
         elif attempt["state"] != "PROXY_RUNNING":
             raise IntegrityError(f"attempt {attempt['attempt_id']} cannot resume execution from {attempt['state']}")
 
@@ -178,7 +149,7 @@ class ExperimentAgent:
                 execution_workdir = Path(execution.get("workdir") or self.context.project_root)
                 log_path = self.context.project_root / "experiment" / "logs" / "command_runs.json"
                 run_result = self.runner.run_plan_commands(commands, execution_workdir, log_path)
-                self.context.artifacts.copy_into_stage(
+                log_record = self.context.artifacts.copy_into_stage(
                     self.stage_key,
                     log_path,
                     "logs/command_runs.json",
@@ -193,7 +164,17 @@ class ExperimentAgent:
                         artifact_type="self_heal_log",
                         summary="Self-heal trace",
                     )
-                    result = {"artifacts": [env_record["path"]], "status": "failed", "blocked_reason": "Experiment commands failed."}
+                    result = {
+                        "artifacts": [env_record["path"], log_record["path"]],
+                        "status": "failed",
+                        "failure_class": "implementation_failure",
+                        "failure_evidence": {
+                            "command_status": "failed",
+                            "exit_code": next((run.get("returncode") for run in run_result.get("runs") or [] if run.get("returncode") not in {None, 0}), 1),
+                            "artifact_path": log_record["path"],
+                            "reason": "Experiment command returned a non-zero exit code.",
+                        },
+                    }
                 elif execution.get("collector") == "laps_eval":
                     result = self._collect_laps_eval_results(log_path, env_record["path"], revision_record["path"] if revision_record else None)
                 else:
@@ -214,26 +195,67 @@ class ExperimentAgent:
             artifact_path = self.context.project_root / rel_path
             if artifact_path.exists() and artifact_path.is_file():
                 raw_artifacts[str(rel_path)] = sha256_file(artifact_path)
-        observations = _typed_execution_observations(main_results, trial_spec, attempt, raw_artifacts)
+        evidence_manifest = _event_bound_evidence_manifest(
+            project_root=self.context.project_root,
+            trial_spec=trial_spec,
+            attempt=attempt,
+            raw_artifacts=raw_artifacts,
+        )
+        ablation_results = read_json(self.context.project_root / "experiment" / "results" / "ablation_results.json", default={}) or {}
+        matched_control_results = read_json(self.context.project_root / "experiment" / "results" / "matched_control_results.json", default={}) or {}
+        coverage_results = read_json(self.context.project_root / "experiment" / "results" / "coverage_results.json", default={}) or {}
+        observations = _typed_execution_observations(
+            main_results,
+            trial_spec,
+            attempt,
+            raw_artifacts,
+            ablation_results=ablation_results,
+            matched_control_results=matched_control_results,
+            coverage_results=coverage_results,
+        )
         if not observations:
             failure_class = _structured_failure_class(result, main_results)
+            evidence = _failure_evidence_from_result(
+                project_root=self.context.project_root,
+                attempt=attempt,
+                result=result,
+                failure_class=failure_class,
+                raw_artifacts=raw_artifacts,
+            )
+            if evidence is None:
+                return self._quarantine_invalid_s3(
+                    result,
+                    attempt,
+                    S3ValidationError("structured failure requires a registered log/result artifact with a verified hash"),
+                    [],
+                    raw_artifacts,
+                )
             try:
                 validate_failure_precommit(
                     project_root=self.context.project_root,
                     attempt=attempt,
-                    failure_class=failure_class,
+                    failure_class=str(failure_class),
                     result=result,
                     artifact_hashes=raw_artifacts,
                     state=ledger.state(),
                 )
             except S3ValidationError as exc:
                 return self._quarantine_invalid_s3(result, attempt, exc, [], raw_artifacts)
-            completed_attempt, route = ledger.disposition_attempt(attempt["attempt_id"], failure_class=failure_class, artifact_hashes=raw_artifacts)
+            completed_attempt, route = ledger.disposition_failure(evidence)
             result["attempt"] = completed_attempt
             result["route_outcome"] = route
+            result["committed_event_id"] = route["source"]["event_id"]
+            result["committed_event_sequence"] = route["source"]["sequence"]
+            result["committed_attempt_id"] = completed_attempt["attempt_id"]
             return result
         try:
-            trial = classify_trial_result(attempt=attempt, trial_spec=trial_spec, observations=observations, raw_artifacts=raw_artifacts)
+            trial = classify_trial_result(
+                attempt=attempt,
+                trial_spec=trial_spec,
+                observations=observations,
+                raw_artifacts=raw_artifacts,
+                evidence_manifest=evidence_manifest,
+            )
             validate_trial_precommit(
                 project_root=self.context.project_root,
                 direction=read_json(self.context.project_root / "literature" / "direction.json", default={}) or {},
@@ -253,7 +275,48 @@ class ExperimentAgent:
         result.setdefault("artifacts", []).append("experiment/results/trial_result.json")
         result["attempt"] = completed_attempt
         result["route_outcome"] = route
+        result["committed_event_id"] = route["source"]["event_id"]
+        result["committed_event_sequence"] = route["source"]["sequence"]
+        result["committed_attempt_id"] = completed_attempt["attempt_id"]
         return result
+
+    @staticmethod
+    def _prepare_attempt_execution(
+        ledger: ResearchEventLedger,
+        attempt: dict[str, Any],
+        *,
+        resource_probe_path: Path | None,
+        project_root: Path,
+    ) -> dict[str, Any]:
+        current = attempt
+        if hasattr(ledger, "state"):
+            state = ledger.state()
+            current = (state.get("attempts") or {}).get(attempt["attempt_id"], attempt)
+        if current["state"] == "RESOURCE_PAUSED":
+            if resource_probe_path is None or not resource_probe_path.is_file():
+                raise IntegrityError("resource resume requires a current resource probe artifact")
+            try:
+                artifact_path = str(resource_probe_path.relative_to(project_root))
+            except ValueError:
+                artifact_path = str(resource_probe_path)
+            resume_evidence = {
+                "schema_version": "auto_research_resume_evidence_v1",
+                "attempt_id": current["attempt_id"],
+                "lifecycle_generation": current["lifecycle_generation"],
+                "implementation_hash": current["implementation_hash"],
+                "attempt_input_hash": current["attempt_input_hash"],
+                "resource_type": "execution_capacity",
+                "probe_status": "available",
+                "artifact": {"path": artifact_path, "sha256": sha256_file(resource_probe_path)},
+                "observed_at": now_utc(),
+            }
+            current = ledger.resume_attempt(resume_evidence)
+        if current["state"] != "READY":
+            raise IntegrityError(f"attempt {current['attempt_id']} cannot enter execution from {current['state']}")
+        proxy_state = (current.get("phases") or {}).get("proxy")
+        if proxy_state == "COMPLETED" and current["attempt_kind"] == "proxy_full":
+            return ledger.transition_attempt(current["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+        return ledger.transition_attempt(current["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
 
     def _quarantine_invalid_s3(
         self,
@@ -307,14 +370,16 @@ class ExperimentAgent:
         )
 
     def _run_simulated(self, plan: dict[str, Any], env_source: str, revision_source: str | None) -> dict[str, Any]:
-        baseline_name = plan["baselines"][0]["name"]
+        baseline_name = str((((plan.get("execution_contract") or {}).get("runtime_config") or {}).get("baseline") or {}).get("name") or "registered_baseline")
         variant = read_json(self.context.project_root / "plan" / "variant.json", default={}) or {}
         results = {
+            "schema_version": "auto_research_main_results_v1",
             "baseline": {"name": baseline_name, "primary_metric": {"mean": 78.4, "std": 0.5}},
             "proposed_method": {"name": variant.get("variant_id"), "primary_metric": {"mean": 80.1, "std": 0.4}},
             "acceptance": {"passed": True, "baseline_mean": 78.4, "candidate_mean": 80.1},
         }
         ablation = {
+            "schema_version": "auto_research_ablation_results_v1",
             "full_model": 80.1,
             "without_core_module": 78.9,
         }
@@ -855,6 +920,7 @@ class ExperimentAgent:
         comparison_candidate = best or best_proxy
         comparison = self._c2c_acceptance_comparison(comparison_candidate, execution.get("baseline") or adapter.baseline, min_delta, max_regression)
         main_payload = {
+            "schema_version": "c2c_main_results_v1",
             "baseline": execution.get("baseline") or adapter.baseline,
             "best_candidate": best,
             "best_proxy_candidate": best_proxy,
@@ -917,6 +983,44 @@ class ExperimentAgent:
         main_payload = _compact_c2c_result_payload(main_payload)
         ablation_payload = _compact_c2c_result_payload(ablation_payload)
         sources = copied_sources
+        matched_control_record = None
+        coverage_record = None
+        full_readiness_record = None
+        if isinstance(best, dict) and isinstance(best.get("matched_control_metrics"), dict):
+            matched_control_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "results/matched_control_results.json",
+                {"schema_version": "auto_research_matched_control_results_v1", **best["matched_control_metrics"]},
+                artifact_type="matched_control_results",
+                summary="Pre-registered matched-control execution results",
+                source_paths=sources,
+            )
+        if isinstance(best, dict) and isinstance(best.get("coverage_metrics"), dict):
+            coverage_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "results/coverage_results.json",
+                {"schema_version": "auto_research_coverage_results_v1", **best["coverage_metrics"]},
+                artifact_type="coverage_results",
+                summary="Pre-registered execution coverage results",
+                source_paths=sources,
+            )
+        readiness_path = self.context.project_root / "experiment" / "results" / "c2c_full_s3_worthiness.json"
+        if isinstance(best, dict) and not readiness_path.is_file():
+            full_readiness_record = self.context.artifacts.write_json(
+                self.stage_key,
+                "results/c2c_full_s3_worthiness.json",
+                {
+                    "schema_version": "c2c_proxy_to_full_readiness_v1",
+                    "candidate_id": best.get("id"),
+                    "run_id": best.get("run_id"),
+                    "status": "ready",
+                    "full_train_allowed": True,
+                    "source": "verified_direct_full_execution",
+                },
+                artifact_type="c2c_full_s3_readiness",
+                summary="Direct full-execution readiness evidence",
+                source_paths=sources,
+            )
         main_record = self.context.artifacts.write_json(
             self.stage_key,
             "results/main_results.json",
@@ -1017,6 +1121,9 @@ class ExperimentAgent:
                         failure_analysis_record["path"],
                         *([bootstrap_record["path"]] if bootstrap_record else []),
                         *([feedback_record["path"]] if feedback_record else []),
+                        *([matched_control_record["path"]] if matched_control_record else []),
+                        *([coverage_record["path"]] if coverage_record else []),
+                        *([full_readiness_record["path"]] if full_readiness_record else []),
                     ],
                     "status": "blocked",
                     "blocked_reason": blocked_reason,
@@ -1032,6 +1139,9 @@ class ExperimentAgent:
                 failure_analysis_record["path"],
                 *([bootstrap_record["path"]] if bootstrap_record else []),
                 *([feedback_record["path"]] if feedback_record else []),
+                *([matched_control_record["path"]] if matched_control_record else []),
+                *([coverage_record["path"]] if coverage_record else []),
+                *([full_readiness_record["path"]] if full_readiness_record else []),
             ],
             "status": "ok" if comparison.get("passed") or (bootstrap_proxy_only and best_proxy) else "not_viable",
         }
@@ -2536,6 +2646,16 @@ class ExperimentAgent:
                 "require_ablation_support": require_ablation_support,
             },
             "mechanism_supported": mechanism_supported,
+            "matched_control_metrics": (
+                {"mean": adapter.baseline.get("mean"), "datasets": deepcopy(adapter.baseline.get("datasets") or {})}
+                if simulate and metrics is not None
+                else deepcopy(run_state.get("matched_control_metrics"))
+            ),
+            "coverage_metrics": (
+                {"mean": 1.0, "datasets": {dataset_id: 1.0 for dataset_id in (metrics or {}).get("datasets", {})}}
+                if simulate and metrics is not None
+                else deepcopy(run_state.get("coverage_metrics"))
+            ),
             "decision": decision,
             "command_logs": _compact_event_logs(logs),
         }
@@ -6360,26 +6480,34 @@ def _typed_execution_observations(
     trial_spec: dict[str, Any],
     attempt: dict[str, Any],
     raw_artifacts: dict[str, str],
+    *,
+    ablation_results: dict[str, Any] | None = None,
+    matched_control_results: dict[str, Any] | None = None,
+    coverage_results: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     if not raw_artifacts:
         return []
-    artifact_hash = raw_artifacts.get("experiment/results/main_results.json") or next(iter(raw_artifacts.values()))
+    artifact_hash = raw_artifacts.get("experiment/results/main_results.json")
+    if not artifact_hash:
+        return []
     datasets = []
     sample_manifest = trial_spec.get("sample_manifest") if isinstance(trial_spec.get("sample_manifest"), dict) else {}
     for item in sample_manifest.get("datasets") or trial_spec.get("datasets") or []:
-        value = item.get("name") if isinstance(item, dict) else item
+        value = item.get("dataset_id") if isinstance(item, dict) else item
         if value:
             datasets.append(str(value))
     datasets = sorted(set(datasets))
     if not datasets:
         return []
-    primary = next((item for item in trial_spec.get("metrics") or [] if isinstance(item, dict) and item.get("primary")), {})
-    metric_id = str(primary.get("name") or primary.get("metric_id") or "primary_metric")
+    metric_id = str(trial_spec.get("primary_metric_id") or "")
+    if not metric_id:
+        return []
     phase = "proxy" if attempt["attempt_kind"] in {"proxy", "bootstrap_proxy"} else "full"
     baseline_values, candidate_values = _metric_values_by_dataset(main_results, datasets)
     if set(candidate_values) != set(datasets):
         return []
     observations = []
+    result_path = "experiment/results/main_results.json"
     for role, values in [("baseline", baseline_values), ("candidate", candidate_values)]:
         for dataset_id, metric_value in values.items():
             if not isinstance(metric_value, (int, float)) or isinstance(metric_value, bool):
@@ -6387,6 +6515,7 @@ def _typed_execution_observations(
             observations.append(
                 {
                     "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+                    "observation_id": f"{attempt['attempt_id']}:{phase}:{role}:{dataset_id}:{metric_id}:{int(attempt['seeds'][0])}",
                     "phase": phase,
                     "role": role,
                     "command_status": "completed",
@@ -6396,10 +6525,79 @@ def _typed_execution_observations(
                     "sample_manifest_hash": attempt["sample_manifest_hash"],
                     "evaluator_hash": attempt["evaluator_hash"],
                     "seed": int(attempt["seeds"][0]),
+                    "raw_artifact_path": result_path,
                     "raw_artifact_hash": artifact_hash,
                 }
             )
+    if "ablation" in (trial_spec.get("required_roles") or []):
+        ablation_hash = raw_artifacts.get("experiment/results/ablation_results.json")
+        if not ablation_hash or not isinstance(ablation_results, dict):
+            return []
+        ablation_values = _ablation_values_by_dataset(ablation_results, datasets)
+        if set(ablation_values) != set(datasets):
+            return []
+        for dataset_id, ablation_value in ablation_values.items():
+            observations.append(
+                {
+                    "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+                    "observation_id": f"{attempt['attempt_id']}:ablation:ablation:{dataset_id}:{metric_id}:{int(attempt['seeds'][0])}",
+                    "phase": "ablation",
+                    "role": "ablation",
+                    "command_status": "completed",
+                    "dataset_id": dataset_id,
+                    "metric_id": metric_id,
+                    "metric_value": float(ablation_value),
+                    "sample_manifest_hash": attempt["sample_manifest_hash"],
+                    "evaluator_hash": attempt["evaluator_hash"],
+                    "seed": int(attempt["seeds"][0]),
+                    "raw_artifact_path": "experiment/results/ablation_results.json",
+                    "raw_artifact_hash": ablation_hash,
+                }
+            )
+    for role, payload, artifact_path in [
+        ("matched_control", matched_control_results, "experiment/results/matched_control_results.json"),
+        ("coverage", coverage_results, "experiment/results/coverage_results.json"),
+    ]:
+        if role not in (trial_spec.get("required_roles") or []):
+            continue
+        role_hash = raw_artifacts.get(artifact_path)
+        role_values = (payload or {}).get("datasets") if isinstance((payload or {}).get("datasets"), dict) else {}
+        if not role_hash or set(role_values) != set(datasets):
+            return []
+        for dataset_id, metric_value in role_values.items():
+            if not isinstance(metric_value, (int, float)) or isinstance(metric_value, bool):
+                return []
+            observations.append(
+                {
+                    "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+                    "observation_id": f"{attempt['attempt_id']}:{phase}:{role}:{dataset_id}:{metric_id}:{int(attempt['seeds'][0])}",
+                    "phase": phase,
+                    "role": role,
+                    "command_status": "completed",
+                    "dataset_id": dataset_id,
+                    "metric_id": metric_id,
+                    "metric_value": float(metric_value),
+                    "sample_manifest_hash": attempt["sample_manifest_hash"],
+                    "evaluator_hash": attempt["evaluator_hash"],
+                    "seed": int(attempt["seeds"][0]),
+                    "raw_artifact_path": artifact_path,
+                    "raw_artifact_hash": role_hash,
+                }
+            )
     return observations
+
+
+def _ablation_values_by_dataset(ablation_results: dict[str, Any], datasets: list[str]) -> dict[str, float]:
+    scalar = ablation_results.get("without_core_module")
+    if isinstance(scalar, (int, float)) and not isinstance(scalar, bool):
+        return {dataset_id: float(scalar) for dataset_id in datasets}
+    candidates = [item for item in ablation_results.get("candidate_ablations") or [] if isinstance(item, dict)]
+    selected_id = ablation_results.get("best_candidate_id")
+    selected = next((item for item in candidates if item.get("candidate_id") == selected_id), None)
+    values = ((selected or {}).get("disabled_metrics") or {}).get("datasets")
+    if not isinstance(values, dict):
+        return {}
+    return {dataset_id: float(values[dataset_id]) for dataset_id in datasets if isinstance(values.get(dataset_id), (int, float)) and not isinstance(values.get(dataset_id), bool)}
 
 
 def _metric_values_by_dataset(main_results: dict[str, Any], datasets: list[str]) -> tuple[dict[str, float], dict[str, float]]:
@@ -6426,17 +6624,165 @@ def _metric_values_by_dataset(main_results: dict[str, Any], datasets: list[str])
     return {}, {}
 
 
-def _structured_failure_class(result: dict[str, Any], main_results: dict[str, Any]) -> str:
+def _structured_failure_class(result: dict[str, Any], main_results: dict[str, Any]) -> str | None:
     explicit = result.get("failure_class") or result.get("failure_classification")
-    if explicit in {"resource_paused", "oom_retry", "resource_unavailable", "integrity", "safety", "identity_mismatch", "artifact_hash_mismatch", "activation_failed", "implementation_failed"}:
+    aliases = {
+        "resource_paused": "resource_pause",
+        "resource_unavailable": "resource_pause",
+        "activation_failed": "activation_failure",
+        "implementation_failed": "implementation_failure",
+        "integrity": "integrity_failure",
+        "identity_mismatch": "integrity_failure",
+        "artifact_hash_mismatch": "integrity_failure",
+        "safety": "safety_failure",
+    }
+    if explicit in {"resource_pause", "oom_retry", "activation_failure", "implementation_failure", "integrity_failure", "safety_failure"}:
         return str(explicit)
+    if explicit in aliases:
+        return aliases[str(explicit)]
     candidates = [item for item in main_results.get("candidate_results") or [] if isinstance(item, dict)]
     if any(item.get("resource_retry") is True or item.get("command_status") == "resource_paused" for item in candidates):
-        return "resource_paused"
+        return "resource_pause"
     if any(item.get("decision") in {"patch_rejected", "proxy_repairable"} for item in candidates):
-        return "activation_failed"
+        return "activation_failure"
     if result.get("status") == "integrity_blocked":
-        return "integrity"
+        return "integrity_failure"
     if result.get("status") == "resource_paused":
-        return "resource_paused"
-    return "implementation_failed"
+        return "resource_pause"
+    return None
+
+
+def _failure_evidence_from_result(
+    *,
+    project_root: Path,
+    attempt: dict[str, Any],
+    result: dict[str, Any],
+    failure_class: str | None,
+    raw_artifacts: dict[str, str],
+) -> dict[str, Any] | None:
+    if failure_class is None:
+        return None
+    supplied = result.get("failure_evidence") if isinstance(result.get("failure_evidence"), dict) else {}
+    artifact_path = str(supplied.get("artifact_path") or "")
+    if not artifact_path or artifact_path not in raw_artifacts:
+        return None
+    absolute_path = project_root / artifact_path
+    if not absolute_path.is_file() or sha256_file(absolute_path) != raw_artifacts[artifact_path]:
+        return None
+    source_phase = "full" if (attempt.get("phases") or {}).get("full") == "RUNNING" else "proxy"
+    validator_check = supplied.get("validator_check")
+    details = dict(supplied.get("details") or {})
+    if failure_class in {"implementation_failure", "integrity_failure"} and not validator_check:
+        validator_check = "execution_failure_evidence"
+    elif failure_class == "activation_failure":
+        validator_check = validator_check or "activation_probe"
+        details.setdefault("activation_probe", str(supplied.get("activation_probe") or validator_check))
+    elif failure_class in {"resource_pause", "oom_retry"}:
+        details.setdefault("resource_type", str(supplied.get("resource_type") or "execution_capacity"))
+        details["available"] = False
+    elif failure_class == "safety_failure":
+        validator_check = validator_check or "safety_check"
+        details.setdefault("safety_check", str(supplied.get("safety_check") or validator_check))
+    evidence = {
+        "schema_version": "auto_research_failure_evidence_v1",
+        "attempt_id": attempt["attempt_id"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "source_state": attempt["state"],
+        "source_phase": source_phase,
+        "failure_class": failure_class,
+        "command_status": supplied.get("command_status"),
+        "exit_code": supplied.get("exit_code"),
+        "validator_check": validator_check,
+        "artifact": {"path": artifact_path, "sha256": raw_artifacts[artifact_path]},
+        "details": details,
+        "reason": str(supplied.get("reason") or ""),
+        "observed_at": str(supplied.get("observed_at") or now_utc()),
+    }
+    if not evidence["reason"]:
+        return None
+    if not evidence["command_status"] and not evidence["validator_check"]:
+        return None
+    return evidence
+
+
+_EVIDENCE_PATHS = {
+    "main_results": "experiment/results/main_results.json",
+    "ablation_results": "experiment/results/ablation_results.json",
+    "coverage_results": "experiment/results/coverage_results.json",
+    "matched_control_results": "experiment/results/matched_control_results.json",
+    "activation_evidence": "plan/code_patches/patch_gate_report.json",
+    "proxy_baseline_fingerprint": "experiment/results/c2c_proxy_baseline_fingerprint.json",
+    "proxy_cache_report": "experiment/results/c2c_proxy_cache_report.json",
+    "effective_proxy_policy": "experiment/results/c2c_effective_proxy_policy.json",
+    "proxy_calibration_policy": "experiment/results/c2c_proxy_calibration_policy.json",
+    "proxy_decision_report": "experiment/results/c2c_proxy_decision_report.json",
+    "full_s3_readiness": "experiment/results/c2c_full_s3_worthiness.json",
+    "bootstrap_completion": "experiment/results/bootstrap_proxy_completion.json",
+}
+
+
+def _trial_execution_view(trial_spec: dict[str, Any]) -> dict[str, Any]:
+    view = deepcopy(trial_spec)
+    runtime = deepcopy((trial_spec.get("execution_contract") or {}).get("runtime_config") or {})
+    view["execution"] = runtime
+    view["datasets"] = [
+        {"name": item["dataset_id"], "split": item["split"], "sample_count": item["sample_count"], "sample_hash": item["sample_hash"]}
+        for item in trial_spec.get("datasets") or []
+    ]
+    view["metrics"] = [
+        {
+            "name": item["metric_id"],
+            "primary": item["role"] == "primary",
+            "higher_is_better": item["objective"] == "maximize",
+        }
+        for item in trial_spec.get("metrics") or []
+    ]
+    criteria: dict[str, Any] = {}
+    for constraint in trial_spec.get("acceptance_constraints") or []:
+        if constraint["kind"] == "minimum_mean_delta":
+            criteria["minimum_mean_delta"] = constraint["threshold"]
+        elif constraint["kind"] == "per_dataset_maximum_regression":
+            criteria["max_dataset_regression"] = constraint["threshold"]
+        elif constraint["kind"] == "matched_control_constraint":
+            criteria["matched_coverage_ablation_required"] = True
+    view["acceptance_criteria"] = criteria
+    return view
+
+
+def _event_bound_evidence_manifest(
+    *,
+    project_root: Path,
+    trial_spec: dict[str, Any],
+    attempt: dict[str, Any],
+    raw_artifacts: dict[str, str],
+) -> dict[str, Any]:
+    spec_hash = trial_spec_hash(trial_spec)
+    entries = []
+    for requirement in trial_spec.get("evidence_requirements") or []:
+        path = _EVIDENCE_PATHS.get(str(requirement.get("kind")))
+        artifact_path = project_root / path if path else None
+        if not path or artifact_path is None or not artifact_path.is_file():
+            continue
+        content_hash = sha256_file(artifact_path)
+        raw_artifacts[path] = content_hash
+        entries.append(
+            {
+                "evidence_id": f"evidence:{attempt['attempt_id']}:{requirement['requirement_id']}",
+                "kind": requirement["kind"],
+                "relative_path": path,
+                "content_hash": content_hash,
+                "schema_version": requirement["schema_version"],
+                "attempt_id": attempt["attempt_id"],
+                "variant_spec_hash": attempt["variant_spec_hash"],
+                "trial_spec_hash": spec_hash,
+                "cross_references": {},
+            }
+        )
+    return {
+        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
+        "trial_spec_hash": spec_hash,
+        "attempt_id": attempt["attempt_id"],
+        "entries": entries,
+    }

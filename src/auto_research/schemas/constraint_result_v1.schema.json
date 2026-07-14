@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "constraint_id", "kind", "hard", "status", "observed", "threshold", "objective", "observation_ids", "evidence_ids"],
+  "properties": {
+    "schema_version": {"const": "auto_research_constraint_result_v1"},
+    "constraint_id": {"type": "string", "minLength": 1},
+    "kind": {"enum": ["minimum_mean_delta", "per_dataset_maximum_regression", "required_ablation_contrast", "matched_control_constraint", "coverage_constraint", "required_artifact_evidence", "primary_metric_threshold", "secondary_metric_threshold"]},
+    "hard": {"type": "boolean"},
+    "status": {"enum": ["PASS", "FAIL", "MISSING"]},
+    "observed": {},
+    "threshold": {"type": ["number", "null"]},
+    "objective": {"type": ["string", "null"], "enum": ["maximize", "minimize", null]},
+    "observation_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "evidence_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+  }
+}

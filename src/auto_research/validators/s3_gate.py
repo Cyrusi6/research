@@ -7,7 +7,7 @@ from auto_research.research_state import IntegrityError, ResearchEventLedger
 from auto_research.s3_validation import S3ValidationError, validate_committed_s3
 from auto_research.utils import read_json
 
-from .base import StageGateValidator, load_schema, validate_min_schema
+from .base import StageGateValidator
 
 
 class S3GateValidator(StageGateValidator):
@@ -73,24 +73,4 @@ class S3GateValidator(StageGateValidator):
                 self.pass_check("bootstrap_failure_route")
             else:
                 self.retry_check("bootstrap_proxy_complete", "bootstrap may finish only after one verified evaluable cheap proxy")
-        self._validate_proxy_contracts_if_present()
         return self.finalize()
-
-    def _validate_proxy_contracts_if_present(self):
-        artifacts = {
-            "baseline_fingerprint": ("experiment/results/c2c_proxy_baseline_fingerprint.json", "c2c_proxy_baseline_fingerprint.schema.json"),
-            "cache_report": ("experiment/results/c2c_proxy_cache_report.json", "c2c_proxy_cache_report.schema.json"),
-            "effective_policy": ("experiment/results/c2c_effective_proxy_policy.json", "c2c_effective_proxy_policy.schema.json"),
-            "decision_report": ("experiment/results/c2c_proxy_decision_report.json", "c2c_proxy_decision_report.schema.json"),
-            "calibration_policy": ("experiment/results/c2c_proxy_calibration_policy.json", "c2c_proxy_calibration_policy.schema.json"),
-        }
-        if not any((self.project_root / path).exists() for path, _ in artifacts.values()):
-            return
-        for name, (path, schema_name) in artifacts.items():
-            if not (self.project_root / path).exists():
-                continue
-            schema_errors = validate_min_schema(self.read_json_artifact(path), load_schema(schema_name))
-            if schema_errors:
-                self.retry_check(f"{name}_schema", f"{path} failed schema validation", details={"errors": schema_errors[:20]})
-            else:
-                self.pass_check(f"{name}_schema", artifact=path)

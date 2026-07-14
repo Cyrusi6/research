@@ -1,5 +1,16 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-14 M1.1.2 Authoritative Attempt / S3 Transaction Closure
+
+- Upgraded the breaking authority layer to Event v3, AttemptRecord v3, TrialSpec v2, ExecutionObservation v2, TrialResult v3, and RouteOutcome v3; prior workspaces are rejected and must restart from S1.
+- `reserve_attempt()` now validates and freezes the complete TrialSpec, then derives protocol, sample-manifest, acceptance-contract, and attempt-input hashes inside the Ledger transaction.
+- Public attempt transitions can only advance execution states. Structured FailureEvidence exclusively derives implementation repair, resource pause, and integrity block; ResumeEvidence exclusively restores `RESOURCE_PAUSED -> READY` without changing attempt or variant identity.
+- S3 precommit, Ledger commit, and postcommit Gate share one validator over frozen TrialSpec, exact observation/result artifacts, activation/proxy/readiness evidence, roles, seeds, phases, constraints, identity, and budget.
+- The deterministic classifier emits ConstraintResult records. Missing required ablation/control/coverage evidence is non-evaluable and zero-write; complete hard-constraint failures are rejected outcomes; only fully passing accepted outcomes can become aggregate best.
+- Orchestrator control is read back from the committed SQLite event. Result routes are diagnostic-only and must canonically equal the event-bound RouteOutcome.
+- Project-global `execution_width=1`, five-slot budget invariants, lifecycle-scoped idempotency, late replay, corrupt/future projection recovery, and sixth-reservation rejection are reducer invariants.
+- Generic and C2C simulated standard runs complete five semantic variants; C2C simulation now emits explicit matched-control, coverage, ablation, activation, and full-readiness evidence rather than relying on mutable summaries.
+
 ## 2026-07-14 M1.1 Authoritative State And S3 Transaction Hardening
 
 - Replaced JSON event files with one SQLite-WAL Event v2 store using transactional sequence allocation, strict type-specific payload validation, event/hash-chain verification, and deterministic rebuilds.

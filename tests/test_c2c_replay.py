@@ -15,6 +15,6 @@ def test_c2c_replay_rebuilds_generic_event_state(tmp_path: Path) -> None:
     plan = build_c2c_replay_plan(tmp_path)
     result = build_c2c_replay_result(tmp_path, plan)
 
-    assert plan["expected_decision_source"] == "meta/research_events"
+    assert plan["expected_decision_source"] == "meta/research_events.sqlite3"
     assert result["status"] == "match"
     assert result["replayed_decisions"]["route_decision"] == "PROPOSE_NEXT_VARIANT"

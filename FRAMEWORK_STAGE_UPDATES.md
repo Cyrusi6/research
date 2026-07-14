@@ -2875,7 +2875,7 @@ uv run pytest -q tests/test_validators.py tests/test_c2c.py tests/test_pipeline.
 
 ## 2026-07-14 M1.1 权威状态层与 S3 提交事务
 
-- 2026-07-14 M1.1 replaces the prior S1-S3 event/snapshot implementation with SQLite WAL Event v2 as the only authority. DirectionSpec v3, VariantSpec v4, AttemptRecord v2, TrialResult v2, and RouteOutcome v2 are breaking contracts; v1 workspaces must rerun from S1.
+- 2026-07-14 M1.1 introduced SQLite WAL as the only authority; M1.1.2 supersedes those payloads with Event v3, AttemptRecord v3, TrialSpec v2, TrialResult v3, and RouteOutcome v3. Older workspaces must rerun from S1.
 - S3 now validates typed ExecutionObservation drafts before committing. TrialResult, terminal attempt state, reservation/budget mutation, route, and the fifth-outcome aggregate are one atomic domain event.
 - The reducer enforces continuous hash-chained events, explicit attempt transitions, repair revision history, retained reservations, explicit abandonment, standard `consumed + reserved <= 5`, and no reopening of closed semantic directions.
 - Standard deterministic generic and C2C simulation generate five scientifically distinct intervention configurations. Bootstrap remains one verified non-budget proxy and cannot collide with standard attempt identity.
@@ -2887,3 +2887,11 @@ uv run pytest -q tests/test_validators.py tests/test_c2c.py tests/test_pipeline.
 - **Reducer authority:** failure class uniquely determines repair/pause/integrity disposition; verified finalization uniquely determines budget and route. Caller-provided derived decisions are not accepted.
 - **Orchestration:** RouteOutcome is interpreted before diagnostic `result.status`; repair, resource pause, integrity block, next variant, new direction, finish direction, and finish run have explicit fail-closed branches.
 - **Projection:** research state, attempt views, latest route, TrialResult, and aggregate are synchronized projections of one SQLite sequence and can be rebuilt after deletion or a commit-before-projection crash.
+
+# 2026-07-14 M1.1.2 Authoritative Attempt / S3 Transaction Closure
+
+- Event v3 is the only S1-S3 authority. AttemptRecord v3 freezes TrialSpec v2 and all derived hashes at reservation; TrialResult v3, RouteOutcome v3, ConstraintResult v1, EvidenceManifest v1, FailureEvidence v1, and ResumeEvidence v1 are breaking contracts.
+- Attempt failure/terminal states are no longer reachable through the generic transition API. Failure disposition validates structured evidence and artifact hashes in the same SQLite transaction; resource resume retains the same reservation and only resets the interrupted phase.
+- Shared S3 validation runs before commit, again inside the Ledger transaction, and as postcommit audit. Any TrialSpec drift, identity/hash mismatch, malformed evidence, missing role/phase/seed coverage, or invalid constraint evidence produces zero authoritative writes.
+- Orchestrator queries the committed operation result from SQLite and fails closed on stale, conflicting, missing, or unknown routes. Projection JSON is never a runtime control source.
+- The project-wide standard execution width is one. The fifth verified outcome creates the exact aggregate; no sixth reservation can reach planning, patching, or execution.

@@ -93,7 +93,10 @@ def test_stage_contract_activates_c2c_small_loop_inputs(tmp_path: Path) -> None:
     }
     paths = init_workspace(config, "topic", project_id="proj_c2c", simulate=True)
     (paths.root / "plan").mkdir(exist_ok=True)
-    (paths.root / "plan" / "trial_spec.json").write_text(json.dumps({"execution": {"collector": "c2c_small_loop"}}), encoding="utf-8")
+    (paths.root / "plan" / "trial_spec.json").write_text(
+        json.dumps({"execution_contract": {"runtime_config": {"collector": "c2c_small_loop"}}}),
+        encoding="utf-8",
+    )
     manager = StageContractManager(paths.root)
 
     s3 = manager.stage_started("S3_experiment", iteration=1, config=config)
@@ -111,7 +114,10 @@ def test_stage_contract_switches_c2c_s3_outputs_for_bootstrap(tmp_path: Path) ->
         "orchestration": {"profile": "bootstrap"},
     }
     paths = init_workspace(config, "topic", project_id="proj_c2c_bootstrap_contract", simulate=True)
-    (paths.root / "plan" / "trial_spec.json").write_text(json.dumps({"execution": {"collector": "c2c_small_loop"}}), encoding="utf-8")
+    (paths.root / "plan" / "trial_spec.json").write_text(
+        json.dumps({"execution_contract": {"runtime_config": {"collector": "c2c_small_loop"}}}),
+        encoding="utf-8",
+    )
 
     s3 = StageContractManager(paths.root).stage_started("S3_experiment", iteration=1, config=config)
 

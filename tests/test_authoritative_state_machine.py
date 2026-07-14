@@ -10,8 +10,9 @@ from pathlib import Path
 import pytest
 
 from auto_research.domain_contracts import (
+    EVIDENCE_MANIFEST_SCHEMA_VERSION,
     EXECUTION_OBSERVATION_SCHEMA_VERSION,
-    attempt_input_hash,
+    TRIAL_SPEC_SCHEMA_VERSION,
     build_direction_spec,
     build_variant_spec,
     canonical_hash,
@@ -24,7 +25,7 @@ from auto_research.domain_contracts import (
     variant_semantic_hash,
     variant_spec_hash,
 )
-from auto_research.research_state import IntegrityError, ResearchEventLedger
+from auto_research.research_state import FAILURE_EVIDENCE_SCHEMA_VERSION, IntegrityError, ResearchEventLedger
 from auto_research.utils import write_json
 
 
@@ -93,82 +94,103 @@ def _initialize(ledger: ResearchEventLedger, direction: dict, variant: dict) -> 
     ledger.plan_variant(variant, feedback_from_attempt_ids=(variant.get("lineage") or {}).get("feedback_from_attempt_ids") or [])
 
 
+def _trial_spec(attempt: dict | None = None, *, profile: str = "standard", attempt_kind: str | None = None) -> dict:
+    kind = attempt_kind or ((attempt or {}).get("attempt_kind")) or ("bootstrap_proxy" if profile == "bootstrap" else "full")
+    phase = "proxy" if kind in {"proxy", "bootstrap_proxy"} else "full"
+    runtime = {"batch": 1, "device": "cpu"}
+    manifest_body = {"manifest_id": "fake-v1", "datasets": ["fake"]}
+    return {
+        "schema_version": TRIAL_SPEC_SCHEMA_VERSION,
+        "protocol": {
+            "protocol_id": f"{phase}-v1",
+            "required_phases": [phase],
+            "terminal_phases": [phase],
+            "proxy_terminal_allowed": phase == "proxy",
+            "aggregation": "mean",
+        },
+        "sample_manifest": {**manifest_body, "content_hash": canonical_hash(manifest_body)},
+        "datasets": [{"dataset_id": "fake", "split": "test", "sample_count": 1, "sample_hash": canonical_hash({"sample": 1})}],
+        "metrics": [{"metric_id": "accuracy", "objective": "maximize", "aggregation": "mean", "role": "primary"}],
+        "primary_metric_id": "accuracy",
+        "statistical_testing": {"method": "none", "seeds": [1], "require_complete_seed_coverage": True},
+        "required_roles": ["baseline", "candidate"],
+        "acceptance_constraints": [{
+            "constraint_id": "primary-delta",
+            "kind": "minimum_mean_delta",
+            "hard": True,
+            "metric_id": "accuracy",
+            "threshold": 0.05,
+            "objective": "maximize",
+        }],
+        "execution_contract": {
+            "runtime_config": runtime,
+            "runtime_config_hash": canonical_hash(runtime),
+            "evaluator_hash": canonical_hash({"evaluator": 1}),
+            "command_contract_hash": canonical_hash({"command": phase}),
+        },
+        "required_artifacts": ["main_results"],
+        "evidence_requirements": [{
+            "requirement_id": "main-results",
+            "kind": "main_results",
+            "required": True,
+            "applicable_phases": [phase],
+            "schema_version": "auto_research_main_results_v1",
+        }],
+    }
+
+
 def _attempt_inputs(variant: dict) -> dict:
-    protocol = {"required_phases": ["full"], "terminal_method_phases": ["full"]}
-    sample_manifest = {"datasets": ["fake"]}
-    runtime_config = {"batch": 1}
-    evaluator = canonical_hash({"evaluator": 1})
-    implementation = implementation_hash(
+    return {"implementation_hash": implementation_hash(
         frozen_patch={"variant": variant["variant_id"]},
         files={"src/router.py": variant["variant_id"]},
         manifest={"v": 1},
-    )
-    return {
-        "implementation_hash": implementation,
-        "attempt_input_hash": attempt_input_hash(
-            implementation_hash_value=implementation,
-            protocol=protocol,
-            sample_manifest=sample_manifest,
-            seeds=[1],
-            runtime_config=runtime_config,
-            evaluator_hash=evaluator,
-        ),
-        "protocol_hash": canonical_hash(protocol),
-        "sample_manifest_hash": canonical_hash(sample_manifest),
-        "runtime_config_hash": canonical_hash(runtime_config),
-        "evaluator_hash": evaluator,
-        "seeds": [1],
-        "required_datasets": ["fake"],
-        "required_phases": ["full"],
-        "terminal_method_phases": ["full"],
-        "required_roles": ["baseline", "candidate"],
-        "require_complete_seed_coverage": False,
-    }
+    )}
 
 
 def _reserve(ledger: ResearchEventLedger, direction: dict, variant: dict, *, profile: str = "standard") -> dict:
     values = _attempt_inputs(variant)
-    phase = "proxy" if profile == "bootstrap" else "full"
-    write_json(
-        ledger.project_root / "plan" / "trial_spec.json",
-        {
-            "protocol": {"required_phases": [phase], "terminal_method_phases": [phase]},
-            "sample_manifest": {"datasets": ["fake"]},
-            "datasets": ["fake"],
-            "metrics": [{"name": "accuracy", "primary": True, "higher_is_better": True}],
-            "acceptance_criteria": {"minimum_mean_delta": 0.05},
-        },
-    )
-    if profile == "bootstrap":
-        protocol = {"required_phases": ["proxy"], "terminal_method_phases": ["proxy"]}
-        values["protocol_hash"] = canonical_hash(protocol)
-        values["attempt_input_hash"] = attempt_input_hash(
-            implementation_hash_value=values["implementation_hash"],
-            protocol=protocol,
-            sample_manifest={"datasets": ["fake"]},
-            seeds=[1],
-            runtime_config={"batch": 1},
-            evaluator_hash=values["evaluator_hash"],
-        )
-        values["required_phases"] = ["proxy"]
-        values["terminal_method_phases"] = ["proxy"]
+    kind = "bootstrap_proxy" if profile == "bootstrap" else "full"
+    trial_spec = _trial_spec(profile=profile, attempt_kind=kind)
+    write_json(ledger.project_root / "plan" / "trial_spec.json", trial_spec)
     return ledger.reserve_attempt(
         profile=profile,
         direction=direction,
         variant=variant,
-        attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full",
+        attempt_kind=kind,
+        trial_spec=trial_spec,
         **values,
     )
 
 
-def _trial_spec(attempt: dict) -> dict:
-    phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
+def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class: str, *, suffix: str = "1") -> dict:
+    aliases = {"resource_paused": "resource_pause", "integrity": "integrity_failure", "activation_failed": "activation_failure"}
+    failure_class = aliases.get(failure_class, failure_class)
+    artifact = ledger.project_root / "experiment" / "raw" / f"failure-{attempt['attempt_id']}-{suffix}.log"
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    artifact.write_text(f"{failure_class}:{suffix}\n", encoding="utf-8")
+    is_resource = failure_class in {"resource_pause", "oom_retry"}
+    details = {"resource_type": "memory", "available": False} if is_resource else {}
+    if failure_class == "activation_failure":
+        details["activation_probe"] = "forward-probe"
+    if failure_class == "safety_failure":
+        details["safety_check"] = "policy-check"
+    phase = next((name for name, status in attempt["phases"].items() if status == "RUNNING"), None)
     return {
-        "protocol": {"required_phases": [phase], "terminal_method_phases": [phase]},
-        "sample_manifest": {"datasets": ["fake"]},
-        "datasets": ["fake"],
-        "metrics": [{"name": "accuracy", "primary": True, "higher_is_better": True}],
-        "acceptance_criteria": {"minimum_mean_delta": 0.05},
+        "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION,
+        "attempt_id": attempt["attempt_id"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "source_state": attempt["state"],
+        "source_phase": phase,
+        "failure_class": failure_class,
+        "command_status": "resource_paused" if is_resource else ("integrity_blocked" if failure_class in {"integrity_failure", "safety_failure"} else "failed"),
+        "exit_code": 137 if is_resource else 1,
+        "validator_check": None if is_resource else f"{failure_class}-check",
+        "artifact": {"path": str(artifact.relative_to(ledger.project_root)), "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest()},
+        "details": details,
+        "reason": f"verified {failure_class}",
+        "observed_at": "2026-01-01T00:00:00Z",
     }
 
 
@@ -181,10 +203,11 @@ def _complete(
     failure: str | None = None,
 ):
     if not evaluable:
-        return ledger.disposition_attempt(attempt["attempt_id"], failure_class=failure or "implementation_failure")
-    artifact = ledger.project_root / "experiment" / "raw" / f"{attempt['attempt_id']}.json"
+        current = ledger.state()["attempts"][attempt["attempt_id"]]
+        return ledger.disposition_failure(_failure_evidence(ledger, current, failure or "implementation_failure"))
+    artifact = ledger.project_root / "experiment" / "raw" / f"main-{attempt['attempt_id']}.json"
     artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_text('{"verified": true}\n', encoding="utf-8")
+    write_json(artifact, {"schema_version": "auto_research_main_results_v1", "attempt_id": attempt["attempt_id"]})
     artifact_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
     phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
     candidate = 0.7 if outcome == "accepted" else 0.51
@@ -193,6 +216,7 @@ def _complete(
         observations.append(
             {
                 "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+                "observation_id": f"obs:{attempt['attempt_id'][:8]}:{role}:1",
                 "phase": phase,
                 "role": role,
                 "command_status": "completed",
@@ -202,27 +226,35 @@ def _complete(
                 "sample_manifest_hash": attempt["sample_manifest_hash"],
                 "evaluator_hash": attempt["evaluator_hash"],
                 "seed": 1,
+                "raw_artifact_path": str(artifact.relative_to(ledger.project_root)),
                 "raw_artifact_hash": artifact_hash,
             }
         )
+    trial_spec = attempt["frozen_trial_spec"]
+    evidence_manifest = {
+        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "attempt_id": attempt["attempt_id"],
+        "entries": [{
+            "evidence_id": f"evidence:{attempt['attempt_id'][:8]}:main",
+            "kind": "main_results",
+            "relative_path": str(artifact.relative_to(ledger.project_root)),
+            "content_hash": artifact_hash,
+            "schema_version": "auto_research_main_results_v1",
+            "attempt_id": attempt["attempt_id"],
+            "variant_spec_hash": attempt["variant_spec_hash"],
+            "trial_spec_hash": attempt["trial_spec_hash"],
+            "cross_references": {},
+        }],
+    }
     trial = classify_trial_result(
         attempt=attempt,
-        trial_spec=_trial_spec(attempt),
+        trial_spec=trial_spec,
         observations=observations,
         raw_artifacts={str(artifact.relative_to(ledger.project_root)): artifact_hash},
+        evidence_manifest=evidence_manifest,
     )
-    if phase == "proxy":
-        write_json(
-            ledger.project_root / "experiment" / "results" / "bootstrap_proxy_completion.json",
-            {
-                "bootstrap_proxy_complete": True,
-                "full_train_executed": False,
-                "full_eval_executed": False,
-            },
-        )
-        ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
-    else:
-        ledger.transition_attempt(attempt["attempt_id"], "FULL_RUNNING", phase="full", phase_state="RUNNING")
+    ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING" if phase == "proxy" else "FULL_RUNNING", phase=phase, phase_state="RUNNING")
     return ledger.complete_attempt(trial)
 
 
@@ -367,13 +399,30 @@ def test_trial_identity_mismatch_writes_nothing(tmp_path: Path) -> None:
     observations = [
         {
             "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+            "observation_id": f"obs:identity:{role}:1",
             "phase": "full", "role": role, "command_status": "completed", "dataset_id": "fake",
             "metric_id": "accuracy", "metric_value": value, "sample_manifest_hash": attempt["sample_manifest_hash"],
-            "evaluator_hash": attempt["evaluator_hash"], "seed": 1, "raw_artifact_hash": digest,
+            "evaluator_hash": attempt["evaluator_hash"], "seed": 1, "raw_artifact_path": "raw.json", "raw_artifact_hash": digest,
         }
         for role, value in (("baseline", 0.5), ("candidate", 0.7))
     ]
-    trial = classify_trial_result(attempt=attempt, trial_spec=_trial_spec(attempt), observations=observations, raw_artifacts={"raw.json": digest})
+    manifest = {
+        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "attempt_id": attempt["attempt_id"],
+        "entries": [{
+            "evidence_id": "evidence:identity:main",
+            "kind": "main_results",
+            "relative_path": "raw.json",
+            "content_hash": digest,
+            "schema_version": "auto_research_main_results_v1",
+            "attempt_id": attempt["attempt_id"],
+            "variant_spec_hash": attempt["variant_spec_hash"],
+            "trial_spec_hash": attempt["trial_spec_hash"],
+            "cross_references": {},
+        }],
+    }
+    trial = classify_trial_result(attempt=attempt, trial_spec=_trial_spec(attempt), observations=observations, raw_artifacts={"raw.json": digest}, evidence_manifest=manifest)
     trial["attempt_input_hash"] = "f" * 64
     with pytest.raises((IntegrityError, ValueError), match="attempt_input_hash mismatch"):
         ledger.complete_attempt(trial)
@@ -412,7 +461,7 @@ def test_abandoned_attempt_cannot_revive_after_five_outcomes(tmp_path: Path) -> 
     first_variant = _variant(direction, 1)
     _initialize(ledger, direction, first_variant)
     first_attempt = _reserve(ledger, direction, first_variant)
-    ledger.disposition_attempt(first_attempt["attempt_id"], failure_class="activation_failure")
+    ledger.disposition_failure(_failure_evidence(ledger, first_attempt, "activation_failure"))
     ledger.abandon_attempt(first_attempt["attempt_id"], reason="replace non-evaluable implementation")
     for index in range(2, 7):
         variant = _variant(direction, index)
@@ -430,12 +479,12 @@ def test_illegal_transition_and_terminal_transition_write_no_event(tmp_path: Pat
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
     count = len(ledger.events())
-    with pytest.raises(IntegrityError, match="illegal attempt transition"):
+    with pytest.raises(IntegrityError, match="cannot enter|illegal attempt transition"):
         ledger.transition_attempt(attempt["attempt_id"], "METHOD_COMPLETED")
     assert len(ledger.events()) == count
     completed, _ = _complete(ledger, attempt, outcome="accepted")
     count = len(ledger.events())
-    with pytest.raises(IntegrityError, match="illegal attempt transition"):
+    with pytest.raises(IntegrityError, match="cannot enter|illegal attempt transition"):
         ledger.transition_attempt(completed["attempt_id"], "READY")
     assert len(ledger.events()) == count
 
@@ -474,20 +523,9 @@ def test_implementation_repair_keeps_attempt_and_variant_identity(tmp_path: Path
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
-    ledger.disposition_attempt(attempt["attempt_id"], failure_class="activation_failure")
-    values = _attempt_inputs(variant)
+    ledger.disposition_failure(_failure_evidence(ledger, attempt, "activation_failure"))
     new_implementation = implementation_hash(frozen_patch={"repair": True}, files={"src/router.py": "repaired"}, manifest={"v": 2})
-    protocol = {"required_phases": ["full"], "terminal_method_phases": ["full"]}
-    values["implementation_hash"] = new_implementation
-    values["attempt_input_hash"] = attempt_input_hash(
-        implementation_hash_value=new_implementation,
-        protocol=protocol,
-        sample_manifest={"datasets": ["fake"]},
-        seeds=[1],
-        runtime_config={"batch": 1},
-        evaluator_hash=values["evaluator_hash"],
-    )
-    repaired = ledger.reserve_attempt(profile="standard", direction=direction, variant=variant, attempt_kind="proxy_full", **values)
+    repaired = ledger.revise_implementation(attempt["attempt_id"], implementation_hash=new_implementation)
     assert repaired["attempt_id"] == attempt["attempt_id"]
     assert repaired["variant_spec_hash"] == attempt["variant_spec_hash"]
     assert repaired["implementation_hash"] != attempt["implementation_hash"]
@@ -496,7 +534,7 @@ def test_implementation_repair_keeps_attempt_and_variant_identity(tmp_path: Path
 
 @pytest.mark.parametrize(
     ("failure_class", "expected_action"),
-    [("resource_paused", "PAUSE_RESOURCE"), ("activation_failure", "REPAIR_IMPLEMENTATION"), ("integrity", "BLOCK_INTEGRITY")],
+    [("resource_pause", "PAUSE_RESOURCE"), ("activation_failure", "REPAIR_IMPLEMENTATION"), ("integrity_failure", "BLOCK_INTEGRITY")],
 )
 def test_bootstrap_failures_never_finish_run(tmp_path: Path, failure_class: str, expected_action: str) -> None:
     ledger = ResearchEventLedger(tmp_path / failure_class)
@@ -504,7 +542,9 @@ def test_bootstrap_failures_never_finish_run(tmp_path: Path, failure_class: str,
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant, profile="bootstrap")
-    failed, route = ledger.disposition_attempt(attempt["attempt_id"], failure_class=failure_class)
+    if failure_class in {"resource_pause", "oom_retry"}:
+        attempt = ledger.transition_attempt(attempt["attempt_id"], "PROXY_RUNNING", phase="proxy", phase_state="RUNNING")
+    failed, route = ledger.disposition_failure(_failure_evidence(ledger, attempt, failure_class))
     assert route["next_action"] == expected_action
     assert route["next_action"] != "FINISH_RUN"
     assert failed["method_evaluable"] is False

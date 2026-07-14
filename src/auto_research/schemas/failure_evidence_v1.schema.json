@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "source_state", "source_phase", "failure_class", "command_status", "exit_code", "validator_check", "artifact", "details", "reason", "observed_at"],
+  "properties": {
+    "schema_version": {"const": "auto_research_failure_evidence_v1"},
+    "attempt_id": {"type": "string", "pattern": "^[a-f0-9-]{36}$"},
+    "lifecycle_generation": {"type": "integer", "minimum": 0},
+    "implementation_hash": {"$ref": "#/$defs/hash"},
+    "attempt_input_hash": {"$ref": "#/$defs/hash"},
+    "source_state": {"enum": ["PLANNED", "IMPLEMENTING", "READY", "PROXY_RUNNING", "PROXY_COMPLETED", "FULL_RUNNING"]},
+    "source_phase": {"type": ["string", "null"], "enum": ["proxy", "full", null]},
+    "failure_class": {"enum": ["implementation_failure", "activation_failure", "resource_pause", "oom_retry", "integrity_failure", "safety_failure"]},
+    "command_status": {"enum": ["failed", "partial", "resource_paused", "integrity_blocked"]},
+    "exit_code": {"type": ["integer", "null"]},
+    "validator_check": {"type": ["string", "null"], "minLength": 1},
+    "artifact": {"$ref": "#/$defs/artifact"},
+    "details": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "resource_type": {"type": "string", "minLength": 1},
+        "available": {"type": "boolean"},
+        "activation_probe": {"type": "string", "minLength": 1},
+        "safety_check": {"type": "string", "minLength": 1}
+      }
+    },
+    "reason": {"type": "string", "minLength": 1},
+    "observed_at": {"type": "string", "minLength": 1}
+  },
+  "allOf": [
+    {"if": {"properties": {"failure_class": {"enum": ["implementation_failure", "activation_failure", "integrity_failure", "safety_failure"]}}, "required": ["failure_class"]}, "then": {"properties": {"validator_check": {"type": "string", "minLength": 1}}}},
+    {"if": {"properties": {"failure_class": {"enum": ["resource_pause", "oom_retry"]}}, "required": ["failure_class"]}, "then": {"properties": {"details": {"required": ["resource_type", "available"], "properties": {"available": {"const": false}}}}}},
+    {"if": {"properties": {"failure_class": {"const": "activation_failure"}}, "required": ["failure_class"]}, "then": {"properties": {"details": {"required": ["activation_probe"]}}}},
+    {"if": {"properties": {"failure_class": {"const": "safety_failure"}}, "required": ["failure_class"]}, "then": {"properties": {"details": {"required": ["safety_check"]}}}}
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "artifact": {"type": "object", "additionalProperties": false, "required": ["path", "sha256"], "properties": {"path": {"type": "string", "minLength": 1}, "sha256": {"$ref": "#/$defs/hash"}}}
+  }
+}

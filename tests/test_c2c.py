@@ -54,6 +54,16 @@ from auto_research.workspace import init_workspace
 from auto_research.cli import _run_c2c_command, _smoke_c2c_command
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_c2c_dataset_cache(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    hf_home = tmp_path / "hf-home"
+    dataset_cache = hf_home / "datasets"
+    for dataset_dir in ["mmlu-redux", "ai2-arc", "openbookqa"]:
+        (dataset_cache / dataset_dir).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.setenv("HF_DATASETS_CACHE", str(dataset_cache))
+
+
 def _torch_available() -> bool:
     try:
         __import__("torch")
@@ -366,14 +376,57 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
     write_json(
         project / "plan" / "trial_spec.json",
         {
-            "schema_version": "auto_research_trial_spec_v1",
-            "direction_id": direction_id,
-            "direction_semantic_hash": direction["direction_semantic_hash"],
-            "direction_spec_hash": direction["direction_spec_hash"],
-            "variant_id": variant["variant_id"],
-            "variant_spec_hash": variant["variant_spec_hash"],
-            "metrics": [{"name": "three_dataset_mean", "primary": True}],
-            "execution": {"collector": "c2c_small_loop"},
+            "schema_version": "auto_research_trial_spec_v2",
+            "protocol": {
+                "protocol_id": "wrapper-utility-proxy",
+                "required_phases": ["proxy"],
+                "terminal_phases": ["proxy"],
+                "proxy_terminal_allowed": True,
+                "aggregation": "mean",
+            },
+            "sample_manifest": {
+                "manifest_id": "wrapper-utility-samples",
+                "datasets": ["mmlu-redux"],
+                "content_hash": canonical_hash({"datasets": ["mmlu-redux"]}),
+            },
+            "datasets": [
+                {
+                    "dataset_id": "mmlu-redux",
+                    "split": "test",
+                    "sample_count": 1,
+                    "sample_hash": canonical_hash({"dataset": "mmlu-redux", "split": "test", "sample_count": 1}),
+                }
+            ],
+            "metrics": [{"metric_id": "three_dataset_mean", "objective": "maximize", "aggregation": "mean", "role": "primary"}],
+            "primary_metric_id": "three_dataset_mean",
+            "statistical_testing": {"method": "none", "seeds": [42], "require_complete_seed_coverage": True},
+            "required_roles": ["baseline", "candidate"],
+            "acceptance_constraints": [
+                {
+                    "constraint_id": "minimum-mean-delta",
+                    "kind": "minimum_mean_delta",
+                    "hard": True,
+                    "metric_id": "three_dataset_mean",
+                    "threshold": 0.0,
+                    "objective": "maximize",
+                }
+            ],
+            "execution_contract": {
+                "runtime_config": {"collector": "c2c_small_loop"},
+                "runtime_config_hash": canonical_hash({"collector": "c2c_small_loop"}),
+                "evaluator_hash": canonical_hash({"metric": "three_dataset_mean"}),
+                "command_contract_hash": canonical_hash({"collector": "c2c_small_loop", "phase": "proxy"}),
+            },
+            "required_artifacts": ["main_results"],
+            "evidence_requirements": [
+                {
+                    "requirement_id": "main-results",
+                    "kind": "main_results",
+                    "required": True,
+                    "applicable_phases": ["proxy"],
+                    "schema_version": "auto_research_main_results_v1",
+                }
+            ],
         },
     )
     write_json(
@@ -7114,6 +7167,16 @@ def test_c2c_train_failure_with_checkpoint_continues_eval(monkeypatch, tmp_path:
 
 
 def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        ExperimentRunner,
+        "_gpu_snapshot",
+        staticmethod(
+            lambda: [
+                {"index": index, "memory_total_mb": 80000, "memory_free_mb": 70000, "memory_used_mb": 10000, "utilization_gpu": 0}
+                for index in [0, 1]
+            ]
+        ),
+    )
     repo = _fake_c2c_repo(tmp_path)
     (repo / "recipe/train_recipe/C2C_0.6+0.5.json").write_text(
         json.dumps(

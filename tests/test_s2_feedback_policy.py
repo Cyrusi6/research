@@ -170,7 +170,7 @@ def test_feedback_context_reads_only_method_evaluable_history(tmp_path: Path) ->
     second = _variant(direction, 2)
     _initialize(ledger, direction, second)
     pending = _reserve(ledger, direction, second)
-    ledger.transition_attempt(pending["attempt_id"], "IMPLEMENTATION_REPAIR")
+    _complete(ledger, pending, outcome="activation_failed", evaluable=False, failure="activation_failed")
 
     context = build_s2_feedback_context(project_root=tmp_path, direction=direction, config={})
 

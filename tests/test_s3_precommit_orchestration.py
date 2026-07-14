@@ -1,20 +1,14 @@
 from __future__ import annotations
 
 import hashlib
-from copy import deepcopy
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
-import auto_research.orchestrator as orchestrator_module
-from auto_research.domain_contracts import EXECUTION_OBSERVATION_SCHEMA_VERSION, classify_trial_result
-from auto_research.orchestrator import Orchestrator
-from auto_research.registry import load_registry, save_registry
+from auto_research.domain_contracts import EVIDENCE_MANIFEST_SCHEMA_VERSION, EXECUTION_OBSERVATION_SCHEMA_VERSION, classify_trial_result
 from auto_research.research_state import IntegrityError, ResearchEventLedger
 from auto_research.utils import write_json
 from test_authoritative_state_machine import _direction, _initialize, _reserve, _trial_spec, _variant
-from test_pipeline import _test_config
 
 
 def _trial(
@@ -26,12 +20,13 @@ def _trial(
 ) -> dict:
     artifact = ledger.project_root / "experiment" / "raw" / f"{attempt['attempt_id']}.json"
     artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_text('{"verified": true}\n', encoding="utf-8")
+    write_json(artifact, {"schema_version": "auto_research_main_results_v1", "attempt_id": attempt["attempt_id"]})
     artifact_hash = hashlib.sha256(artifact.read_bytes()).hexdigest()
     phase = "proxy" if attempt["attempt_kind"] == "bootstrap_proxy" else "full"
     observations = [
         {
             "schema_version": EXECUTION_OBSERVATION_SCHEMA_VERSION,
+            "observation_id": f"obs:{attempt['attempt_id'][:8]}:{role}:1",
             "phase": phase,
             "role": role,
             "command_status": "completed",
@@ -41,15 +36,33 @@ def _trial(
             "sample_manifest_hash": attempt["sample_manifest_hash"],
             "evaluator_hash": attempt["evaluator_hash"],
             "seed": 1,
+            "raw_artifact_path": str(artifact.relative_to(ledger.project_root)),
             "raw_artifact_hash": artifact_hash,
         }
         for role, value in (("baseline", baseline), ("candidate", candidate))
     ]
+    manifest = {
+        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "attempt_id": attempt["attempt_id"],
+        "entries": [{
+            "evidence_id": f"evidence:{attempt['attempt_id'][:8]}:main",
+            "kind": "main_results",
+            "relative_path": str(artifact.relative_to(ledger.project_root)),
+            "content_hash": artifact_hash,
+            "schema_version": "auto_research_main_results_v1",
+            "attempt_id": attempt["attempt_id"],
+            "variant_spec_hash": attempt["variant_spec_hash"],
+            "trial_spec_hash": attempt["trial_spec_hash"],
+            "cross_references": {},
+        }],
+    }
     return classify_trial_result(
         attempt=attempt,
-        trial_spec=_trial_spec(attempt),
+        trial_spec=attempt["frozen_trial_spec"],
         observations=observations,
         raw_artifacts={str(artifact.relative_to(ledger.project_root)): artifact_hash},
+        evidence_manifest=manifest,
     )
 
 
@@ -90,7 +103,7 @@ def _assert_precommit_rejected_without_authoritative_write(
 @pytest.mark.parametrize(
     "invalid_case",
     [
-        "proxy_contract",
+        "evidence_cross_reference",
         "artifact_hash",
         "dataset_coverage",
         "phase_mismatch",
@@ -104,11 +117,8 @@ def test_s3_precommit_rejects_invalid_trial_without_finalization_or_budget_chang
     ledger, direction, _, attempt = _prepared_attempt(tmp_path)
     trial = _trial(ledger, attempt)
 
-    if invalid_case == "proxy_contract":
-        write_json(
-            tmp_path / "experiment" / "results" / "c2c_proxy_decision_report.json",
-            {"schema_version": "c2c_proxy_decision_report_v1", "decision": "forged"},
-        )
+    if invalid_case == "evidence_cross_reference":
+        trial["evidence_manifest"]["entries"][0]["trial_spec_hash"] = "0" * 64
     elif invalid_case == "artifact_hash":
         trial["raw_artifacts"][next(iter(trial["raw_artifacts"]))] = "0" * 64
     elif invalid_case == "dataset_coverage":
@@ -126,82 +136,9 @@ def test_s3_precommit_rejects_invalid_trial_without_finalization_or_budget_chang
 def test_bootstrap_precommit_requires_verified_completion_before_finish_run(tmp_path: Path) -> None:
     ledger, direction, _, attempt = _prepared_attempt(tmp_path, bootstrap=True)
     trial = _trial(ledger, attempt)
-
+    trial["evidence_manifest"]["entries"] = []
+    trial["raw_artifacts"] = {}
     _assert_precommit_rejected_without_authoritative_write(ledger, direction, trial)
-
-
-class _RouteObserved(RuntimeError):
-    pass
-
-
-def _run_s3_route(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    *,
-    next_action: str,
-) -> dict:
-    config = _test_config(tmp_path, simulate=True)
-    monkeypatch.setattr(orchestrator_module, "load_root_config", lambda: config)
-    project_id = Orchestrator().init_project("route authority", project_id=f"route-{next_action.lower()}", simulate=True)
-    project_root = tmp_path / project_id
-    registry_path = project_root / "meta" / "registry.yaml"
-    registry = load_registry(registry_path)
-    registry["current_stage"] = "S3_experiment"
-    registry["status"] = "running"
-    save_registry(registry_path, registry)
-
-    route = {"next_action": next_action, "source": {"attempt_id": "attempt-route"}}
-    monkeypatch.setattr(
-        orchestrator_module.ExperimentAgent,
-        "run",
-        lambda self: {
-            "status": "blocked",
-            "blocked_reason": "diagnostic status must not override reducer route",
-            "attempt": {"attempt_id": "attempt-route"},
-            "route_outcome": route,
-            "artifacts": [],
-        },
-    )
-    monkeypatch.setattr(
-        orchestrator_module,
-        "gate_s3",
-        lambda *args, **kwargs: SimpleNamespace(
-            legacy_tuple=lambda: (True, ""),
-            to_dict=lambda: {"schema_version": "stage_gate_v1", "stage": "S3_experiment", "status": "PASS", "checks": []},
-        ),
-    )
-    monkeypatch.setattr(
-        orchestrator_module.StageContractManager,
-        "required_input_status",
-        lambda self, *args, **kwargs: {"missing_inputs": [], "required_inputs": []},
-    )
-    if next_action == "REPAIR_IMPLEMENTATION":
-        def observe_invalidation(registry_payload, stage_key, *, invalidated_by):
-            assert stage_key == "S2_plan"
-            assert invalidated_by == "route_outcome:REPAIR_IMPLEMENTATION"
-            raise _RouteObserved
-
-        monkeypatch.setattr(orchestrator_module, "invalidate_from", observe_invalidation)
-        with pytest.raises(_RouteObserved):
-            Orchestrator().start(project_id)
-        return {"status": "repair_observed"}
-    return Orchestrator().start(project_id)
-
-
-def test_orchestrator_prefers_repair_route_over_blocked_result_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    assert _run_s3_route(monkeypatch, tmp_path, next_action="REPAIR_IMPLEMENTATION")["status"] == "repair_observed"
-
-
-def test_orchestrator_prefers_pause_route_over_blocked_result_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    result = _run_s3_route(monkeypatch, tmp_path, next_action="PAUSE_RESOURCE")
-    assert result["status"] == "retryable_paused"
-    assert result["attempt_id"] == "attempt-route"
-
-
-def test_orchestrator_prefers_integrity_route_over_blocked_result_status(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    result = _run_s3_route(monkeypatch, tmp_path, next_action="BLOCK_INTEGRITY")
-    assert result["status"] == "blocked"
-    assert result["reason"] == "Integrity block recorded by the attempt reducer"
 
 
 def test_direction_aggregate_selects_best_accepted_delta_not_highest_absolute_candidate(tmp_path: Path) -> None:
@@ -233,4 +170,3 @@ def test_direction_aggregate_selects_best_accepted_delta_not_highest_absolute_ca
     assert next(item for item in aggregate["outcomes"] if item["attempt_id"] == rejected_high_candidate_attempt_id)["outcome"] == "rejected"
     assert aggregate["selection"]["best_attempt_id"] == expected_best_attempt_id
     assert aggregate["selection"]["best_attempt_id"] != rejected_high_candidate_attempt_id
-

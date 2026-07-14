@@ -559,7 +559,9 @@ def _discover_execution_collector(project_root: Path) -> str:
         return ""
     try:
         plan = read_json(plan_path, default={}) or {}
-        return str((plan.get("execution") or {}).get("collector") or "")
+        execution_contract = plan.get("execution_contract") if isinstance(plan.get("execution_contract"), dict) else {}
+        runtime_config = execution_contract.get("runtime_config") if isinstance(execution_contract.get("runtime_config"), dict) else {}
+        return str(runtime_config.get("collector") or "")
     except Exception:
         return ""
 

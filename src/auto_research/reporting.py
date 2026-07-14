@@ -9,6 +9,7 @@ from typing import Any
 from .config import load_project_config, load_root_config
 from .direction_contracts import direction_planner_seed
 from .method_memory import load_shared_method_memory, shared_method_memory_for_prompt
+from .research_state import ResearchEventLedger
 from .registry import load_registry
 from .utils import read_json
 
@@ -20,11 +21,12 @@ def build_project_report(project_root: Path) -> dict[str, Any]:
     direction_scorecard = read_json(project_root / "plan" / "direction_scorecard.json", default={}) or {}
     performance_feedback = read_json(project_root / "plan" / "performance_feedback.json", default={}) or {}
     main_results = read_json(project_root / "experiment" / "results" / "main_results.json", default={}) or {}
-    trial_result = read_json(project_root / "experiment" / "results" / "trial_result.json", default={}) or {}
-    research_state = read_json(project_root / "meta" / "research_state.json", default={}) or {}
+    ledger_path = project_root / "meta" / "research_events.sqlite3"
+    research_state = ResearchEventLedger(project_root).state() if ledger_path.exists() else {}
+    trial_result = research_state.get("latest_trial_result") if isinstance(research_state.get("latest_trial_result"), dict) else {}
     readiness = read_json(project_root / "experiment" / "results" / "full_s3_readiness_report.json", default={}) or {}
     patch_manifest = read_json(project_root / "plan" / "code_patches" / "patch_manifest.json", default={}) or {}
-    route_decision = read_json(project_root / "meta" / "route_outcome.json", default={}) or {}
+    route_decision = research_state.get("last_route_outcome") if isinstance(research_state.get("last_route_outcome"), dict) else {}
     attempt_ledger = research_state
     evidence_quality = read_json(project_root / "literature" / "c2c" / "evidence_quality_score.json", default={}) or {}
     planner_gate = read_json(project_root / "plan" / "s2_planner" / "planner_gate_report.json", default={}) or {}

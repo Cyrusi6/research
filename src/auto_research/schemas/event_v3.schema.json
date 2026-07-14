@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object", "additionalProperties": false,
+  "required": ["schema_version", "event_id", "sequence", "event_type", "previous_event_hash", "event_hash", "created_at", "payload"],
+  "properties": {
+    "schema_version": {"const": "auto_research_event_v3"}, "event_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/\\-]{0,255}$"}, "sequence": {"type": "integer", "minimum": 1},
+    "event_type": {"enum": ["DirectionSelected", "VariantPlanned", "AttemptReserved", "AttemptTransitioned", "AttemptImplementationRevised", "AttemptResumed", "AttemptAbandoned", "AttemptDispositioned", "AttemptFinalized", "AuditMarker"]},
+    "previous_event_hash": {"$ref": "#/$defs/hash"}, "event_hash": {"$ref": "#/$defs/hash"}, "created_at": {"type": "string", "minLength": 1}, "payload": {"type": "object"}
+  },
+  "oneOf": [
+    {"properties": {"event_type": {"const": "DirectionSelected"}, "payload": {"$ref": "#/$defs/direction"}}},
+    {"properties": {"event_type": {"const": "VariantPlanned"}, "payload": {"$ref": "#/$defs/variant"}}},
+    {"properties": {"event_type": {"const": "AttemptReserved"}, "payload": {"$ref": "#/$defs/reserved"}}},
+    {"properties": {"event_type": {"const": "AttemptTransitioned"}, "payload": {"$ref": "#/$defs/transition"}}},
+    {"properties": {"event_type": {"const": "AttemptImplementationRevised"}, "payload": {"$ref": "#/$defs/revision"}}},
+    {"properties": {"event_type": {"const": "AttemptResumed"}, "payload": {"$ref": "#/$defs/resume"}}},
+    {"properties": {"event_type": {"const": "AttemptAbandoned"}, "payload": {"$ref": "#/$defs/abandon"}}},
+    {"properties": {"event_type": {"const": "AttemptDispositioned"}, "payload": {"$ref": "#/$defs/disposition"}}},
+    {"properties": {"event_type": {"const": "AttemptFinalized"}, "payload": {"$ref": "#/$defs/finalized"}}},
+    {"properties": {"event_type": {"const": "AuditMarker"}, "payload": {"$ref": "#/$defs/audit"}}}
+  ],
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}, "request": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "direction": {"type": "object", "additionalProperties": false, "required": ["direction"], "properties": {"direction": {"type": "object"}, "request_fingerprint": {"$ref": "#/$defs/request"}}},
+    "variant": {"type": "object", "additionalProperties": false, "required": ["variant", "feedback_from_attempt_ids"], "properties": {"variant": {"type": "object"}, "feedback_from_attempt_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string"}}, "request_fingerprint": {"$ref": "#/$defs/request"}}},
+    "reserved": {"type": "object", "additionalProperties": false, "required": ["attempt"], "properties": {"attempt": {"type": "object"}, "request_fingerprint": {"$ref": "#/$defs/request"}}},
+    "transition": {"type": "object", "additionalProperties": false, "required": ["attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "new_state", "phase", "phase_state"], "properties": {"attempt_id": {"type": "string"}, "lifecycle_generation": {"type": "integer", "minimum": 0}, "implementation_hash": {"$ref": "#/$defs/hash"}, "attempt_input_hash": {"$ref": "#/$defs/hash"}, "expected_state": {"type": "string"}, "new_state": {"type": "string"}, "phase": {"type": ["string", "null"]}, "phase_state": {"type": ["string", "null"]}, "request_fingerprint": {"$ref": "#/$defs/request"}}},
+    "revision": {"type": "object", "additionalProperties": false, "required": ["attempt_id", "lifecycle_generation", "previous_implementation_hash", "previous_attempt_input_hash", "expected_state", "implementation_hash", "attempt_input_hash"], "properties": {"attempt_id": {"type": "string"}, "lifecycle_generation": {"type": "integer"}, "previous_implementation_hash": {"$ref": "#/$defs/hash"}, "previous_attempt_input_hash": {"$ref": "#/$defs/hash"}, "expected_state": {"type": "string"}, "implementation_hash": {"$ref": "#/$defs/hash"}, "attempt_input_hash": {"$ref": "#/$defs/hash"}, "request_fingerprint": {"$ref": "#/$defs/request"}}},
+    "resume": {"type": "object", "additionalProperties": false, "required": ["resume_evidence"], "properties": {"resume_evidence": {"type": "object"}, "request_fingerprint": {"$ref": "#/$defs/request"}}},
+    "abandon": {"type": "object", "additionalProperties": false, "required": ["attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "reason"], "properties": {"attempt_id": {"type": "string"}, "lifecycle_generation": {"type": "integer"}, "implementation_hash": {"$ref": "#/$defs/hash"}, "attempt_input_hash": {"$ref": "#/$defs/hash"}, "expected_state": {"type": "string"}, "reason": {"type": "string", "minLength": 1}, "request_fingerprint": {"$ref": "#/$defs/request"}}},
+    "disposition": {"type": "object", "additionalProperties": false, "required": ["failure_evidence"], "properties": {"failure_evidence": {"type": "object"}, "request_fingerprint": {"$ref": "#/$defs/request"}}},
+    "finalized": {"type": "object", "additionalProperties": false, "required": ["trial_result", "lifecycle_generation", "expected_state", "implementation_hash", "attempt_input_hash"], "properties": {"trial_result": {"type": "object"}, "lifecycle_generation": {"type": "integer"}, "expected_state": {"type": "string"}, "implementation_hash": {"$ref": "#/$defs/hash"}, "attempt_input_hash": {"$ref": "#/$defs/hash"}, "request_fingerprint": {"$ref": "#/$defs/request"}}},
+    "audit": {"type": "object", "additionalProperties": false, "required": ["index"], "properties": {"index": {"type": "integer"}, "request_fingerprint": {"$ref": "#/$defs/request"}}}
+  }
+}

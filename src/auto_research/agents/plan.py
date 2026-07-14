@@ -42,7 +42,7 @@ from ..s2_feedback_policy import (
     build_s2_score_adjustment_report,
 )
 from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, write_yaml
-from ..domain_contracts import canonical_hash
+from ..domain_contracts import TRIAL_SPEC_SCHEMA_VERSION, canonical_hash, validate_trial_spec
 from ..research_state import ResearchEventLedger
 from .base import AgentContext
 
@@ -112,6 +112,10 @@ class PlanAgent:
                 "seeds": self.context.config.get("experiment", {}).get("random_seeds", [42, 123, 456]),
                 "report": "mean ± std",
                 "significance_level": 0.05,
+            },
+            "acceptance_criteria": {
+                "minimum_mean_delta": 0.01,
+                "must_emit": ["main_results.json", "ablation_results.json", "hypothesis_verification.md"],
             },
             "ablation_matrix": [
                 {"experiment": "w/o core module", "tests_hypothesis": "H2", "modification": "Remove the main intervention."}
@@ -228,7 +232,7 @@ class PlanAgent:
         plan_record = self.context.artifacts.write_json(
             self.stage_key,
             "trial_spec.json",
-            _trial_spec_from_plan(plan, variant_contract),
+            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config)),
             artifact_type="plan",
             summary="Structured experiment plan",
             source_paths=["literature/direction.json", "literature/direction.json"],
@@ -744,7 +748,7 @@ class PlanAgent:
         plan_record = self.context.artifacts.write_json(
             self.stage_key,
             "trial_spec.json",
-            _trial_spec_from_plan(plan, variant_contract),
+            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config)),
             artifact_type="plan",
             summary="C2C structured small-loop experiment plan",
             source_paths=["literature/direction.json", "literature/c2c/baseline_evidence.json"],
@@ -1108,7 +1112,7 @@ class PlanAgent:
         plan_record = self.context.artifacts.write_json(
             self.stage_key,
             "trial_spec.json",
-            _trial_spec_from_plan(plan, variant_contract),
+            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config)),
             artifact_type="plan",
             summary="C2C plan updated after S2.5-only implementation repair",
             source_paths=["plan/performance_feedback.json", "plan/s2_planner/candidate_pool.json", "plan/code_patches/patch_manifest.json"],
@@ -1438,7 +1442,7 @@ class PlanAgent:
         plan_record = self.context.artifacts.write_json(
             self.stage_key,
             "trial_spec.json",
-            _trial_spec_from_plan(plan, variant_contract),
+            _trial_spec_from_plan(plan, variant_contract, profile=_execution_profile(self.context.config)),
             artifact_type="plan",
             summary="C2C S2.5-only implementation repair blocked",
             source_paths=["plan/performance_feedback.json", "plan/s2_5_repair_dispatch.json"],
@@ -3587,28 +3591,183 @@ def _parse_s2_codex_session_id(stderr: str, stdout: str = "") -> str | None:
 
 
 
-def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "schema_version": "auto_research_trial_spec_v1",
-        "direction_id": variant.get("direction_id"),
-        "direction_semantic_hash": variant.get("direction_semantic_hash"),
-        "direction_spec_hash": variant.get("direction_spec_hash"),
-        "variant_id": variant.get("variant_id"),
-        "variant_spec_hash": variant.get("variant_spec_hash"),
+def _execution_profile(config: dict[str, Any]) -> str:
+    return str(((config.get("orchestration") or {}).get("profile") or "standard")).lower()
+
+
+def _trial_spec_from_plan(plan: dict[str, Any], variant: dict[str, Any], *, profile: str = "standard") -> dict[str, Any]:
+    raw_datasets = deepcopy(plan.get("datasets") or [])
+    raw_metrics = deepcopy(plan.get("metrics") or [])
+    statistical = deepcopy(plan.get("statistical_testing") or {})
+    execution = deepcopy(plan.get("execution") or {})
+    acceptance = deepcopy(plan.get("acceptance_criteria") or {})
+    ablations = deepcopy(plan.get("ablation_matrix") or [])
+    datasets = []
+    for item in raw_datasets:
+        source = item if isinstance(item, dict) else {"name": item}
+        dataset_id = str(source.get("dataset_id") or source.get("name") or "")
+        split = str(source.get("split") or "")
+        if not dataset_id or not split:
+            raise ValueError("TrialSpec datasets require dataset identity and split")
+        sample_count = source.get("sample_count")
+        if not isinstance(sample_count, int) or isinstance(sample_count, bool) or sample_count < 1:
+            if execution.get("mode") == "simulate" or execution.get("collector") == "c2c_small_loop":
+                sample_count = 1
+            else:
+                raise ValueError(f"TrialSpec dataset {dataset_id} requires a pre-registered sample_count")
+        sample_hash = source.get("sample_hash") or canonical_hash(
+            {"dataset_id": dataset_id, "split": split, "sample_count": sample_count, "sample_contract": source}
+        )
+        datasets.append({"dataset_id": dataset_id, "split": split, "sample_count": sample_count, "sample_hash": sample_hash})
+    if not datasets:
+        raise ValueError("TrialSpec requires datasets")
+    metrics = []
+    for item in raw_metrics:
+        if not isinstance(item, dict):
+            raise ValueError("TrialSpec metric entries must be objects")
+        metric_id = str(item.get("metric_id") or item.get("name") or "")
+        if not metric_id:
+            raise ValueError("TrialSpec metric requires an identity")
+        metrics.append(
+            {
+                "metric_id": metric_id,
+                "objective": "maximize" if item.get("higher_is_better", True) else "minimize",
+                "aggregation": "mean",
+                "role": "primary" if item.get("primary") is True else "secondary",
+            }
+        )
+    primary = [item for item in metrics if item["role"] == "primary"]
+    if len(primary) != 1:
+        raise ValueError("TrialSpec requires exactly one primary metric")
+    primary_metric_id = primary[0]["metric_id"]
+    seeds = [int(item) for item in statistical.get("seeds") or []]
+    if not seeds:
+        raise ValueError("TrialSpec requires pre-registered seeds")
+    proxy_terminal = profile == "bootstrap"
+    required_phases = ["proxy"] if proxy_terminal else ["full"]
+    terminal_phases = ["proxy"] if proxy_terminal else ["full"]
+    required_roles = ["baseline", "candidate"]
+    if ablations:
+        required_roles.append("ablation")
+    constraints = []
+    minimum_delta = acceptance.get("minimum_mean_delta")
+    if not isinstance(minimum_delta, (int, float)) or isinstance(minimum_delta, bool):
+        raise ValueError("TrialSpec requires a typed minimum_mean_delta")
+    constraints.append(
+        {
+            "constraint_id": "primary-minimum-mean-delta",
+            "kind": "minimum_mean_delta",
+            "hard": True,
+            "metric_id": primary_metric_id,
+            "threshold": float(minimum_delta),
+            "objective": primary[0]["objective"],
+        }
+    )
+    maximum_regression = acceptance.get("maximum_dataset_regression", acceptance.get("max_dataset_regression"))
+    if isinstance(maximum_regression, (int, float)) and not isinstance(maximum_regression, bool):
+        constraints.append(
+            {
+                "constraint_id": "per-dataset-maximum-regression",
+                "kind": "per_dataset_maximum_regression",
+                "hard": True,
+                "metric_id": primary_metric_id,
+                "threshold": float(maximum_regression),
+                "objective": "minimize",
+            }
+        )
+    if ablations:
+        constraints.append(
+            {
+                "constraint_id": "required-ablation-contrast",
+                "kind": "required_ablation_contrast",
+                "hard": True,
+                "metric_id": primary_metric_id,
+                "threshold": float(acceptance.get("minimum_ablation_delta", 0.0)),
+                "objective": primary[0]["objective"],
+            }
+        )
+    if acceptance.get("matched_coverage_ablation_required"):
+        required_roles.extend(["matched_control", "coverage"])
+        constraints.extend(
+            [
+                {"constraint_id": "matched-control", "kind": "matched_control_constraint", "hard": True, "metric_id": primary_metric_id, "threshold": 0.0, "objective": primary[0]["objective"]},
+                {"constraint_id": "coverage", "kind": "coverage_constraint", "hard": True, "metric_id": primary_metric_id, "threshold": 1.0, "objective": "maximize"},
+            ]
+        )
+    required_artifacts = ["main_results"]
+    if ablations:
+        required_artifacts.append("ablation_results")
+    if "coverage" in required_roles:
+        required_artifacts.append("coverage_results")
+    if "matched_control" in required_roles:
+        required_artifacts.append("matched_control_results")
+    evidence_requirements = [
+        {"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": list(terminal_phases), "schema_version": "auto_research_main_results_v1"},
+        {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["always"], "schema_version": "auto_research_patch_gate_v1"},
+    ]
+    if ablations:
+        evidence_requirements.append({"requirement_id": "ablation-results", "kind": "ablation_results", "required": True, "applicable_phases": ["ablation"], "schema_version": "auto_research_ablation_results_v1"})
+    if "coverage" in required_roles:
+        evidence_requirements.append({"requirement_id": "coverage-results", "kind": "coverage_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_coverage_results_v1"})
+    if "matched_control" in required_roles:
+        evidence_requirements.append({"requirement_id": "matched-control-results", "kind": "matched_control_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_matched_control_results_v1"})
+    if execution.get("collector") == "c2c_small_loop":
+        evidence_requirements[0]["schema_version"] = "c2c_main_results_v1"
+        evidence_requirements[1]["schema_version"] = "c2c_s2_5_patch_gate_report_v1"
+        for requirement in evidence_requirements:
+            if requirement["kind"] == "ablation_results":
+                requirement["schema_version"] = "c2c_ablation_results_v1"
+        proxy_evidence = [
+            ("proxy-baseline", "proxy_baseline_fingerprint", "c2c_proxy_baseline_fingerprint_v1"),
+            ("proxy-cache", "proxy_cache_report", "c2c_proxy_cache_report_v1"),
+            ("effective-policy", "effective_proxy_policy", "c2c_effective_proxy_policy_v1"),
+            ("calibration-policy", "proxy_calibration_policy", "c2c_proxy_calibration_policy_v1"),
+            ("proxy-decision", "proxy_decision_report", "c2c_proxy_decision_report_v1"),
+        ]
+        evidence_requirements.extend(
+            {"requirement_id": requirement_id, "kind": kind, "required": True, "applicable_phases": ["proxy"], "schema_version": version}
+            for requirement_id, kind, version in proxy_evidence
+        )
+        if proxy_terminal:
+            evidence_requirements.append({"requirement_id": "bootstrap-completion", "kind": "bootstrap_completion", "required": True, "applicable_phases": ["proxy"], "schema_version": "bootstrap_proxy_completion_v1"})
+        else:
+            evidence_requirements.append({"requirement_id": "full-readiness", "kind": "full_s3_readiness", "required": True, "applicable_phases": ["full"], "schema_version": "c2c_proxy_to_full_readiness_v1"})
+    runtime_config = deepcopy(execution)
+    evaluator_identity = {"metrics": metrics, "datasets": datasets, "collector": execution.get("collector")}
+    command_contract = deepcopy(execution.get("commands") or [])
+    dataset_ids = [item["dataset_id"] for item in datasets]
+    sample_manifest_body = {"manifest_id": f"{variant.get('variant_id')}:sample-manifest", "datasets": dataset_ids}
+    trial_spec = {
+        "schema_version": TRIAL_SPEC_SCHEMA_VERSION,
         "protocol": {
-            "hypotheses": plan.get("hypotheses") or [],
-            "acceptance_criteria": plan.get("acceptance_criteria") or {},
-            "statistical_testing": plan.get("statistical_testing") or {},
-            "ablation_matrix": plan.get("ablation_matrix") or [],
+            "protocol_id": f"{variant.get('variant_id')}:registered-protocol",
+            "required_phases": required_phases,
+            "terminal_phases": terminal_phases,
+            "proxy_terminal_allowed": proxy_terminal,
+            "aggregation": "mean",
         },
-        "baselines": plan.get("baselines") or [],
-        "datasets": plan.get("datasets") or [],
-        "sample_manifest": {"datasets": [item.get("name") if isinstance(item, dict) else item for item in plan.get("datasets") or []]},
-        "metrics": plan.get("metrics") or [],
-        "statistical_testing": plan.get("statistical_testing") or {},
-        "execution": plan.get("execution") or {},
-        "resource_budget": plan.get("resource_budget") or {},
+        "sample_manifest": {**sample_manifest_body, "content_hash": canonical_hash(sample_manifest_body)},
+        "datasets": datasets,
+        "metrics": metrics,
+        "primary_metric_id": primary_metric_id,
+        "statistical_testing": {
+            "method": "paired" if len(seeds) > 1 else "none",
+            "seeds": seeds,
+            "require_complete_seed_coverage": bool(statistical.get("require_complete_seed_coverage", False)),
+        },
+        "required_roles": list(dict.fromkeys(required_roles)),
+        "acceptance_constraints": constraints,
+        "execution_contract": {
+            "runtime_config": runtime_config,
+            "runtime_config_hash": canonical_hash(runtime_config),
+            "evaluator_hash": canonical_hash(evaluator_identity),
+            "command_contract_hash": canonical_hash(command_contract),
+        },
+        "required_artifacts": required_artifacts,
+        "evidence_requirements": evidence_requirements,
     }
+    validate_trial_spec(trial_spec)
+    return trial_spec
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
     try:

@@ -1,0 +1,111 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "protocol", "sample_manifest", "datasets", "metrics", "primary_metric_id", "statistical_testing", "required_roles", "acceptance_constraints", "execution_contract", "required_artifacts", "evidence_requirements"],
+  "properties": {
+    "schema_version": {"const": "auto_research_trial_spec_v2"},
+    "protocol": {
+      "type": "object", "additionalProperties": false,
+      "required": ["protocol_id", "required_phases", "terminal_phases", "proxy_terminal_allowed", "aggregation"],
+      "properties": {
+        "protocol_id": {"type": "string", "minLength": 1},
+        "required_phases": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["proxy", "full"]}},
+        "terminal_phases": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["proxy", "full"]}},
+        "proxy_terminal_allowed": {"type": "boolean"},
+        "aggregation": {"const": "mean"}
+      }
+    },
+    "sample_manifest": {
+      "type": "object", "additionalProperties": false,
+      "required": ["manifest_id", "datasets", "content_hash"],
+      "properties": {
+        "manifest_id": {"type": "string", "minLength": 1},
+        "datasets": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "content_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "datasets": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["dataset_id", "split", "sample_count", "sample_hash"],
+        "properties": {
+          "dataset_id": {"type": "string", "minLength": 1},
+          "split": {"type": "string", "minLength": 1},
+          "sample_count": {"type": "integer", "minimum": 1},
+          "sample_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+        }
+      }
+    },
+    "metrics": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["metric_id", "objective", "aggregation", "role"],
+        "properties": {
+          "metric_id": {"type": "string", "minLength": 1},
+          "objective": {"enum": ["maximize", "minimize"]},
+          "aggregation": {"const": "mean"},
+          "role": {"enum": ["primary", "secondary"]}
+        }
+      }
+    },
+    "primary_metric_id": {"type": "string", "minLength": 1},
+    "statistical_testing": {
+      "type": "object", "additionalProperties": false,
+      "required": ["method", "seeds", "require_complete_seed_coverage"],
+      "properties": {
+        "method": {"enum": ["none", "paired", "unpaired"]},
+        "seeds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}},
+        "require_complete_seed_coverage": {"type": "boolean"}
+      }
+    },
+    "required_roles": {"type": "array", "minItems": 2, "uniqueItems": true, "contains": {"const": "baseline"}, "items": {"enum": ["baseline", "candidate", "ablation", "matched_control", "coverage"]}, "allOf": [{"contains": {"const": "candidate"}}]},
+    "acceptance_constraints": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["constraint_id", "kind", "hard"],
+        "properties": {
+          "constraint_id": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["minimum_mean_delta", "per_dataset_maximum_regression", "required_ablation_contrast", "matched_control_constraint", "coverage_constraint", "required_artifact_evidence", "primary_metric_threshold", "secondary_metric_threshold"]},
+          "hard": {"type": "boolean"},
+          "metric_id": {"type": "string", "minLength": 1},
+          "threshold": {"type": "number"},
+          "objective": {"enum": ["maximize", "minimize"]},
+          "evidence_kind": {"enum": ["proxy_baseline_fingerprint", "proxy_cache_report", "effective_proxy_policy", "proxy_calibration_policy", "proxy_decision_report", "full_s3_readiness", "activation_evidence", "bootstrap_completion", "main_results", "ablation_results", "coverage_results", "matched_control_results"]}
+        },
+        "allOf": [
+          {"if": {"properties": {"kind": {"const": "required_artifact_evidence"}}, "required": ["kind"]}, "then": {"required": ["evidence_kind"]}},
+          {"if": {"properties": {"kind": {"enum": ["minimum_mean_delta", "per_dataset_maximum_regression", "required_ablation_contrast", "matched_control_constraint", "coverage_constraint", "primary_metric_threshold", "secondary_metric_threshold"]}}, "required": ["kind"]}, "then": {"required": ["metric_id", "threshold"]}}
+        ]
+      }
+    },
+    "execution_contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["runtime_config", "runtime_config_hash", "evaluator_hash", "command_contract_hash"],
+      "properties": {
+        "runtime_config": {"type": "object"},
+        "runtime_config_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "evaluator_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+        "command_contract_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}
+      }
+    },
+    "required_artifacts": {"type": "array", "uniqueItems": true, "items": {"enum": ["main_results", "ablation_results", "coverage_results", "matched_control_results"]}},
+    "evidence_requirements": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["requirement_id", "kind", "required", "applicable_phases", "schema_version"],
+        "properties": {
+          "requirement_id": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["proxy_baseline_fingerprint", "proxy_cache_report", "effective_proxy_policy", "proxy_calibration_policy", "proxy_decision_report", "full_s3_readiness", "activation_evidence", "bootstrap_completion", "main_results", "ablation_results", "coverage_results", "matched_control_results"]},
+          "required": {"type": "boolean"},
+          "applicable_phases": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["always", "proxy", "full", "ablation"]}},
+          "schema_version": {"type": "string", "minLength": 1}
+        }
+      }
+    }
+  }
+}

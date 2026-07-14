@@ -223,14 +223,12 @@ def test_real_mode_blocks_at_experiment_stage(monkeypatch, tmp_path: Path) -> No
     result = orchestrator.start(project_id)
 
     assert result["status"] == "blocked"
-    assert result["stage"] == "S3_experiment"
+    assert result["stage"] == "S2_plan"
+    assert "pre-registered sample_count" in result["reason"]
     state = json.loads((tmp_path / project_id / "orchestration" / "state.json").read_text(encoding="utf-8"))
     assert state["status"] == "blocked"
-    assert state["current_stage"] == "S3_experiment"
-    assert state["stages"]["S3_experiment"]["last_error"]
-    s3_contract = json.loads((tmp_path / project_id / "orchestration" / "stage_contracts" / "S3_experiment.json").read_text(encoding="utf-8"))
-    assert s3_contract["status"] == "blocked"
-    assert s3_contract["reason"]
+    assert state["current_stage"] == "S2_plan"
+    assert state["stages"]["S3_experiment"]["status"] == "pending"
 
 
 def test_c2c_real_run_readiness_blocks_before_s0(monkeypatch, tmp_path: Path) -> None:
