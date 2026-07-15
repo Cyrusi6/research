@@ -190,3 +190,16 @@ TMPDIR=$PWD/.tmp uv run pytest -q
 - Authoritative evidence/phase/resource/replay targeted groups pass, including explicit completion IDs, stale-generation rejection, reducer mutation rejection, proxy-before-full ordering, symlink-ancestor rejection, wrong-resource identity rejection, and real evaluator-manifest drift.
 - Generic non-simulated external-manifest production components commit one strict full TrialResult from a local command. C2C strict real-adapter collection is non-empty; the full five-variant Generic/C2C regression loops remain explicitly synthetic/local and finish at `target=5, reserved=0, consumed=5`.
 - Full suite passes in normal, proxy-cleared, and empty HOME/HF with Codex absent from PATH environments: `552 passed, 2 skipped`, with only the pre-existing torch/transformers dynamic skips.
+
+## 2026-07-15 M1.1.5 Strict Phase Executor Shells
+
+- Added the independent `phase_execution.py` control layer with immutable authoritative phase contexts, phase-bound artifact inventories, typed failures, and a runtime-checkable executor protocol.
+- Added dedicated C2C proxy/full, Generic external, and Synthetic executor shells. Every shell invokes its injected SQLite authority checker before any runner side effect and rejects authority identity drift.
+- Full-phase contexts require a committed `RUN_FULL` proxy authorization binding. Artifact inventories require exact phase identity, one current producer run, unique kinds, and safe project-relative source paths.
+- Kept the module decoupled from `agents/experiment.py` and `research_state.py`; integration into the existing experiment agent remains a separate migration step.
+
+### M1.1.5 validation
+
+- `tests/test_m115_phase_executor.py` plus the M1.1.4 authoritative phase transaction suite pass: `27 passed`.
+- Core stage-contract and pipeline regression tests pass: `12 passed`.
+- The full suite was stopped after `6 passed` to unblock immediate integration; no failure was observed before interruption.
