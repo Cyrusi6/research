@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import re
+from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
-from .domain_contracts import canonical_hash
+from .contract_store import ContractStore
+from .domain_contracts import PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION, canonical_hash
 
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
 _SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$")
@@ -231,6 +233,7 @@ class AuthoritativePhaseContext:
 class PhaseArtifactInventory:
     context: AuthoritativePhaseContext
     artifacts: Sequence[Mapping[str, str]]
+    complete: bool = True
 
     def __post_init__(self) -> None:
         if not isinstance(self.context, AuthoritativePhaseContext):
@@ -254,9 +257,24 @@ class PhaseArtifactInventory:
                 raise ValueError("artifact producer_run_id differs from phase context")
             seen.add(kind)
             normalized.append(MappingProxyType(dict(artifact)))
-        if seen != set(self.context.expected_evidence_kinds):
+        if not isinstance(self.complete, bool):
+            raise ValueError("artifact inventory complete flag must be boolean")
+        if self.complete and seen != set(self.context.expected_evidence_kinds):
             raise ValueError("artifact inventory must exactly match authorized evidence kinds")
         object.__setattr__(self, "artifacts", tuple(normalized))
+
+    @classmethod
+    def combine(
+        cls,
+        context: AuthoritativePhaseContext,
+        inventories: Sequence[PhaseArtifactInventory],
+    ) -> PhaseArtifactInventory:
+        artifacts: list[Mapping[str, str]] = []
+        for inventory in inventories:
+            if inventory.context != context:
+                raise ValueError("cannot combine inventories from different phase contexts")
+            artifacts.extend(inventory.artifacts)
+        return cls(context=context, artifacts=tuple(artifacts), complete=True)
 
 
 class TypedPhaseFailure(RuntimeError):
@@ -267,6 +285,85 @@ class TypedPhaseFailure(RuntimeError):
         self.executor = executor
         self.retryable = retryable
         self.details = dict(details or {})
+
+
+@dataclass(frozen=True)
+class ExecutorCapability:
+    """Opaque, callback-scoped proof that a strict executor owns execution."""
+
+    executor_name: str
+    adapter_identity: str
+    attempt_id: str
+    lifecycle_generation: int
+    phase: str
+    phase_execution_id: str
+    authorization_hash: str
+    _nonce: object = field(repr=False, compare=False)
+
+
+_ACTIVE_EXECUTOR_CAPABILITY: ContextVar[ExecutorCapability | None] = ContextVar(
+    "auto_research_active_executor_capability",
+    default=None,
+)
+
+
+def _required_executor_names(context: AuthoritativePhaseContext) -> frozenset[str]:
+    if context.provenance_mode == "synthetic":
+        return frozenset({"synthetic"})
+    try:
+        plan = ContractStore(context.project_root).read_json(
+            context.command_plan_hash,
+            schema_file="phase_command_plan_v1.schema.json",
+        )
+    except (OSError, TypeError, ValueError):
+        return frozenset()
+    adapter_id = str((plan.get("adapter_identity") or {}).get("adapter_id") or "").lower()
+    plan_provenance = str((plan.get("adapter_identity") or {}).get("provenance_mode") or "")
+    if plan_provenance == "synthetic":
+        return frozenset({"synthetic"})
+    if "c2c" in adapter_id:
+        return frozenset({"c2c_proxy" if context.phase == "proxy" else "c2c_full"})
+    return frozenset({"generic_external"})
+
+
+def require_executor_capability(context: AuthoritativePhaseContext) -> ExecutorCapability:
+    """Fail closed unless called inside the currently authorized executor callback."""
+
+    capability = _ACTIVE_EXECUTOR_CAPABILITY.get()
+    if capability is None:
+        raise TypedPhaseFailure(
+            "executor_capability_missing",
+            "side-effect command requires current PhaseExecutor capability",
+            phase=context.phase,
+            executor="unowned",
+        )
+    expected = (
+        context.attempt_id,
+        context.lifecycle_generation,
+        context.phase,
+        context.phase_execution_id,
+        context.authorization_hash,
+    )
+    actual = (
+        capability.attempt_id,
+        capability.lifecycle_generation,
+        capability.phase,
+        capability.phase_execution_id,
+        capability.authorization_hash,
+    )
+    required_executors = _required_executor_names(context)
+    if (
+        actual != expected
+        or capability.adapter_identity != context.adapter_identity
+        or capability.executor_name not in required_executors
+    ):
+        raise TypedPhaseFailure(
+            "executor_capability_mismatch",
+            "PhaseExecutor capability does not authorize this phase context",
+            phase=context.phase,
+            executor=capability.executor_name,
+        )
+    return capability
 
 
 @runtime_checkable
@@ -308,8 +405,8 @@ class ResearchLedgerPhaseAuthority:
         if not isinstance(event, Mapping) or event.get("event_type") != ("ProxyPhaseStarted" if phase == "proxy" else "FullPhaseStarted"):
             raise ValueError("authoritative phase-start event is missing")
         manifest = (event.get("payload") or {}).get("phase_execution_manifest")
-        if not isinstance(manifest, Mapping) or manifest.get("schema_version") != "auto_research_phase_execution_manifest_v2":
-            raise ValueError("authoritative PhaseExecutionManifest v2 is required")
+        if not isinstance(manifest, Mapping) or manifest.get("schema_version") != PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION:
+            raise ValueError(f"authoritative {PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION} is required")
         proxy = attempt.get("committed_proxy_outcome") if phase == "full" else None
         runtime = attempt["frozen_trial_spec"]["execution_contract"]["runtime_config"]
         collector = str(runtime.get("collector") or "generic")
@@ -356,10 +453,32 @@ class _StrictPhaseExecutor:
         authorization = self._authorize(context)
         if authorization.authorization_hash != context.authorization_hash:
             raise TypedPhaseFailure("authority_identity_mismatch", "Ledger authorization differs from phase context", phase=context.phase, executor=self.executor_name)
-        inventory = self.runner(context)
-        if not isinstance(inventory, PhaseArtifactInventory) or inventory.context != context:
+        required_executors = _required_executor_names(context)
+        if self.executor_name not in required_executors or authorization.adapter_identity != context.adapter_identity:
+            raise TypedPhaseFailure(
+                "executor_adapter_mismatch",
+                f"{self.executor_name} is not authorized for adapter {context.adapter_identity}",
+                phase=context.phase,
+                executor=self.executor_name,
+            )
+        capability = ExecutorCapability(
+            executor_name=self.executor_name,
+            adapter_identity=context.adapter_identity,
+            attempt_id=context.attempt_id,
+            lifecycle_generation=context.lifecycle_generation,
+            phase=context.phase,
+            phase_execution_id=context.phase_execution_id,
+            authorization_hash=context.authorization_hash,
+            _nonce=object(),
+        )
+        token: Token[ExecutorCapability | None] = _ACTIVE_EXECUTOR_CAPABILITY.set(capability)
+        try:
+            inventory = self.runner(context)
+            self._assert_authorization(context, authorization)
+        finally:
+            _ACTIVE_EXECUTOR_CAPABILITY.reset(token)
+        if not isinstance(inventory, PhaseArtifactInventory) or inventory.context != context or not inventory.complete:
             raise TypedPhaseFailure("artifact_identity_mismatch", "runner returned inventory for a different phase", phase=context.phase, executor=self.executor_name)
-        self._authorize(context)
         return inventory
 
     def __call__(self, context: AuthoritativePhaseContext) -> PhaseArtifactInventory:
@@ -375,6 +494,20 @@ class _StrictPhaseExecutor:
         if not isinstance(authorization, PhaseAuthorization):
             raise TypedPhaseFailure("invalid_authority_verdict", "authority must return PhaseAuthorization", phase=context.phase, executor=self.executor_name)
         return authorization
+
+    def _assert_authorization(
+        self,
+        context: AuthoritativePhaseContext,
+        expected: PhaseAuthorization,
+    ) -> None:
+        current = self._authorize(context)
+        if current != expected or current.authorization_hash != context.authorization_hash:
+            raise TypedPhaseFailure(
+                "authority_changed",
+                "SQLite phase authorization changed during executor callback",
+                phase=context.phase,
+                executor=self.executor_name,
+            )
 
 
 @dataclass(frozen=True)
@@ -408,6 +541,7 @@ def _safe_relative_path(value: str) -> bool:
 
 __all__ = [
     "AuthoritativePhaseContext", "C2CFullPhaseExecutor", "C2CProxyPhaseExecutor", "GenericExternalPhaseExecutor",
-    "PhaseArtifactInventory", "PhaseAuthorization", "PhaseAuthority", "PhaseExecutor", "ResearchLedgerPhaseAuthority", "SyntheticPhaseExecutor",
-    "TypedPhaseFailure",
+    "ExecutorCapability", "PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION", "PhaseArtifactInventory", "PhaseAuthorization",
+    "PhaseAuthority", "PhaseExecutor", "ResearchLedgerPhaseAuthority", "SyntheticPhaseExecutor", "TypedPhaseFailure",
+    "require_executor_capability",
 ]

@@ -136,6 +136,10 @@ class ExperimentRunner:
     ) -> dict[str, Any]:
         retry_policy = retry_policy or {}
         max_attempts = max(1, int(retry_policy.get("max_attempts", 1) or 1))
+        retryable_exit_codes = {
+            int(value) for value in retry_policy.get("retryable_exit_codes", [])
+        }
+        backoff_seconds = max(0.0, float(retry_policy.get("backoff_seconds", 0) or 0))
         timeout_seconds = _coerce_timeout_seconds(retry_policy.get("timeout_seconds"))
         attempts = []
         status = "failed"
@@ -183,6 +187,10 @@ class ExperimentRunner:
             if returncode == 0:
                 status = "ok"
                 break
+            if attempt >= max_attempts or returncode not in retryable_exit_codes:
+                break
+            if backoff_seconds:
+                time.sleep(backoff_seconds)
         return {"step": name, "status": status, "attempts": attempts, "returncode": attempts[-1]["returncode"]}
 
     def run_plan_commands(self, commands: list[str], working_dir: Path, log_path: Path) -> dict[str, Any]:

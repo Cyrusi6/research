@@ -27,6 +27,7 @@ from auto_research.domain_contracts import canonical_hash
 from auto_research.evidence import content_addressed_evidence_path, encode_canonical_evidence
 from auto_research.research_state import IntegrityError, ResearchEventLedger, _event_hash, canonical_json
 from auto_research.s3_validation import S3ValidationError
+from support.authoritative_evidence import record_completed_evidence_command
 from test_m112_ledger_authority import _direction as named_direction
 from test_m112_ledger_authority import _variant as named_variant
 from test_m112_experiment_flow import _authoritative_direction_and_variant
@@ -35,6 +36,7 @@ from test_m113_ledger_closure import (
     _failure_evidence,
     _resume_evidence,
     _running_attempt,
+    _receipt_backed_completion,
     _scoped_artifact,
     _trial_spec,
     _trial_spec_legacy,
@@ -57,6 +59,10 @@ def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dic
     trial_spec["protocol"]["required_phases"] = ["proxy"] if profile == "bootstrap" else ["proxy", "full"]
     trial_spec["protocol"]["terminal_phases"] = ["proxy"] if profile == "bootstrap" else ["full"]
     trial_spec["protocol"]["proxy_terminal_allowed"] = profile == "bootstrap"
+    trial_spec["execution_contract"]["runtime_config"]["collector"] = "c2c_small_loop"
+    trial_spec["execution_contract"]["runtime_config_hash"] = canonical_hash(
+        trial_spec["execution_contract"]["runtime_config"]
+    )
     trial_spec["evidence_requirements"] = [
         {"requirement_id": "proxy-results", "kind": "proxy_results", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_results_v1"},
         {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_activation_evidence_v3"},
@@ -69,7 +75,12 @@ def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dic
     if profile == "standard":
         trial_spec["evidence_requirements"].append({"requirement_id": "main", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_main_results_v3"})
     trial_spec["required_artifacts"] = [item["kind"] for item in trial_spec["evidence_requirements"]]
-    trial_spec = build_trial_spec_v5(trial_spec, project_root=tmp_path)
+    trial_spec = build_trial_spec_v5(
+        trial_spec,
+        project_root=tmp_path,
+        adapter_id="auto-research-c2c",
+        command_provenance_mode="local-external",
+    )
     attempt = ledger.reserve_attempt(profile=profile, direction=direction, variant=variant, implementation_hash=canonical_hash({"impl": profile}), attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full", trial_spec=trial_spec)
     attempt = start_attempt_phase(ledger, attempt, "proxy")
     trial_spec = deepcopy(attempt["frozen_trial_spec"])
@@ -79,6 +90,9 @@ def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dic
             "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
             "baseline_metrics": {"mean": 0.0, "datasets": {"fake": 0.0}},
         },
+        "activation_smoke": {"status": "passed", "attempts": [{"status": "ok"}], "implementation_surface_ids": ["src/router.py"]},
+        "full_s3_readiness": {"status": "ready", "full_train_allowed": True},
+        "bootstrap": {"status": "proxy_reached"},
         "ablation": {"metrics": {"datasets": {"fake": 0.5}}},
         "matched_control_metrics": {"datasets": {"fake": 0.8}},
         "coverage_metrics": {"datasets": {"fake": 1.0}},
@@ -163,7 +177,7 @@ def _rehash_chain(ledger: ResearchEventLedger, sequence: int, payload: dict) -> 
 @pytest.mark.parametrize("field", ["outcome_classification", "all_hard_constraints_passed", "primary_metric_summary"])
 def test_reducer_rejects_forged_finalization_derivatives(tmp_path: Path, field: str) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    completion = _valid_completion(tmp_path, attempt)
+    completion = _receipt_backed_completion(tmp_path, ledger, attempt)
     ledger.complete_attempt(completion)
     event = next(item for item in ledger.events() if item["event_type"] == "AttemptFinalized")
     payload = deepcopy(event["payload"])
@@ -181,7 +195,7 @@ def test_reducer_rejects_forged_finalization_derivatives(tmp_path: Path, field: 
 
 def test_evidence_parent_symlink_escape_is_rejected(tmp_path: Path) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    completion = _valid_completion(tmp_path, attempt)
+    completion = _receipt_backed_completion(tmp_path, ledger, attempt)
     entry = completion["entries"][0]
     artifact = tmp_path / entry["relative_path"]
     outside = tmp_path.parent / f"outside-{tmp_path.name}"
@@ -220,7 +234,7 @@ def test_resume_rejects_probe_with_other_attempt_identity(tmp_path: Path) -> Non
 
 def test_exact_replay_uses_attempt_scoped_trial_spec_not_global_projection(tmp_path: Path) -> None:
     ledger, attempt_a = _running_attempt(tmp_path)
-    completion = _valid_completion(tmp_path, attempt_a)
+    completion = _receipt_backed_completion(tmp_path, ledger, attempt_a)
     completed, route = ledger.complete_attempt(completion)
     direction_b = named_direction("direction-b")
     variant_b = named_variant(direction_b, "variant-b")
@@ -258,14 +272,14 @@ def test_bootstrap_and_standard_cannot_both_be_active(tmp_path: Path) -> None:
 
 def test_complete_attempt_honors_explicit_event_id(tmp_path: Path) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    completion = _valid_completion(tmp_path, attempt)
+    completion = _receipt_backed_completion(tmp_path, ledger, attempt)
     ledger.complete_attempt(completion, event_id="explicit-finalization-id")
     assert ledger.events()[-1]["event_id"] == "explicit-finalization-id"
 
 
 def test_unregistered_optional_evidence_is_rejected_before_commit(tmp_path: Path) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    completion = _valid_completion(tmp_path, attempt)
+    completion = _receipt_backed_completion(tmp_path, ledger, attempt)
     producer_run_id = attempt["phase_executions"]["full"]["producer_run_id"]
     evidence_id = "evidence:unregistered-activation"
     payload = {
@@ -369,7 +383,7 @@ def test_generic_non_simulate_external_manifest_commits_strict_trial(tmp_path: P
     sample_manifest = contract_store.read_contract(
         trial_spec["sample_manifest_ref"],
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v2.schema.json",
+        schema_file="sample_manifest_v3.schema.json",
     )
     evaluator_manifest = contract_store.read_contract(
         trial_spec["execution_contract"]["evaluator_manifest_ref"],
@@ -508,6 +522,7 @@ def test_proxy_evidence_transaction_gates_full_without_budget_consumption(tmp_pa
         comparison_candidate=comparison, baseline=baseline, simulate=False,
     )
     completion = _stage_evidence_inventory(project_root=tmp_path, attempt=attempt, trial_spec=trial_spec, inventory=inventory)
+    record_completed_evidence_command(tmp_path, ledger, attempt, completion)
     proxy_attempt, route = ledger.commit_proxy_evidence(completion)
     assert proxy_attempt["state"] == "PROXY_COMPLETED"
     assert route["next_action"] == "RUN_FULL"
@@ -526,6 +541,7 @@ def test_proxy_reject_prevents_full_start_and_releases_reservation(tmp_path: Pat
         comparison_candidate=comparison, baseline=baseline, simulate=False,
     )
     completion = _stage_evidence_inventory(project_root=tmp_path, attempt=attempt, trial_spec=trial_spec, inventory=inventory)
+    record_completed_evidence_command(tmp_path, ledger, attempt, completion)
     rejected, route = ledger.commit_proxy_evidence(completion)
     assert rejected["state"] == "ABANDONED"
     assert route["next_action"] == "PROPOSE_NEXT_VARIANT"
@@ -540,6 +556,7 @@ def test_rebuild_rejects_forged_proxy_outcome_derivatives(tmp_path: Path) -> Non
     ledger = ResearchEventLedger(tmp_path)
     inventory = _c2c_strict_evidence_inventory(project_root=tmp_path, attempt=attempt, trial_spec=trial_spec, comparison_candidate=comparison, baseline=baseline, simulate=False)
     completion = _stage_evidence_inventory(project_root=tmp_path, attempt=attempt, trial_spec=trial_spec, inventory=inventory)
+    record_completed_evidence_command(tmp_path, ledger, attempt, completion)
     ledger.commit_proxy_evidence(completion)
     event = next(item for item in ledger.events() if item["event_type"] == "ProxyEvidenceCommitted")
     payload = deepcopy(event["payload"])

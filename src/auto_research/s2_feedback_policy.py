@@ -79,7 +79,6 @@ def build_s2_feedback_context(
     registry = read_yaml(project_root / "meta" / "registry.yaml", default={}) or {}
     state = ResearchEventLedger(project_root).state()
     route_outcome = state.get("last_route_outcome") or {}
-    proxy_calibration_policy = read_json(project_root / "experiment" / "results" / "c2c_proxy_calibration_policy.json", default={}) or {}
     method_history = [
         item for item in state.get("method_tried_history") or []
         if isinstance(item, dict) and item.get("method_evaluable") and item.get("direction_semantic_hash") == direction_hash
@@ -101,7 +100,7 @@ def build_s2_feedback_context(
         if isinstance(item, dict)
     ]
     budget = (((state.get("directions") or {}).get(direction_hash) or {}).get("budget") or {}) if direction_hash else {}
-    dragging_datasets = _dragging_datasets({}, {}, {}, proxy_calibration_policy)
+    dragging_datasets: list[dict[str, Any]] = []
     return {
         "schema_version": C2C_S2_FEEDBACK_CONTEXT_SCHEMA_VERSION,
         "created_at": now_utc(),
@@ -125,9 +124,9 @@ def build_s2_feedback_context(
             "direction_budget_reserved": int(budget.get("reserved", 0)),
         },
         "proxy_calibration": {
-            "global_false_positive_rate": _number(_nested(proxy_calibration_policy, ["summary", "proxy_false_positive_rate"]), 0.0),
-            "mechanism_false_positive_rate": _number(proxy_calibration_policy.get("mechanism_false_positive_rate"), 0.0),
-            "integration_point_false_positive_rate": _number(proxy_calibration_policy.get("integration_point_false_positive_rate"), 0.0),
+            "global_false_positive_rate": 0.0,
+            "mechanism_false_positive_rate": 0.0,
+            "integration_point_false_positive_rate": 0.0,
             "dataset_risks": [],
         },
         "recent_failures": recent_failures[-25:],
@@ -142,7 +141,6 @@ def build_s2_feedback_context(
             "meta/research_events",
             "meta/route_outcome.json",
             "experiment/results/trial_result.json",
-            "experiment/results/c2c_proxy_calibration_policy.json",
         ],
     }
 

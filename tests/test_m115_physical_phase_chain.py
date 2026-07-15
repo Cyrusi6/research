@@ -6,13 +6,21 @@ from types import SimpleNamespace
 from auto_research.agents.experiment import (
     ExperimentAgent,
     _c2c_strict_evidence_inventory,
-    _decode_staged_execution_observations,
     _stage_evidence_inventory,
 )
 import auto_research.agents.experiment as experiment_module
 from auto_research.command_journal import LedgerCommandJournal
-from auto_research.phase_execution import ResearchLedgerPhaseAuthority
+from auto_research.domain_contracts import canonical_hash
+from auto_research.phase_execution import (
+    C2CFullPhaseExecutor,
+    PhaseArtifactInventory,
+    ResearchLedgerPhaseAuthority,
+)
 from auto_research.research_state import ResearchEventLedger
+from support.authoritative_evidence import (
+    record_completed_evidence_command,
+    validate_authoritative_completion,
+)
 from test_m114_authoritative_phase_transactions import _c2c_inputs
 
 
@@ -25,6 +33,8 @@ def _proxy_comparison(*, baseline_value: float, proxy_value: float, full_value: 
             "baseline_metrics": {"mean": baseline_value, "datasets": {"fake": baseline_value}},
             "proxy_baseline": {"mean": baseline_value, "datasets": {"fake": baseline_value}},
         },
+        "activation_smoke": {"status": "passed", "attempts": [{"status": "ok"}], "implementation_surface_ids": ["src/router.py"]},
+        "full_s3_readiness": {"status": "ready", "full_train_allowed": True},
         "ablation": {"metrics": {"datasets": {"fake": full_value - 0.1}}},
         "matched_control_metrics": {"datasets": {"fake": full_value - 0.2}},
         "coverage_metrics": {"datasets": {"fake": 1.0}},
@@ -33,6 +43,7 @@ def _proxy_comparison(*, baseline_value: float, proxy_value: float, full_value: 
 
 def test_proxy_inventory_uses_proxy_command_metrics_not_full_aggregate(tmp_path: Path) -> None:
     attempt, trial_spec, _, baseline = _c2c_inputs(tmp_path)
+    ledger = ResearchEventLedger(tmp_path)
     comparison = _proxy_comparison(baseline_value=10.0, proxy_value=11.0, full_value=99.0)
 
     inventory = _c2c_strict_evidence_inventory(
@@ -49,7 +60,13 @@ def test_proxy_inventory_uses_proxy_command_metrics_not_full_aggregate(tmp_path:
         trial_spec=trial_spec,
         inventory=inventory,
     )
-    rows = _decode_staged_execution_observations(tmp_path, attempt, trial_spec, completion)
+    record_completed_evidence_command(tmp_path, ledger, attempt, completion)
+    rows = validate_authoritative_completion(
+        tmp_path,
+        ledger,
+        attempt,
+        completion,
+    ).observations
 
     assert {(row["role"], row["metric_value"]) for row in rows} == {("baseline", 10.0), ("candidate", 11.0)}
     assert all(row["metric_value"] != 99.0 for row in rows)
@@ -73,6 +90,7 @@ def test_full_callbacks_observe_committed_proxy_and_full_phase_started(tmp_path:
         trial_spec=trial_spec,
         inventory=inventory,
     )
+    record_completed_evidence_command(tmp_path, ledger, attempt, completion)
     proxy_attempt, route = ledger.commit_proxy_evidence(completion)
     assert route["next_action"] == "RUN_FULL"
     full_attempt = ledger.start_full_phase(
@@ -122,29 +140,55 @@ def test_full_callbacks_observe_committed_proxy_and_full_phase_started(tmp_path:
     )
     agent.runner = Runner()
     phase_authority = ResearchLedgerPhaseAuthority(ledger)
-    agent._active_phase_context = phase_authority.context_for_attempt(
+    phase_context = phase_authority.context_for_attempt(
         tmp_path,
         full_attempt["attempt_id"],
         "full",
     )
+    agent._active_phase_context = phase_context
     agent._active_command_journal = LedgerCommandJournal(tmp_path, ledger)
     agent._load_frozen_c2c_patch = lambda candidate: {}
     agent._prepare_c2c_execution_repo = lambda candidate, adapter, patch: {"status": "skipped"}
     agent._apply_frozen_c2c_patch = lambda candidate, adapter, patch, execution_repo: {"status": "skipped", "changed_files": ["candidate.py"]}
-    agent._load_reusable_c2c_proxy_state = lambda run_spec, patch_fingerprint: None
     agent._run_c2c_ablation_eval = lambda **kwargs: {"enabled": False, "status": "skipped", "attempts": []}
 
-    result = agent._run_single_c2c_full_candidate(
-        adapter=Adapter(),
-        candidate={"id": "candidate", "title": "candidate", "hypothesis": "test"},
-        index=0,
-        simulate=False,
-        baseline_mean=0.0,
-        min_delta=0.1,
-        max_regression=1.0,
-        gpu_selection=SimpleNamespace(selected_ids=[]),
-        proxy_gpu_selection=SimpleNamespace(selected_ids=[]),
-    )
+    result_holder: dict[str, dict] = {}
+
+    def execute_full(context):
+        raw_output = tmp_path / "experiment" / "phase-authority" / "main_results.json"
+        raw_output.parent.mkdir(parents=True, exist_ok=True)
+        raw_output.write_text("{}", encoding="utf-8")
+        command_result = agent._run_authoritative_step(
+            name="command_0",
+            command=["fixture-phase-command", "full"],
+            command_spec_id="full-command-000",
+            working_dir=tmp_path,
+            authoritative_output_factory=lambda: [
+                {
+                    "kind": "main_results",
+                    "source_path": raw_output.relative_to(tmp_path).as_posix(),
+                }
+            ],
+        )
+        assert command_result["status"] == "ok"
+        result_holder["result"] = {"metrics": {"datasets": {"fake": 1.0}}}
+        artifacts = []
+        for kind in context.expected_evidence_kinds:
+            relative_path = f"experiment/phase-authority/{kind}.json"
+            path = tmp_path / relative_path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}", encoding="utf-8")
+            artifacts.append({
+                "kind": kind,
+                "source_path": relative_path,
+                "content_hash": canonical_hash({}),
+                "receipt_hash": canonical_hash({"kind": kind, "phase": context.phase_execution_id}),
+                "producer_run_id": context.producer_run_id,
+            })
+        return PhaseArtifactInventory(context=context, artifacts=artifacts)
+
+    C2CFullPhaseExecutor(phase_authority, execute_full).execute(phase_context)
+    result = result_holder["result"]
 
     assert full_attempt["state"] == "FULL_RUNNING"
     assert result["metrics"]["datasets"] == {"fake": 1.0}

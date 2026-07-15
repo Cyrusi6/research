@@ -34,11 +34,16 @@
     "observed_capacity",
     "unit",
     "probe_status",
-    "observed_at"
+    "observed_at",
+    "command_id",
+    "command_hash",
+    "command_plan_hash",
+    "receipt_ref",
+    "receipt_hash"
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_resume_evidence_v4"
+      "const": "auto_research_resume_evidence_v5"
     },
     "evidence_kind": {
       "const": "resume_evidence"
@@ -82,7 +87,9 @@
     "cross_references": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["resource_probe_hash"],
+      "required": [
+        "resource_probe_hash"
+      ],
       "properties": {
         "resource_probe_hash": {
           "$ref": "#/$defs/sha256"
@@ -118,7 +125,12 @@
       "$ref": "#/$defs/sha256"
     },
     "pause_phase": {
-      "enum": ["implementation", "activation", "proxy", "full"]
+      "enum": [
+        "implementation",
+        "activation",
+        "proxy",
+        "full"
+      ]
     },
     "pause_phase_execution_id": {
       "type": "string",
@@ -129,7 +141,13 @@
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
     },
     "resource_type": {
-      "enum": ["gpu_memory", "system_memory", "disk", "network", "quota"]
+      "enum": [
+        "gpu_memory",
+        "system_memory",
+        "disk",
+        "network",
+        "quota"
+      ]
     },
     "resource_id": {
       "type": "string",
@@ -144,7 +162,11 @@
       "minimum": 0
     },
     "unit": {
-      "enum": ["bytes", "count", "bytes_per_second"]
+      "enum": [
+        "bytes",
+        "count",
+        "bytes_per_second"
+      ]
     },
     "probe_status": {
       "const": "available"
@@ -152,9 +174,56 @@
     "observed_at": {
       "type": "string",
       "format": "date-time"
+    },
+    "command_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
+    },
+    "command_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "command_plan_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "receipt_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "receipt_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "algorithm",
+        "digest",
+        "size_bytes",
+        "relative_path"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "auto_research_contract_blob_v1"
+        },
+        "algorithm": {
+          "const": "sha256"
+        },
+        "digest": {
+          "$ref": "#/$defs/hash"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "relative_path": {
+          "type": "string",
+          "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"
+        }
+      }
     }
   },
   "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
     "sha256": {
       "type": "string",
       "pattern": "^[a-f0-9]{64}$"

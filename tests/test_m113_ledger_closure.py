@@ -8,6 +8,7 @@ from copy import deepcopy
 
 import pytest
 
+from auto_research.contract_store import ContractStore
 from auto_research.domain_contracts import (
     build_direction_spec,
     build_variant_spec,
@@ -27,6 +28,8 @@ from auto_research.research_state import (
     initial_state,
     reduce_event,
 )
+from support.authoritative_evidence import build_failure_evidence_v4, build_resource_failure_evidence_v4
+from support.authoritative_evidence import record_completed_evidence_command
 
 
 def _direction() -> dict:
@@ -228,6 +231,16 @@ def _valid_completion(tmp_path: Path, attempt: dict) -> dict:
         phase="full",
     )
 
+
+def _receipt_backed_completion(
+    tmp_path: Path,
+    ledger: ResearchEventLedger,
+    attempt: dict,
+) -> dict:
+    completion = _valid_completion(tmp_path, attempt)
+    record_completed_evidence_command(tmp_path, ledger, attempt, completion)
+    return completion
+
 def _forged_trial(tmp_path: Path, attempt: dict) -> dict:
     relative_path = "experiment/results/main_results.json"
     artifact_path = tmp_path / relative_path
@@ -271,6 +284,34 @@ def _scoped_artifact(tmp_path: Path, attempt: dict, producer_run_id: str, kind: 
     return digest
 
 
+def _operation_receipt_binding(tmp_path: Path, attempt: dict, *, label: str) -> dict:
+    phase = "full" if attempt["phase_executions"].get("full") else "proxy"
+    execution = attempt["phase_executions"][phase]
+    receipt_ref = ContractStore(tmp_path).put_bytes(
+        encode_canonical_evidence(
+            {
+                "schema_version": "m113_operation_receipt_fixture_v1",
+                "attempt_id": attempt["attempt_id"],
+                "lifecycle_generation": attempt["lifecycle_generation"],
+                "label": label,
+            }
+        )
+    )
+    return {
+        "command_id": f"fixture-{label}-{attempt['lifecycle_generation']:04d}",
+        "command_hash": canonical_hash(
+            {
+                "attempt_id": attempt["attempt_id"],
+                "lifecycle_generation": attempt["lifecycle_generation"],
+                "label": label,
+            }
+        ),
+        "command_plan_hash": execution["command_plan_hash"],
+        "receipt_ref": receipt_ref,
+        "receipt_hash": receipt_ref["digest"],
+    }
+
+
 def _failure_evidence(
     tmp_path: Path,
     attempt: dict,
@@ -279,88 +320,61 @@ def _failure_evidence(
     exit_code: int | None,
     resource_type: str = "gpu_memory",
 ) -> dict:
-    source_phase = "activation" if failure_class == "activation_failure" else "full"
-    execution = attempt["phase_executions"]["full"]
-    producer_run_id = execution["producer_run_id"]
-    identity = {
-        "attempt_id": attempt["attempt_id"],
-        "producer_run_id": producer_run_id,
-        "direction_semantic_hash": attempt["direction_semantic_hash"],
-        "direction_spec_hash": attempt["direction_spec_hash"],
-        "variant_semantic_hash": attempt["variant_semantic_hash"],
-        "variant_spec_hash": attempt["variant_spec_hash"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "protocol_hash": attempt["protocol_hash"],
-        "sample_manifest_hash": attempt["sample_manifest_hash"],
-        "evaluator_hash": attempt["evaluator_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
-        "phase": source_phase,
-        "phase_execution_id": execution["phase_execution_id"],
-        "phase_start_event_id": execution["phase_start_event_id"],
-    }
+    authoritative_exit = int(exit_code or 1) or 1
     if failure_class in {"resource_pause", "oom_retry"}:
-        probe = {
-            "schema_version": "auto_research_resource_probe_evidence_v3",
-            "evidence_kind": "resource_probe",
-            "evidence_id": f"resource-probe-{attempt['lifecycle_generation']}",
-            **{**identity, "phase": "full"},
-            "resource_type": resource_type,
-            "resource_id": "resource-0",
-            "required_capacity": 10.0,
-            "observed_capacity": 1.0,
-            "unit": "bytes",
-            "probe_status": "insufficient",
-            "observed_at": "2026-07-14T00:00:00Z",
-        }
-        referenced_hash = _scoped_artifact(tmp_path, attempt, producer_run_id, "resource_probe", probe)
-        cross_references = {"resource_probe_hash": referenced_hash}
-        command_status = "resource_paused"
-        log_hash = referenced_hash
+        evidence = build_resource_failure_evidence_v4(
+            tmp_path,
+            attempt,
+            failure_class=failure_class,
+            suffix=f"m113-{attempt['lifecycle_generation']}",
+            resource_type=resource_type,
+            resource_id="resource-0",
+            required_capacity=10.0,
+            observed_capacity=1.0,
+            unit="bytes",
+            exit_code=authoritative_exit,
+        )
     else:
-        receipt = {
-            "schema_version": "auto_research_command_result_evidence_v1",
-            "evidence_kind": "command_result_evidence",
-            "evidence_id": f"command-result-{attempt['lifecycle_generation']}",
-            **identity,
-            "command_id": f"command-failure-{attempt['lifecycle_generation']:04d}",
-            "command": ["python", "failure_fixture.py", "--phase", source_phase],
-            "working_directory": "runner",
-            "started_at": "2026-07-14T00:00:00Z",
-            "finished_at": "2026-07-14T00:00:01Z",
-            "command_status": "failed",
-            "exit_code": exit_code,
-            "stdout_hash": "a" * 64,
-            "stderr_hash": "b" * 64,
-        }
-        referenced_hash = _scoped_artifact(tmp_path, attempt, producer_run_id, "command_result_evidence", receipt)
-        cross_references = {"command_result_evidence_hash": referenced_hash}
-        command_status = "failed"
-        log_hash = receipt["stderr_hash"]
-    evidence = {
-        "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION,
-        "evidence_kind": "failure_evidence",
-        "evidence_id": f"failure-evidence-{attempt['lifecycle_generation']}",
-        **identity,
-        "cross_references": cross_references,
-        "source_state": attempt["state"],
-        "source_phase": source_phase,
-        "failure_class": failure_class,
-        "command_status": command_status,
-        "exit_code": exit_code,
-        "reason": failure_class,
-        "observed_at": "2026-07-14T00:00:00Z",
-        "log_hash": log_hash,
-    }
-    _scoped_artifact(tmp_path, attempt, producer_run_id, "failure_evidence", evidence)
+        evidence = build_failure_evidence_v4(
+            tmp_path,
+            attempt,
+            failure_class=failure_class,
+            suffix=f"m113-{attempt['lifecycle_generation']}",
+            exit_code=authoritative_exit,
+        )
+    if exit_code != authoritative_exit:
+        evidence["exit_code"] = exit_code
+        _scoped_artifact(tmp_path, attempt, evidence["producer_run_id"], "failure_evidence", evidence)
     return evidence
 
 
 def _resume_evidence(tmp_path: Path, ledger: ResearchEventLedger, attempt: dict, *, resource_type: str) -> dict:
     producer_run_id = f"resume-producer-{attempt['lifecycle_generation']}"
+    core_receipt = {
+        "schema_version": "auto_research_core_resource_probe_receipt_v1",
+        "attempt_id": attempt["attempt_id"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "resource_type": resource_type,
+        "resource_id": "resource-0",
+        "required_capacity": 10.0,
+        "observed_capacity": 20.0,
+        "unit": "bytes",
+        "probe_status": "available",
+        "observed_at": "2026-07-14T00:01:00Z",
+    }
+    receipt_ref = ContractStore(tmp_path).put_bytes(encode_canonical_evidence(core_receipt))
+    command_id = f"core-resource-probe-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}"
+    receipt_binding = {
+        "command_id": command_id,
+        "command_hash": canonical_hash({"command_id": command_id, "receipt": receipt_ref["digest"]}),
+        "command_plan_hash": canonical_hash({"operation": "resume-resource-probe", "trial_spec_hash": attempt["trial_spec_hash"], "paused_phase": attempt["paused_phase"]}),
+        "receipt_ref": receipt_ref,
+        "receipt_hash": receipt_ref["digest"],
+    }
     probe = {
-        "schema_version": "auto_research_resource_probe_evidence_v3", "evidence_kind": "resource_probe",
+        "schema_version": "auto_research_resource_probe_evidence_v4", "evidence_kind": "resource_probe",
         "evidence_id": f"resume-probe-{attempt['lifecycle_generation']}", "attempt_id": attempt["attempt_id"],
         "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"],
         "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"],
@@ -373,6 +387,7 @@ def _resume_evidence(tmp_path: Path, ledger: ResearchEventLedger, attempt: dict,
         "attempt_input_hash": attempt["attempt_input_hash"], "phase": "resume",
         "phase_execution_id": f"phase-resume-{attempt['lifecycle_generation']:04d}",
         "phase_start_event_id": f"event:resume:{attempt['lifecycle_generation']}",
+        **receipt_binding,
     }
     probe_hash = _scoped_artifact(tmp_path, attempt, producer_run_id, "resource_probe", probe)
     pause_event = next(event for event in reversed(ledger.events()) if event["event_type"] == "AttemptDispositioned")
@@ -399,6 +414,7 @@ def _resume_evidence(tmp_path: Path, ledger: ResearchEventLedger, attempt: dict,
         "resource_type": resource_type, "resource_id": "resource-0", "required_capacity": 10.0,
         "observed_capacity": 20.0, "unit": "bytes", "probe_status": "available",
         "observed_at": "2026-07-14T00:01:00Z",
+        **receipt_binding,
     }
     _scoped_artifact(tmp_path, attempt, producer_run_id, "resume_evidence", evidence)
     return evidence
@@ -406,10 +422,10 @@ def _resume_evidence(tmp_path: Path, ledger: ResearchEventLedger, attempt: dict,
 
 def test_identity_only_artifact_cannot_finalize_with_forged_observations(tmp_path: Path) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    before = ledger.state()
-    valid = _valid_completion(tmp_path, attempt)
+    valid = _receipt_backed_completion(tmp_path, ledger, attempt)
     canonical = ledger.validate_trial_precommit(valid)
     assert canonical["outcome_classification"] == "accepted"
+    before = ledger.state()
     forged = _forged_trial(tmp_path, attempt)
     assert forged["outcome_classification"] == "accepted"
 
@@ -462,10 +478,10 @@ def test_attempt_reserved_reducer_rejects_noncanonical_initial_record(
 
 def test_resource_pause_with_success_exit_code_is_zero_write_rejected(tmp_path: Path) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    before = ledger.state()
     evidence = _failure_evidence(
         tmp_path, attempt, failure_class="resource_pause", exit_code=0
     )
+    before = ledger.state()
 
     with pytest.raises(IntegrityError, match="exit|resource|failure"):
         ledger.disposition_failure(evidence)
@@ -527,7 +543,7 @@ def test_revision_cycle_back_to_prior_hash_is_not_implicit_late_replay(tmp_path:
 
 def test_completion_public_validation_and_reducer_use_same_canonical_trial(tmp_path: Path) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    completion = _valid_completion(tmp_path, attempt)
+    completion = _receipt_backed_completion(tmp_path, ledger, attempt)
     canonical = ledger.validate_trial_precommit(completion)
 
     completed, route = ledger.complete_attempt(completion)
@@ -542,7 +558,7 @@ def test_completion_public_validation_and_reducer_use_same_canonical_trial(tmp_p
 
 def test_orphan_evidence_before_db_can_retry_without_duplicate_commit(tmp_path: Path) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    completion = _valid_completion(tmp_path, attempt)
+    completion = _receipt_backed_completion(tmp_path, ledger, attempt)
     canonical = ledger.validate_trial_precommit(completion)
     invalid = deepcopy(completion)
     invalid["diagnostic_trial_result"] = {**canonical, "outcome_classification": "rejected"}
@@ -550,7 +566,7 @@ def test_orphan_evidence_before_db_can_retry_without_duplicate_commit(tmp_path: 
     artifact = tmp_path / completion["entries"][0]["relative_path"]
     assert artifact.is_file()
 
-    with pytest.raises(IntegrityError, match="diagnostic TrialResult"):
+    with pytest.raises(IntegrityError, match="CompletionEvidence v3|diagnostic TrialResult"):
         ledger.complete_attempt(invalid)
 
     assert artifact.is_file()
@@ -563,7 +579,7 @@ def test_orphan_evidence_before_db_can_retry_without_duplicate_commit(tmp_path: 
 
 def test_db_commit_before_projection_crash_recovers_one_result_and_route(tmp_path: Path) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    completion = _valid_completion(tmp_path, attempt)
+    completion = _receipt_backed_completion(tmp_path, ledger, attempt)
 
     def crash() -> None:
         raise RuntimeError("after-db-before-projection")
@@ -587,7 +603,7 @@ def test_db_commit_before_projection_crash_recovers_one_result_and_route(tmp_pat
 
 def test_missing_trial_spec_projection_rejects_completion_with_zero_write(tmp_path: Path) -> None:
     ledger, attempt = _running_attempt(tmp_path)
-    completion = _valid_completion(tmp_path, attempt)
+    completion = _receipt_backed_completion(tmp_path, ledger, attempt)
     ledger.validate_trial_precommit(completion)
     before = len(ledger.events())
     (tmp_path / "plan" / "attempts" / attempt["attempt_id"] / "trial_spec" / f"{attempt['trial_spec_hash']}.json").unlink()

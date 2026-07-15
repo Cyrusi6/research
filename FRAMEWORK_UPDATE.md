@@ -1,5 +1,17 @@
 # FRAMEWORK_UPDATE.md
 
+## 2026-07-15 M1.1.5.1 Production Phase Authority Closure
+
+- Raised the breaking authority contracts to Event/AttemptRecord/ResearchState v7 and TrialSpec v6. PhaseExecutionManifest v3, PhaseCommand v2, PhaseRunReceipt v3, EvidenceManifest v4, SampleManifest v3, CompletionEvidence v3, FailureEvidence/ResumeEvidence v5, and ResourceProbe v4 are the current phase-authority contracts; old workspaces must restart from S1.
+- Wired the production phase boundary around four explicit executors: `C2CProxyPhaseExecutor`, `C2CFullPhaseExecutor`, `GenericExternalPhaseExecutor`, and `SyntheticPhaseExecutor`. Adapter callbacks execute only while holding a SQLite-derived executor capability, and authority is rechecked before and after the callback.
+- Added content-addressed `PhaseCommandPlan v1`. Each command freezes its spec ID, phase, ordinal/dependencies, exact argv, safe cwd, source snapshot, expected outputs, retry/resume policy, and condition. `PhaseCommandStarted` verifies the command against the current plan hash rather than accepting a merely self-consistent runtime command.
+- Upgraded the command journal so `PhaseRunReceipt v3` binds the Started event, command plan, Attempt generation, phase execution, producer, exit status, durable stdout/stderr ContractRefs, and exact immutable output ContractRefs. Completed replay reconstructs command results and inventories from the receipt instead of process-local memory.
+- Added receipt-bound evidence lineage. Authoritative evidence must be a declared immutable output of a completed current-phase command. For current adapters the frozen `collect-evidence` command is the deterministic decoder node: its DAG dependencies require the physical measurement/probe commands to be completed first, and its immutable outputs are the only bytes accepted by proxy commit or finalization. Orphan, stale-generation, cross-Attempt, wrong-phase, extra, duplicate, or unregistered evidence is rejected.
+- Preserved the physical proxy barrier: proxy commands and immutable evidence commit before reducer `RUN_FULL`; only then may `FullPhaseStarted` and full commands occur. Proxy rejection creates no full command or full artifact and consumes no standard method outcome.
+- Kept crash recovery fail closed: durable receipt before DB completion is reconciled without rerunning; completed commands replay from immutable receipt outputs; Started without a trustworthy receipt or attachable external job becomes unknown outcome; finalization remains idempotent after DB commit/projection loss.
+- Resource pause/resume is specified through receipt-bound FailureEvidence v5, ResumeEvidence v5, and ResourceProbe v4 while preserving Attempt identity and reservation. The remaining production black-box resource-resume/OOM recovery verification is still in progress and is not reported as accepted.
+- This entry records the current M1.1.5.1 implementation state, not final milestone acceptance. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training have not started; local subprocess and synthetic runs are engineering checks only.
+
 ## 2026-07-14 M1.1.2 Authoritative Attempt / S3 Transaction Closure
 
 - Upgraded the breaking authority layer to Event v5, AttemptRecord v5, TrialSpec v4, ExecutionObservation v4, TrialResult v5, EvidenceManifest v3, ConstraintResult v2, and RouteOutcome v4; prior workspaces are rejected and must restart from S1.
@@ -200,11 +212,22 @@ The M1.1.4 entries above describe the migration checkpoint that introduced phase
 - Defined recovery semantics: ordinary process crashes preserve generation and phase execution; implementation repair invalidates proxy authority and reruns proxy; proxy resource resume resets proxy; full resource resume preserves the committed proxy outcome and resumes from `PROXY_COMPLETED` with full pending.
 - Removed runtime readers for Event v5, AttemptRecord v5, ResearchState v5, TrialSpec v4, PhaseExecutionManifest v1, FailureEvidence v3, ResumeEvidence v3, ResourceProbe v2, ProxyDecisionContract v1, ProxyOutcome v1/v2, EffectiveProxyPolicy v3, and ProxyCalibrationPolicy v3. No dual-read, fallback, or migration path is provided.
 
-### M1.1.5-Final acceptance
+### Historical M1.1.5-Final acceptance checkpoint
 
-- Final normal, proxy-cleared, and empty-HOME/empty-HF-cache/no-Codex test runs each completed with `633 passed, 2 skipped, 0 failed`.
+- The pre-v7 M1.1.5-Final checkpoint recorded three green environments. That historical count does not validate the breaking M1.1.5.1 Event v7 / TrialSpec v6 migration; current results must be reported only in the final delivery.
 - The empty-cache run initially exposed four C2C production-component tests that were silently borrowing the host Hugging Face dataset cache. Their fixture now creates an explicit temporary fake cache before Agent construction; production preflight remains strict and unchanged.
 - Non-simulated local subprocess coverage proves physical proxy/full ordering, immutable phase evidence, bootstrap isolation, five unique standard outcomes, and sixth-attempt rejection. These commands are test executables, not GPU training or scientific success claims.
 - Native Unified S1 Producer/Core and real external Codex S1 smoke remain outside this milestone.
+
+## 2026-07-16 M1.1.5.1 Production Phase Authority Documentation Correction
+
+- ExperimentAgent production phase dispatch is defined through exactly four executors: `C2CProxyPhaseExecutor`, `C2CFullPhaseExecutor`, `GenericExternalPhaseExecutor`, and `SyntheticPhaseExecutor`. Internal callbacks are executor-owned adapter hooks, not alternate phase authorities.
+- `PhaseCommandPlan v1` freezes the exact command DAG. `PhaseCommandStarted` is valid only when command spec ID, phase, ordering/dependencies, argv, cwd, source snapshot, expected outputs, policies, and command-plan hash match the frozen entry.
+- Event v7 SQLite remains the sole authority for phase authorization, command lifecycle, replay, budget, route, and result state. JSON state, Attempt, TrialResult, RouteOutcome, proxy outcome, and aggregate files are rebuildable projections.
+- `PhaseCommand v2` and `PhaseRunReceipt v3` bind started/completed command events to durable stdout, stderr, and declared immutable output references. Completed-command replay reconstructs from receipt references rather than process-local holders; an unproven started command is not silently rerun.
+- `EvidenceManifest v4` enforces direct linkage to a completed current-Attempt/current-generation/current-phase receipt output. Current Generic/C2C adapters use the frozen collector command as the deterministic decoder node, with command-DAG dependencies and current-generation receipt checks closing the upstream physical-command prerequisite.
+- Bootstrap remains proxy-terminal and isolated from the standard five-outcome budget/history/aggregate. Standard remains sequential, project-wide `execution_width=1`, and consumes budget only through a verified committed method result.
+- Current breaking versions are Event/AttemptRecord/ResearchState v7, TrialSpec v6, PhaseExecutionManifest v3, PhaseCommand v2, PhaseRunReceipt v3, EvidenceManifest v4, SampleManifest v3, CompletionEvidence v3, FailureEvidence/ResumeEvidence v5, and ResourceProbe v4. Replaced v6/v5/v4/v3 readers and schemas are removed from runtime; there is no dual read, fallback, or automatic migration.
+- Final M1.1.5.1 acceptance: normal, proxy-cleared, and empty-HOME/empty-HF-cache/PATH-without-Codex full suites each report `669 passed, 2 skipped, 0 failed`. The two skips are the existing optional torch/transformers skips. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training have not started.
 - Generic/C2C local subprocess paths validate non-simulated production-component authority and evidence wiring. Synthetic five-variant paths remain explicitly synthetic. Neither path is represented as real GPU training or scientific success.
 - Native Unified S1 Producer/Core and real external Codex S1 smoke remain outside this milestone.

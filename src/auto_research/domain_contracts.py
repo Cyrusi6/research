@@ -18,15 +18,27 @@ from .evidence import (
     EXECUTION_OBSERVATION_SCHEMA_VERSION,
     decode_evidence_inventory,
 )
+from .phase_command_plan import phase_command_plan_for_phase, validate_phase_command_plan
 
 DIRECTION_SCHEMA_VERSION = "auto_research_direction_v3"
 VARIANT_SCHEMA_VERSION = "auto_research_variant_v4"
-ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v6"
-TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v5"
+EVENT_SCHEMA_VERSION = "auto_research_event_v7"
+ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v7"
+RESEARCH_STATE_SCHEMA_VERSION = "auto_research_state_v7"
+TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v6"
 TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v5"
 ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v4"
 CONSTRAINT_RESULT_SCHEMA_VERSION = "auto_research_constraint_result_v2"
 DIRECTION_AGGREGATE_SCHEMA_VERSION = "auto_research_direction_outcome_aggregate_v1"
+PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION = "auto_research_phase_execution_manifest_v3"
+PHASE_COMMAND_SCHEMA_VERSION = "auto_research_phase_command_v2"
+PHASE_RUN_RECEIPT_SCHEMA_VERSION = "auto_research_phase_run_receipt_v3"
+AUTHORITATIVE_EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v4"
+SAMPLE_MANIFEST_SCHEMA_VERSION = "auto_research_sample_manifest_v3"
+COMPLETION_EVIDENCE_SCHEMA_VERSION = "auto_research_completion_evidence_v3"
+FAILURE_EVIDENCE_SCHEMA_VERSION = "auto_research_failure_evidence_v5"
+RESUME_EVIDENCE_SCHEMA_VERSION = "auto_research_resume_evidence_v5"
+RESOURCE_PROBE_SCHEMA_VERSION = "auto_research_resource_probe_evidence_v4"
 
 
 def canonical_json(value: Any) -> str:
@@ -204,7 +216,7 @@ def validate_variant_identity(direction: dict[str, Any], spec: dict[str, Any], *
 
 
 def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
-    validate_contract(trial_spec, "trial_spec_v5.schema.json")
+    validate_contract(trial_spec, "trial_spec_v6.schema.json")
     datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
     manifest_datasets = {item["dataset_id"] for item in trial_spec["sample_manifest"]["datasets"]}
     if datasets != manifest_datasets:
@@ -255,6 +267,9 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
     phase_contracts = {item["phase"]: item for item in trial_spec["phase_contracts"]}
     if set(phase_contracts) != required_phases:
         raise ValueError("TrialSpec phase_contracts must exactly cover required phases")
+    command_plan_hashes = runtime["phase_command_plan_hashes"]
+    if set(command_plan_hashes) != required_phases:
+        raise ValueError("TrialSpec phase command plan hashes must exactly cover required phases")
     known_datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
     known_metrics = {item["metric_id"] for item in trial_spec["metrics"]}
     for phase, contract in phase_contracts.items():
@@ -264,6 +279,15 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
             raise ValueError(f"{phase} phase contract contains unknown metric")
         if contract["terminal"] != (phase in terminal_phases):
             raise ValueError(f"{phase} phase terminal semantics mismatch")
+        plan = phase_command_plan_for_phase(trial_spec, phase)
+        if contract["command_plan_hash"] != canonical_hash(plan):
+            raise ValueError(f"{phase} phase command_plan_hash mismatch")
+        if command_plan_hashes[phase] != contract["command_plan_hash"]:
+            raise ValueError(f"{phase} execution contract command plan hash mismatch")
+        reference = contract["command_plan_ref"]
+        if reference["digest"] != contract["command_plan_hash"]:
+            raise ValueError(f"{phase} phase command plan content reference mismatch")
+        validate_phase_command_plan(plan, expected_evidence_kinds=contract["evidence_kinds"])
     expected_versions = {
         "main_results": "auto_research_main_results_v3",
         "proxy_results": "auto_research_proxy_results_v1",
@@ -279,6 +303,18 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
     for requirement in trial_spec["evidence_requirements"]:
         if requirement["schema_version"] != expected_versions[requirement["kind"]]:
             raise ValueError(f"evidence requirement schema mismatch: {requirement['kind']}")
+    for phase, contract in phase_contracts.items():
+        requirement_kinds = {
+            requirement["kind"]
+            for requirement in trial_spec["evidence_requirements"]
+            if phase in requirement["applicable_phases"] or "always" in requirement["applicable_phases"]
+        }
+        if requirement_kinds != set(contract["evidence_kinds"]):
+            missing = sorted(requirement_kinds - set(contract["evidence_kinds"]))
+            extra = sorted(set(contract["evidence_kinds"]) - requirement_kinds)
+            raise ValueError(
+                f"{phase} phase evidence authority mismatch; missing={missing}, extra={extra}"
+            )
     if not any(
         item["kind"] == "minimum_mean_delta"
         and item.get("metric_id") == trial_spec["primary_metric_id"]
@@ -321,7 +357,7 @@ def validate_execution_observation(observation: dict[str, Any]) -> None:
 
 
 def validate_evidence_manifest(manifest: dict[str, Any], *, trial_spec: dict[str, Any]) -> None:
-    validate_contract(manifest, "evidence_manifest_v3.schema.json")
+    validate_contract(manifest, "evidence_manifest_v4.schema.json")
     expected_hash = trial_spec_hash(trial_spec)
     if manifest["trial_spec_hash"] != expected_hash:
         raise ValueError("evidence manifest TrialSpec hash mismatch")

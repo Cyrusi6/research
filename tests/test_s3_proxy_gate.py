@@ -19,7 +19,7 @@ from auto_research.research_state import IntegrityError, ResearchEventLedger
 from auto_research.utils import write_json
 from auto_research.validators import run_stage_gate
 from test_authoritative_state_machine import _attempt_inputs, _direction, _initialize, _reserve, _trial_spec, _variant
-from support.authoritative_evidence import start_attempt_phase
+from support.authoritative_evidence import record_completed_evidence_command, start_attempt_phase
 
 
 _BOOTSTRAP_EVIDENCE_KINDS = (
@@ -87,6 +87,7 @@ def _prepare_s3_outputs(root: Path, *, bootstrap: bool = False) -> tuple[Researc
             trial_spec=trial_spec,
             inventory=inventory,
         )
+        record_completed_evidence_command(root, ledger, attempt, completion)
         ledger.complete_attempt(completion)
     else:
         attempt = _reserve(ledger, direction, variant)

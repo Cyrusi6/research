@@ -20,6 +20,7 @@ from auto_research.utils import write_json
 from test_authoritative_state_machine import _direction, _initialize, _reserve, _trial_spec, _variant
 from test_m113_evidence_contracts import _attempt as _contract_attempt
 from test_m113_evidence_contracts import _main_inventory, _trial_spec as _contract_trial_spec
+from support.authoritative_evidence import refresh_phase_command_plans
 
 
 def _classify(spec: dict, values: dict[tuple[str, int], tuple[float, float]]) -> dict:
@@ -46,6 +47,7 @@ def _classify(spec: dict, values: dict[tuple[str, int], tuple[float, float]]) ->
         lambda value: value["execution_contract"]["runtime_config"].__setitem__("batch_size", 4),
         lambda value: value["required_artifacts"].append("coverage_results"),
         lambda value: value["evidence_requirements"][0].__setitem__("schema_version", "forged-v9"),
+        lambda value: value["phase_contracts"][0]["command_plan"]["commands"][0]["argv"].append("--changed"),
     ],
 )
 def test_trial_spec_hash_changes_for_every_authoritative_field(mutate) -> None:
@@ -55,13 +57,13 @@ def test_trial_spec_hash_changes_for_every_authoritative_field(mutate) -> None:
     assert trial_spec_hash(changed) != trial_spec_hash(original)
 
 
-def test_trial_spec_v5_is_closed_and_v4_is_rejected() -> None:
+def test_trial_spec_v6_is_closed_and_v5_is_rejected() -> None:
     spec = _contract_trial_spec()
     spec["unexpected"] = True
     with pytest.raises(ValueError, match="Additional properties"):
         validate_trial_spec(spec)
     spec = _contract_trial_spec()
-    spec["schema_version"] = "auto_research_trial_spec_v4"
+    spec["schema_version"] = "auto_research_trial_spec_v5"
     with pytest.raises(ValueError, match=TRIAL_SPEC_SCHEMA_VERSION):
         validate_trial_spec(spec)
 
@@ -102,6 +104,7 @@ def _with_role_requirement(role: str, kind: str, artifact: str, threshold: float
     full_contract = next(item for item in spec["phase_contracts"] if item["phase"] == "full")
     full_contract["roles"].append(role)
     full_contract["evidence_kinds"].append(artifact)
+    refresh_phase_command_plans(spec)
     validate_trial_spec(spec)
     return spec
 
@@ -191,6 +194,19 @@ def _add_role_evidence(
             **common,
             "phase": phase,
             "cross_references": {},
+            "command_id": manifest["entries"][0]["command_id"],
+            "command_hash": manifest["entries"][0]["command_hash"],
+            "command_plan_hash": manifest["entries"][0]["command_plan_hash"],
+            "receipt_ref": deepcopy(manifest["entries"][0]["receipt_ref"]),
+            "receipt_hash": manifest["entries"][0]["receipt_hash"],
+            "output_ref": {
+                "schema_version": "auto_research_contract_blob_v1",
+                "algorithm": "sha256",
+                "digest": digest,
+                "size_bytes": len(raw),
+                "relative_path": f"meta/contracts/sha256/{digest[:2]}/{digest}.json",
+            },
+            "completed_event_id": manifest["entries"][0]["completed_event_id"],
         }
     )
     evidence_bytes[evidence_id] = raw

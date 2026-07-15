@@ -240,6 +240,43 @@ def classify_proxy_outcome(
     return outcome
 
 
+def classify_receipt_bound_proxy_outcome(
+    *,
+    frozen_policy: Mapping[str, Any],
+    evaluation_binding: Mapping[str, Any],
+    receipt_bound_evidence: Any,
+    evidence_manifest_hash: str,
+) -> dict[str, Any]:
+    """Classify only evidence already proven against command receipts.
+
+    ``ReceiptBoundEvidence`` is intentionally duck-typed here to keep the pure
+    classifier free of project storage concerns.  The lineage map must cover
+    the decoded inventory exactly, preventing callers from mixing receipt-bound
+    rows with producer-authored qualitative evidence.
+    """
+
+    decoded = getattr(receipt_bound_evidence, "decoded_evidence", None)
+    lineage = getattr(receipt_bound_evidence, "lineage", None)
+    if not isinstance(decoded, Mapping) or not isinstance(lineage, Mapping):
+        raise ValueError("proxy classification requires receipt-bound evidence")
+    if set(decoded) != set(lineage):
+        raise ValueError("proxy evidence lineage does not exactly cover decoded evidence")
+    for evidence_id, payload in decoded.items():
+        item = lineage[evidence_id]
+        if getattr(item, "evidence_id", None) != evidence_id:
+            raise ValueError("proxy evidence lineage identity mismatch")
+        if getattr(item, "evidence_kind", None) != payload.get("evidence_kind"):
+            raise ValueError("proxy evidence lineage kind mismatch")
+        if not getattr(item, "command_id", None) or not getattr(item, "receipt_hash", None):
+            raise ValueError("proxy evidence lacks completed command receipt identity")
+    return classify_proxy_outcome(
+        frozen_policy=frozen_policy,
+        evaluation_binding=evaluation_binding,
+        decoded_evidence=decoded,
+        evidence_manifest_hash=evidence_manifest_hash,
+    )
+
+
 def _constraint_result(*, constraint_id: str, kind: str, observed: Any, threshold: float, passed: bool, policy: Mapping[str, Any], observation_ids: list[str], evidence_id: str) -> dict[str, Any]:
     return {
         "schema_version": CONSTRAINT_RESULT_SCHEMA_VERSION,

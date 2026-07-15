@@ -9,7 +9,6 @@ import pytest
 
 from auto_research.domain_contracts import canonical_hash, variant_semantic_hash, variant_spec_hash
 from auto_research.evidence import content_addressed_evidence_path, encode_canonical_evidence
-from auto_research.failure_validation import canonical_evidence_bytes, evidence_bytes_hash
 from auto_research.research_state import IntegrityError, ResearchEventLedger
 from test_authoritative_state_machine import (
     _attempt_inputs,
@@ -22,7 +21,11 @@ from test_authoritative_state_machine import (
     _trial_spec,
     _variant,
 )
-from support.authoritative_evidence import start_attempt_phase
+from support.authoritative_evidence import (
+    build_quantitative_completion,
+    record_completed_evidence_command,
+    start_attempt_phase,
+)
 
 
 def _reserve_kind(
@@ -43,50 +46,6 @@ def _reserve_kind(
         trial_spec=trial_spec,
         **values,
     )
-
-
-def _activation_failure_v4(project_root: Path, attempt: dict) -> dict:
-    execution = attempt["phase_executions"]["full"]
-    producer_run_id = execution["producer_run_id"]
-    identity = {
-        "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id,
-        "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"],
-        "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"],
-        "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"],
-        "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"], "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"], "phase": "full",
-        "phase_execution_id": execution["phase_execution_id"], "phase_start_event_id": execution["phase_start_event_id"],
-    }
-    receipt = {
-        "schema_version": "auto_research_command_result_evidence_v1", "evidence_kind": "command_result_evidence",
-        "evidence_id": "activation-command-failure", **identity, "command_id": "activation-command-0001",
-        "command": ["python", "activation_probe.py"], "working_directory": "runner",
-        "started_at": "2026-07-15T00:00:00Z", "finished_at": "2026-07-15T00:00:01Z",
-        "command_status": "failed", "exit_code": 2, "stdout_hash": "b" * 64, "stderr_hash": "c" * 64,
-    }
-    receipt_raw = canonical_evidence_bytes(receipt)
-    receipt_hash = evidence_bytes_hash(receipt_raw)
-    receipt_path = project_root / "experiment" / "attempts" / attempt["attempt_id"] / producer_run_id / "command_result_evidence" / f"{receipt_hash}.json"
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_bytes(receipt_raw)
-    failure = {
-        "schema_version": "auto_research_failure_evidence_v4", "evidence_kind": "failure_evidence",
-        "evidence_id": "activation-failure-0001", **identity,
-        "cross_references": {"command_result_evidence_hash": receipt_hash},
-        "source_state": "FULL_RUNNING", "source_phase": "full", "failure_class": "activation_failure",
-        "command_status": "failed", "exit_code": 2, "reason": "activation failed",
-        "observed_at": "2026-07-15T00:00:01Z", "log_hash": "c" * 64,
-    }
-    failure_raw = canonical_evidence_bytes(failure)
-    failure_hash = evidence_bytes_hash(failure_raw)
-    failure_path = project_root / content_addressed_evidence_path(
-        attempt_id=attempt["attempt_id"], producer_run_id=producer_run_id,
-        evidence_kind="failure_evidence", content_hash=failure_hash,
-    )
-    failure_path.parent.mkdir(parents=True, exist_ok=True)
-    failure_path.write_bytes(failure_raw)
-    return failure
 
 
 @pytest.mark.parametrize(
@@ -189,15 +148,9 @@ def test_ready_attempt_cannot_finalize(tmp_path: Path) -> None:
     variant = _variant(direction, 1)
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
-    completion = {
-        "schema_version": "auto_research_completion_evidence_v2",
-        "attempt_id": attempt["attempt_id"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
-        "entries": [],
-    }
+    staged_attempt = deepcopy(attempt)
+    staged_attempt["phase_executions"]["full"] = _schema_only_phase_execution(attempt, "full", "ready")
+    completion = _schema_valid_completion(ledger, staged_attempt, "full")
     _assert_trial_rejected_without_writes(ledger, completion, match="READY|execution state|cannot finalize")
 
 
@@ -209,7 +162,7 @@ def test_failed_phase_cannot_be_overwritten_by_finalization(tmp_path: Path) -> N
     attempt = _reserve(ledger, direction, variant)
     running = start_attempt_phase(ledger, attempt, "full")
     completion = _valid_completion(ledger, running)
-    ledger.disposition_failure(_activation_failure_v4(tmp_path, running))
+    ledger.disposition_failure(_failure_evidence(ledger, running, "activation_failure"))
     _assert_trial_rejected_without_writes(ledger, completion, match="phase|FAILED|completed|execution state|IMPLEMENTATION_REPAIR")
 
 
@@ -220,17 +173,36 @@ def test_full_trial_requires_full_execution_state(tmp_path: Path) -> None:
     _initialize(ledger, direction, variant)
     attempt = _reserve_kind(ledger, direction, variant, profile="standard", attempt_kind="proxy_full")
     attempt = start_attempt_phase(ledger, attempt, "proxy")
-    completion = {
-        "schema_version": "auto_research_completion_evidence_v2",
-        "attempt_id": attempt["attempt_id"], "trial_spec_hash": attempt["trial_spec_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"], "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"], "entries": [],
-    }
+    staged_attempt = deepcopy(attempt)
+    staged_attempt["phase_executions"]["full"] = _schema_only_phase_execution(attempt, "full", "proxy-state")
+    completion = _schema_valid_completion(ledger, staged_attempt, "full")
     _assert_trial_rejected_without_writes(ledger, completion, match="PROXY_RUNNING|full|phase|execution state")
 
 
 def _valid_completion(ledger: ResearchEventLedger, attempt: dict) -> dict:
     return _completion_evidence(ledger, attempt, outcome="accepted")
+
+
+def _schema_only_phase_execution(attempt: dict, phase: str, suffix: str) -> dict:
+    phase_contract = next(item for item in attempt["frozen_trial_spec"]["phase_contracts"] if item["phase"] == phase)
+    return {
+        "phase_execution_id": f"{phase}-{suffix}-schema-attack",
+        "phase_start_event_id": f"evt-{phase}-{suffix}-schema-attack",
+        "producer_run_id": f"producer-{phase}-{suffix}-schema-attack",
+        "command_plan_hash": phase_contract["command_plan_hash"],
+    }
+
+
+def _schema_valid_completion(ledger: ResearchEventLedger, attempt: dict, phase: str) -> dict:
+    return build_quantitative_completion(
+        ledger.project_root,
+        attempt,
+        role_values={"baseline": 0.5, "candidate": 0.7},
+        dataset_id="fake",
+        metric_id="accuracy",
+        seed=1,
+        phase=phase,
+    )
 
 
 def _rewrite_completion_artifact(ledger: ResearchEventLedger, completion: dict, mutate) -> None:
@@ -297,6 +269,7 @@ def test_ledger_independently_rejects_forged_trial_result(
     attempt = _reserve(ledger, direction, variant)
     attempt = start_attempt_phase(ledger, attempt, "full")
     completion = _valid_completion(ledger, attempt)
+    record_completed_evidence_command(ledger.project_root, ledger, attempt, completion)
     assert ledger.validate_trial_precommit(completion)["outcome_classification"] == "accepted"
 
     if forgery == "unregistered_seed":

@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import bootstrap_cached_s0_only_enabled
+from .domain_contracts import RESEARCH_STATE_SCHEMA_VERSION, TRIAL_SPEC_SCHEMA_VERSION
 from .research_state import ResearchEventLedger
 from .utils import ensure_dir, now_utc, read_json, read_yaml, sha256_file, write_json
 from .validators.base import load_schema, validate_min_schema
@@ -26,6 +27,8 @@ C2C_EXECUTION_HOOKS_SCHEMA_VERSION = "c2c_execution_hooks_report_v1"
 C2C_REPLAY_PLAN_SCHEMA_VERSION = "c2c_replay_plan_v1"
 C2C_REPLAY_RESULT_SCHEMA_VERSION = "c2c_replay_result_v1"
 C2C_REAL_SMOKE_RECORD_SCHEMA_VERSION = "c2c_real_smoke_record_v1"
+TRIAL_SPEC_SCHEMA = f"{TRIAL_SPEC_SCHEMA_VERSION.removeprefix('auto_research_')}.schema.json"
+RESEARCH_STATE_SCHEMA = f"research_{RESEARCH_STATE_SCHEMA_VERSION.removeprefix('auto_research_')}.schema.json"
 
 
 STAGE_ARTIFACT_REQUIREMENTS = {
@@ -40,7 +43,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
     ],
     "S2_plan": [
         ("plan/variant.json", "variant_v4.schema.json"),
-        ("plan/trial_spec.json", "trial_spec_v5.schema.json"),
+        ("plan/trial_spec.json", TRIAL_SPEC_SCHEMA),
         ("plan/s2_planner/candidate_pool.json", "s2_candidate_pool.schema.json"),
         ("plan/s2_planner/feedback_context.json", "s2_feedback_context.schema.json"),
         ("plan/s2_planner/adaptive_policy.json", "s2_adaptive_policy.schema.json"),
@@ -64,7 +67,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
     ],
     "orchestration": [
         ("meta/route_outcome.json", "route_outcome_v4.schema.json"),
-        ("meta/research_state.json", "research_state_v6.schema.json"),
+        ("meta/research_state.json", RESEARCH_STATE_SCHEMA),
         ("meta/iteration_trace.jsonl", None),
     ],
 }
@@ -462,9 +465,9 @@ def build_c2c_replay_plan(project_root: Path, *, replay_from: str = "S3_experime
     """Freeze immutable event hashes for deterministic reducer replay."""
 
     ledger = ResearchEventLedger(project_root)
-    ledger.events()
+    events = ledger.events()
     frozen_inputs = ["meta/research_events.sqlite3"]
-    input_hashes = {rel: _sha_or_none(project_root / rel) for rel in frozen_inputs}
+    input_hashes = {"meta/research_events.sqlite3": _stable_hash(events)}
     state = ledger.state()
     normalized = _normalize_research_state(state)
     return {
@@ -491,7 +494,11 @@ def build_c2c_replay_result(project_root: Path, replay_plan: dict[str, Any] | No
     plan = replay_plan if isinstance(replay_plan, dict) else read_json(project_root / "meta" / "c2c_replay_plan.json", default={}) or {}
     mismatches: list[dict[str, Any]] = []
     for rel, expected_hash in (plan.get("input_hashes") or {}).items():
-        actual_hash = _sha_or_none(project_root / rel)
+        actual_hash = (
+            _stable_hash(ResearchEventLedger(project_root).events())
+            if rel == "meta/research_events.sqlite3"
+            else _sha_or_none(project_root / rel)
+        )
         if expected_hash != actual_hash:
             mismatches.append({"kind": "input_hash_mismatch", "path": rel, "expected": expected_hash, "actual": actual_hash})
     state = ResearchEventLedger(project_root).rebuild()
@@ -1034,10 +1041,10 @@ def _optional_artifact_checks(project_root: Path, *, require_schema: bool) -> li
         ("meta/c2c_replay_result.json", "c2c_replay_result.schema.json", "orchestration"),
         ("meta/c2c_real_smoke_record.json", "c2c_real_smoke_record.schema.json", "orchestration"),
     ]
-    proxy = read_json(project_root / "experiment" / "results" / "c2c_proxy_decision_report.json", default={}) or {}
+    route = ResearchEventLedger(project_root).state().get("last_route_outcome") or {}
     for rel, schema, stage in optional:
         path = project_root / rel
-        if rel.endswith("c2c_full_s3_worthiness.json") and proxy.get("decision") != "neutral_proxy_full_s3" and not path.exists():
+        if rel.endswith("c2c_full_s3_worthiness.json") and route.get("next_action") != "RUN_FULL" and not path.exists():
             continue
         if not path.exists():
             continue

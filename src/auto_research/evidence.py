@@ -16,7 +16,8 @@ from typing import Any, Mapping
 from jsonschema import Draft202012Validator
 
 EXECUTION_OBSERVATION_SCHEMA_VERSION = "auto_research_execution_observation_v4"
-EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v3"
+EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v4"
+COMPLETION_EVIDENCE_SCHEMA_VERSION = "auto_research_completion_evidence_v3"
 QUANTITATIVE_EVIDENCE_SCHEMA_VERSIONS = {
     "main_results": "auto_research_main_results_v3",
     "proxy_results": "auto_research_proxy_results_v1",
@@ -34,9 +35,9 @@ EVIDENCE_SCHEMA_VERSIONS = {
 }
 
 TRANSACTION_EVIDENCE_SCHEMA_VERSIONS = {
-    "failure_evidence": "auto_research_failure_evidence_v4",
-    "resource_probe": "auto_research_resource_probe_evidence_v3",
-    "resume_evidence": "auto_research_resume_evidence_v4",
+    "failure_evidence": "auto_research_failure_evidence_v5",
+    "resource_probe": "auto_research_resource_probe_evidence_v4",
+    "resume_evidence": "auto_research_resume_evidence_v5",
 }
 
 CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS = {
@@ -186,7 +187,7 @@ def decode_evidence_inventory(
     that were content-addressed; this function never reopens an artifact path.
     """
 
-    _validate_schema(manifest, "evidence_manifest_v3.schema.json")
+    _validate_schema(manifest, "evidence_manifest_v4.schema.json")
     _validate_manifest_identity(attempt, trial_spec, manifest)
     entries = manifest["entries"]
     entry_ids = [entry["evidence_id"] for entry in entries]
@@ -227,6 +228,131 @@ def decode_evidence_inventory(
     if len(identities) != len(set(identities)):
         raise ValueError("duplicate quantitative measurement row identity")
     return observations, decoded
+
+
+def decode_receipt_bound_evidence_inventory(
+    *,
+    project_root: Path,
+    attempt: Mapping[str, Any],
+    trial_spec: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    phase_commands: Mapping[str, Mapping[str, Any]],
+    phase: str,
+):
+    """Decode evidence only after proving completed command receipt lineage.
+
+    Imported lazily to keep the low-level byte decoder independent from ledger
+    projections while exposing one production integration point.
+    """
+
+    from .evidence_lineage import validate_receipt_bound_evidence
+
+    return validate_receipt_bound_evidence(
+        project_root=project_root,
+        attempt=attempt,
+        trial_spec=trial_spec,
+        manifest=manifest,
+        phase_commands=phase_commands,
+        phase=phase,
+    )
+
+
+def stage_completion_evidence(
+    *,
+    project_root: Path,
+    attempt: Mapping[str, Any],
+    trial_spec: Mapping[str, Any],
+    inventory: list[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Stage raw phase outputs without accepting caller-derived conclusions.
+
+    The returned CompletionEvidence v3 contains only immutable evidence facts.
+    Command, receipt, observations, constraints, outcome, and summary are not
+    caller fields; the authoritative transaction derives them later.
+    """
+
+    if not inventory:
+        raise ValueError("completion evidence inventory is empty")
+    first_raw = EvidenceStore(project_root).read_staged_source(str(inventory[0]["source_path"]))
+    try:
+        first_payload = json.loads(first_raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError("staged evidence is not canonical JSON") from exc
+    phase = str(first_payload.get("phase") or "") if isinstance(first_payload, dict) else ""
+    phase_execution = (attempt.get("phase_executions") or {}).get(phase)
+    if phase not in {"proxy", "full"} or not isinstance(phase_execution, Mapping):
+        raise ValueError("completion evidence requires an authoritative running phase")
+    expected_kinds = {
+        str(requirement["kind"])
+        for requirement in trial_spec.get("evidence_requirements", [])
+        if phase in requirement.get("applicable_phases", []) or "always" in requirement.get("applicable_phases", [])
+    }
+    supplied_kinds = [str(item.get("kind") or "") for item in inventory]
+    if len(supplied_kinds) != len(set(supplied_kinds)) or set(supplied_kinds) != expected_kinds:
+        raise ValueError("completion evidence kinds must exactly match the frozen phase contract")
+
+    store = EvidenceStore(project_root)
+    entries: list[dict[str, Any]] = []
+    for item in inventory:
+        kind = str(item["kind"])
+        raw = store.read_staged_source(str(item["source_path"]))
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError("staged evidence is not canonical JSON") from exc
+        if not isinstance(payload, dict) or canonical_json(payload).encode("utf-8") != raw:
+            raise ValueError("staged evidence bytes are not canonical JSON")
+        _validate_schema(payload, _SCHEMA_FILES[kind])
+        digest = hashlib.sha256(raw).hexdigest()
+        entry = {
+            "evidence_id": str(payload["evidence_id"]),
+            "kind": kind,
+            "relative_path": content_addressed_evidence_path(
+                attempt_id=str(attempt["attempt_id"]),
+                producer_run_id=str(payload["producer_run_id"]),
+                evidence_kind=kind,
+                content_hash=digest,
+            ),
+            "content_hash": digest,
+            "schema_version": str(payload["schema_version"]),
+            "attempt_id": str(attempt["attempt_id"]),
+            "producer_run_id": str(payload["producer_run_id"]),
+            "direction_semantic_hash": str(attempt["direction_semantic_hash"]),
+            "direction_spec_hash": str(attempt["direction_spec_hash"]),
+            "variant_semantic_hash": str(attempt["variant_semantic_hash"]),
+            "variant_spec_hash": str(attempt["variant_spec_hash"]),
+            "trial_spec_hash": str(attempt["trial_spec_hash"]),
+            "protocol_hash": str(attempt["protocol_hash"]),
+            "sample_manifest_hash": str(attempt["sample_manifest_hash"]),
+            "evaluator_hash": str(attempt["evaluator_hash"]),
+            "lifecycle_generation": attempt["lifecycle_generation"],
+            "implementation_hash": str(attempt["implementation_hash"]),
+            "attempt_input_hash": str(attempt["attempt_input_hash"]),
+            "phase": phase,
+            "phase_execution_id": str(phase_execution["phase_execution_id"]),
+            "phase_start_event_id": str(phase_execution["phase_start_event_id"]),
+        }
+        identity_entry = {**entry, "cross_references": deepcopy(payload.get("cross_references", {}))}
+        _validate_evidence_identity(payload, identity_entry, attempt, trial_spec)
+        _validate_evidence_semantics(payload)
+        store.write_entry(entry, attempt, raw)
+        entries.append(entry)
+
+    completion = {
+        "schema_version": COMPLETION_EVIDENCE_SCHEMA_VERSION,
+        "attempt_id": str(attempt["attempt_id"]),
+        "trial_spec_hash": str(attempt["trial_spec_hash"]),
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": str(attempt["implementation_hash"]),
+        "attempt_input_hash": str(attempt["attempt_input_hash"]),
+        "phase": phase,
+        "phase_execution_id": str(phase_execution["phase_execution_id"]),
+        "producer_run_id": str(phase_execution["producer_run_id"]),
+        "command_plan_hash": str(phase_execution["command_plan_hash"]),
+        "entries": entries,
+    }
+    _validate_schema(completion, "completion_evidence_v3.schema.json")
+    return completion
 
 
 def encode_canonical_evidence(payload: Mapping[str, Any]) -> bytes:

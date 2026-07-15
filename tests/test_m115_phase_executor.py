@@ -13,8 +13,11 @@ from auto_research.phase_execution import (
     PhaseAuthorization,
     ResearchLedgerPhaseAuthority,
     SyntheticPhaseExecutor,
+    GenericExternalPhaseExecutor,
     TypedPhaseFailure,
 )
+from auto_research.contract_store import ContractStore
+from auto_research.phase_command_plan import build_phase_command_plan, store_phase_command_plan
 from auto_research.agents.experiment import ExperimentAgent
 from auto_research.research_state import IntegrityError
 
@@ -87,12 +90,73 @@ class Authority:
 
 def test_executor_rechecks_exact_sqlite_authorization_before_and_after_runner(tmp_path: Path) -> None:
     context = _context(tmp_path)
-    authority = Authority(_authorization())
+    plan = build_phase_command_plan(
+        phase="proxy",
+        adapter_id="c2c-phase-adapter",
+        adapter_version="1",
+        provenance_mode="production",
+        variant_spec_hash=context.variant_spec_hash,
+        source_snapshot_hash=context.implementation_hash,
+        command_values=({"argv": ["true"], "cwd": str(tmp_path)},),
+        expected_evidence=({"kind": "proxy_results", "schema_version": "auto_research_proxy_results_v1", "required": True},),
+        default_cwd=str(tmp_path),
+    )
+    _, plan_hash = store_phase_command_plan(tmp_path, plan)
+    authorization = replace(_authorization(), command_plan_hash=plan_hash)
+    context = replace(context, command_plan_hash=plan_hash, authorization_hash=authorization.authorization_hash)
+    authority = Authority(authorization)
     calls: list[str] = []
     executor = C2CProxyPhaseExecutor(authority, lambda received: calls.append("runner") or _inventory(received))
     assert executor.execute(context).context == context
     assert calls == ["runner"]
     assert authority.calls == 2
+
+
+def test_executor_kind_must_match_authorized_adapter(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    plan = {
+        "schema_version": "auto_research_phase_command_plan_v1",
+        "plan_id": "c2c-phase-adapter:proxy:commands",
+        "phase": "proxy",
+        "adapter_identity": {"adapter_id": "c2c-phase-adapter", "adapter_version": "1", "provenance_mode": "production"},
+        "variant_spec_hash": context.variant_spec_hash,
+        "source_snapshot_hash": context.implementation_hash,
+        "commands": [{
+            "command_spec_id": "proxy-command-000",
+            "phase": "proxy",
+            "ordinal": 0,
+            "dependencies": [],
+            "argv": ["true"],
+            "cwd": str(tmp_path),
+            "source_snapshot_hash": context.implementation_hash,
+            "expected_outputs": [{"kind": "proxy_results", "schema_version": "auto_research_proxy_results_v1", "required": True}],
+            "resource_policy": {"resource_class": "cpu", "minimum_capacity": 1, "unit": "count"},
+            "retry_policy": {"max_attempts": 1, "retryable_exit_codes": [], "backoff_seconds": 0},
+            "resume_policy": {"mode": "receipt_only", "external_job_attach_required": False},
+            "condition": {"kind": "always", "predicate_hash": None},
+        }],
+    }
+    plan_hash = ContractStore(tmp_path).put_json(plan, schema_file="phase_command_plan_v1.schema.json")["digest"]
+    authorization = replace(_authorization(), command_plan_hash=plan_hash)
+    context = replace(context, command_plan_hash=plan_hash, authorization_hash=authorization.authorization_hash)
+    calls: list[str] = []
+    with pytest.raises(TypedPhaseFailure, match="not authorized"):
+        GenericExternalPhaseExecutor(
+            Authority(authorization),
+            lambda received: calls.append("runner") or _inventory(received),
+        ).execute(context)
+    assert calls == []
+
+
+def test_synthetic_executor_requires_synthetic_authorization(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    calls: list[str] = []
+    with pytest.raises(TypedPhaseFailure, match="not authorized"):
+        SyntheticPhaseExecutor(
+            Authority(_authorization()),
+            lambda received: calls.append("runner") or _inventory(received),
+        ).execute(context)
+    assert calls == []
 
 
 @pytest.mark.parametrize("verdict", [True, None, False, {"state": "PROXY_RUNNING"}])
@@ -147,17 +211,32 @@ def test_inventory_requires_exact_authorized_kinds_and_receipt_hash(tmp_path: Pa
         },))
 
 
-def test_research_ledger_authority_reconstructs_exact_v2_authorization(tmp_path: Path) -> None:
+def test_research_ledger_authority_reconstructs_exact_v3_authorization(tmp_path: Path) -> None:
     expected = _authorization()
     context = _context(tmp_path)
+    command_plan_ref = ContractStore(tmp_path).put_bytes(b'{"command_plan":"fixture"}')
     manifest = {
-        "schema_version": "auto_research_phase_execution_manifest_v2",
+        "schema_version": "auto_research_phase_execution_manifest_v3",
+        "attempt_id": expected.attempt_id,
+        "direction_semantic_hash": "1" * 64,
+        "direction_spec_hash": "2" * 64,
+        "variant_semantic_hash": "3" * 64,
+        "variant_spec_hash": "4" * 64,
+        "trial_spec_hash": expected.trial_spec_hash,
+        "lifecycle_generation": expected.lifecycle_generation,
+        "implementation_hash": expected.implementation_hash,
+        "attempt_input_hash": expected.attempt_input_hash,
+        "phase": expected.phase,
         "phase_execution_id": expected.phase_execution_id,
+        "phase_start_event_id": expected.phase_start_event_id,
         "producer_run_id": expected.producer_run_id,
         "command_plan_hash": expected.command_plan_hash,
         "phase_contract_hash": expected.phase_contract_hash,
         "expected_evidence_kinds": list(expected.expected_evidence_kinds),
-        "provenance_mode": expected.provenance_mode,
+        "provenance_mode": "local-external",
+        "proxy_evaluation_binding": None,
+        "proxy_authorization": None,
+        "command_plan_ref": command_plan_ref,
     }
 
     class Ledger:
@@ -180,7 +259,7 @@ def test_research_ledger_authority_reconstructs_exact_v2_authorization(tmp_path:
     assert ResearchLedgerPhaseAuthority(Ledger()).authorize_phase(context) == expected
 
 
-def test_research_ledger_authority_rejects_v1_manifest(tmp_path: Path) -> None:
+def test_research_ledger_authority_rejects_replaced_manifest(tmp_path: Path) -> None:
     expected = _authorization()
 
     class Ledger:
@@ -196,7 +275,7 @@ def test_research_ledger_authority_rejects_v1_manifest(tmp_path: Path) -> None:
             return [{"event_id": expected.phase_start_event_id, "event_hash": "a" * 64, "sequence": 3,
                      "event_type": "ProxyPhaseStarted", "payload": {"phase_execution_manifest": {"schema_version": "auto_research_phase_execution_manifest_v1"}}}]
 
-    with pytest.raises(ValueError, match="v2"):
+    with pytest.raises(ValueError, match="v3"):
         ResearchLedgerPhaseAuthority(Ledger()).authorize_phase(_context(tmp_path))
 
 

@@ -4,7 +4,7 @@
   "additionalProperties": false,
   "required": ["schema_version", "manifest_id", "provenance_mode", "datasets"],
   "properties": {
-    "schema_version": {"const": "auto_research_sample_manifest_v2"},
+    "schema_version": {"const": "auto_research_sample_manifest_v3"},
     "manifest_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"},
     "provenance_mode": {"enum": ["real", "synthetic"]},
     "datasets": {

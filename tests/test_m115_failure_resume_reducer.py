@@ -12,6 +12,8 @@ from auto_research.failure_validation import canonical_evidence_bytes, evidence_
 from auto_research.research_state import IntegrityError, ResearchEventLedger, _event_hash, canonical_json
 from auto_research.agents.plan import _trial_spec_from_plan
 from test_m113_ledger_closure import _direction, _variant
+from support.authoritative_evidence import build_resource_failure_evidence_v4
+from auto_research.contract_store import ContractStore
 from auto_research.agents.experiment import _c2c_strict_evidence_inventory, _stage_evidence_inventory
 
 
@@ -72,6 +74,8 @@ def _full_running_proxy_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, di
             "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
             "baseline_metrics": {"mean": 0.0, "datasets": {"fake": 0.0}},
         },
+        "activation_smoke": {"status": "passed", "attempts": [{"status": "ok"}], "implementation_surface_ids": ["src/router.py"]},
+        "full_s3_readiness": {"status": "ready", "full_train_allowed": True},
     }
     baseline = {"mean": 0.0, "datasets": {"fake": 0.0}}
     inventory = _c2c_strict_evidence_inventory(
@@ -92,6 +96,8 @@ def _full_running_proxy_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, di
         trial_spec=trial_spec,
         inventory=inventory,
     )
+    from support.authoritative_evidence import record_completed_evidence_command
+    record_completed_evidence_command(tmp_path, ledger, attempt, completion)
     proxy_completed, route = ledger.commit_proxy_evidence(completion)
     assert route["next_action"] == "RUN_FULL"
     return ledger, ledger.start_full_phase(
@@ -102,55 +108,22 @@ def _full_running_proxy_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, di
 
 
 def _resource_pause(tmp_path: Path, attempt: dict) -> tuple[dict, dict, str]:
-    execution = attempt["phase_executions"]["full"]
-    identity = {
-        "attempt_id": attempt["attempt_id"],
-        "producer_run_id": execution["producer_run_id"],
-        "direction_semantic_hash": attempt["direction_semantic_hash"],
-        "direction_spec_hash": attempt["direction_spec_hash"],
-        "variant_semantic_hash": attempt["variant_semantic_hash"],
-        "variant_spec_hash": attempt["variant_spec_hash"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "protocol_hash": attempt["protocol_hash"],
-        "sample_manifest_hash": attempt["sample_manifest_hash"],
-        "evaluator_hash": attempt["evaluator_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
-        "phase": "full",
-        "phase_execution_id": execution["phase_execution_id"],
-        "phase_start_event_id": execution["phase_start_event_id"],
-    }
-    probe = {
-        "schema_version": "auto_research_resource_probe_evidence_v3",
-        "evidence_kind": "resource_probe",
-        "evidence_id": "resource-probe-full-0001",
-        **identity,
-        "resource_type": "gpu_memory",
-        "resource_id": "gpu:0",
-        "required_capacity": 10.0,
-        "observed_capacity": 4.0,
-        "unit": "bytes",
-        "probe_status": "insufficient",
-        "observed_at": "2026-07-15T01:00:00Z",
-    }
-    probe_hash = _stage_operation_bytes(tmp_path, attempt, identity["producer_run_id"], "resource_probe", probe)
-    failure = {
-        "schema_version": "auto_research_failure_evidence_v4",
-        "evidence_kind": "failure_evidence",
-        "evidence_id": "failure-resource-full-0001",
-        **identity,
-        "cross_references": {"resource_probe_hash": probe_hash},
-        "source_state": "FULL_RUNNING",
-        "source_phase": "full",
-        "failure_class": "resource_pause",
-        "command_status": "resource_paused",
-        "exit_code": 137,
-        "reason": "gpu memory insufficient",
-        "observed_at": "2026-07-15T01:00:01Z",
-        "log_hash": probe_hash,
-    }
-    failure_hash = _stage_operation_bytes(tmp_path, attempt, identity["producer_run_id"], "failure_evidence", failure)
+    failure = build_resource_failure_evidence_v4(
+        tmp_path,
+        attempt,
+        failure_class="resource_pause",
+        suffix="full-0001",
+        resource_type="gpu_memory",
+        resource_id="gpu:0",
+        required_capacity=10.0,
+        observed_capacity=4.0,
+        unit="bytes",
+        exit_code=137,
+    )
+    probe_hash = failure["cross_references"]["resource_probe_hash"]
+    probe_path = tmp_path / "experiment" / "attempts" / attempt["attempt_id"] / failure["producer_run_id"] / "resource_probe" / f"{probe_hash}.json"
+    probe = json.loads(probe_path.read_text(encoding="utf-8"))
+    failure_hash = evidence_bytes_hash(canonical_evidence_bytes(failure))
     return failure, probe, failure_hash
 
 
@@ -174,8 +147,31 @@ def _resume(tmp_path: Path, attempt: dict, pause_event: dict, pause_failure: dic
         "phase_execution_id": "phase-resume-resource-0001",
         "phase_start_event_id": "event:resume:resource:0001",
     }
+    core_receipt = {
+        "schema_version": "auto_research_core_resource_probe_receipt_v1",
+        "attempt_id": attempt["attempt_id"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "resource_type": "gpu_memory",
+        "resource_id": "gpu:0",
+        "required_capacity": 10.0,
+        "observed_capacity": 20.0,
+        "unit": "bytes",
+        "probe_status": "available",
+        "observed_at": "2026-07-15T01:01:00Z",
+    }
+    receipt_ref = ContractStore(tmp_path).put_bytes(canonical_evidence_bytes(core_receipt))
+    command_id = f"core-resource-probe-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}"
+    command_binding = {
+        "command_id": command_id,
+        "command_hash": canonical_hash({"command_id": command_id, "receipt": receipt_ref["digest"]}),
+        "command_plan_hash": canonical_hash({"operation": "resume-resource-probe", "trial_spec_hash": attempt["trial_spec_hash"], "paused_phase": attempt["paused_phase"]}),
+        "receipt_ref": receipt_ref,
+        "receipt_hash": receipt_ref["digest"],
+    }
     probe = {
-        "schema_version": "auto_research_resource_probe_evidence_v3",
+        "schema_version": "auto_research_resource_probe_evidence_v4",
         "evidence_kind": "resource_probe",
         "evidence_id": "resource-probe-resume-0001",
         **identity,
@@ -186,10 +182,11 @@ def _resume(tmp_path: Path, attempt: dict, pause_event: dict, pause_failure: dic
         "unit": "bytes",
         "probe_status": "available",
         "observed_at": "2026-07-15T01:01:00Z",
+        **command_binding,
     }
     probe_hash = _stage_operation_bytes(tmp_path, attempt, producer_run_id, "resource_probe", probe)
     resume = {
-        "schema_version": "auto_research_resume_evidence_v4",
+        "schema_version": "auto_research_resume_evidence_v5",
         "evidence_kind": "resume_evidence",
         "evidence_id": "resume-resource-full-0001",
         **identity,
@@ -206,6 +203,7 @@ def _resume(tmp_path: Path, attempt: dict, pause_event: dict, pause_failure: dic
         "unit": "bytes",
         "probe_status": "available",
         "observed_at": "2026-07-15T01:01:00Z",
+        **command_binding,
     }
     _stage_operation_bytes(tmp_path, attempt, producer_run_id, "resume_evidence", resume)
     return resume
@@ -282,7 +280,7 @@ def test_rebuild_rejects_rehashed_failure_semantic_mutation(tmp_path: Path) -> N
     )
     _rehash_from(ledger, event["sequence"], attacked)
 
-    with pytest.raises(IntegrityError, match="FailureEvidence|resource|schema|raw-byte"):
+    with pytest.raises(IntegrityError, match="FailureEvidence|resource|schema|raw-byte|operation evidence"):
         ledger.rebuild()
 
 

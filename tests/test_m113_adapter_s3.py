@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from copy import deepcopy
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 
 from auto_research.agents.experiment import (
-    _decode_staged_execution_observations,
     _stage_evidence_inventory,
 )
 from auto_research.agents.plan import _trial_spec_from_plan
@@ -95,6 +95,9 @@ def _attempt(trial_spec: dict) -> dict:
                 "phase_execution_id": "phase-full-0001",
                 "phase_start_event_id": "phase-start-full",
                 "producer_run_id": "producer-run-1",
+                "command_plan_hash": next(
+                    item["command_plan_hash"] for item in trial_spec["phase_contracts"] if item["phase"] == "full"
+                ),
             },
         },
     }
@@ -126,6 +129,48 @@ def _measurement(attempt: dict, *, rows: list[dict] | None = None) -> dict:
     }
 
 
+def _activation(attempt: dict) -> dict:
+    execution = attempt["phase_executions"]["full"]
+    return {
+        "schema_version": EVIDENCE_SCHEMA_VERSIONS["activation_evidence"],
+        "evidence_kind": "activation_evidence",
+        "evidence_id": "evidence:activation:producer-run-1",
+        "attempt_id": attempt["attempt_id"],
+        "producer_run_id": "producer-run-1",
+        "direction_semantic_hash": attempt["direction_semantic_hash"],
+        "direction_spec_hash": attempt["direction_spec_hash"],
+        "variant_semantic_hash": attempt["variant_semantic_hash"],
+        "variant_spec_hash": attempt["variant_spec_hash"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "protocol_hash": attempt["protocol_hash"],
+        "sample_manifest_hash": attempt["sample_manifest_hash"],
+        "evaluator_hash": attempt["evaluator_hash"],
+        "cross_references": {},
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": "full",
+        "phase_execution_id": execution["phase_execution_id"],
+        "phase_start_event_id": execution["phase_start_event_id"],
+        "probe_id": "fixture-forward-probe",
+        "status": "passed",
+        "command_status": "completed",
+        "exit_code": 0,
+        "implementation_surface_ids": ["src/router.py"],
+    }
+
+
+def _write_inventory(tmp_path: Path, attempt: dict, main_payload: dict) -> list[dict]:
+    runner = tmp_path / "runner"
+    runner.mkdir(parents=True, exist_ok=True)
+    (runner / "main.json").write_bytes(encode_canonical_evidence(main_payload))
+    (runner / "activation.json").write_bytes(encode_canonical_evidence(_activation(attempt)))
+    return [
+        {"kind": "activation_evidence", "source_path": "runner/activation.json", "producer_run_id": "producer-run-1"},
+        {"kind": "main_results", "source_path": "runner/main.json", "producer_run_id": "producer-run-1"},
+    ]
+
+
 def _row(attempt: dict, *, role: str, value: float) -> dict:
     return {
         "phase": "full",
@@ -153,18 +198,16 @@ def _row(attempt: dict, *, role: str, value: float) -> dict:
 def test_identity_only_main_evidence_cannot_create_observations(tmp_path: Path) -> None:
     trial_spec = _trial_spec_from_plan(_plan(), _variant(), project_root=tmp_path)
     attempt = _attempt(trial_spec)
-    source = tmp_path / "runner" / "main.json"
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_bytes(encode_canonical_evidence(_measurement(attempt)))
+    inventory = _write_inventory(tmp_path, attempt, _measurement(attempt))
 
     with pytest.raises(S3ValidationError, match=r"rows: \[\] is too short"):
         _stage_evidence_inventory(
             project_root=tmp_path,
             attempt=attempt,
             trial_spec=trial_spec,
-            inventory=[{"kind": "main_results", "source_path": "runner/main.json", "producer_run_id": "producer-run-1"}],
+            inventory=inventory,
         )
-    assert not (tmp_path / "experiment" / "attempts").exists()
+    assert not list((tmp_path / "experiment" / "attempts").glob("**/main_results/*.json"))
 
 
 def test_real_generic_trial_spec_uses_readable_content_addressed_contracts(tmp_path: Path) -> None:
@@ -174,7 +217,7 @@ def test_real_generic_trial_spec_uses_readable_content_addressed_contracts(tmp_p
     sample_manifest = store.read_contract(
         trial_spec["sample_manifest_ref"],
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v2.schema.json",
+        schema_file="sample_manifest_v3.schema.json",
     )
     evaluator_manifest = store.read_contract(
         trial_spec["execution_contract"]["evaluator_manifest_ref"],
@@ -195,7 +238,7 @@ def test_only_explicit_inventory_is_staged_even_when_legacy_fixed_path_exists(tm
     legacy.parent.mkdir(parents=True, exist_ok=True)
     legacy.write_bytes(encode_canonical_evidence(_measurement(attempt, rows=[_row(attempt, role="baseline", value=0.0), _row(attempt, role="candidate", value=1.0)])))
 
-    with pytest.raises(S3ValidationError, match="required evidence|missing"):
+    with pytest.raises(S3ValidationError, match="inventory is empty|required evidence|missing"):
         _stage_evidence_inventory(
             project_root=tmp_path,
             attempt=attempt,
@@ -209,26 +252,33 @@ def test_staged_rows_are_attempt_scoped_and_content_addressed(tmp_path: Path) ->
     trial_spec = _trial_spec_from_plan(_plan(), _variant(), project_root=tmp_path)
     attempt = _attempt(trial_spec)
     payload = _measurement(attempt, rows=[_row(attempt, role="baseline", value=0.0), _row(attempt, role="candidate", value=1.0)])
-    source = tmp_path / "runner" / "main.json"
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_bytes(encode_canonical_evidence(payload))
+    inventory = _write_inventory(tmp_path, attempt, payload)
 
     completion = _stage_evidence_inventory(
         project_root=tmp_path,
         attempt=attempt,
         trial_spec=trial_spec,
-        inventory=[{"kind": "main_results", "source_path": "runner/main.json", "producer_run_id": "producer-run-1"}],
+        inventory=inventory,
     )
-    observations = _decode_staged_execution_observations(tmp_path, attempt, trial_spec, completion)
-
-    assert set(completion) == {"schema_version", "attempt_id", "trial_spec_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "entries"}
-    assert completion["schema_version"] == "auto_research_completion_evidence_v2"
-    entry = completion["entries"][0]
+    assert set(completion) == {
+        "schema_version",
+        "attempt_id",
+        "trial_spec_hash",
+        "lifecycle_generation",
+        "implementation_hash",
+        "attempt_input_hash",
+        "phase",
+        "phase_execution_id",
+        "producer_run_id",
+        "command_plan_hash",
+        "entries",
+    }
+    assert completion["schema_version"] == "auto_research_completion_evidence_v3"
+    entry = next(item for item in completion["entries"] if item["kind"] == "main_results")
+    staged_payload = json.loads((tmp_path / entry["relative_path"]).read_text(encoding="utf-8"))
     assert entry["relative_path"].startswith(f"experiment/attempts/{attempt['attempt_id']}/producer-run-1/main_results/")
     assert entry["relative_path"].endswith(f"{entry['content_hash']}.json")
-    assert {item["role"] for item in observations} == {"baseline", "candidate"}
-    assert {item["raw_artifact_path"] for item in observations} == {entry["relative_path"]}
-    assert {item["raw_artifact_hash"] for item in observations} == {entry["content_hash"]}
+    assert {item["role"] for item in staged_payload["rows"]} == {"baseline", "candidate"}
 
 
 def test_cross_attempt_inventory_is_rejected(tmp_path: Path) -> None:
@@ -236,23 +286,22 @@ def test_cross_attempt_inventory_is_rejected(tmp_path: Path) -> None:
     attempt = _attempt(trial_spec)
     payload = _measurement(attempt, rows=[_row(attempt, role="baseline", value=0.0), _row(attempt, role="candidate", value=1.0)])
     payload["attempt_id"] = "attempt-other"
-    source = tmp_path / "runner" / "main.json"
-    source.parent.mkdir(parents=True, exist_ok=True)
-    source.write_bytes(encode_canonical_evidence(payload))
+    inventory = _write_inventory(tmp_path, attempt, payload)
 
     with pytest.raises(S3ValidationError, match="attempt_id"):
         _stage_evidence_inventory(
             project_root=tmp_path,
             attempt=attempt,
             trial_spec=trial_spec,
-            inventory=[{"kind": "main_results", "source_path": "runner/main.json", "producer_run_id": "producer-run-1"}],
+            inventory=inventory,
         )
 
 
 def test_missing_trial_spec_projection_is_integrity_error(tmp_path: Path) -> None:
     trial_spec = _trial_spec_from_plan(_plan(), _variant(), project_root=tmp_path)
+    attempt = _attempt(trial_spec)
     errors: list[str] = []
 
-    _validate_trial_spec_projection_drift(errors, tmp_path, deepcopy(trial_spec))
+    _validate_trial_spec_projection_drift(errors, tmp_path, attempt, deepcopy(trial_spec))
 
     assert errors == ["canonical TrialSpec projection is missing"]

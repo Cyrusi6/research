@@ -19,7 +19,9 @@ from .domain_contracts import (
     validate_trial_spec,
     validate_variant_identity,
 )
-from .evidence import EvidenceStore, decode_evidence_inventory
+from .evidence import EvidenceStore, decode_receipt_bound_evidence_inventory
+from .evidence_lineage import validate_receipt_bound_evidence
+from .proxy_classifier import classify_proxy_outcome
 from .utils import read_json
 
 
@@ -56,7 +58,6 @@ def validate_trial_precommit(
     trial_spec: dict[str, Any],
     trial_result: dict[str, Any],
     state: dict[str, Any] | None = None,
-    allow_pending_full_transition: bool = False,
 ) -> dict[str, Any]:
     """Pure validator used before commit, inside the ledger, and after commit."""
 
@@ -67,13 +68,13 @@ def validate_trial_precommit(
     _capture(errors, validate_trial_spec, frozen)
     if canonical_json(trial_spec) != canonical_json(frozen):
         errors.append("supplied TrialSpec differs from frozen Attempt TrialSpec")
-    _validate_trial_spec_projection_drift(errors, project_root, frozen)
+    _validate_trial_spec_projection_drift(errors, project_root, attempt, frozen)
     _validate_identity(errors, direction, variant, attempt, trial_result)
     _validate_attempt_hashes(errors, attempt, frozen)
     _capture(errors, validate_trial_result, trial_result, attempt=attempt, trial_spec=frozen)
     _validate_attempt_contract(errors, attempt, state=state, terminal=attempt.get("state") == "METHOD_COMPLETED")
-    _validate_execution_state(errors, attempt, trial_result, allow_pending_full_transition=allow_pending_full_transition)
-    _validate_evidence(errors, project_root, attempt, frozen, trial_result)
+    _validate_execution_state(errors, attempt, trial_result)
+    _validate_evidence(errors, project_root, attempt, frozen, trial_result, state=state)
     if errors:
         raise S3ValidationError("; ".join(dict.fromkeys(errors)))
     return {
@@ -123,7 +124,7 @@ def validate_failure_precommit(
     errors: list[str] = []
     frozen = _frozen_trial_spec(attempt)
     _capture(errors, validate_trial_spec, frozen)
-    _validate_trial_spec_projection_drift(errors, project_root, frozen)
+    _validate_trial_spec_projection_drift(errors, project_root, attempt, frozen)
     _validate_attempt_hashes(errors, attempt, frozen)
     _validate_attempt_contract(errors, attempt, state=state, terminal=False)
     if failure_class not in _FAILURE_ROUTES:
@@ -152,6 +153,7 @@ def validate_committed_s3(
     route_outcome: dict[str, Any],
     trial_spec: dict[str, Any],
     trial_result: dict[str, Any] | None,
+    proxy_event_payload: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     errors: list[str] = []
     if attempt.get("method_evaluable"):
@@ -170,6 +172,14 @@ def validate_committed_s3(
                 )
             except S3ValidationError as exc:
                 errors.append(str(exc))
+    if isinstance(attempt.get("committed_proxy_outcome"), dict):
+        _validate_committed_proxy_evidence(
+            errors,
+            project_root=project_root,
+            state=state,
+            attempt=attempt,
+            proxy_event_payload=proxy_event_payload,
+        )
     errors.extend(contract_errors(route_outcome, "route_outcome_v4.schema.json"))
     source = route_outcome.get("source") if isinstance(route_outcome.get("source"), dict) else {}
     if source.get("attempt_id") != attempt.get("attempt_id") or not source.get("event_id"):
@@ -207,14 +217,75 @@ def _frozen_trial_spec(attempt: dict[str, Any]) -> dict[str, Any]:
     return frozen
 
 
-def _validate_trial_spec_projection_drift(errors: list[str], project_root: Path, frozen: dict[str, Any]) -> None:
-    path = project_root / "plan" / "trial_spec.json"
+def _validate_trial_spec_projection_drift(
+    errors: list[str], project_root: Path, attempt: dict[str, Any], frozen: dict[str, Any]
+) -> None:
+    path = (
+        project_root
+        / "plan"
+        / "attempts"
+        / attempt["attempt_id"]
+        / "trial_spec"
+        / f"{attempt['trial_spec_hash']}.json"
+    )
     if not path.exists():
         errors.append("canonical TrialSpec projection is missing")
         return
     projected = read_json(path, default=None)
     if not isinstance(projected, dict) or canonical_json(projected) != canonical_json(frozen):
         errors.append("canonical TrialSpec projection drifted from frozen Attempt snapshot")
+
+
+def _validate_committed_proxy_evidence(
+    errors: list[str],
+    *,
+    project_root: Path,
+    state: dict[str, Any],
+    attempt: dict[str, Any],
+    proxy_event_payload: dict[str, Any] | None,
+) -> None:
+    committed = attempt.get("committed_proxy_outcome") or {}
+    if not isinstance(proxy_event_payload, dict):
+        errors.append("committed proxy outcome is missing its authoritative event payload")
+        return
+    supplied_outcome = proxy_event_payload.get("proxy_outcome")
+    manifest = proxy_event_payload.get("evidence_manifest")
+    if not isinstance(supplied_outcome, dict) or not isinstance(manifest, dict):
+        errors.append("committed proxy event payload is malformed")
+        return
+    if supplied_outcome.get("attempt_id") != attempt.get("attempt_id"):
+        errors.append("committed ProxyOutcome attempt identity mismatch")
+        return
+    state_outcome = (state.get("proxy_outcomes") or {}).get(attempt.get("attempt_id"))
+    if canonical_json(state_outcome) != canonical_json(supplied_outcome):
+        errors.append("committed ProxyOutcome projection differs from event payload")
+    if supplied_outcome.get("evidence_manifest_hash") != canonical_hash(manifest):
+        errors.append("committed ProxyOutcome evidence manifest hash mismatch")
+    try:
+        bound = validate_receipt_bound_evidence(
+            project_root=project_root,
+            attempt=attempt,
+            trial_spec=_frozen_trial_spec(attempt),
+            manifest=manifest,
+            phase_commands=state.get("phase_commands") or {},
+            phase="proxy",
+        )
+        if canonical_json(bound.manifest) != canonical_json(manifest):
+            raise ValueError("proxy EvidenceManifest lineage is not canonical")
+        phase_execution = (attempt.get("phase_executions") or {}).get("proxy") or {}
+        binding = phase_execution.get("proxy_evaluation_binding")
+        if not isinstance(binding, dict):
+            raise ValueError("proxy phase lacks frozen evaluation binding")
+        expected = classify_proxy_outcome(
+            frozen_policy=_frozen_trial_spec(attempt)["proxy_decision_policy"],
+            evaluation_binding=binding,
+            decoded_evidence=bound.decoded_evidence,
+            evidence_manifest_hash=canonical_hash(bound.manifest),
+        )
+        if canonical_json(expected) != canonical_json(supplied_outcome):
+            raise ValueError("ProxyOutcome differs from receipt-derived classifier result")
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        errors.append(f"committed proxy evidence audit failed: {exc}")
 
 
 def _validate_attempt_hashes(errors: list[str], attempt: dict[str, Any], frozen: dict[str, Any]) -> None:
@@ -267,7 +338,7 @@ def _validate_attempt_contract(errors, attempt, *, state, terminal) -> None:
             errors.append("direction budget exceeds target")
 
 
-def _validate_execution_state(errors, attempt, trial_result, *, allow_pending_full_transition) -> None:
+def _validate_execution_state(errors, attempt, trial_result) -> None:
     completeness = trial_result.get("completeness")
     state = attempt.get("state")
     phases = attempt.get("phases") or {}
@@ -279,17 +350,16 @@ def _validate_execution_state(errors, attempt, trial_result, *, allow_pending_fu
     elif completeness == "full":
         if attempt.get("attempt_kind") not in {"full", "proxy_full"}:
             errors.append("attempt kind does not permit full outcome")
-        if state not in {"FULL_RUNNING", "METHOD_COMPLETED"} and not (allow_pending_full_transition and state == "PROXY_RUNNING"):
+        if state not in {"FULL_RUNNING", "METHOD_COMPLETED"}:
             errors.append("full TrialResult requires full execution state")
         frozen = _frozen_trial_spec(attempt)
-        pending_proxy_completion = allow_pending_full_transition and state == "PROXY_RUNNING" and phases.get("proxy") == "RUNNING"
-        if "proxy" in frozen["protocol"]["required_phases"] and phases.get("proxy") != "COMPLETED" and not pending_proxy_completion:
+        if "proxy" in frozen["protocol"]["required_phases"] and phases.get("proxy") != "COMPLETED":
             errors.append("full TrialResult requires completed preregistered proxy phase")
     if state == "METHOD_COMPLETED" and phases.get(completeness) != "COMPLETED":
         errors.append("METHOD_COMPLETED phase is inconsistent with TrialResult")
 
 
-def _validate_evidence(errors, project_root, attempt, trial_spec, trial_result) -> None:
+def _validate_evidence(errors, project_root, attempt, trial_spec, trial_result, *, state) -> None:
     manifest = trial_result.get("evidence_manifest")
     try:
         validate_evidence_manifest(manifest, trial_spec=trial_spec)
@@ -300,7 +370,6 @@ def _validate_evidence(errors, project_root, attempt, trial_spec, trial_result) 
         errors.append("evidence manifest attempt identity mismatch")
     raw_artifacts = trial_result.get("raw_artifacts") or {}
     requirements = {item["kind"]: item for item in trial_spec["evidence_requirements"]}
-    evidence_bytes: dict[str, bytes] = {}
     for entry in manifest["entries"]:
         path = entry["relative_path"]
         if raw_artifacts.get(path) != entry["content_hash"]:
@@ -317,7 +386,7 @@ def _validate_evidence(errors, project_root, attempt, trial_spec, trial_result) 
         elif entry["schema_version"] != requirement["schema_version"]:
             errors.append(f"evidence schema version mismatch: {path}")
         try:
-            evidence_bytes[entry["evidence_id"]] = EvidenceStore(project_root).read_entry(entry, attempt)
+            EvidenceStore(project_root).read_entry(entry, attempt)
         except ValueError as exc:
             errors.append(str(exc))
     applicable_phases = {str(trial_result.get("completeness") or "")}
@@ -330,14 +399,19 @@ def _validate_evidence(errors, project_root, attempt, trial_spec, trial_result) 
     missing = sorted(required_kinds - present_kinds)
     if missing:
         errors.append(f"required preregistered evidence is missing: {', '.join(missing)}")
+    if not isinstance(state, dict) or not isinstance(state.get("phase_commands"), dict):
+        errors.append("authoritative phase command state is required for receipt evidence lineage")
+        return
     try:
-        observations, _ = decode_evidence_inventory(
+        receipt_bound = decode_receipt_bound_evidence_inventory(
+            project_root=project_root,
             attempt=attempt,
             trial_spec=trial_spec,
             manifest=manifest,
-            evidence_bytes=evidence_bytes,
+            phase_commands=state["phase_commands"],
+            phase=str(trial_result.get("completeness")),
         )
-        if canonical_json(observations) != canonical_json(trial_result.get("observations") or []):
+        if canonical_json(receipt_bound.observations) != canonical_json(trial_result.get("observations") or []):
             errors.append("TrialResult observations differ from deterministic evidence decoding")
     except (TypeError, ValueError) as exc:
         errors.append(str(exc))

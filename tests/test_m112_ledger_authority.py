@@ -63,9 +63,6 @@ def _reserved(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
 
 
 def _failure(root: Path, attempt: dict, index: int, *, failure_class: str = "resource_pause") -> dict:
-    if failure_class == "resource_pause":
-        from test_m115_failure_resume_reducer import _resource_pause
-        return _resource_pause(root, attempt)[0]
     return _canonical_failure_evidence(
         root,
         attempt,
@@ -76,12 +73,7 @@ def _failure(root: Path, attempt: dict, index: int, *, failure_class: str = "res
 
 
 def _resume(root: Path, ledger: ResearchEventLedger, attempt: dict, index: int) -> dict:
-    from auto_research.failure_validation import canonical_evidence_bytes, evidence_bytes_hash
-    from test_m115_failure_resume_reducer import _resume as canonical_resume
-    pause_event = next(event for event in reversed(ledger.events()) if event["event_type"] == "AttemptDispositioned")
-    pause_failure = pause_event["payload"]["failure_evidence"]
-    pause_hash = evidence_bytes_hash(canonical_evidence_bytes(pause_failure))
-    return canonical_resume(root, attempt, pause_event, pause_failure, pause_hash)
+    return _canonical_resume_evidence(root, ledger, attempt, resource_type="system_memory")
 
 
 @pytest.mark.parametrize("forged", ["IMPLEMENTATION_REPAIR", "RESOURCE_PAUSED", "INTEGRITY_BLOCKED", "ABANDONED", "METHOD_COMPLETED"])

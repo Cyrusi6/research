@@ -21,7 +21,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_trial_spec_v5"
+      "const": "auto_research_trial_spec_v6"
     },
     "protocol": {
       "type": "object",
@@ -81,7 +81,7 @@
       ],
       "properties": {
         "schema_version": {
-          "const": "auto_research_sample_manifest_v2"
+          "const": "auto_research_sample_manifest_v3"
         },
         "manifest_id": {
           "type": "string",
@@ -388,7 +388,7 @@
         "evaluator_provenance",
         "evaluator_manifest_ref",
         "evaluator_hash",
-        "command_contract_hash"
+        "phase_command_plan_hashes"
       ],
       "properties": {
         "runtime_config": {
@@ -457,10 +457,6 @@
           "type": "string",
           "pattern": "^[a-f0-9]{64}$"
         },
-        "command_contract_hash": {
-          "type": "string",
-          "pattern": "^[a-f0-9]{64}$"
-        },
         "evaluator_manifest_ref": {
           "type": "object",
           "additionalProperties": false,
@@ -474,10 +470,7 @@
               "const": "auto_research_contract_ref_v1"
             },
             "contract_kind": {
-              "enum": [
-                "sample_manifest",
-                "evaluator_manifest"
-              ]
+              "const": "evaluator_manifest"
             },
             "blob": {
               "type": "object",
@@ -510,6 +503,20 @@
                 }
               }
             }
+          }
+        },
+        "phase_command_plan_hashes": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/hash"
+          },
+          "minProperties": 1,
+          "maxProperties": 2,
+          "propertyNames": {
+            "enum": [
+              "proxy",
+              "full"
+            ]
           }
         }
       }
@@ -606,7 +613,10 @@
           "metrics",
           "evidence_kinds",
           "terminal",
-          "consumes_direction_budget"
+          "consumes_direction_budget",
+          "command_plan",
+          "command_plan_ref",
+          "command_plan_hash"
         ],
         "properties": {
           "phase": {
@@ -670,6 +680,15 @@
           },
           "consumes_direction_budget": {
             "type": "boolean"
+          },
+          "command_plan": {
+            "$ref": "phase_command_plan_v1.schema.json"
+          },
+          "command_plan_ref": {
+            "$ref": "#/$defs/contract_blob"
+          },
+          "command_plan_hash": {
+            "$ref": "#/$defs/hash"
           }
         }
       }
@@ -697,10 +716,7 @@
           "const": "auto_research_contract_ref_v1"
         },
         "contract_kind": {
-          "enum": [
-            "sample_manifest",
-            "evaluator_manifest"
-          ]
+          "const": "sample_manifest"
         },
         "blob": {
           "type": "object",

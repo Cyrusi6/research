@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 
 import pytest
 
 from auto_research.contract_store import ContractStore, canonical_contract_bytes, contract_digest, validate_schema
+from auto_research.phase_command_plan import build_phase_command_plan, store_phase_command_plan
 
 
 def test_contract_store_digest_proves_exact_persisted_bytes(tmp_path: Path) -> None:
@@ -60,13 +62,13 @@ def test_contract_store_rejects_leaf_symlink_and_hard_link(tmp_path: Path) -> No
         store.read_bytes(reference)
 
 
-def test_sample_and_evaluator_v2_bind_cas_references(tmp_path: Path) -> None:
+def test_sample_v3_and_evaluator_v2_bind_cas_references(tmp_path: Path) -> None:
     store = ContractStore(tmp_path)
     sample_blob = store.put_bytes(b'{"sample":1}')
     evaluator_blob = store.put_bytes(b'{"evaluator":"v2"}')
     evaluator_config = store.put_bytes(b'{"metric":"accuracy"}')
     sample_manifest = {
-        "schema_version": "auto_research_sample_manifest_v2",
+        "schema_version": "auto_research_sample_manifest_v3",
         "manifest_id": "samples-m115",
         "provenance_mode": "real",
         "datasets": [{
@@ -90,25 +92,25 @@ def test_sample_and_evaluator_v2_bind_cas_references(tmp_path: Path) -> None:
         "source_digest": evaluator_blob["digest"],
         "dependency_digest": contract_digest(b""),
     }
-    validate_schema(sample_manifest, "sample_manifest_v2.schema.json")
+    validate_schema(sample_manifest, "sample_manifest_v3.schema.json")
     validate_schema(evaluator_manifest, "evaluator_manifest_v2.schema.json")
-    assert store.read_json(store.put_json(sample_manifest, schema_file="sample_manifest_v2.schema.json")) == sample_manifest
+    assert store.read_json(store.put_json(sample_manifest, schema_file="sample_manifest_v3.schema.json")) == sample_manifest
     assert store.read_json(store.put_json(evaluator_manifest, schema_file="evaluator_manifest_v2.schema.json")) == evaluator_manifest
     sample_ref = store.put_contract(
         sample_manifest,
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v2.schema.json",
+        schema_file="sample_manifest_v3.schema.json",
     )
     assert store.read_contract(
         sample_ref,
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v2.schema.json",
+        schema_file="sample_manifest_v3.schema.json",
     ) == sample_manifest
     with pytest.raises(ValueError, match="kind mismatch"):
         store.read_contract(
             sample_ref,
             contract_kind="evaluator_manifest",
-            schema_file="sample_manifest_v2.schema.json",
+            schema_file="sample_manifest_v3.schema.json",
         )
 
     evaluator_manifest["source_digest"] = "9" * 64
@@ -162,13 +164,32 @@ class FakeLedger:
         return current
 
 
-def _command_context(tmp_path: Path) -> tuple[AuthoritativePhaseContext, PhaseAuthorization]:
+def _command_context(
+    tmp_path: Path,
+    *,
+    commands: tuple[dict, ...] | None = None,
+) -> tuple[AuthoritativePhaseContext, PhaseAuthorization]:
+    (tmp_path / "work").mkdir(exist_ok=True)
+    source_snapshot_hash = "f" * 64
+    command_values = commands or ({"command_spec_id": "full-command-train", "argv": ["python", "train.py"]},)
+    plan = build_phase_command_plan(
+        phase="full",
+        adapter_id="adapter-command-1",
+        adapter_version="1",
+        provenance_mode="local-external",
+        variant_spec_hash="c" * 64,
+        source_snapshot_hash=source_snapshot_hash,
+        command_values=command_values,
+        expected_evidence=[{"kind": "main_results", "schema_version": "auto_research_main_results_v3"}],
+        default_cwd="work",
+    )
+    _, command_plan_hash = store_phase_command_plan(tmp_path, plan)
     authorization = PhaseAuthorization(
         attempt_id="attempt-command-1", lifecycle_generation=0, phase="full",
         phase_execution_id="phase-full-command", phase_start_event_id="event:full:start",
         phase_start_event_hash="1" * 64, phase_start_sequence=3, producer_run_id="producer-command-1",
         implementation_hash="2" * 64, attempt_input_hash="3" * 64, trial_spec_hash="4" * 64,
-        command_plan_hash="5" * 64, phase_contract_hash="6" * 64,
+        command_plan_hash=command_plan_hash, phase_contract_hash="6" * 64,
         expected_evidence_kinds=("main_results",), adapter_identity="adapter-command-1",
         provenance_mode="local_external", state="FULL_RUNNING",
         proxy_commit_event_id="event:proxy:commit", proxy_commit_event_hash="7" * 64,
@@ -186,8 +207,16 @@ def _command_context(tmp_path: Path) -> tuple[AuthoritativePhaseContext, PhaseAu
 
 def _command_result(tmp_path: Path) -> CommandExecutionResult:
     output = ContractStore(tmp_path).put_bytes(b'{"metric":1}')
+    stdout = "fixture command completed"
+    stderr = ""
     return CommandExecutionResult(
-        exit_code=0, stdout_hash="d" * 64, stderr_hash="e" * 64, outputs=(output,), external_job_id="job-1",
+        exit_code=0,
+        stdout_hash=hashlib.sha256(stdout.encode()).hexdigest(),
+        stderr_hash=hashlib.sha256(stderr.encode()).hexdigest(),
+        outputs=(output,),
+        external_job_id="job-1",
+        stdout=stdout,
+        stderr=stderr,
     )
 
 
@@ -210,7 +239,7 @@ def test_ledger_journal_executes_completed_command_exactly_once(tmp_path: Path) 
     assert first["status"] == second["status"] == "completed"
     assert calls == ["run"]
     assert ledger.authorization_calls == 3
-    receipt = ContractStore(tmp_path).read_json(first["receipt"], schema_file="phase_run_receipt_v2.schema.json")
+    receipt = ContractStore(tmp_path).read_json(first["receipt"], schema_file="phase_run_receipt_v3.schema.json")
     assert receipt["phase_start_event_id"] == context.phase_start_event_id
     assert receipt["producer_run_id"] == context.producer_run_id
 
@@ -254,7 +283,21 @@ def test_receipt_after_side_effect_before_db_can_be_reconciled_without_rerun(tmp
 
 
 def test_command_id_reuse_with_different_intent_is_integrity_conflict(tmp_path: Path) -> None:
-    context, authorization = _command_context(tmp_path)
+    context, authorization = _command_context(
+        tmp_path,
+        commands=(
+            {
+                "command_spec_id": "full-command-true",
+                "argv": ["true"],
+                "expected_outputs": [{"kind": "main_results", "schema_version": "auto_research_main_results_v3", "required": True}],
+            },
+            {
+                "command_spec_id": "full-command-false",
+                "argv": ["false"],
+                "expected_outputs": [],
+            },
+        ),
+    )
     ledger = FakeLedger(authorization)
     journal = LedgerCommandJournal(tmp_path, ledger)
     journal.run_once(
@@ -264,5 +307,59 @@ def test_command_id_reuse_with_different_intent_is_integrity_conflict(tmp_path: 
     with pytest.raises(CommandJournalError, match="conflicts"):
         journal.run_once(
             context, command_id="command-full-0004", argv=("false",), cwd="work",
-            source_snapshot_hash="f" * 64, expected_outputs=("main_results",), runner=lambda: _command_result(tmp_path),
+            source_snapshot_hash="f" * 64, expected_outputs=(), runner=lambda: _command_result(tmp_path),
         )
+
+
+def test_ledger_journal_requires_exact_frozen_source_and_policies(tmp_path: Path) -> None:
+    policies = {
+        "retry_policy": {"max_attempts": 2, "retryable_exit_codes": [75], "backoff_seconds": 1},
+        "resource_policy": {"resource_class": "cpu", "minimum_capacity": 2, "unit": "count"},
+        "resume_policy": {"mode": "receipt_only", "external_job_attach_required": False},
+    }
+    context, authorization = _command_context(
+        tmp_path,
+        commands=({"command_spec_id": "full-command-policy", "argv": ["python", "train.py"], **policies},),
+    )
+    journal = LedgerCommandJournal(tmp_path, FakeLedger(authorization))
+    common = {
+        "command_id": "command-full-policy",
+        "command_spec_id": "full-command-policy",
+        "argv": ("python", "train.py"),
+        "cwd": "work",
+        "expected_outputs": ("main_results",),
+        "runner": lambda: _command_result(tmp_path),
+    }
+    with pytest.raises(CommandJournalError, match="source snapshot"):
+        journal.run_once(context, source_snapshot_hash=context.implementation_hash, **common)
+    with pytest.raises(CommandJournalError, match="retry_policy"):
+        journal.run_once(
+            context,
+            source_snapshot_hash="f" * 64,
+            retry_policy={"max_attempts": 1, "retryable_exit_codes": [], "backoff_seconds": 0},
+            **common,
+        )
+    assert journal.run_once(context, source_snapshot_hash="f" * 64, **policies, **common)["status"] == "completed"
+
+
+def test_ledger_journal_rejects_symlinked_cwd_before_start(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "linked-work").symlink_to(outside, target_is_directory=True)
+    context, authorization = _command_context(
+        tmp_path,
+        commands=({"command_spec_id": "full-command-linked", "argv": ["python", "train.py"], "cwd": "linked-work"},),
+    )
+    ledger = FakeLedger(authorization)
+    with pytest.raises(CommandJournalError, match="symlink"):
+        LedgerCommandJournal(tmp_path, ledger).run_once(
+            context,
+            command_id="command-full-linked",
+            command_spec_id="full-command-linked",
+            argv=("python", "train.py"),
+            cwd="linked-work",
+            source_snapshot_hash="f" * 64,
+            expected_outputs=("main_results",),
+            runner=lambda: _command_result(tmp_path),
+        )
+    assert ledger.commands == {}

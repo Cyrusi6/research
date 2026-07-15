@@ -17,7 +17,7 @@ from test_authoritative_state_machine import (
     _reserve,
     _variant,
 )
-from support.authoritative_evidence import start_attempt_phase
+from support.authoritative_evidence import record_completed_evidence_command, start_attempt_phase
 
 
 def _prepared_attempt(tmp_path: Path, *, bootstrap: bool = False) -> tuple[ResearchEventLedger, dict, dict, dict]:
@@ -90,6 +90,7 @@ def test_s3_precommit_rejects_invalid_trial_without_finalization_or_budget_chang
 ) -> None:
     ledger, direction, _, attempt = _prepared_attempt(tmp_path)
     completion = _completion_evidence(ledger, attempt, outcome="accepted")
+    record_completed_evidence_command(ledger.project_root, ledger, attempt, completion)
 
     if invalid_case == "evidence_cross_reference":
         _rewrite_payload(ledger, completion, lambda payload: payload["cross_references"].update({"policy_hash": "a" * 64}))
@@ -108,6 +109,7 @@ def test_s3_precommit_rejects_invalid_trial_without_finalization_or_budget_chang
 def test_bootstrap_precommit_requires_verified_completion_before_finish_run(tmp_path: Path) -> None:
     ledger, direction, _, attempt = _prepared_attempt(tmp_path, bootstrap=True)
     completion = _completion_evidence(ledger, attempt, outcome="accepted")
+    record_completed_evidence_command(ledger.project_root, ledger, attempt, completion)
     completion["entries"] = []
     _assert_precommit_rejected_without_authoritative_write(ledger, direction, completion)
 
@@ -129,6 +131,7 @@ def test_direction_aggregate_selects_best_accepted_delta_not_highest_absolute_ca
             for row in payload["rows"]:
                 row["metric_value"] = baseline if row["role"] == "baseline" else candidate
         _rewrite_payload(ledger, completion, set_measurements)
+        record_completed_evidence_command(ledger.project_root, ledger, attempt, completion)
         ledger.complete_attempt(completion)
         if index == 1:
             expected_best_attempt_id = attempt["attempt_id"]

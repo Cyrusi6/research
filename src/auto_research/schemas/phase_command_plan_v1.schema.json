@@ -1,0 +1,147 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "plan_id",
+    "phase",
+    "adapter_identity",
+    "variant_spec_hash",
+    "source_snapshot_hash",
+    "commands"
+  ],
+  "properties": {
+    "schema_version": {"const": "auto_research_phase_command_plan_v1"},
+    "plan_id": {"$ref": "#/$defs/safe_id"},
+    "phase": {"enum": ["proxy", "full"]},
+    "adapter_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["adapter_id", "adapter_version", "provenance_mode"],
+      "properties": {
+        "adapter_id": {"$ref": "#/$defs/safe_id"},
+        "adapter_version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "provenance_mode": {"enum": ["synthetic", "local-external", "production"]}
+      }
+    },
+    "variant_spec_hash": {"$ref": "#/$defs/hash"},
+    "source_snapshot_hash": {"$ref": "#/$defs/hash"},
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/command_spec"}
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "safe_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"},
+    "output": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "schema_version", "required"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "main_results",
+            "proxy_results",
+            "ablation_results",
+            "coverage_results",
+            "matched_control_results",
+            "activation_evidence",
+            "proxy_baseline_fingerprint",
+            "proxy_cache_report",
+            "full_s3_readiness",
+            "bootstrap_completion",
+            "command_result_evidence",
+            "resource_probe"
+          ]
+        },
+        "schema_version": {"type": "string", "pattern": "^auto_research_[a-z0-9_]+_v[0-9]+$"},
+        "required": {"type": "boolean"}
+      }
+    },
+    "command_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "command_spec_id",
+        "phase",
+        "ordinal",
+        "dependencies",
+        "argv",
+        "cwd",
+        "source_snapshot_hash",
+        "expected_outputs",
+        "resource_policy",
+        "retry_policy",
+        "resume_policy",
+        "condition"
+      ],
+      "properties": {
+        "command_spec_id": {"$ref": "#/$defs/safe_id"},
+        "phase": {"enum": ["proxy", "full"]},
+        "ordinal": {"type": "integer", "minimum": 0},
+        "dependencies": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/safe_id"}
+        },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1, "maxLength": 8192}
+        },
+        "cwd": {"type": "string", "minLength": 1, "maxLength": 4096, "pattern": "^(?!.*(?:^|[/\\\\])\\.\\.(?:[/\\\\]|$)).+$"},
+        "source_snapshot_hash": {"$ref": "#/$defs/hash"},
+        "expected_outputs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/output"}
+        },
+        "resource_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["resource_class", "minimum_capacity", "unit"],
+          "properties": {
+            "resource_class": {"enum": ["cpu", "gpu_memory", "system_memory", "disk", "network", "quota"]},
+            "minimum_capacity": {"type": "number", "minimum": 0},
+            "unit": {"enum": ["count", "bytes", "bytes_per_second"]}
+          }
+        },
+        "retry_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_attempts", "retryable_exit_codes", "backoff_seconds"],
+          "properties": {
+            "max_attempts": {"type": "integer", "minimum": 1, "maximum": 16},
+            "retryable_exit_codes": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"type": "integer", "minimum": 1, "maximum": 255}
+            },
+            "backoff_seconds": {"type": "number", "minimum": 0, "maximum": 86400}
+          }
+        },
+        "resume_policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mode", "external_job_attach_required"],
+          "properties": {
+            "mode": {"enum": ["receipt_only", "attach_external_job", "never"]},
+            "external_job_attach_required": {"type": "boolean"}
+          }
+        },
+        "condition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "predicate_hash"],
+          "properties": {
+            "kind": {"enum": ["always", "proxy_route", "artifact_present"]},
+            "predicate_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]}
+          }
+        }
+      }
+    }
+  }
+}

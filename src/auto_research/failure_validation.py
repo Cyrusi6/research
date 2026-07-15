@@ -13,11 +13,16 @@ from typing import Any, Mapping
 
 from jsonschema import Draft202012Validator
 
+from .domain_contracts import (
+    FAILURE_EVIDENCE_SCHEMA_VERSION,
+    RESOURCE_PROBE_SCHEMA_VERSION,
+    RESUME_EVIDENCE_SCHEMA_VERSION,
+)
 
 COMMAND_RESULT_SCHEMA_VERSION = "auto_research_command_result_evidence_v1"
-FAILURE_EVIDENCE_SCHEMA_VERSION = "auto_research_failure_evidence_v4"
-RESOURCE_PROBE_SCHEMA_VERSION = "auto_research_resource_probe_evidence_v3"
-RESUME_EVIDENCE_SCHEMA_VERSION = "auto_research_resume_evidence_v4"
+FAILURE_EVIDENCE_SCHEMA = f"{FAILURE_EVIDENCE_SCHEMA_VERSION.removeprefix('auto_research_')}.schema.json"
+RESOURCE_PROBE_SCHEMA = f"{RESOURCE_PROBE_SCHEMA_VERSION.removeprefix('auto_research_').replace('_evidence_', '_')}.schema.json"
+RESUME_EVIDENCE_SCHEMA = f"{RESUME_EVIDENCE_SCHEMA_VERSION.removeprefix('auto_research_')}.schema.json"
 
 _RESOURCE_FAILURE_CLASSES = {"resource_pause", "oom_retry"}
 _IDENTITY_FIELDS = (
@@ -73,7 +78,7 @@ def validate_failure_evidence(
     expected = _require_identity(expected_identity)
     if expected["phase"] == "resume":
         raise ValueError("failure authority phase cannot be resume")
-    failure = _decode_canonical(failure_raw, "failure_evidence_v4.schema.json", label="failure evidence")
+    failure = _decode_canonical(failure_raw, FAILURE_EVIDENCE_SCHEMA, label="failure evidence")
     _match_identity(failure, expected, label="failure evidence")
     if failure["source_phase"] != failure["phase"]:
         raise ValueError("failure source_phase does not match authoritative phase")
@@ -83,7 +88,7 @@ def validate_failure_evidence(
             raise ValueError("resource failure must not substitute a command receipt for a resource probe")
         if resource_probe_raw is None:
             raise ValueError("resource failure requires canonical resource probe bytes")
-        probe = _decode_canonical(resource_probe_raw, "resource_probe_v3.schema.json", label="resource probe")
+        probe = _decode_canonical(resource_probe_raw, RESOURCE_PROBE_SCHEMA, label="resource probe")
         _match_identity(probe, expected, label="resource probe")
         _match_digest(
             failure["cross_references"]["resource_probe_hash"],
@@ -140,8 +145,8 @@ def validate_resume_evidence(
     expected = _require_identity(expected_identity)
     if expected["phase"] != "resume":
         raise ValueError("resume authority phase must be resume")
-    resume = _decode_canonical(resume_raw, "resume_evidence_v4.schema.json", label="resume evidence")
-    probe = _decode_canonical(resource_probe_raw, "resource_probe_v3.schema.json", label="resource probe")
+    resume = _decode_canonical(resume_raw, RESUME_EVIDENCE_SCHEMA, label="resume evidence")
+    probe = _decode_canonical(resource_probe_raw, RESOURCE_PROBE_SCHEMA, label="resource probe")
     _match_identity(resume, expected, label="resume evidence")
     _match_identity(probe, expected, label="resource probe")
     _match_digest(
@@ -173,10 +178,10 @@ def validate_resume_evidence(
     if (pause_failure_raw is None) != (pause_resource_probe_raw is None):
         raise ValueError("resume validation requires both pause failure and pause resource probe bytes")
     if pause_failure_raw is not None and pause_resource_probe_raw is not None:
-        pause = _decode_canonical(pause_failure_raw, "failure_evidence_v4.schema.json", label="pause failure evidence")
+        pause = _decode_canonical(pause_failure_raw, FAILURE_EVIDENCE_SCHEMA, label="pause failure evidence")
         pause_probe = _decode_canonical(
             pause_resource_probe_raw,
-            "resource_probe_v3.schema.json",
+            RESOURCE_PROBE_SCHEMA,
             label="pause resource probe",
         )
         _match_digest(resume["pause_evidence_hash"], pause_failure_raw, label="pause failure evidence")

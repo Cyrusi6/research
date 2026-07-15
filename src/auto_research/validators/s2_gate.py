@@ -2,7 +2,13 @@
 
 from __future__ import annotations
 
-from auto_research.domain_contracts import contract_errors, validate_direction_identity, validate_trial_spec, validate_variant_identity
+from auto_research.domain_contracts import (
+    TRIAL_SPEC_SCHEMA_VERSION,
+    contract_errors,
+    validate_direction_identity,
+    validate_trial_spec,
+    validate_variant_identity,
+)
 from auto_research.research_state import ResearchEventLedger
 from auto_research.utils import read_json
 
@@ -40,13 +46,18 @@ class S2GateValidator(StageGateValidator):
             self.retry_check("variant_v4", "VariantSpec v4 validation failed", artifact="plan/variant.json", details={"errors": errors[:20]})
         else:
             self.pass_check("variant_v4", artifact="plan/variant.json", details={"variant_id": variant["variant_id"], "variant_semantic_hash": variant["variant_semantic_hash"], "variant_spec_hash": variant["variant_spec_hash"]})
-        trial_errors = contract_errors(trial_spec, "trial_spec_v5.schema.json")
+        trial_errors = contract_errors(trial_spec, "trial_spec_v6.schema.json")
         try:
             validate_trial_spec(trial_spec)
         except ValueError as exc:
             trial_errors.append(str(exc))
         if trial_errors:
-            self.retry_check("trial_spec", "TrialSpec v5 validation failed", artifact="plan/trial_spec.json", details={"errors": trial_errors[:20]})
+            self.retry_check(
+                "trial_spec",
+                f"TrialSpec {TRIAL_SPEC_SCHEMA_VERSION} validation failed",
+                artifact="plan/trial_spec.json",
+                details={"errors": trial_errors[:20]},
+            )
         else:
             self.pass_check("trial_spec", artifact="plan/trial_spec.json")
 

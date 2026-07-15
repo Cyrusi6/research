@@ -109,7 +109,7 @@ def test_audit_full_scope_keeps_current_full_requirements(tmp_path: Path) -> Non
 
 
 def test_audit_uses_current_trial_and_state_schemas() -> None:
-    assert ("plan/trial_spec.json", "trial_spec_v5.schema.json") in STAGE_ARTIFACT_REQUIREMENTS["S2_plan"]
-    assert ("meta/research_state.json", "research_state_v6.schema.json") in STAGE_ARTIFACT_REQUIREMENTS["orchestration"]
-    assert all(schema != "trial_spec_v4.schema.json" for requirements in STAGE_ARTIFACT_REQUIREMENTS.values() for _, schema in requirements)
-    assert all(schema != "research_state_v5.schema.json" for requirements in STAGE_ARTIFACT_REQUIREMENTS.values() for _, schema in requirements)
+    assert ("plan/trial_spec.json", "trial_spec_v6.schema.json") in STAGE_ARTIFACT_REQUIREMENTS["S2_plan"]
+    assert ("meta/research_state.json", "research_state_v7.schema.json") in STAGE_ARTIFACT_REQUIREMENTS["orchestration"]
+    assert all(schema != "trial_spec_v5.schema.json" for requirements in STAGE_ARTIFACT_REQUIREMENTS.values() for _, schema in requirements)
+    assert all(schema != "research_state_v6.schema.json" for requirements in STAGE_ARTIFACT_REQUIREMENTS.values() for _, schema in requirements)

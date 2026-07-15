@@ -14,7 +14,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_event_v6"
+      "const": "auto_research_event_v7"
     },
     "event_id": {
       "type": "string",
@@ -512,7 +512,7 @@
           "type": "string"
         },
         "phase_execution_manifest": {
-          "type": "object"
+          "$ref": "phase_execution_manifest_v3.schema.json"
         },
         "request_fingerprint": {
           "$ref": "#/$defs/request"
@@ -531,7 +531,7 @@
           "type": "object"
         },
         "evidence_manifest": {
-          "type": "object"
+          "$ref": "evidence_manifest_v4.schema.json"
         },
         "request_fingerprint": {
           "$ref": "#/$defs/request"
@@ -541,42 +541,99 @@
     "phase_command_started": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["command"],
+      "required": [
+        "command"
+      ],
       "properties": {
-        "command": {"type": "object"},
-        "request_fingerprint": {"$ref": "#/$defs/request"}
+        "command": {
+          "$ref": "phase_command_v2.schema.json"
+        },
+        "request_fingerprint": {
+          "$ref": "#/$defs/request"
+        }
       }
     },
     "phase_command_completed": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["command_id", "receipt_ref"],
+      "required": [
+        "command_id",
+        "command_hash",
+        "command_plan_hash",
+        "receipt_ref",
+        "receipt_hash"
+      ],
       "properties": {
-        "command_id": {"type": "string", "minLength": 1},
-        "receipt_ref": {"$ref": "#/$defs/blob"},
-        "request_fingerprint": {"$ref": "#/$defs/request"}
+        "command_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "command_hash": {
+          "$ref": "#/$defs/hash"
+        },
+        "command_plan_hash": {
+          "$ref": "#/$defs/hash"
+        },
+        "receipt_ref": {
+          "$ref": "#/$defs/blob"
+        },
+        "receipt_hash": {
+          "$ref": "#/$defs/hash"
+        },
+        "request_fingerprint": {
+          "$ref": "#/$defs/request"
+        }
       }
     },
     "phase_command_unknown": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["command_id", "reason"],
+      "required": [
+        "command_id",
+        "reason"
+      ],
       "properties": {
-        "command_id": {"type": "string", "minLength": 1},
-        "reason": {"type": "string", "minLength": 1},
-        "request_fingerprint": {"$ref": "#/$defs/request"}
+        "command_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        },
+        "request_fingerprint": {
+          "$ref": "#/$defs/request"
+        }
       }
     },
     "blob": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "algorithm", "digest", "size_bytes", "relative_path"],
+      "required": [
+        "schema_version",
+        "algorithm",
+        "digest",
+        "size_bytes",
+        "relative_path"
+      ],
       "properties": {
-        "schema_version": {"const": "auto_research_contract_blob_v1"},
-        "algorithm": {"const": "sha256"},
-        "digest": {"$ref": "#/$defs/hash"},
-        "size_bytes": {"type": "integer", "minimum": 0},
-        "relative_path": {"type": "string", "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"}
+        "schema_version": {
+          "const": "auto_research_contract_blob_v1"
+        },
+        "algorithm": {
+          "const": "sha256"
+        },
+        "digest": {
+          "$ref": "#/$defs/hash"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "relative_path": {
+          "type": "string",
+          "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"
+        }
       }
     }
   }

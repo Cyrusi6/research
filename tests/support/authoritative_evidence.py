@@ -7,16 +7,80 @@ from pathlib import Path
 
 from auto_research.contract_store import ContractStore, canonical_contract_bytes
 from auto_research.domain_contracts import TRIAL_SPEC_SCHEMA_VERSION, canonical_hash, validate_trial_spec
-from auto_research.evidence import content_addressed_evidence_path, encode_canonical_evidence
+from auto_research.command_journal import CommandExecutionResult, LedgerCommandJournal
+from auto_research.evidence import (
+    content_addressed_evidence_path,
+    encode_canonical_evidence,
+    stage_completion_evidence,
+)
+from auto_research.evidence_lineage import (
+    manifest_from_completion_evidence,
+    validate_receipt_bound_evidence,
+)
+from auto_research.phase_execution import ResearchLedgerPhaseAuthority
+from auto_research.phase_command_plan import build_phase_command_plan, store_phase_command_plan
 from auto_research.proxy_classifier import build_proxy_decision_policy
-from auto_research.research_state import FAILURE_EVIDENCE_SCHEMA_VERSION
+from auto_research.research_state import FAILURE_EVIDENCE_SCHEMA_VERSION, ResearchEventLedger
 
 
 _DEFAULT_CONTRACT_ROOT = Path(tempfile.mkdtemp(prefix="auto-research-test-contracts-"))
 
 
-def build_trial_spec_v5(spec: dict, *, project_root: Path | None = None) -> dict:
-    """Rebuild a legacy test specification as a strict CAS-backed TrialSpec v5."""
+def _record_failed_phase_command(
+    project_root: Path,
+    attempt: dict,
+    *,
+    suffix: str,
+    exit_code: int,
+    stderr: str,
+) -> dict:
+    running_phase = next(phase for phase in ("proxy", "full") if attempt["phases"].get(phase) == "RUNNING")
+    ledger = ResearchEventLedger(project_root)
+    context = ResearchLedgerPhaseAuthority(ledger).context_for_attempt(project_root, attempt["attempt_id"], running_phase)
+    plan = ContractStore(project_root).read_json(context.command_plan_hash, schema_file="phase_command_plan_v1.schema.json")
+    used = {
+        record["command"]["command_spec_id"]
+        for record in ledger.state()["phase_commands"].values()
+        if record["command"]["attempt_id"] == attempt["attempt_id"]
+        and record["command"]["lifecycle_generation"] == attempt["lifecycle_generation"]
+        and record["command"]["phase_execution_id"] == context.phase_execution_id
+    }
+    command_spec = next(command for command in plan["commands"] if command["command_spec_id"] not in used)
+    stdout = ""
+    result = LedgerCommandJournal(project_root, ledger).run_once(
+        context,
+        command_id=f"failure-{running_phase}-{attempt['lifecycle_generation']}-{suffix}",
+        command_spec_id=command_spec["command_spec_id"],
+        argv=tuple(command_spec["argv"]),
+        cwd=command_spec["cwd"],
+        source_snapshot_hash=command_spec["source_snapshot_hash"],
+        expected_outputs=tuple(output["kind"] for output in command_spec["expected_outputs"]),
+        runner=lambda: CommandExecutionResult(
+            exit_code=exit_code,
+            stdout_hash=hashlib.sha256(stdout.encode()).hexdigest(),
+            stderr_hash=hashlib.sha256(stderr.encode()).hexdigest(),
+            outputs=(),
+            stdout=stdout,
+            stderr=stderr,
+        ),
+    )
+    return {
+        "command_id": result.receipt["command_id"],
+        "command_hash": result.receipt["command_hash"],
+        "command_plan_hash": result.receipt["command_plan_hash"],
+        "receipt_ref": dict(result.receipt_ref),
+        "receipt_hash": result.receipt_ref["digest"],
+    }
+
+
+def build_trial_spec_v5(
+    spec: dict,
+    *,
+    project_root: Path | None = None,
+    adapter_id: str = "fixture-phase-adapter",
+    command_provenance_mode: str = "synthetic",
+) -> dict:
+    """Rebuild a legacy test specification as the current strict TrialSpec."""
 
     result = deepcopy(spec)
     root = Path(project_root) if project_root is not None else _DEFAULT_CONTRACT_ROOT
@@ -61,7 +125,7 @@ def build_trial_spec_v5(spec: dict, *, project_root: Path | None = None) -> dict
     if len(manifest_id) < 8:
         manifest_id = f"fixture-{manifest_id}"
     sample_manifest = {
-        "schema_version": "auto_research_sample_manifest_v2",
+        "schema_version": "auto_research_sample_manifest_v3",
         "manifest_id": manifest_id,
         "provenance_mode": legacy_manifest.get("provenance_mode", "synthetic"),
         "datasets": sample_datasets,
@@ -70,7 +134,7 @@ def build_trial_spec_v5(spec: dict, *, project_root: Path | None = None) -> dict
     result["sample_manifest_ref"] = store.put_contract(
         sample_manifest,
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v2.schema.json",
+        schema_file="sample_manifest_v3.schema.json",
     )
     result["datasets"] = dataset_specs
 
@@ -152,23 +216,46 @@ def build_trial_spec_v5(spec: dict, *, project_root: Path | None = None) -> dict
                     }
                 )
     result["required_artifacts"] = [item["kind"] for item in requirements]
-    result["phase_contracts"] = [
-        {
+    result["execution_contract"].pop("command_contract_hash", None)
+    phase_contracts = []
+    for phase in required_phases:
+        evidence_kinds = [
+            item["kind"]
+            for item in result["evidence_requirements"]
+            if phase in item["applicable_phases"] or "always" in item["applicable_phases"]
+        ]
+        plan = build_phase_command_plan(
+            phase=phase,
+            adapter_id=adapter_id,
+            adapter_version="1",
+            provenance_mode=command_provenance_mode,
+            variant_spec_hash=canonical_hash({"fixture": "variant"}),
+            source_snapshot_hash=evaluator_manifest["source_digest"],
+            command_values=[["fixture-phase-command", phase]],
+            expected_evidence=[
+                next(item for item in result["evidence_requirements"] if item["kind"] == kind)
+                for kind in evidence_kinds
+            ],
+            default_cwd=str(root),
+        )
+        plan_ref, plan_hash = store_phase_command_plan(root, plan)
+        phase_contracts.append({
             "phase": phase,
             "datasets": datasets,
             "seeds": seeds,
             "roles": ["baseline", "candidate"] if phase == "proxy" else list(result["required_roles"]),
             "metrics": [result["primary_metric_id"]],
-            "evidence_kinds": [
-                item["kind"]
-                for item in result["evidence_requirements"]
-                if phase in item["applicable_phases"] or "always" in item["applicable_phases"]
-            ],
+            "evidence_kinds": evidence_kinds,
             "terminal": phase in result["protocol"]["terminal_phases"],
             "consumes_direction_budget": phase in result["protocol"]["terminal_phases"],
-        }
-        for phase in required_phases
-    ]
+            "command_plan": plan,
+            "command_plan_ref": plan_ref,
+            "command_plan_hash": plan_hash,
+        })
+    result["phase_contracts"] = phase_contracts
+    result["execution_contract"]["phase_command_plan_hashes"] = {
+        item["phase"]: item["command_plan_hash"] for item in phase_contracts
+    }
     if "proxy" in required_phases:
         proxy_contract = next(item for item in result["phase_contracts"] if item["phase"] == "proxy")
         primary_constraint = next(
@@ -201,12 +288,135 @@ def build_trial_spec_v5(spec: dict, *, project_root: Path | None = None) -> dict
     return result
 
 
+def refresh_phase_command_plans(spec: dict, *, project_root: Path | None = None) -> dict:
+    root = Path(project_root) if project_root is not None else _DEFAULT_CONTRACT_ROOT
+    source_snapshot_hash = spec["execution_contract"]["evaluator_provenance"]["source_digest"]
+    for contract in spec["phase_contracts"]:
+        requirements = [
+            item
+            for item in spec["evidence_requirements"]
+            if contract["phase"] in item["applicable_phases"] or "always" in item["applicable_phases"]
+        ]
+        plan = build_phase_command_plan(
+            phase=contract["phase"],
+            adapter_id="fixture-phase-adapter",
+            adapter_version="1",
+            provenance_mode="synthetic",
+            variant_spec_hash=canonical_hash({"fixture": "variant"}),
+            source_snapshot_hash=source_snapshot_hash,
+            command_values=[["fixture-phase-command", contract["phase"]]],
+            expected_evidence=requirements,
+            default_cwd=str(root),
+        )
+        reference, digest = store_phase_command_plan(root, plan)
+        contract["command_plan"] = plan
+        contract["command_plan_ref"] = reference
+        contract["command_plan_hash"] = digest
+    spec["execution_contract"]["phase_command_plan_hashes"] = {
+        item["phase"]: item["command_plan_hash"] for item in spec["phase_contracts"]
+    }
+    return spec
+
+
 def start_attempt_phase(ledger, attempt: dict, phase: str) -> dict:
     phase_execution_id = f"{phase}-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}"
     producer_run_id = f"producer-{phase}-{attempt['attempt_id'][:8]}-g{attempt['lifecycle_generation']}"
     if phase == "proxy":
         return ledger.start_proxy_phase(attempt["attempt_id"], phase_execution_id=phase_execution_id, producer_run_id=producer_run_id)
     return ledger.start_full_phase(attempt["attempt_id"], phase_execution_id=phase_execution_id, producer_run_id=producer_run_id)
+
+
+def stage_authoritative_completion(
+    project_root: Path,
+    attempt: dict,
+    trial_spec: dict,
+    inventory: list[dict],
+) -> dict:
+    """Stage production-shaped raw evidence without constructing TrialResult fields."""
+
+    return stage_completion_evidence(
+        project_root=project_root,
+        attempt=attempt,
+        trial_spec=trial_spec,
+        inventory=inventory,
+    )
+
+
+def record_completed_evidence_command(
+    project_root: Path,
+    ledger,
+    attempt: dict,
+    completion: dict,
+) -> dict:
+    """Commit the exact frozen command receipt that produced a completion inventory."""
+
+    phase = completion["entries"][0]["phase"]
+    context = ResearchLedgerPhaseAuthority(ledger).context_for_attempt(
+        project_root,
+        attempt["attempt_id"],
+        phase,
+    )
+    phase_contract = next(
+        item for item in attempt["frozen_trial_spec"]["phase_contracts"] if item["phase"] == phase
+    )
+    command_spec = phase_contract["command_plan"]["commands"][-1]
+    entries_by_kind = {entry["kind"]: entry for entry in completion["entries"]}
+    outputs = []
+    store = ContractStore(project_root)
+    for expected in command_spec["expected_outputs"]:
+        entry = entries_by_kind[expected["kind"]]
+        reference = store.put_bytes((project_root / entry["relative_path"]).read_bytes())
+        outputs.append(
+            {
+                "kind": expected["kind"],
+                "schema_version": expected["schema_version"],
+                "contract_ref": reference,
+            }
+        )
+    result = LedgerCommandJournal(project_root, ledger).run_once(
+        context,
+        command_id=f"fixture-{phase}-{attempt['attempt_id'][:12]}",
+        command_spec_id=command_spec["command_spec_id"],
+        argv=tuple(command_spec["argv"]),
+        cwd=command_spec["cwd"],
+        source_snapshot_hash=command_spec["source_snapshot_hash"],
+        expected_outputs=tuple(item["kind"] for item in command_spec["expected_outputs"]),
+        runner=lambda: CommandExecutionResult(
+            exit_code=0,
+            stdout_hash=hashlib.sha256(f"{attempt['attempt_id']}:{phase}".encode()).hexdigest(),
+            stderr_hash=hashlib.sha256(b"").hexdigest(),
+            outputs=tuple(outputs),
+            stdout=f"{attempt['attempt_id']}:{phase}",
+            stderr="",
+            external_job_id=f"fixture-job-{phase}-{attempt['attempt_id'][:8]}",
+        ),
+    )
+    if result["status"] != "completed":
+        raise AssertionError(f"fixture command did not complete: {result}")
+    return dict(result)
+
+
+def validate_authoritative_completion(
+    project_root: Path,
+    ledger,
+    attempt: dict,
+    completion: dict,
+):
+    """Return the canonical manifest derived from the committed command receipt."""
+
+    state = ledger.state()
+    staged_manifest = manifest_from_completion_evidence(
+        attempt=state["attempts"][attempt["attempt_id"]],
+        completion_evidence=completion,
+    )
+    return validate_receipt_bound_evidence(
+        project_root=project_root,
+        attempt=state["attempts"][attempt["attempt_id"]],
+        trial_spec=attempt["frozen_trial_spec"],
+        manifest=staged_manifest,
+        phase_commands=state["phase_commands"],
+        phase=completion["entries"][0]["phase"],
+    )
 
 
 def build_quantitative_completion(
@@ -288,12 +498,16 @@ def build_quantitative_completion(
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(raw)
     return {
-        "schema_version": "auto_research_completion_evidence_v2",
+        "schema_version": "auto_research_completion_evidence_v3",
         "attempt_id": attempt["attempt_id"],
         "trial_spec_hash": attempt["trial_spec_hash"],
         "lifecycle_generation": attempt["lifecycle_generation"],
         "implementation_hash": attempt["implementation_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": phase,
+        "phase_execution_id": phase_execution["phase_execution_id"],
+        "producer_run_id": producer_run_id,
+        "command_plan_hash": phase_execution["command_plan_hash"],
         "entries": [
             {
                 "evidence_id": evidence_id,
@@ -327,7 +541,7 @@ def build_bootstrap_completion(
 ) -> dict:
     """Build the complete strict bootstrap inventory through production staging."""
 
-    from auto_research.agents.experiment import _c2c_strict_evidence_inventory, _stage_evidence_inventory
+    from auto_research.agents.experiment import _c2c_strict_evidence_inventory
 
     inventory = _c2c_strict_evidence_inventory(
         project_root=project_root,
@@ -343,12 +557,7 @@ def build_bootstrap_completion(
         baseline={"mean": baseline_value, "datasets": {"fake": baseline_value}},
         simulate=True,
     )
-    return _stage_evidence_inventory(
-        project_root=project_root,
-        attempt=attempt,
-        trial_spec=trial_spec,
-        inventory=inventory,
-    )
+    return stage_authoritative_completion(project_root, attempt, trial_spec, inventory)
 
 
 def build_failure_evidence_v4(
@@ -425,6 +634,13 @@ def build_failure_evidence_v4(
     )
     receipt_path.parent.mkdir(parents=True, exist_ok=True)
     receipt_path.write_bytes(receipt_raw)
+    command_binding = _record_failed_phase_command(
+        project_root,
+        attempt,
+        suffix=suffix,
+        exit_code=exit_code,
+        stderr="b" * 64,
+    )
 
     command_status = "integrity_blocked" if failure_class in {"integrity_failure", "safety_failure"} else "failed"
     evidence = {
@@ -441,6 +657,7 @@ def build_failure_evidence_v4(
         "reason": f"verified {failure_class}",
         "observed_at": "2026-07-14T00:00:01Z",
         "log_hash": receipt["stderr_hash"],
+        **command_binding,
     }
     evidence_raw = encode_canonical_evidence(evidence)
     evidence_hash = hashlib.sha256(evidence_raw).hexdigest()
@@ -503,8 +720,15 @@ def build_resource_failure_evidence_v4(
         "phase_execution_id": phase_execution["phase_execution_id"],
         "phase_start_event_id": phase_execution["phase_start_event_id"],
     }
+    command_binding = _record_failed_phase_command(
+        project_root,
+        attempt,
+        suffix=suffix,
+        exit_code=exit_code,
+        stderr="resource capacity insufficient",
+    )
     probe = {
-        "schema_version": "auto_research_resource_probe_evidence_v3",
+        "schema_version": "auto_research_resource_probe_evidence_v4",
         "evidence_kind": "resource_probe",
         "evidence_id": f"resource-probe-{attempt['lifecycle_generation']}-{suffix}",
         **identity,
@@ -515,6 +739,7 @@ def build_resource_failure_evidence_v4(
         "unit": unit,
         "probe_status": "insufficient",
         "observed_at": "2026-07-14T00:00:00Z",
+        **command_binding,
     }
     probe_raw = encode_canonical_evidence(probe)
     probe_hash = hashlib.sha256(probe_raw).hexdigest()
@@ -541,6 +766,7 @@ def build_resource_failure_evidence_v4(
         "reason": f"verified {failure_class}",
         "observed_at": "2026-07-14T00:00:01Z",
         "log_hash": probe_hash,
+        **command_binding,
     }
     evidence_raw = encode_canonical_evidence(evidence)
     evidence_hash = hashlib.sha256(evidence_raw).hexdigest()

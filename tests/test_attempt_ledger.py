@@ -1,6 +1,7 @@
 from pathlib import Path
 
 from auto_research.research_state import ResearchEventLedger
+from support.authoritative_evidence import record_completed_evidence_command
 from test_authoritative_state_machine import _completion_evidence, _direction, _variant, _initialize, _reserve, _complete
 
 
@@ -27,6 +28,8 @@ def test_duplicate_attempt_completion_does_not_double_count(tmp_path: Path) -> N
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
     completion = _completion_evidence(ledger, attempt, outcome="rejected")
+    current = ledger.state()["attempts"][attempt["attempt_id"]]
+    record_completed_evidence_command(ledger.project_root, ledger, current, completion)
     completed, _ = ledger.complete_attempt(completion)
     finalization_event = next(event for event in reversed(ledger.events()) if event["event_type"] == "AttemptFinalized")
     before = ledger.state()

@@ -5,11 +5,34 @@ from copy import deepcopy
 import pytest
 
 from auto_research.failure_validation import (
+    FAILURE_EVIDENCE_SCHEMA_VERSION,
+    RESOURCE_PROBE_SCHEMA_VERSION,
+    RESUME_EVIDENCE_SCHEMA_VERSION,
     canonical_evidence_bytes,
     evidence_bytes_hash,
     validate_failure_evidence,
     validate_resume_evidence,
 )
+
+
+def _receipt_ref(digest: str = "e" * 64) -> dict:
+    return {
+        "schema_version": "auto_research_contract_blob_v1",
+        "algorithm": "sha256",
+        "digest": digest,
+        "size_bytes": 128,
+        "relative_path": f"meta/contracts/sha256/{digest[:2]}/{digest}.json",
+    }
+
+
+def _command_binding() -> dict:
+    return {
+        "command_id": "command-proxy-0001",
+        "command_hash": "d" * 64,
+        "command_plan_hash": "e" * 64,
+        "receipt_ref": _receipt_ref(),
+        "receipt_hash": "f" * 64,
+    }
 
 
 def _identity(*, phase: str = "proxy", generation: int = 0, producer: str = "producer-proxy-0001") -> dict:
@@ -54,7 +77,7 @@ def _command_receipt(identity: dict, *, exit_code: int = 2) -> dict:
 def _failure(identity: dict, *, failure_class: str, referenced_hash: str, exit_code: int = 2) -> dict:
     resource_failure = failure_class in {"resource_pause", "oom_retry"}
     return {
-        "schema_version": "auto_research_failure_evidence_v4",
+        "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION,
         "evidence_kind": "failure_evidence",
         "evidence_id": "evidence:failure:m115",
         **identity,
@@ -69,12 +92,13 @@ def _failure(identity: dict, *, failure_class: str, referenced_hash: str, exit_c
         "reason": "authoritative failure",
         "observed_at": "2026-07-15T00:00:01Z",
         "log_hash": "d" * 64 if resource_failure else "c" * 64,
+        **_command_binding(),
     }
 
 
 def _probe(identity: dict, *, status: str, observed: float, required: float = 10.0) -> dict:
     return {
-        "schema_version": "auto_research_resource_probe_evidence_v3",
+        "schema_version": RESOURCE_PROBE_SCHEMA_VERSION,
         "evidence_kind": "resource_probe",
         "evidence_id": "evidence:resource:m115",
         **identity,
@@ -85,12 +109,13 @@ def _probe(identity: dict, *, status: str, observed: float, required: float = 10
         "unit": "bytes",
         "probe_status": status,
         "observed_at": "2026-07-15T00:00:02Z",
+        **_command_binding(),
     }
 
 
 def _resume(resume_identity: dict, pause_identity: dict, probe: dict, pause_hash: str) -> dict:
     return {
-        "schema_version": "auto_research_resume_evidence_v4",
+        "schema_version": RESUME_EVIDENCE_SCHEMA_VERSION,
         "evidence_kind": "resume_evidence",
         "evidence_id": "evidence:resume:m115",
         **resume_identity,
@@ -107,6 +132,7 @@ def _resume(resume_identity: dict, pause_identity: dict, probe: dict, pause_hash
         "unit": probe["unit"],
         "probe_status": probe["probe_status"],
         "observed_at": probe["observed_at"],
+        **_command_binding(),
     }
 
 

@@ -26,6 +26,7 @@ from support.authoritative_evidence import (
     build_failure_evidence_v4,
     build_quantitative_completion,
     build_resource_failure_evidence_v4,
+    record_completed_evidence_command,
 )
 from auto_research.research_state import IntegrityError, ResearchEventLedger
 from auto_research.utils import write_json
@@ -275,6 +276,10 @@ def _complete(
         current = ledger.state()["attempts"][attempt["attempt_id"]]
         return ledger.disposition_failure(_failure_evidence(ledger, current, failure or "implementation_failure"))
     completion = _completion_evidence(ledger, attempt, outcome=outcome)
+    current = ledger.state()["attempts"][attempt["attempt_id"]]
+    phase = completion["phase"]
+    if current["phases"].get(phase) == "RUNNING":
+        record_completed_evidence_command(ledger.project_root, ledger, current, completion)
     return ledger.complete_attempt(completion)
 
 
@@ -410,6 +415,8 @@ def test_trial_identity_mismatch_writes_nothing(tmp_path: Path) -> None:
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
     completion = _completion_evidence(ledger, attempt, outcome="accepted")
+    current = ledger.state()["attempts"][attempt["attempt_id"]]
+    record_completed_evidence_command(ledger.project_root, ledger, current, completion)
     before_events = len(ledger.events())
     before_state = ledger.state()
     completion["trial_spec_hash"] = "f" * 64

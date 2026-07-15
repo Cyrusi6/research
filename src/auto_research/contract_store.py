@@ -16,7 +16,7 @@ from jsonschema import Draft202012Validator
 
 CONTRACT_BLOB_SCHEMA_VERSION = "auto_research_contract_blob_v1"
 CONTRACT_REF_SCHEMA_VERSION = "auto_research_contract_ref_v1"
-SAMPLE_MANIFEST_SCHEMA_VERSION = "auto_research_sample_manifest_v2"
+SAMPLE_MANIFEST_SCHEMA_VERSION = "auto_research_sample_manifest_v3"
 EVALUATOR_MANIFEST_SCHEMA_VERSION = "auto_research_evaluator_manifest_v2"
 CONTRACT_STORE_ROOT = PurePosixPath("meta/contracts/sha256")
 
@@ -53,9 +53,9 @@ def _schema_validator(schema_file: str) -> Draft202012Validator:
 
 
 def validate_sample_manifest(payload: Mapping[str, Any], *, store: ContractStore | None = None) -> None:
-    validate_schema(payload, "sample_manifest_v2.schema.json")
+    validate_schema(payload, "sample_manifest_v3.schema.json")
     if store is not None:
-        store._validate_known_contract(payload, "sample_manifest_v2.schema.json")
+        store._validate_known_contract(payload, "sample_manifest_v3.schema.json")
 
 
 def validate_evaluator_manifest(payload: Mapping[str, Any], *, store: ContractStore | None = None) -> None:
@@ -245,7 +245,7 @@ class ContractStore:
         return digest.hexdigest()
 
     def _validate_known_contract(self, payload: Mapping[str, Any], schema_file: str) -> None:
-        if schema_file == "sample_manifest_v2.schema.json":
+        if schema_file == "sample_manifest_v3.schema.json":
             dataset_ids: set[str] = set()
             for dataset in payload["datasets"]:
                 if dataset["dataset_id"] in dataset_ids:
@@ -268,9 +268,12 @@ class ContractStore:
                 raise ValueError("evaluator dependency_digest does not prove dependency blob bytes")
             if config_digest != payload["config_digest"]:
                 raise ValueError("evaluator config_digest does not prove config blob bytes")
-        elif schema_file == "phase_run_receipt_v2.schema.json":
-            for reference in payload["outputs"]:
+        elif schema_file == "phase_run_receipt_v3.schema.json":
+            for output in payload["outputs"]:
+                reference = output["contract_ref"]
                 self.verify(reference)
+                if reference["digest"] != output["content_hash"]:
+                    raise ValueError("receipt output content hash does not match ContractRef")
 
     store_bytes = put_bytes
     store_json = put_json

@@ -1,6 +1,6 @@
-# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.5-Final
+# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.5.1
 
-The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M1.1.5-Final does not restore their legacy readers, route policy, schemas, or artifact mirrors. Valid behavior is covered through the current canonical contracts and SQLite Event v6 state/command layer.
+The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M1.1.5.1 does not restore their legacy readers, route policy, schemas, or artifact mirrors. Valid behavior is migrated to the current canonical contracts and SQLite Event v7 state/command layer.
 
 ## Migration Classes
 
@@ -11,7 +11,7 @@ The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M
 | Proxy/full execution, all-zero/neutral proxy, ablation, paired baseline, readiness, artifact lock | Yes | Existing C2C proxy, hook, manifest, Gate, and pipeline tests plus strict TrialResult tests | Retained as execution/Gate evidence. Routing authority moved from mutable proxy/main-results files to the committed attempt transaction. |
 | Codex S2/S2.5 session persistence and duplicate session recovery | Yes | Existing C2C planner and code-patch persistence tests in `tests/test_c2c.py` | Retained. A repeated scientific variant is rejected; IDs can no longer disguise duplication. |
 | Snapshot pollution, replay, stale route-invalidated artifacts | Yes | Event tamper, crash-before-projection, rebuild, audit, and replay tests | Replaced mutable snapshot authority with hash-chained SQLite events and rebuildable projections. |
-| S1/S2/S3 negative Gate paths and strict falsifiability/ablation fields | Yes | `tests/test_validators.py`, `tests/test_stage_contracts.py`, strict schema tests | Rewritten against DirectionSpec v3, VariantSpec v4, TrialSpec v5, TrialResult v5, immutable evidence, and pre-agent missing-input blocking. |
+| S1/S2/S3 negative Gate paths and strict falsifiability/ablation fields | Yes | `tests/test_validators.py`, `tests/test_stage_contracts.py`, strict schema tests | Rewritten against DirectionSpec v3, VariantSpec v4, TrialSpec v6, TrialResult v5, immutable evidence, and pre-agent missing-input blocking. |
 | Feedback attribution and adaptive history | Yes | State-machine semantic duplicate tests and existing `tests/test_s2_feedback_policy.py` | Method history reads only verified standard outcomes; implementation/resource history and planner feedback remain separate. |
 | Legacy `route_policy` branch-by-branch decisions | No | Unified reducer route tests | Obsolete because multiple route authorities caused conflicting counters and non-atomic decisions. `RouteOutcome v4` is reducer-derived. |
 | Legacy direction/idea fallback, v1 variant loading, candidate/next-variant execution inputs | No | Runtime `rg` assertion in `tests/test_authoritative_state_machine.py` | Obsolete under the breaking canonical switch. Old workspaces must rerun from S1. |
@@ -197,9 +197,31 @@ The runtime intentionally rejects and does not migrate Event v5, AttemptRecord v
 - Existing Generic/C2C five-variant simulation tests remain **synthetic** and prove deterministic state/budget/evidence behavior only.
 - Native Unified S1 Producer/Core and real external Codex S1 smoke are not migrated or claimed by M1.1.5-Final.
 
-### Final hermetic migration
+### Historical pre-v7 hermetic checkpoint
 
 - `tests/test_m115_final_e2e.py` now provisions its own temporary C2C dataset cache. The non-simulated tests no longer pass only because `/root/.cache`, the invoking user's HF cache, or another host cache happens to exist.
 - `tests/test_resources.py::test_scan_reusable_runs_skips_directories_that_disappear_during_walk` replaces the racy project-wide `Path.rglob()` behavior with a filesystem-race-tolerant scan.
 - `tests/test_resources.py::test_scan_reusable_runs_ignores_project_temp_directory` ensures concurrent pytest `.tmp` trees are not interpreted as reusable scientific runs.
-- Final normal, proxy-cleared, and empty-HOME/no-Codex suites each report `633 passed, 2 skipped, 0 failed`; the two skips remain the pre-existing optional torch/transformers dynamic skips.
+- The pre-v7 checkpoint recorded green normal, proxy-cleared, and empty-HOME/no-Codex suites. Those historical counts do not validate M1.1.5.1 and are intentionally not repeated as current results.
+
+## M1.1.5.1 Production Phase Authority Migration
+
+The v7/v6 authority migration supersedes the historical M1.1.5-Final acceptance count above. The following mappings record the current production invariants and canonical regression locations; they do not claim the full M1.1.5.1 matrix is green until the final three-environment run completes.
+
+| Replaced or bypassed behavior | Canonical regression | Current authority |
+|---|---|---|
+| Generic completed command replay depends on in-process `result_holder` | `tests/test_m1151_command_restart.py` | Replay reconstructs stdout, stderr, and output inventory from PhaseRunReceipt v3 ContractRefs without rerunning the subprocess |
+| Runtime substitutes an arbitrary argv after freezing another producer command | `tests/test_phase_command_plan.py`; `tests/test_m1151_command_restart.py` | PhaseCommandStarted must exactly match PhaseCommandPlan v1 command spec, argv, cwd, source snapshot, phase, and dependencies |
+| Passing metrics/activation/readiness bytes without a command receipt authorize proxy/finalization | `tests/test_m1151_receipt_lineage.py` | EvidenceManifest v4 requires the exact immutable output of the frozen collector command; that command can run only after its physical measurement/probe DAG dependencies and current-generation receipts are complete |
+| ExperimentAgent invokes phase side effects outside an executor | `tests/test_m1151_executor_wiring.py` | Generic, C2C proxy, C2C full, and synthetic paths require their corresponding PhaseExecutor capability before runner invocation |
+| Extra, duplicate, wrong-phase, stale-generation, or cross-Attempt command/evidence is accepted | `tests/test_phase_command_plan.py`; `tests/test_m1151_receipt_lineage.py`; `tests/test_m114_authoritative_phase_transactions.py` | Frozen command DAG and exact receipt-linked evidence set are revalidated by transaction, reducer/rebuild, and Gate |
+| Command output/log hashes exist but bytes cannot be recovered after crash | `tests/test_m1151_command_restart.py` | PhaseRunReceipt v3 stores durable stdout/stderr/output ContractRefs and completed replay reads the immutable bytes |
+| Proxy/full runner can execute before SQLite phase authorization | `tests/test_m1151_executor_wiring.py`; `tests/test_m115_physical_phase_chain.py` | Executor obtains and rereads SQLite PhaseAuthorization around callbacks; direct or stale capability fails before side effects |
+| Resource pause/resume uses caller-authored status or unrelated probe bytes | `tests/test_m112_experiment_flow.py`; `tests/test_m115_failure_resume_reducer.py` | FailureEvidence/ResumeEvidence v5 and ResourceProbe v4 must bind the current authorized command and receipt |
+| Historical M1.1.5 test counts are reused after a breaking schema migration | this document and `FRAMEWORK_STAGE_UPDATES.md` | Event/Attempt/State v7 and TrialSpec v6 require a fresh complete acceptance run; old counts are historical only |
+
+Final acceptance commands and exact counts are recorded in the delivery report. The migration keeps the scientific/state requirements above and removes the former fixed-path, caller-authored and process-local execution bypasses.
+
+The current runtime versions are Event/AttemptRecord/ResearchState v7, TrialSpec v6, PhaseExecutionManifest v3, PhaseCommand v2, PhaseRunReceipt v3, EvidenceManifest v4, SampleManifest v3, CompletionEvidence v3, FailureEvidence/ResumeEvidence v5, and ResourceProbe v4. Replaced v6/v5/v4/v3 readers and schemas are removed; they are not dual-read or migrated.
+
+Final M1.1.5.1 verification reports `669 passed, 2 skipped, 0 failed` in the normal, proxy-cleared, and empty-HOME/empty-HF-cache/PATH-without-Codex full suites. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training remain outside this migration. Local subprocess and synthetic fixtures are engineering validation only.

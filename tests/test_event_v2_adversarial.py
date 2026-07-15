@@ -17,11 +17,11 @@ from test_authoritative_state_machine import (
     _trial_spec,
     _variant,
 )
-from test_m113_ledger_closure import (
-    _failure_evidence as _canonical_failure_evidence,
-    _resume_evidence,
+from support.authoritative_evidence import (
+    build_failure_evidence_v4,
+    build_resource_failure_evidence_v4,
+    start_attempt_phase,
 )
-from support.authoritative_evidence import build_failure_evidence_v4, start_attempt_phase
 
 
 def _start_execution(ledger: ResearchEventLedger, attempt: dict) -> dict:
@@ -132,15 +132,16 @@ def test_late_disposition_replay_returns_original_attempt_route(tmp_path: Path) 
     _initialize(ledger, direction, _variant(direction, 1))
     first = _reserve(ledger, direction, _variant(direction, 1))
     running = _start_execution(ledger, first)
-    evidence = _canonical_failure_evidence(
+    evidence = build_resource_failure_evidence_v4(
         tmp_path,
         running,
         failure_class="resource_pause",
+        suffix="late-replay",
         exit_code=137,
         resource_type="system_memory",
     )
     historical_attempt, historical_route = ledger.disposition_failure(evidence, event_id="pause:first")
-    ledger.resume_attempt(_resume_evidence(tmp_path, ledger, historical_attempt, resource_type="system_memory"))
+    ledger.append("AuditMarker", {"index": 1}, event_id="audit:after-pause")
     before = len(ledger.events())
     replayed_attempt, replayed_route = ledger.disposition_failure(evidence, event_id="pause:first")
     assert len(ledger.events()) == before

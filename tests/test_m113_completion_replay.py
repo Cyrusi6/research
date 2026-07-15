@@ -8,6 +8,7 @@ import pytest
 
 from auto_research.domain_contracts import canonical_hash
 from auto_research.research_state import IntegrityError, ResearchEventLedger
+from support.authoritative_evidence import record_completed_evidence_command
 from test_authoritative_state_machine import _completion_evidence, _direction, _initialize, _reserve, _variant
 
 
@@ -18,6 +19,8 @@ def _ready_finalization(tmp_path: Path, *, outcome: str = "rejected"):
     _initialize(ledger, direction, variant)
     attempt = _reserve(ledger, direction, variant)
     completion = _completion_evidence(ledger, attempt, outcome=outcome)
+    authoritative_attempt = ledger.state()["attempts"][attempt["attempt_id"]]
+    record_completed_evidence_command(tmp_path, ledger, authoritative_attempt, completion)
     completed, route = ledger.complete_attempt(completion)
     event = ledger.events()[-1]
     assert event["event_type"] == "AttemptFinalized"
@@ -59,7 +62,7 @@ def test_conflicting_completion_for_completed_attempt_is_zero_write_integrity_er
     conflicting = _completion_evidence(ledger, attempt, outcome="accepted")
     before = _authoritative_snapshot(ledger, direction, attempt["attempt_id"])
 
-    with pytest.raises(IntegrityError, match="completion fingerprint conflict"):
+    with pytest.raises(IntegrityError, match="completion fingerprint conflict|receipt output hash"):
         ledger.complete_attempt(conflicting)
 
     with sqlite3.connect(ledger.db_path) as connection:
@@ -75,11 +78,11 @@ def test_completion_replay_revalidates_immutable_evidence_before_returning_histo
     if attack == "missing":
         artifact.unlink()
         match = "artifact rejected|unavailable"
-        state_match = "immutable evidence audit failed: evidence path contains a symlink or is unavailable"
+        state_match = "immutable receipt-bound evidence audit failed: evidence path contains a symlink or is unavailable"
     else:
         artifact.write_bytes(artifact.read_bytes() + b"\n")
-        match = "evidence content hash mismatch"
-        state_match = "immutable TrialResult audit failed: evidence content hash mismatch"
+        match = "evidence content hash mismatch|receipt output bytes differ"
+        state_match = "immutable receipt-bound evidence audit failed: receipt output bytes differ"
 
     with pytest.raises(IntegrityError, match=match):
         ledger.complete_attempt(completion)

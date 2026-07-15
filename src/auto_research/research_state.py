@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import re
 import sqlite3
 import tempfile
+import threading
 import time
 import uuid
 import fcntl
@@ -15,7 +17,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .domain_contracts import (
+    ATTEMPT_SCHEMA_VERSION,
     DIRECTION_AGGREGATE_SCHEMA_VERSION,
+    EVENT_SCHEMA_VERSION,
+    FAILURE_EVIDENCE_SCHEMA_VERSION,
+    PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION,
+    RESEARCH_STATE_SCHEMA_VERSION,
+    RESUME_EVIDENCE_SCHEMA_VERSION,
     acceptance_contract_hash,
     attempt_input_hash,
     canonical_hash,
@@ -30,13 +38,15 @@ from .domain_contracts import (
 )
 from .s3_validation import validate_ledger_trial_precommit
 from .contract_store import ContractStore, canonical_contract_bytes, contract_digest
-from .evidence import EvidenceStore, content_addressed_evidence_path, decode_evidence_inventory
+from .evidence import EvidenceStore, content_addressed_evidence_path
+from .evidence_lineage import manifest_from_completion_evidence, validate_receipt_bound_evidence
 from .proxy_classifier import (
     build_proxy_evaluation_binding,
     classify_proxy_outcome,
     validate_proxy_evaluation_binding,
 )
 from .phase_execution import AuthoritativePhaseContext, PhaseAuthorization
+from .phase_command_plan import validate_phase_command_plan
 from .failure_validation import (
     canonical_evidence_bytes,
     evidence_bytes_hash,
@@ -45,14 +55,12 @@ from .failure_validation import (
 )
 from .utils import ensure_dir, now_utc
 
-EVENT_SCHEMA_VERSION = "auto_research_event_v6"
-ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v6"
-STATE_SCHEMA_VERSION = "auto_research_state_v6"
+STATE_SCHEMA_VERSION = RESEARCH_STATE_SCHEMA_VERSION
 ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v4"
-FAILURE_EVIDENCE_SCHEMA_VERSION = "auto_research_failure_evidence_v4"
-RESUME_EVIDENCE_SCHEMA_VERSION = "auto_research_resume_evidence_v4"
 EVENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/\-]{0,255}$")
 ZERO_HASH = "0" * 64
+_PROCESS_STATE_CACHE_LOCK = threading.RLock()
+_PROCESS_STATE_CACHE: dict[str, tuple[int, str, dict[str, Any]]] = {}
 TARGET_OUTCOMES = 5
 ACTIVE_ATTEMPT_STATES = {"READY", "IMPLEMENTING", "IMPLEMENTATION_REPAIR", "PROXY_RUNNING", "PROXY_COMPLETED", "FULL_RUNNING", "RESOURCE_PAUSED"}
 TERMINAL_ATTEMPT_STATES = {"METHOD_COMPLETED", "INTEGRITY_BLOCKED", "ABANDONED"}
@@ -177,12 +185,15 @@ class ResearchEventLedger:
 
     def state(self) -> dict[str, Any]:
         with self._connect() as connection:
-            state = self._state_in_transaction(connection, allow_cache=False)
+            state = self._state_in_transaction(connection, allow_cache=True)
         self._write_projections(state)
         return state
 
     def rebuild(self) -> dict[str, Any]:
-        return self.state()
+        with self._connect() as connection:
+            state = self._state_in_transaction(connection, allow_cache=False)
+        self._write_projections(state)
+        return state
 
     def query_operation_result(self, event_id: str) -> dict[str, Any]:
         """Return the immutable historical result derived at one committed event."""
@@ -286,7 +297,9 @@ class ResearchEventLedger:
                         connection.commit()
                         self._write_projections(state)
                         return event, event_state, True
-                event_type, payload, event_id = build(deepcopy(state))
+                build_state = deepcopy(state)
+                build_state["project_root"] = str(self.project_root)
+                event_type, payload, event_id = build(build_state)
                 if request_fingerprint is not None:
                     payload = {**payload, "request_fingerprint": request_fingerprint}
                 _validate_event_request(event_type, payload, event_id)
@@ -393,7 +406,7 @@ class ResearchEventLedger:
                 trial_spec=frozen_trial_spec,
                 timestamp=timestamp,
             )
-            validate_contract(attempt, "attempt_record_v6.schema.json")
+            validate_contract(attempt, "attempt_record_v7.schema.json")
             existing = state["attempts"].get(attempt_id)
             if existing is not None:
                 immutable_keys = [
@@ -480,8 +493,9 @@ class ResearchEventLedger:
                 if attempt["attempt_kind"] == "proxy_full" and (not isinstance(proxy, dict) or proxy.get("decision") != "RUN_FULL"):
                     raise IntegrityError("full phase requires committed RUN_FULL ProxyOutcome")
             operation_id = event_id or _operation_event_id(f"{phase}-phase-started", attempt, {"phase": phase, "phase_execution_id": phase_execution_id, "producer_run_id": producer_run_id})
+            phase_contract = next(item for item in attempt["frozen_trial_spec"]["phase_contracts"] if item["phase"] == phase)
             manifest = {
-                "schema_version": "auto_research_phase_execution_manifest_v2",
+                "schema_version": PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION,
                 "attempt_id": attempt["attempt_id"],
                 "direction_semantic_hash": attempt["direction_semantic_hash"],
                 "direction_spec_hash": attempt["direction_spec_hash"],
@@ -495,10 +509,11 @@ class ResearchEventLedger:
                 "phase_execution_id": phase_execution_id,
                 "phase_start_event_id": operation_id,
                 "producer_run_id": producer_run_id,
-                "command_plan_hash": attempt["frozen_trial_spec"]["execution_contract"]["command_contract_hash"],
-                "phase_contract_hash": canonical_hash(next(item for item in attempt["frozen_trial_spec"]["phase_contracts"] if item["phase"] == phase)),
-                "expected_evidence_kinds": sorted(next(item for item in attempt["frozen_trial_spec"]["phase_contracts"] if item["phase"] == phase)["evidence_kinds"]),
-                "provenance_mode": "synthetic" if attempt["frozen_trial_spec"]["sample_manifest"]["provenance_mode"] == "synthetic" else "production",
+                "command_plan_hash": phase_contract["command_plan_hash"],
+                "command_plan_ref": deepcopy(phase_contract["command_plan_ref"]),
+                "phase_contract_hash": canonical_hash(phase_contract),
+                "expected_evidence_kinds": sorted(phase_contract["evidence_kinds"]),
+                "provenance_mode": phase_contract["command_plan"]["adapter_identity"]["provenance_mode"],
                 "proxy_evaluation_binding": None,
                 "proxy_authorization": None,
             }
@@ -520,7 +535,7 @@ class ResearchEventLedger:
                     "proxy_event_hash": proxy["event_hash"],
                     "proxy_outcome_hash": proxy["outcome_hash"],
                 }
-            validate_contract(manifest, "phase_execution_manifest_v2.schema.json")
+            validate_contract(manifest, "phase_execution_manifest_v3.schema.json")
             payload = {"attempt_id": attempt_id, "lifecycle_generation": attempt["lifecycle_generation"], "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"], "expected_state": expected_state, "phase_execution_manifest": manifest}
             return ("ProxyPhaseStarted" if phase == "proxy" else "FullPhaseStarted"), payload, operation_id
         _, state, _ = self._domain_transact(build, explicit_event_id=event_id, request_fingerprint=request_fingerprint if event_id else None)
@@ -534,9 +549,11 @@ class ResearchEventLedger:
             if attempt["attempt_kind"] != "proxy_full" or attempt["state"] != "PROXY_RUNNING":
                 raise IntegrityError("ProxyEvidence commit requires a running proxy_full Attempt")
             manifest, _observations, completion_fingerprint = _decode_phase_completion(
-                project_root=self.project_root, attempt=attempt, completion_evidence=completion_evidence, expected_phase="proxy"
+                project_root=self.project_root, attempt=attempt, completion_evidence=completion_evidence,
+                expected_phase="proxy", phase_commands=state["phase_commands"],
             )
-            proxy_outcome = _canonical_proxy_outcome_from_manifest(self.project_root, attempt, manifest)
+            bound = _receipt_bound_phase_evidence(self.project_root, state, attempt, manifest, "proxy")
+            proxy_outcome = _canonical_proxy_outcome_from_bound(attempt, bound)
             validate_contract(proxy_outcome, "proxy_outcome_v3.schema.json")
             payload = {"proxy_outcome": proxy_outcome, "evidence_manifest": manifest, "request_fingerprint": completion_fingerprint}
             return "ProxyEvidenceCommitted", payload, event_id or _operation_event_id("proxy-evidence-committed", attempt, payload)
@@ -556,7 +573,7 @@ class ResearchEventLedger:
         return authorization
 
     def start_phase_command(self, command: dict[str, Any]) -> dict[str, Any]:
-        validate_contract(command, "phase_command_v1.schema.json")
+        validate_contract(command, "phase_command_v2.schema.json")
         request_fingerprint = canonical_hash({"operation": "start_phase_command", "command": command})
 
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
@@ -576,15 +593,22 @@ class ResearchEventLedger:
 
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
             record = _phase_command(state, command_id)
+            command = record["command"]
+            payload = {
+                "command_id": command_id,
+                "command_hash": command["command_hash"],
+                "command_plan_hash": command["command_plan_hash"],
+                "receipt_ref": deepcopy(receipt_ref),
+                "receipt_hash": receipt_ref["digest"],
+            }
             if record["status"] == "completed":
                 if canonical_json(record["receipt_ref"]) != canonical_json(receipt_ref):
                     raise IntegrityError("completed phase command receipt conflict")
-                return "PhaseCommandCompleted", {"command_id": command_id, "receipt_ref": deepcopy(receipt_ref)}, record["completed_event_id"]
+                return "PhaseCommandCompleted", payload, record["completed_event_id"]
             if record["status"] != "started":
                 raise IntegrityError("only a started phase command can complete")
             _validate_phase_command_authorization(state, record["command"])
             _validate_phase_run_receipt(self.project_root, record, receipt_ref)
-            payload = {"command_id": command_id, "receipt_ref": deepcopy(receipt_ref)}
             return "PhaseCommandCompleted", payload, f"phase-command-completed:{request_fingerprint}"
 
         event, state, _ = self._domain_transact(build)
@@ -642,7 +666,7 @@ class ResearchEventLedger:
         return deepcopy(state["attempts"][attempt_id])
 
     def disposition_failure(self, failure_evidence: dict[str, Any], *, event_id: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-        validate_contract(failure_evidence, "failure_evidence_v4.schema.json")
+        validate_contract(failure_evidence, "failure_evidence_v5.schema.json")
         request_fingerprint = canonical_hash({"operation": "disposition_failure", "evidence": failure_evidence})
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
             attempt = _attempt(state, failure_evidence["attempt_id"])
@@ -651,14 +675,14 @@ class ResearchEventLedger:
             replay = state["operation_events"].get(key)
             if replay is not None:
                 return "AttemptDispositioned", replay["payload"], replay["event_id"]
-            _validate_failure_evidence(self.project_root, attempt, failure_evidence)
+            _validate_failure_evidence(self.project_root, state, attempt, failure_evidence)
             return "AttemptDispositioned", payload, event_id or _operation_event_id("attempt-disposition", attempt, payload)
         _, event_state, _ = self._domain_transact(build, explicit_event_id=event_id, request_fingerprint=request_fingerprint if event_id else None)
         attempt_id = failure_evidence["attempt_id"]
         return deepcopy(event_state["attempts"][attempt_id]), deepcopy(event_state["last_route_outcome"])
 
     def resume_attempt(self, resume_evidence: dict[str, Any], *, event_id: str | None = None) -> dict[str, Any]:
-        validate_contract(resume_evidence, "resume_evidence_v4.schema.json")
+        validate_contract(resume_evidence, "resume_evidence_v5.schema.json")
         request_fingerprint = canonical_hash({"operation": "resume_attempt", "evidence": resume_evidence})
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
             attempt = _attempt(state, resume_evidence["attempt_id"])
@@ -687,6 +711,7 @@ class ResearchEventLedger:
                 project_root=self.project_root,
                 attempt=attempt,
                 completion_evidence=completion_evidence,
+                phase_commands=state["phase_commands"],
             )
             replay = state["operation_events"].get(_finalization_attempt_key(attempt["attempt_id"]))
             if replay is not None:
@@ -718,15 +743,9 @@ class ResearchEventLedger:
             project_root=self.project_root,
             attempt=attempt,
             completion_evidence=completion_evidence,
+            phase_commands=state["phase_commands"],
         )
-        validation_state = state
-        if trial_result["completeness"] == "full" and attempt["state"] == "PROXY_RUNNING":
-            validation_state = deepcopy(state)
-            pending_attempt = validation_state["attempts"][attempt["attempt_id"]]
-            pending_attempt["state"] = "FULL_RUNNING"
-            pending_attempt["phases"]["proxy"] = "COMPLETED"
-            pending_attempt["phases"]["full"] = "RUNNING"
-        _validate_trial_against_state(validation_state, trial_result)
+        _validate_trial_against_state(state, trial_result)
         return trial_result
 
     def _validated_events(self, connection: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -762,13 +781,71 @@ class ResearchEventLedger:
             and self._transaction_cache_sequence == sequence
             and self._transaction_cache_event_hash == event_hash
         ):
-            return deepcopy(self._transaction_state_cache)
+            self._validate_cached_authoritative_references(events, self._transaction_state_cache)
+            cached_result = deepcopy(self._transaction_state_cache)
+            cached_result.pop("project_root", None)
+            return cached_result
+        process_key = str(self.project_root.resolve())
+        if allow_cache:
+            with _PROCESS_STATE_CACHE_LOCK:
+                process_cached = _PROCESS_STATE_CACHE.get(process_key)
+            if process_cached is not None and process_cached[0] == sequence and process_cached[1] == event_hash:
+                cached_state = process_cached[2]
+                self._validate_cached_authoritative_references(events, cached_state)
+                self._transaction_state_cache = deepcopy(cached_state)
+                self._transaction_cache_sequence = sequence
+                self._transaction_cache_event_hash = event_hash
+                cached_result = deepcopy(cached_state)
+                cached_result.pop("project_root", None)
+                return cached_result
         state = _reduce_all(self.project_root.name, events, project_root=self.project_root)
         if allow_cache:
             self._transaction_state_cache = deepcopy(state)
             self._transaction_cache_sequence = sequence
             self._transaction_cache_event_hash = event_hash
+            with _PROCESS_STATE_CACHE_LOCK:
+                _PROCESS_STATE_CACHE[process_key] = (sequence, event_hash, deepcopy(state))
         return state
+
+    def _validate_cached_authoritative_references(
+        self, events: list[dict[str, Any]], state: dict[str, Any]
+    ) -> None:
+        for record in state.get("phase_commands", {}).values():
+            if record.get("status") == "completed":
+                _validate_phase_run_receipt(self.project_root, record, record["receipt_ref"])
+        for event in events:
+            payload = event.get("payload") or {}
+            manifests: list[tuple[dict[str, Any], str]] = []
+            if event.get("event_type") == "ProxyEvidenceCommitted":
+                manifests.append((payload.get("evidence_manifest"), "proxy"))
+            elif event.get("event_type") == "AttemptFinalized":
+                trial = payload.get("trial_result") or {}
+                manifests.append((trial.get("evidence_manifest"), str(trial.get("completeness") or "full")))
+            for manifest, phase in manifests:
+                attempt_id = (manifest or {}).get("attempt_id")
+                attempt = (state.get("attempts") or {}).get(attempt_id)
+                if not isinstance(attempt, dict):
+                    raise IntegrityError("cached receipt-bound evidence Attempt is missing")
+                audit_attempt = deepcopy(attempt)
+                for key in (
+                    "lifecycle_generation",
+                    "implementation_hash",
+                    "attempt_input_hash",
+                    "trial_spec_hash",
+                ):
+                    if (manifest or {}).get(key) is not None:
+                        audit_attempt[key] = (manifest or {})[key]
+                try:
+                    validate_receipt_bound_evidence(
+                        project_root=self.project_root,
+                        attempt=audit_attempt,
+                        trial_spec=audit_attempt["frozen_trial_spec"],
+                        manifest=manifest,
+                        phase_commands=state.get("phase_commands") or {},
+                        phase="proxy" if phase == "proxy" else "full",
+                    )
+                except (KeyError, OSError, TypeError, ValueError) as exc:
+                    raise IntegrityError(f"immutable receipt-bound evidence audit failed: {exc}") from exc
 
     def _remember_transaction_state(self, state: dict[str, Any], event: dict[str, Any]) -> None:
         cached = deepcopy(state)
@@ -776,6 +853,12 @@ class ResearchEventLedger:
         self._transaction_state_cache = cached
         self._transaction_cache_sequence = event["sequence"]
         self._transaction_cache_event_hash = event["event_hash"]
+        with _PROCESS_STATE_CACHE_LOCK:
+            _PROCESS_STATE_CACHE[str(self.project_root.resolve())] = (
+                event["sequence"],
+                event["event_hash"],
+                deepcopy(cached),
+            )
 
     def _write_projections(self, state: dict[str, Any]) -> None:
         del state
@@ -871,7 +954,7 @@ def _validate_trial_contracts(project_root: Path, trial_spec: dict[str, Any]) ->
         sample_manifest = store.read_contract(
             trial_spec["sample_manifest_ref"],
             contract_kind="sample_manifest",
-            schema_file="sample_manifest_v2.schema.json",
+            schema_file="sample_manifest_v3.schema.json",
         )
         evaluator_manifest = store.read_contract(
             trial_spec["execution_contract"]["evaluator_manifest_ref"],
@@ -1009,7 +1092,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         next_state["current_variant_spec_hash"] = variant["variant_spec_hash"]
     elif event_type == "AttemptReserved":
         attempt = payload["attempt"]
-        validate_contract(attempt, "attempt_record_v6.schema.json")
+        validate_contract(attempt, "attempt_record_v7.schema.json")
         project_root = next_state.get("project_root")
         if not project_root:
             raise IntegrityError("AttemptReserved rebuild requires authoritative project_root")
@@ -1066,7 +1149,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         if payload["expected_state"] != attempt["state"]:
             raise IntegrityError("phase start source state mismatch")
         manifest = payload["phase_execution_manifest"]
-        validate_contract(manifest, "phase_execution_manifest_v2.schema.json")
+        validate_contract(manifest, "phase_execution_manifest_v3.schema.json")
         phase = manifest["phase"]
         if event_type == "ProxyPhaseStarted" and phase != "proxy":
             raise IntegrityError("ProxyPhaseStarted requires proxy manifest")
@@ -1114,7 +1197,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         attempt["updated_at"] = event["created_at"]
     elif event_type == "PhaseCommandStarted":
         command = payload["command"]
-        validate_contract(command, "phase_command_v1.schema.json")
+        validate_contract(command, "phase_command_v2.schema.json")
         if command["command_id"] in next_state["phase_commands"]:
             raise IntegrityError("duplicate PhaseCommandStarted command_id")
         _validate_phase_command_authorization(next_state, command)
@@ -1139,6 +1222,12 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         record = _phase_command(next_state, payload["command_id"])
         if record["status"] != "started":
             raise IntegrityError("PhaseCommandCompleted requires started command")
+        if payload["command_hash"] != record["command"]["command_hash"]:
+            raise IntegrityError("PhaseCommandCompleted command_hash mismatch")
+        if payload["command_plan_hash"] != record["command"]["command_plan_hash"]:
+            raise IntegrityError("PhaseCommandCompleted command_plan_hash mismatch")
+        if payload["receipt_hash"] != payload["receipt_ref"]["digest"]:
+            raise IntegrityError("PhaseCommandCompleted receipt_hash mismatch")
         _validate_phase_command_authorization(next_state, record["command"])
         project_root = next_state.get("project_root")
         if not project_root:
@@ -1180,7 +1269,10 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         project_root = next_state.get("project_root")
         if not project_root:
             raise IntegrityError("proxy evidence reduction requires project root")
-        expected_proxy = _canonical_proxy_outcome_from_manifest(Path(project_root), attempt, payload["evidence_manifest"])
+        bound = _receipt_bound_phase_evidence(
+            Path(project_root), next_state, attempt, payload["evidence_manifest"], "proxy"
+        )
+        expected_proxy = _canonical_proxy_outcome_from_bound(attempt, bound)
         if canonical_json(proxy_outcome) != canonical_json(expected_proxy):
             raise IntegrityError("ProxyOutcome differs from immutable evidence-derived outcome")
         attempt["phases"]["proxy"] = "COMPLETED"
@@ -1219,7 +1311,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         next_state["operation_events"][_revision_replay_key_from_payload(payload)] = {"event_id": event["event_id"], "payload": deepcopy(payload)}
     elif event_type == "AttemptResumed":
         evidence = payload["resume_evidence"]
-        validate_contract(evidence, "resume_evidence_v4.schema.json")
+        validate_contract(evidence, "resume_evidence_v5.schema.json")
         attempt = _attempt(next_state, evidence["attempt_id"])
         project_root = next_state.get("project_root")
         if not project_root:
@@ -1266,12 +1358,12 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         attempt["updated_at"] = event["created_at"]
     elif event_type == "AttemptDispositioned":
         evidence = payload["failure_evidence"]
-        validate_contract(evidence, "failure_evidence_v4.schema.json")
+        validate_contract(evidence, "failure_evidence_v5.schema.json")
         attempt = _attempt(next_state, evidence["attempt_id"])
         project_root = next_state.get("project_root")
         if not project_root:
             raise IntegrityError("failure reduction requires project root")
-        _validate_failure_evidence(Path(project_root), attempt, evidence)
+        _validate_failure_evidence(Path(project_root), next_state, attempt, evidence)
         action, target_state = _failure_route(evidence["failure_class"])
         _apply_failure_disposition(next_state, attempt, target_state, evidence, event["created_at"])
         route = build_route_outcome(next_state, action, [evidence["failure_class"]], attempt, source_event_id=event["event_id"], source_sequence=event["sequence"])
@@ -1287,7 +1379,10 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         project_root = next_state.get("project_root")
         if not project_root:
             raise IntegrityError("TrialResult reduction requires project root")
-        expected_trial = _canonical_trial_from_manifest(Path(project_root), attempt, trial["evidence_manifest"])
+        bound = _receipt_bound_phase_evidence(
+            Path(project_root), next_state, attempt, trial["evidence_manifest"], trial["completeness"]
+        )
+        expected_trial = _canonical_trial_from_bound(attempt, bound)
         if canonical_json(trial) != canonical_json(expected_trial):
             raise IntegrityError("TrialResult differs from immutable evidence-derived result")
         next_state = _apply_trial_to_state(next_state, trial)
@@ -1477,7 +1572,7 @@ def _validate_event_request(event_type: str, payload: dict[str, Any], event_id: 
         raise IntegrityError(f"invalid event_id format: {event_id}")
     if not isinstance(payload, dict):
         raise IntegrityError("event payload must be an object")
-    required = {"DirectionSelected": {"direction"}, "VariantPlanned": {"variant", "feedback_from_attempt_ids"}, "AttemptReserved": {"attempt"}, "AttemptTransitioned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "new_state", "phase", "phase_state"}, "ProxyPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "FullPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "ProxyEvidenceCommitted": {"proxy_outcome", "evidence_manifest"}, "PhaseCommandStarted": {"command"}, "PhaseCommandCompleted": {"command_id", "receipt_ref"}, "PhaseCommandUnknownOutcome": {"command_id", "reason"}, "AttemptImplementationRevised": {"attempt_id", "lifecycle_generation", "previous_implementation_hash", "previous_attempt_input_hash", "expected_state", "implementation_hash", "attempt_input_hash"}, "AttemptResumed": {"resume_evidence"}, "AttemptAbandoned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "reason"}, "AttemptDispositioned": {"failure_evidence"}, "AttemptFinalized": {"trial_result", "lifecycle_generation", "expected_state", "implementation_hash", "attempt_input_hash"}, "AuditMarker": {"index"}}[event_type]
+    required = {"DirectionSelected": {"direction"}, "VariantPlanned": {"variant", "feedback_from_attempt_ids"}, "AttemptReserved": {"attempt"}, "AttemptTransitioned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "new_state", "phase", "phase_state"}, "ProxyPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "FullPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "ProxyEvidenceCommitted": {"proxy_outcome", "evidence_manifest"}, "PhaseCommandStarted": {"command"}, "PhaseCommandCompleted": {"command_id", "command_hash", "command_plan_hash", "receipt_ref", "receipt_hash"}, "PhaseCommandUnknownOutcome": {"command_id", "reason"}, "AttemptImplementationRevised": {"attempt_id", "lifecycle_generation", "previous_implementation_hash", "previous_attempt_input_hash", "expected_state", "implementation_hash", "attempt_input_hash"}, "AttemptResumed": {"resume_evidence"}, "AttemptAbandoned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "reason"}, "AttemptDispositioned": {"failure_evidence"}, "AttemptFinalized": {"trial_result", "lifecycle_generation", "expected_state", "implementation_hash", "attempt_input_hash"}, "AuditMarker": {"index"}}[event_type]
     actual = set(payload) - {"request_fingerprint"}
     if actual != required or ("request_fingerprint" in payload and not re.fullmatch(r"[a-f0-9]{64}", payload["request_fingerprint"])):
         raise IntegrityError(f"{event_type} payload fields must be {sorted(required)}")
@@ -1487,7 +1582,7 @@ def _validate_event(event: dict[str, Any]) -> None:
     if event.get("schema_version") != EVENT_SCHEMA_VERSION:
         raise BreakingSchemaError("invalid or unsupported Event v3 schema")
     try:
-        validate_contract(event, "event_v6.schema.json")
+        validate_contract(event, "event_v7.schema.json")
     except ValueError as exc:
         raise IntegrityError(f"invalid Event v3 schema: {exc}") from exc
     _validate_event_request(event["event_type"], event["payload"], event["event_id"])
@@ -1522,41 +1617,42 @@ def _reduce_all(project_id: str, events: list[dict[str, Any]], *, project_root: 
     return state
 
 
-def _manifest_evidence_bytes(project_root: Path, attempt: dict[str, Any], manifest: dict[str, Any]) -> dict[str, bytes]:
-    store = EvidenceStore(project_root)
-    evidence_bytes: dict[str, bytes] = {}
-    for entry in manifest.get("entries") or []:
-        try:
-            evidence_bytes[entry["evidence_id"]] = store.read_entry(entry, attempt)
-        except (KeyError, ValueError) as exc:
-            raise IntegrityError(f"immutable evidence audit failed: {exc}") from exc
-    return evidence_bytes
+def _receipt_bound_phase_evidence(
+    project_root: Path,
+    state: dict[str, Any],
+    attempt: dict[str, Any],
+    manifest: dict[str, Any],
+    phase: str,
+):
+    try:
+        bound = validate_receipt_bound_evidence(
+            project_root=project_root,
+            attempt=attempt,
+            trial_spec=attempt["frozen_trial_spec"],
+            manifest=manifest,
+            phase_commands=state["phase_commands"],
+            phase=phase,
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise IntegrityError(f"immutable receipt-bound evidence audit failed: {exc}") from exc
+    if canonical_json(bound.manifest) != canonical_json(manifest):
+        raise IntegrityError("event EvidenceManifest differs from canonical receipt-derived lineage")
+    return bound
 
 
-def _canonical_trial_from_manifest(project_root: Path, attempt: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
+def _canonical_trial_from_bound(attempt: dict[str, Any], bound: Any) -> dict[str, Any]:
     try:
         return classify_trial_result(
             attempt=attempt,
             trial_spec=attempt["frozen_trial_spec"],
-            evidence_manifest=manifest,
-            evidence_bytes=_manifest_evidence_bytes(project_root, attempt, manifest),
+            evidence_manifest=bound.manifest,
+            evidence_bytes=bound.evidence_bytes,
         )
     except (ValueError, OSError) as exc:
         raise IntegrityError(f"immutable TrialResult audit failed: {exc}") from exc
 
 
-def _canonical_proxy_outcome_from_manifest(project_root: Path, attempt: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
-    evidence_bytes = _manifest_evidence_bytes(project_root, attempt, manifest)
-    try:
-        observations, decoded = decode_evidence_inventory(
-            attempt=attempt,
-            trial_spec=attempt["frozen_trial_spec"],
-            manifest=manifest,
-            evidence_bytes=evidence_bytes,
-        )
-    except ValueError as exc:
-        raise IntegrityError(f"immutable ProxyOutcome audit failed: {exc}") from exc
-    del observations
+def _canonical_proxy_outcome_from_bound(attempt: dict[str, Any], bound: Any) -> dict[str, Any]:
     phase_execution = attempt.get("phase_executions", {}).get("proxy") or {}
     binding = phase_execution.get("proxy_evaluation_binding")
     if not isinstance(binding, dict):
@@ -1565,8 +1661,8 @@ def _canonical_proxy_outcome_from_manifest(project_root: Path, attempt: dict[str
         return classify_proxy_outcome(
             frozen_policy=attempt["frozen_trial_spec"]["proxy_decision_policy"],
             evaluation_binding=binding,
-            decoded_evidence=decoded,
-            evidence_manifest_hash=canonical_hash(manifest),
+            decoded_evidence=bound.decoded_evidence,
+            evidence_manifest_hash=canonical_hash(bound.manifest),
         )
     except ValueError as exc:
         raise IntegrityError(f"immutable ProxyOutcome audit failed: {exc}") from exc
@@ -1643,19 +1739,109 @@ def _validate_phase_command_authorization(state: dict[str, Any], command: dict[s
         "implementation_hash": authorization.implementation_hash,
         "attempt_input_hash": authorization.attempt_input_hash,
         "authorization_hash": authorization.authorization_hash,
-        "provenance_mode": authorization.provenance_mode,
+        "provenance_mode": authorization.provenance_mode.replace("_", "-"),
     }
     for key, value in expected.items():
         if command.get(key) != value:
             raise IntegrityError(f"PhaseCommand {key} differs from SQLite authorization")
-    command_plan = command["command_plan"]
-    if contract_digest(canonical_contract_bytes(command_plan)) != command["command_hash"]:
+    attempt = _attempt(state, command["attempt_id"])
+    phase_contract = next(
+        (
+            item
+            for item in attempt["frozen_trial_spec"]["phase_contracts"]
+            if item["phase"] == command["phase"]
+        ),
+        None,
+    )
+    if not isinstance(phase_contract, dict):
+        raise IntegrityError("PhaseCommand phase is not preregistered")
+    if command["command_plan_hash"] != phase_contract["command_plan_hash"]:
+        raise IntegrityError("PhaseCommand command_plan_hash differs from frozen phase contract")
+    try:
+        store = ContractStore(Path(state["project_root"]))
+        frozen_plan = store.read_json(command["command_plan_ref"], schema_file="phase_command_plan_v1.schema.json")
+        validate_phase_command_plan(frozen_plan, expected_evidence_kinds=phase_contract["evidence_kinds"])
+        plan_blob = store.verify(command["command_plan_ref"])
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise IntegrityError(f"PhaseCommandPlan rejected: {exc}") from exc
+    if plan_blob["digest"] != command["command_plan_hash"]:
+        raise IntegrityError("PhaseCommandPlan reference hash mismatch")
+    matches = [item for item in frozen_plan["commands"] if item["command_spec_id"] == command["command_spec_id"]]
+    if len(matches) != 1 or canonical_json(matches[0]) != canonical_json(command["command_spec"]):
+        raise IntegrityError("PhaseCommand does not exactly match its frozen command spec")
+    command_spec = command["command_spec"]
+    if contract_digest(canonical_contract_bytes(command_spec)) != command["command_hash"]:
         raise IntegrityError("PhaseCommand command_hash mismatch")
+    execution_records = [
+        record
+        for record in state["phase_commands"].values()
+        if record["command"]["attempt_id"] == command["attempt_id"]
+        and record["command"]["lifecycle_generation"] == command["lifecycle_generation"]
+        and record["command"]["phase_execution_id"] == command["phase_execution_id"]
+        and record["command"]["command_id"] != command["command_id"]
+    ]
+    if any(record["command"]["command_spec_id"] == command["command_spec_id"] for record in execution_records):
+        raise IntegrityError("duplicate PhaseCommand command_spec_id")
+    completed_specs = {
+        record["command"]["command_spec_id"]
+        for record in execution_records
+        if record["status"] == "completed"
+    }
+    if any(dependency not in completed_specs for dependency in command_spec["dependencies"]):
+        raise IntegrityError("PhaseCommand dependencies are not completed")
+    if any(record["status"] != "completed" for record in execution_records):
+        raise IntegrityError("a prior PhaseCommand is not authoritatively completed")
+    records_by_spec = {record["command"]["command_spec_id"]: record for record in execution_records}
+
+    def completed_receipt(spec_id: str) -> dict[str, Any] | None:
+        record = records_by_spec.get(spec_id)
+        if not isinstance(record, dict) or record.get("status") != "completed":
+            return None
+        receipt_ref = record.get("receipt_ref")
+        if not isinstance(receipt_ref, dict):
+            return None
+        return _validate_phase_run_receipt(Path(state["project_root"]), record, receipt_ref)
+
+    def receipt_is_oom(receipt: dict[str, Any] | None) -> bool:
+        if not isinstance(receipt, dict) or int(receipt.get("exit_code", 0)) == 0:
+            return False
+        try:
+            stderr = ContractStore(Path(state["project_root"])).read_bytes(receipt["stderr_ref"]).decode("utf-8").lower()
+        except (KeyError, TypeError, ValueError, UnicodeDecodeError) as exc:
+            raise IntegrityError(f"conditional command receipt log rejected: {exc}") from exc
+        return any(token in stderr for token in ("out of memory", "cuda oom", "cublas_status_alloc_failed"))
+
+    spec_id = command_spec["command_spec_id"]
+    if spec_id == "full-train_recovery_reduced_concurrency" and not receipt_is_oom(completed_receipt("full-train")):
+        raise IntegrityError("reduced-concurrency recovery requires an authoritative OOM train receipt")
+    if spec_id == "full-train_recovery_memory_safe":
+        predecessor = "full-train_recovery_reduced_concurrency" if any(
+            item["command_spec_id"] == "full-train_recovery_reduced_concurrency" for item in frozen_plan["commands"]
+        ) else "full-train"
+        if not receipt_is_oom(completed_receipt(predecessor)):
+            raise IntegrityError("memory-safe recovery requires an authoritative predecessor OOM receipt")
+    if spec_id.startswith(("full-eval_", "full-ablation_eval_", "full-collect-evidence")):
+        training_receipts = [
+            completed_receipt(item["command_spec_id"])
+            for item in frozen_plan["commands"]
+            if item["command_spec_id"] == "full-train" or item["command_spec_id"].startswith("full-train_recovery_")
+        ]
+        if not any(isinstance(receipt, dict) and int(receipt["exit_code"]) == 0 for receipt in training_receipts):
+            raise IntegrityError("full post-training command requires one successful authoritative train receipt")
+    preceding = [item for item in frozen_plan["commands"] if item["ordinal"] < command_spec["ordinal"]]
+    missing_unconditional = [
+        item["command_spec_id"]
+        for item in preceding
+        if item["condition"]["kind"] == "always" and item["command_spec_id"] not in completed_specs
+    ]
+    if missing_unconditional:
+        raise IntegrityError("PhaseCommand is out of frozen plan order")
     expected_idempotency = contract_digest(
         canonical_contract_bytes(
             {
                 "command_id": command["command_id"],
                 "command_hash": command["command_hash"],
+                "command_plan_hash": command["command_plan_hash"],
                 "attempt_id": command["attempt_id"],
                 "generation": command["lifecycle_generation"],
                 "phase_execution_id": command["phase_execution_id"],
@@ -1668,7 +1854,7 @@ def _validate_phase_command_authorization(state: dict[str, Any], command: dict[s
 
 def _validate_phase_run_receipt(project_root: Path, record: dict[str, Any], receipt_ref: dict[str, Any]) -> dict[str, Any]:
     try:
-        receipt = ContractStore(project_root).read_json(receipt_ref, schema_file="phase_run_receipt_v2.schema.json")
+        receipt = ContractStore(project_root).read_json(receipt_ref, schema_file="phase_run_receipt_v3.schema.json")
     except (KeyError, TypeError, ValueError, OSError) as exc:
         raise IntegrityError(f"PhaseRunReceipt rejected: {exc}") from exc
     command = record["command"]
@@ -1692,13 +1878,20 @@ def _validate_phase_run_receipt(project_root: Path, record: dict[str, Any], rece
         if receipt.get(key) != value:
             raise IntegrityError(f"PhaseRunReceipt {key} mismatch")
     store = ContractStore(project_root)
-    for output in receipt["outputs"]:
-        try:
-            store.verify(output)
-        except ValueError as exc:
-            raise IntegrityError(f"PhaseRunReceipt output rejected: {exc}") from exc
-    if len(receipt["outputs"]) != len(command["command_plan"]["expected_outputs"]):
+    expected_outputs = command["command_spec"]["expected_outputs"]
+    if receipt["exit_code"] != 0 and not receipt["outputs"]:
+        return receipt
+    if len(receipt["outputs"]) != len(expected_outputs):
         raise IntegrityError("PhaseRunReceipt output count differs from frozen command plan")
+    for expected_output, output in zip(expected_outputs, receipt["outputs"], strict=True):
+        if output["kind"] != expected_output["kind"] or output["schema_version"] != expected_output["schema_version"]:
+            raise IntegrityError("PhaseRunReceipt output differs from frozen command plan")
+        try:
+            blob = store.verify(output["contract_ref"])
+        except (TypeError, ValueError, OSError) as exc:
+            raise IntegrityError(f"PhaseRunReceipt output rejected: {exc}") from exc
+        if blob["digest"] != output["content_hash"]:
+            raise IntegrityError("PhaseRunReceipt output content hash mismatch")
     return receipt
 
 
@@ -1768,7 +1961,7 @@ def _validate_state_invariants(state: dict[str, Any]) -> None:
         if candidate_phases != {trial["completeness"]}:
             raise IntegrityError("TrialResult observations disagree with completeness")
     for attempt in state["attempts"].values():
-        validate_contract(attempt, "attempt_record_v6.schema.json")
+        validate_contract(attempt, "attempt_record_v7.schema.json")
         _validate_frozen_trial_spec(attempt)
         expected_consumes, expected_reserved_at_reservation = _profile_budget_mapping(attempt["profile"], attempt["attempt_kind"])
         if attempt["consumes_direction_budget"] != expected_consumes:
@@ -2031,7 +2224,12 @@ def _validate_failure_identity(attempt: dict[str, Any], evidence: dict[str, Any]
         raise IntegrityError("FailureEvidence phase must equal source_phase")
 
 
-def _validate_failure_evidence(project_root: Path, attempt: dict[str, Any], evidence: dict[str, Any]) -> None:
+def _validate_failure_evidence(
+    project_root: Path,
+    state: dict[str, Any],
+    attempt: dict[str, Any],
+    evidence: dict[str, Any],
+) -> None:
     _validate_failure_identity(attempt, evidence)
     execution_phase = evidence["source_phase"] if evidence["source_phase"] in {"proxy", "full"} else (
         "proxy" if attempt["state"] == "PROXY_RUNNING" else "full" if attempt["state"] == "FULL_RUNNING" else None
@@ -2046,6 +2244,7 @@ def _validate_failure_evidence(project_root: Path, attempt: dict[str, Any], evid
         if evidence["producer_run_id"] != execution["producer_run_id"]:
             raise IntegrityError("FailureEvidence producer_run_id mismatch")
     _failure_route(evidence["failure_class"])
+    _validate_operation_command_binding(project_root, state, attempt, evidence, allow_core_probe=False)
     _validate_trial_spec_projection(project_root, attempt)
     failure_raw = _read_canonical_operation_evidence(
         project_root,
@@ -2090,6 +2289,69 @@ def _validate_resume_identity(attempt: dict[str, Any], evidence: dict[str, Any])
         raise IntegrityError("ResumeEvidence phase mismatch")
 
 
+def _validate_operation_command_binding(
+    project_root: Path,
+    state: dict[str, Any],
+    attempt: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    allow_core_probe: bool,
+) -> None:
+    receipt_ref = evidence.get("receipt_ref")
+    if not isinstance(receipt_ref, dict) or evidence.get("receipt_hash") != receipt_ref.get("digest"):
+        raise IntegrityError("operation evidence receipt binding is malformed")
+    if allow_core_probe:
+        try:
+            raw = ContractStore(project_root).read_bytes(receipt_ref)
+            receipt = json.loads(raw.decode("utf-8"))
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise IntegrityError(f"core resource probe receipt rejected: {exc}") from exc
+        expected_fields = {
+            "schema_version": "auto_research_core_resource_probe_receipt_v1",
+            "attempt_id": attempt["attempt_id"],
+            "lifecycle_generation": attempt["lifecycle_generation"],
+            "implementation_hash": attempt["implementation_hash"],
+            "attempt_input_hash": attempt["attempt_input_hash"],
+        }
+        if any(receipt.get(key) != value for key, value in expected_fields.items()):
+            raise IntegrityError("core resource probe receipt identity mismatch")
+        for key in ("resource_type", "resource_id", "required_capacity", "observed_capacity", "unit", "probe_status", "observed_at"):
+            if receipt.get(key) != evidence.get(key):
+                raise IntegrityError(f"core resource probe receipt {key} mismatch")
+        expected_command_hash = canonical_hash({"command_id": evidence["command_id"], "receipt": receipt_ref["digest"]})
+        expected_plan_hash = canonical_hash({
+            "operation": "resume-resource-probe",
+            "trial_spec_hash": attempt["trial_spec_hash"],
+            "paused_phase": attempt.get("paused_phase"),
+        })
+        if evidence["command_hash"] != expected_command_hash or evidence["command_plan_hash"] != expected_plan_hash:
+            raise IntegrityError("core resource probe command identity mismatch")
+        return
+    record = state.get("phase_commands", {}).get(evidence.get("command_id"))
+    if not isinstance(record, dict) or record.get("status") != "completed":
+        raise IntegrityError("operation evidence requires a completed authoritative command")
+    command = record.get("command") or {}
+    for key in ("command_id", "command_hash", "command_plan_hash"):
+        if evidence.get(key) != command.get(key):
+            raise IntegrityError(f"operation evidence {key} mismatch")
+    if record.get("receipt_ref") != receipt_ref:
+        raise IntegrityError("operation evidence receipt differs from SQLite command record")
+    receipt = _validate_phase_run_receipt(project_root, record, receipt_ref)
+    expected = {
+        "attempt_id": attempt["attempt_id"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase_execution_id": evidence["phase_execution_id"],
+        "phase_start_event_id": evidence["phase_start_event_id"],
+        "producer_run_id": evidence["producer_run_id"],
+    }
+    if any(receipt.get(key) != value for key, value in expected.items()):
+        raise IntegrityError("operation evidence receipt identity mismatch")
+    if int(receipt["exit_code"]) != int(evidence.get("exit_code", receipt["exit_code"])):
+        raise IntegrityError("operation evidence exit_code differs from receipt")
+
+
 def _validate_resume_evidence(project_root: Path, state: dict[str, Any], attempt: dict[str, Any], evidence: dict[str, Any]) -> None:
     _validate_resume_identity(attempt, evidence)
     if attempt["state"] != "RESOURCE_PAUSED":
@@ -2100,6 +2362,7 @@ def _validate_resume_evidence(project_root: Path, state: dict[str, Any], attempt
     pause_event_id, pause_evidence = pause_operation
     if evidence["pause_event_id"] != pause_event_id or evidence["pause_evidence_hash"] != evidence_bytes_hash(canonical_evidence_bytes(pause_evidence)):
         raise IntegrityError("resume does not bind the committed pause event")
+    _validate_operation_command_binding(project_root, state, attempt, evidence, allow_core_probe=True)
     _validate_trial_spec_projection(project_root, attempt)
     resume_raw = _read_canonical_operation_evidence(
         project_root,
@@ -2263,21 +2526,10 @@ def _validate_route_for_attempt(route: dict[str, Any], attempt: dict[str, Any]) 
 def _validate_completion_request_shape(completion_evidence: dict[str, Any]) -> None:
     if not isinstance(completion_evidence, dict):
         raise IntegrityError("CompletionEvidence must be an object")
-    allowed = {"schema_version", "attempt_id", "trial_spec_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "entries", "diagnostic_trial_result"}
-    if set(completion_evidence) - allowed or set(completion_evidence) < {"schema_version", "attempt_id", "trial_spec_hash", "entries"}:
-        raise IntegrityError("CompletionEvidence has invalid fields")
-    if completion_evidence.get("schema_version") != "auto_research_completion_evidence_v2":
-        raise IntegrityError("CompletionEvidence schema version mismatch")
-    for key in ("lifecycle_generation", "implementation_hash", "attempt_input_hash"):
-        if key not in completion_evidence:
-            raise IntegrityError(f"CompletionEvidence {key} is required")
-    if not isinstance(completion_evidence.get("attempt_id"), str) or not completion_evidence["attempt_id"]:
-        raise IntegrityError("CompletionEvidence attempt_id is required")
-    if not re.fullmatch(r"[a-f0-9]{64}", str(completion_evidence.get("trial_spec_hash", ""))):
-        raise IntegrityError("CompletionEvidence trial_spec_hash is invalid")
-    entries = completion_evidence.get("entries")
-    if not isinstance(entries, list):
-        raise IntegrityError("CompletionEvidence evidence inventory must be an array")
+    try:
+        validate_contract(completion_evidence, "completion_evidence_v3.schema.json")
+    except ValueError as exc:
+        raise IntegrityError(f"CompletionEvidence v3 rejected: {exc}") from exc
 
 
 def _classify_completion_evidence(
@@ -2285,6 +2537,7 @@ def _classify_completion_evidence(
     project_root: Path,
     attempt: dict[str, Any],
     completion_evidence: dict[str, Any],
+    phase_commands: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any], str]:
     if completion_evidence["attempt_id"] != attempt["attempt_id"]:
         raise IntegrityError("CompletionEvidence attempt identity mismatch")
@@ -2323,22 +2576,7 @@ def _classify_completion_evidence(
             raise IntegrityError("CompletionEvidence artifact is not valid JSON") from exc
         manifest_entries.append({**deepcopy(entry), "cross_references": deepcopy(payload.get("cross_references", {}))})
         evidence_bytes[evidence_id] = raw
-    manifest = {
-        "schema_version": "auto_research_evidence_manifest_v3",
-        "attempt_id": attempt["attempt_id"],
-        "direction_semantic_hash": attempt["direction_semantic_hash"],
-        "direction_spec_hash": attempt["direction_spec_hash"],
-        "variant_semantic_hash": attempt["variant_semantic_hash"],
-        "variant_spec_hash": attempt["variant_spec_hash"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "protocol_hash": attempt["protocol_hash"],
-        "sample_manifest_hash": attempt["sample_manifest_hash"],
-        "evaluator_hash": attempt["evaluator_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
-        "entries": manifest_entries,
-    }
+    manifest = manifest_from_completion_evidence(attempt=attempt, completion_evidence=completion_evidence)
     phases = {entry["phase"] for entry in manifest_entries}
     executions = {entry["phase_execution_id"] for entry in manifest_entries}
     producers = {entry["producer_run_id"] for entry in manifest_entries}
@@ -2369,6 +2607,20 @@ def _classify_completion_evidence(
         for key in ("phase_execution_id", "phase_start_event_id", "producer_run_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash"):
             if entry[key] != phase_execution[key]:
                 raise IntegrityError(f"CompletionEvidence {key} does not match current phase execution")
+    try:
+        bound = validate_receipt_bound_evidence(
+            project_root=project_root,
+            attempt=attempt,
+            trial_spec=attempt["frozen_trial_spec"],
+            manifest=manifest,
+            phase_commands=phase_commands,
+            phase=phase,
+        )
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise IntegrityError(f"CompletionEvidence receipt lineage failed: {exc}") from exc
+    manifest = bound.manifest
+    evidence_bytes = bound.evidence_bytes
+    manifest_entries = manifest["entries"]
     manifest_hash = canonical_hash(manifest)
     completion_fingerprint = canonical_hash({
         "operation": "complete_attempt",
@@ -2407,6 +2659,7 @@ def _decode_phase_completion(
     attempt: dict[str, Any],
     completion_evidence: dict[str, Any],
     expected_phase: str,
+    phase_commands: dict[str, dict[str, Any]],
 ) -> tuple[dict[str, Any], list[dict[str, Any]], str]:
     for key in ("attempt_id", "trial_spec_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash"):
         if completion_evidence.get(key) != attempt.get(key):
@@ -2452,29 +2705,21 @@ def _decode_phase_completion(
     required_kinds = {item["kind"] for item in applicable if item["required"]}
     if not set(kinds).issubset(registered) or not required_kinds.issubset(kinds):
         raise IntegrityError("CompletionEvidence phase inventory violates frozen TrialSpec")
-    manifest = {
-        "schema_version": "auto_research_evidence_manifest_v3",
-        "attempt_id": attempt["attempt_id"],
-        "direction_semantic_hash": attempt["direction_semantic_hash"],
-        "direction_spec_hash": attempt["direction_spec_hash"],
-        "variant_semantic_hash": attempt["variant_semantic_hash"],
-        "variant_spec_hash": attempt["variant_spec_hash"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "protocol_hash": attempt["protocol_hash"],
-        "sample_manifest_hash": attempt["sample_manifest_hash"],
-        "evaluator_hash": attempt["evaluator_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
-        "entries": entries,
-    }
+    manifest = manifest_from_completion_evidence(attempt=attempt, completion_evidence=completion_evidence)
     try:
-        observations, _ = decode_evidence_inventory(
-            attempt=attempt, trial_spec=attempt["frozen_trial_spec"], manifest=manifest, evidence_bytes=evidence_bytes
+        bound = validate_receipt_bound_evidence(
+            project_root=project_root,
+            attempt=attempt,
+            trial_spec=attempt["frozen_trial_spec"],
+            manifest=manifest,
+            phase_commands=phase_commands,
+            phase=expected_phase,
         )
-    except ValueError as exc:
-        raise IntegrityError(f"CompletionEvidence decode failed: {exc}") from exc
-    fingerprint = canonical_hash({"operation": f"commit_{expected_phase}_evidence", "attempt_id": attempt["attempt_id"], "generation": attempt["lifecycle_generation"], "manifest_hash": canonical_hash(manifest), "artifact_hashes": sorted(entry["content_hash"] for entry in entries)})
+    except (KeyError, OSError, TypeError, ValueError) as exc:
+        raise IntegrityError(f"CompletionEvidence receipt lineage failed: {exc}") from exc
+    manifest = bound.manifest
+    observations = list(bound.observations)
+    fingerprint = canonical_hash({"operation": f"commit_{expected_phase}_evidence", "attempt_id": attempt["attempt_id"], "generation": attempt["lifecycle_generation"], "manifest_hash": canonical_hash(manifest), "artifact_hashes": sorted(entry["content_hash"] for entry in manifest["entries"])})
     return manifest, observations, fingerprint
 
 

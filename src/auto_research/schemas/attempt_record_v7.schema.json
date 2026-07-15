@@ -46,7 +46,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_attempt_v6"
+      "const": "auto_research_attempt_v7"
     },
     "attempt_id": {
       "type": "string",
@@ -79,7 +79,7 @@
       "$ref": "#/$defs/hash"
     },
     "frozen_trial_spec": {
-      "type": "object"
+      "$ref": "trial_spec_v6.schema.json"
     },
     "trial_spec_hash": {
       "$ref": "#/$defs/hash"
@@ -301,7 +301,7 @@
               "type": "null"
             },
             {
-              "$ref": "phase_execution_manifest_v2.schema.json"
+              "$ref": "phase_execution_manifest_v3.schema.json"
             }
           ]
         },
@@ -311,7 +311,7 @@
               "type": "null"
             },
             {
-              "$ref": "phase_execution_manifest_v2.schema.json"
+              "$ref": "phase_execution_manifest_v3.schema.json"
             }
           ]
         }

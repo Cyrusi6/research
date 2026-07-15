@@ -14,21 +14,10 @@ class S3GateValidator(StageGateValidator):
     validator_name = "s3_experiment_gate_v3"
 
     def validate(self):
-        required = ["literature/direction.json", "plan/variant.json"]
-        if not all(self.require_file(path, retry=True) for path in required):
-            return self.finalize()
-        if not self.require_file("plan/trial_spec.json", retry=True):
-            self.retry_check("s3_authoritative_transaction", "S3 pre/post-commit audit requires canonical plan/trial_spec.json")
-            return self.finalize()
-        direction = self.read_json_artifact("literature/direction.json")
-        variant = self.read_json_artifact("plan/variant.json")
-        trial_spec = self.read_json_artifact("plan/trial_spec.json")
-        if not isinstance(direction, dict) or not isinstance(variant, dict) or not isinstance(trial_spec, dict):
-            self.retry_check("s3_authoritative_json", "DirectionSpec, VariantSpec, and TrialSpec must be JSON objects")
-            return self.finalize()
         errors: list[str] = []
+        ledger = ResearchEventLedger(self.project_root)
         try:
-            state = ResearchEventLedger(self.project_root).rebuild()
+            state = ledger.rebuild()
         except (ValueError, IntegrityError) as exc:
             errors.append(str(exc))
             state = {}
@@ -39,17 +28,35 @@ class S3GateValidator(StageGateValidator):
         if not isinstance(route, dict) or not isinstance(attempt, dict):
             errors.append("S3 requires one reducer-committed RouteOutcome bound to an attempt")
         else:
-            try:
-                validate_committed_s3(
-                    project_root=self.project_root,
-                    direction=direction,
-                    variant=variant,
-                    state=state,
-                    attempt=attempt,
-                    route_outcome=route,
-                    trial_spec=trial_spec,
-                    trial_result=trial,
+            direction_state = (state.get("directions") or {}).get(attempt.get("direction_semantic_hash"))
+            direction = direction_state.get("spec") if isinstance(direction_state, dict) else None
+            variant = (state.get("variants") or {}).get(attempt.get("variant_spec_hash"))
+            trial_spec = attempt.get("frozen_trial_spec")
+            proxy_payload = None
+            committed_proxy = attempt.get("committed_proxy_outcome")
+            if isinstance(committed_proxy, dict):
+                event_id = committed_proxy.get("event_id")
+                proxy_event = next(
+                    (event for event in ledger.events() if event.get("event_id") == event_id),
+                    None,
                 )
+                if isinstance(proxy_event, dict) and proxy_event.get("event_type") == "ProxyEvidenceCommitted":
+                    proxy_payload = proxy_event.get("payload")
+            if not isinstance(direction, dict) or not isinstance(variant, dict) or not isinstance(trial_spec, dict):
+                errors.append("S3 authoritative DirectionSpec, VariantSpec, or frozen TrialSpec is missing")
+            try:
+                if not errors:
+                    validate_committed_s3(
+                        project_root=self.project_root,
+                        direction=direction,
+                        variant=variant,
+                        state=state,
+                        attempt=attempt,
+                        route_outcome=route,
+                        trial_spec=trial_spec,
+                        trial_result=trial,
+                        proxy_event_payload=proxy_payload,
+                    )
             except S3ValidationError as exc:
                 errors.append(str(exc))
 

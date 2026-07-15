@@ -1,0 +1,179 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "attempt_id",
+    "direction_semantic_hash",
+    "direction_spec_hash",
+    "variant_semantic_hash",
+    "variant_spec_hash",
+    "trial_spec_hash",
+    "lifecycle_generation",
+    "implementation_hash",
+    "attempt_input_hash",
+    "phase",
+    "phase_execution_id",
+    "phase_start_event_id",
+    "producer_run_id",
+    "command_plan_hash",
+    "phase_contract_hash",
+    "expected_evidence_kinds",
+    "provenance_mode",
+    "proxy_evaluation_binding",
+    "proxy_authorization",
+    "command_plan_ref"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "auto_research_phase_execution_manifest_v3"
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "direction_semantic_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "direction_spec_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "variant_semantic_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "variant_spec_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "trial_spec_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "lifecycle_generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "implementation_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "attempt_input_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "phase": {
+      "enum": [
+        "proxy",
+        "full"
+      ]
+    },
+    "phase_execution_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "phase_start_event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
+    },
+    "producer_run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "command_plan_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "phase_contract_hash": {
+      "$ref": "#/$defs/hash"
+    },
+    "expected_evidence_kinds": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "provenance_mode": {
+      "enum": [
+        "synthetic",
+        "local-external",
+        "production"
+      ]
+    },
+    "proxy_evaluation_binding": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "proxy_evaluation_binding_v1.schema.json"
+        }
+      ]
+    },
+    "proxy_authorization": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "proxy_event_id",
+            "proxy_event_hash",
+            "proxy_outcome_hash"
+          ],
+          "properties": {
+            "proxy_event_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "proxy_event_hash": {
+              "$ref": "#/$defs/hash"
+            },
+            "proxy_outcome_hash": {
+              "$ref": "#/$defs/hash"
+            }
+          }
+        }
+      ]
+    },
+    "command_plan_ref": {
+      "$ref": "#/$defs/blob"
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "algorithm",
+        "digest",
+        "size_bytes",
+        "relative_path"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "auto_research_contract_blob_v1"
+        },
+        "algorithm": {
+          "const": "sha256"
+        },
+        "digest": {
+          "$ref": "#/$defs/hash"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "relative_path": {
+          "type": "string",
+          "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"
+        }
+      }
+    }
+  }
+}

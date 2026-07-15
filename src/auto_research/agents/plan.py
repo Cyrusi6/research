@@ -46,6 +46,7 @@ from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml,
 from ..domain_contracts import TRIAL_SPEC_SCHEMA_VERSION, canonical_hash, canonical_json, validate_trial_spec
 from ..evidence import EVIDENCE_SCHEMA_VERSIONS
 from ..proxy_classifier import build_proxy_decision_policy
+from ..phase_command_plan import build_phase_command_plan, store_phase_command_plan
 from ..research_state import ResearchEventLedger
 from .base import AgentContext
 
@@ -3284,8 +3285,6 @@ def _c2c_s2_available_artifacts() -> dict[str, str]:
         "performance_feedback": "plan/performance_feedback.json",
         "direction_scorecard": "plan/direction_scorecard.json",
         "failure_feedback": "experiment/results/failure_feedback.json",
-        "main_results": "experiment/results/main_results.json",
-        "proxy_calibration": "experiment/results/proxy_calibration.json",
         "iteration_trace": "meta/iteration_trace.jsonl",
         "candidate_ideas": "plan/s2_planner/candidate_pool.json",
         "patch_manifest": "plan/code_patches/patch_manifest.json",
@@ -3704,7 +3703,7 @@ def _store_trial_contracts(
             }
         )
     sample_manifest = {
-        "schema_version": "auto_research_sample_manifest_v2",
+        "schema_version": "auto_research_sample_manifest_v3",
         "manifest_id": f"{variant.get('variant_id')}:sample-manifest",
         "provenance_mode": provenance_mode,
         "datasets": sample_datasets,
@@ -3712,7 +3711,7 @@ def _store_trial_contracts(
     sample_ref = store.put_contract(
         sample_manifest,
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v2.schema.json",
+        schema_file="sample_manifest_v3.schema.json",
     )
 
     source_blobs: list[dict[str, Any]] = []
@@ -3919,7 +3918,6 @@ def _trial_spec_from_plan(
             evidence_requirements.append({"requirement_id": "full-readiness", "kind": "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["full_s3_readiness"]})
     runtime_config = deepcopy(execution)
     provenance_mode = "synthetic" if execution.get("mode") == "simulate" else "real"
-    command_contract = deepcopy(execution.get("commands") or [])
     dataset_ids = [item["dataset_id"] for item in datasets]
     if project_root is None:
         raise ValueError("TrialSpec production requires a project_root for immutable ContractStore manifests")
@@ -3954,6 +3952,44 @@ def _trial_spec_from_plan(
             evidence_kinds=proxy_evidence_kinds,
             mode="terminal_bootstrap" if proxy_terminal else "gate_to_full",
         )
+    phase_contracts = []
+    adapter_id = _phase_adapter_id(execution, provenance_mode=provenance_mode)
+    adapter_version = str(execution.get("adapter_version") or "1")
+    source_snapshot_hash = str(evaluator_manifest["source_digest"])
+    for phase in required_phases:
+        phase_requirements = [
+            item
+            for item in evidence_requirements
+            if phase in item["applicable_phases"] or "always" in item["applicable_phases"]
+        ]
+        phase_commands = _frozen_phase_commands(execution, phase=phase, adapter_id=adapter_id)
+        command_plan = build_phase_command_plan(
+            phase=phase,
+            adapter_id=adapter_id,
+            adapter_version=adapter_version,
+            provenance_mode="synthetic" if provenance_mode == "synthetic" else "production",
+            variant_spec_hash=str(variant["variant_spec_hash"]),
+            source_snapshot_hash=source_snapshot_hash,
+            command_values=phase_commands,
+            expected_evidence=phase_requirements,
+            default_cwd=str(execution.get("workdir") or project_root),
+        )
+        command_plan_ref, command_plan_hash = store_phase_command_plan(project_root, command_plan)
+        phase_contracts.append(
+            {
+                "phase": phase,
+                "datasets": dataset_ids,
+                "seeds": seeds,
+                "roles": ["baseline", "candidate"] if phase == "proxy" else list(dict.fromkeys(required_roles)),
+                "metrics": [primary_metric_id],
+                "evidence_kinds": [item["kind"] for item in phase_requirements],
+                "terminal": phase in terminal_phases,
+                "consumes_direction_budget": profile == "standard" and phase in terminal_phases,
+                "command_plan": command_plan,
+                "command_plan_ref": command_plan_ref,
+                "command_plan_hash": command_plan_hash,
+            }
+        )
     trial_spec = {
         "schema_version": TRIAL_SPEC_SCHEMA_VERSION,
         "protocol": {
@@ -3981,31 +4017,55 @@ def _trial_spec_from_plan(
             "evaluator_provenance": evaluator_manifest,
             "evaluator_manifest_ref": evaluator_manifest_ref,
             "evaluator_hash": canonical_hash(evaluator_manifest),
-            "command_contract_hash": canonical_hash(command_contract),
+            "phase_command_plan_hashes": {
+                item["phase"]: item["command_plan_hash"] for item in phase_contracts
+            },
         },
         "required_artifacts": required_artifacts,
         "evidence_requirements": evidence_requirements,
-        "phase_contracts": [
-            {
-                "phase": phase,
-                "datasets": dataset_ids,
-                "seeds": seeds,
-                "roles": ["baseline", "candidate"] if phase == "proxy" else list(dict.fromkeys(required_roles)),
-                "metrics": [primary_metric_id],
-                "evidence_kinds": [
-                    item["kind"]
-                    for item in evidence_requirements
-                    if phase in item["applicable_phases"] or "always" in item["applicable_phases"]
-                ],
-                "terminal": phase in terminal_phases,
-                "consumes_direction_budget": profile == "standard" and phase in terminal_phases,
-            }
-            for phase in required_phases
-        ],
+        "phase_contracts": phase_contracts,
         "proxy_decision_policy": proxy_decision_policy,
     }
     validate_trial_spec(trial_spec)
     return trial_spec
+
+
+def _phase_adapter_id(execution: dict[str, Any], *, provenance_mode: str) -> str:
+    collector = str(execution.get("collector") or "generic").replace("_", "-")
+    if provenance_mode == "synthetic":
+        return "synthetic-phase-adapter"
+    if collector == "c2c-small-loop":
+        return "c2c-phase-adapter"
+    return "generic-external-adapter"
+
+
+def _frozen_phase_commands(execution: dict[str, Any], *, phase: str, adapter_id: str) -> list[Any]:
+    configured = execution.get("phase_commands")
+    if isinstance(configured, dict) and isinstance(configured.get(phase), list):
+        commands = deepcopy(configured[phase])
+    else:
+        raw = execution.get("commands")
+        if isinstance(raw, dict):
+            phase_value = raw.get(phase)
+            if isinstance(phase_value, list):
+                commands = deepcopy(phase_value)
+            elif phase_value:
+                commands = [deepcopy(phase_value)]
+            else:
+                commands = []
+        elif isinstance(raw, list):
+            commands = deepcopy(raw) if phase == "full" else []
+        elif raw:
+            commands = [deepcopy(raw)] if phase == "full" else []
+        else:
+            commands = []
+    if commands:
+        return commands
+    if adapter_id == "c2c-phase-adapter":
+        return [["auto-research-adapter", "c2c", phase, "freeze-required"]]
+    if adapter_id == "synthetic-phase-adapter":
+        return [["auto-research-adapter", "synthetic", phase]]
+    raise ValueError(f"{adapter_id} {phase} phase requires explicit executable commands")
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:
     try:

@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "attempt_id",
+    "trial_spec_hash",
+    "lifecycle_generation",
+    "implementation_hash",
+    "attempt_input_hash",
+    "phase",
+    "phase_execution_id",
+    "producer_run_id",
+    "command_plan_hash",
+    "entries"
+  ],
+  "properties": {
+    "schema_version": {"const": "auto_research_completion_evidence_v3"},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "trial_spec_hash": {"$ref": "#/$defs/hash"},
+    "lifecycle_generation": {"type": "integer", "minimum": 0},
+    "implementation_hash": {"$ref": "#/$defs/hash"},
+    "attempt_input_hash": {"$ref": "#/$defs/hash"},
+    "phase": {"enum": ["proxy", "full"]},
+    "phase_execution_id": {"$ref": "#/$defs/execution_id"},
+    "producer_run_id": {"$ref": "#/$defs/execution_id"},
+    "command_plan_hash": {"$ref": "#/$defs/hash"},
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/staged_entry"}
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "safe_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"},
+    "execution_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "staged_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id", "kind", "relative_path", "content_hash", "schema_version",
+        "attempt_id", "producer_run_id", "direction_semantic_hash", "direction_spec_hash",
+        "variant_semantic_hash", "variant_spec_hash", "trial_spec_hash", "protocol_hash",
+        "sample_manifest_hash", "evaluator_hash", "lifecycle_generation", "implementation_hash",
+        "attempt_input_hash", "phase", "phase_execution_id", "phase_start_event_id"
+      ],
+      "properties": {
+        "evidence_id": {"$ref": "#/$defs/safe_id"},
+        "kind": {
+          "enum": [
+            "main_results", "ablation_results", "coverage_results", "matched_control_results",
+            "activation_evidence", "proxy_baseline_fingerprint", "proxy_cache_report",
+            "full_s3_readiness", "bootstrap_completion", "proxy_results"
+          ]
+        },
+        "relative_path": {"type": "string", "pattern": "^experiment/attempts/[^/]+/[^/]+/[^/]+/[a-f0-9]{64}\\.json$"},
+        "content_hash": {"$ref": "#/$defs/hash"},
+        "schema_version": {"type": "string", "pattern": "^auto_research_[a-z0-9_]+_v[0-9]+$"},
+        "attempt_id": {"type": "string", "minLength": 1},
+        "producer_run_id": {"$ref": "#/$defs/execution_id"},
+        "direction_semantic_hash": {"$ref": "#/$defs/hash"},
+        "direction_spec_hash": {"$ref": "#/$defs/hash"},
+        "variant_semantic_hash": {"$ref": "#/$defs/hash"},
+        "variant_spec_hash": {"$ref": "#/$defs/hash"},
+        "trial_spec_hash": {"$ref": "#/$defs/hash"},
+        "protocol_hash": {"$ref": "#/$defs/hash"},
+        "sample_manifest_hash": {"$ref": "#/$defs/hash"},
+        "evaluator_hash": {"$ref": "#/$defs/hash"},
+        "lifecycle_generation": {"type": "integer", "minimum": 0},
+        "implementation_hash": {"$ref": "#/$defs/hash"},
+        "attempt_input_hash": {"$ref": "#/$defs/hash"},
+        "phase": {"enum": ["proxy", "full"]},
+        "phase_execution_id": {"$ref": "#/$defs/execution_id"},
+        "phase_start_event_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"}
+      }
+    }
+  }
+}

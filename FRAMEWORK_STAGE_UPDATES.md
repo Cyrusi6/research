@@ -2961,9 +2961,76 @@ AttemptReserved
 - Removed authority: mutable sample/evaluator paths, producer proxy thresholds/decisions, fixed result discovery, arbitrary hash lookup, phase validation spoofing, phase-agnostic production C2C execution, and caller-authored result/failure/resume decisions.
 - Native Unified S1 Producer/Core and real external Codex S1 smoke are not part of this stage update.
 
-### Final Acceptance
+### Historical M1.1.5-Final Acceptance
 
-- `TMPDIR=$PWD/.tmp-final2-normal uv run pytest -q --tb=short`: `633 passed, 2 skipped`.
-- With upper/lowercase proxy variables removed: `633 passed, 2 skipped`.
-- With empty `HOME`, isolated empty HF caches, and a `PATH` without Codex: `633 passed, 2 skipped`.
-- The only red signature found during final closure was a hermetic-test defect: four non-simulated C2C tests depended on the host HF cache. The tests now provision a temporary fake cache explicitly; C2C production preflight still blocks a genuinely missing required cache.
+- The pre-v7 checkpoint recorded normal, proxy-cleared, and empty-HOME/no-Codex runs. Those historical results are superseded by the breaking M1.1.5.1 schema migration and are not current acceptance counts.
+
+## 2026-07-15 M1.1.5.1 Production Phase Authority Closure
+
+This is a breaking authority migration layered on the existing Evidence/Event architecture. It integrates phase executors, frozen command plans, command receipts, and evidence lineage into the ExperimentAgent production boundary. It does not start Native Unified S1.
+
+### Current Contracts
+
+- Event v7, AttemptRecord v7, and ResearchState v7 remain the sole SQLite-derived state authority.
+- TrialSpec v6 freezes phase contracts and references the content-addressed PhaseCommandPlan v1.
+- PhaseExecutionManifest v3 binds the current Attempt, lifecycle generation, implementation/input identity, phase execution, producer, adapter, provenance, expected evidence kinds, and command-plan hash.
+- PhaseCommand v2 freezes exact argv, cwd, source snapshot, ordering/dependencies, output schemas, resource/retry/resume policy, and deterministic conditions.
+- PhaseRunReceipt v3 binds the Started event and command plan to exit status, external-job identity, durable stdout/stderr ContractRefs, and exact immutable output ContractRefs.
+- EvidenceManifest v4 and CompletionEvidence v3 require receipt-linked evidence lineage. SampleManifest v3 binds content-addressed sample bytes. FailureEvidence/ResumeEvidence v5 and ResourceProbe v4 carry command/receipt bindings.
+- RouteOutcome v4 and TrialResult v5 remain unchanged because their authoritative shapes did not change in this migration.
+
+There is no dual read, compatibility fallback, or automatic migration. A workspace with replaced authority versions must return a breaking-schema error and rerun from S1.
+
+### Executor-Only Production Boundary
+
+ExperimentAgent routes phase work through exactly one of `C2CProxyPhaseExecutor`, `C2CFullPhaseExecutor`, `GenericExternalPhaseExecutor`, or `SyntheticPhaseExecutor`. Each executor receives an `AuthoritativePhaseContext` produced after the phase-start transaction, obtains an exact `PhaseAuthorization` from SQLite, installs an executor capability for the adapter callback, and rereads authority after the callback. Direct phase side effects without the matching capability fail before runner invocation. Adapter callbacks may remain internal implementation details, but they are not independent production entry points and must return a `PhaseArtifactInventory` bound to the same context.
+
+### Frozen Command DAG
+
+`PhaseCommandPlan v1` is generated from frozen TrialSpec, Variant, implementation/source snapshot, adapter identity, provenance mode, and phase. A command may start only when its command spec ID, phase, ordinal/dependencies, exact argv, safe cwd, source snapshot, command-plan hash, expected outputs, policies, and deterministic condition equal the frozen plan entry. The Ledger rejects extra, duplicate, out-of-order, wrong-phase, dependency-violating, or runtime-substituted commands. A self-consistent command hash is insufficient if the command is not in the current plan.
+
+### Receipt-Bound Evidence
+
+```text
+PhaseCommandStarted
+→ side effect
+→ immutable stdout/stderr/output blobs
+→ PhaseRunReceipt v3
+→ PhaseCommandCompleted
+→ receipt-linked PhaseArtifactInventory
+→ evidence ingest/classification
+```
+
+Receipt outputs record exact evidence kind, schema, content hash, ContractRef, producer, phase, and generation. EvidenceManifest v4 entries currently reference a completed command, its PhaseRunReceipt v3, and one of that receipt's exact immutable outputs. Reducer, rebuild, and S3 audit reread those immutable bytes and reject orphan evidence, stale generations, other Attempts/phases, Started-only or unknown commands, damaged outputs, unregistered kinds, duplicates, and extras. Adapter-authored `passed`, `ready`, summary, constraints, proxy decision, or outcome cannot authorize state, budget, route, or aggregate changes.
+
+Current adapters close provenance through a frozen collector command in the same authoritative command DAG. The collector cannot start until its preregistered physical measurement/probe dependencies are completed, rereads current-generation command receipts, and emits the canonical evidence bytes as its own immutable receipt outputs. Reducer/rebuild/Gate revalidate that exact command plan, dependency chain, receipt and output bytes; no post-command directory scan or caller-authored result can replace them.
+
+### Crash and Replay Semantics
+
+| Crash point | Required recovery |
+|---|---|
+| After Started, before a trustworthy receipt | Attach by frozen external-job identity or enter unknown outcome; do not silently rerun |
+| After side effect and durable receipt, before Completed | Verify the locator and submit Completed without rerunning |
+| After Completed, before proxy/full evidence commit | Reconstruct result and inventory from receipt stdout/stderr/output refs |
+| After ProxyEvidenceCommitted, before FullPhaseStarted | Rebuild the same RUN_FULL authorization and start full at most once |
+| After full evidence ingest, before finalization | Reuse immutable evidence and finalize exactly once |
+| After DB finalization, before projection | Rebuild one result, route, aggregate, and budget projection |
+| Exact finalization replay | Return the historical operation result without a new event or budget change |
+
+Receipt replay does not depend on process-local `result_holder` state. A repeated event ID with a different request fingerprint remains an integrity conflict.
+
+### Resource Pause and Resume
+
+Resource handling uses receipt-bound ResourceProbe v4 facts. Pause requires `insufficient`, observed capacity below required capacity, current Attempt/generation/phase identity, and a completed authorized probe command. Resume requires `available`, sufficient capacity, the same resource identity and pause event, and a current authorized probe receipt. Implementation repair invalidates uncommitted old-generation evidence and reruns proxy; full resource resume preserves a committed proxy outcome and resumes only the interrupted full phase under a new generation.
+
+The schema and reducer boundaries are present. Production black-box closure for three-round resource resume and receipt-backed OOM recovery remains under verification, so those E2E paths are not marked accepted.
+
+### Scope and Acceptance Status
+
+Historical M1.1.5-Final counts did not constitute M1.1.5.1 acceptance after the breaking v7/v6 migration. The final rerun now records `669 passed, 2 skipped, 0 failed` in each of the normal, proxy-cleared, and empty-HOME/empty-HF-cache/PATH-without-Codex environments. The non-simulated Generic/C2C/bootstrap production-component E2E group reports `6 passed`; these are local fixture commands, not GPU scientific training.
+
+Native Unified S1 Producer/Core has not started. Real external Codex S1 smoke and real GPU scientific training are outside this milestone. Synthetic and local subprocess fixtures validate engineering authority only and are not scientific results.
+
+### Breaking Schema Removal
+
+The current runtime accepts only Event/AttemptRecord/ResearchState v7, TrialSpec v6, PhaseExecutionManifest v3, PhaseCommand v2, PhaseRunReceipt v3, EvidenceManifest v4, SampleManifest v3, CompletionEvidence v3, FailureEvidence/ResumeEvidence v5, and ResourceProbe v4. Replaced v6/v5/v4/v3 authority schemas and readers are deleted rather than dual-read or migrated. Older workspaces must restart from S1.

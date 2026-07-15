@@ -128,7 +128,8 @@ def _main_inventory(spec: dict, values: dict[tuple[str, int], tuple[float, float
     raw = encode_canonical_evidence(payload)
     digest = evidence_content_hash(payload)
     path = content_addressed_evidence_path(attempt_id=attempt["attempt_id"], producer_run_id=producer_run_id, evidence_kind="main_results", content_hash=digest)
-    entry = {"evidence_id": evidence_id, "kind": "main_results", "relative_path": path, "content_hash": digest, "schema_version": payload["schema_version"], "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], **common, "cross_references": {}}
+    blob = lambda value: {"schema_version": "auto_research_contract_blob_v1", "algorithm": "sha256", "digest": value, "size_bytes": 1, "relative_path": f"meta/contracts/sha256/{value[:2]}/{value}.json"}
+    entry = {"evidence_id": evidence_id, "kind": "main_results", "relative_path": path, "content_hash": digest, "schema_version": payload["schema_version"], "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], **common, "cross_references": {}, "command_id": "command-main-attempt-1", "command_hash": "a" * 64, "command_plan_hash": "b" * 64, "receipt_ref": blob("c" * 64), "receipt_hash": "c" * 64, "output_ref": blob(digest), "completed_event_id": "event:command:completed:main"}
     manifest = {"schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION, "attempt_id": attempt["attempt_id"], "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "lifecycle_generation": 0, "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"], "entries": [entry]}
     return manifest, {evidence_id: raw}
 
@@ -287,9 +288,9 @@ def test_nonquantitative_evidence_schema_baseline_then_version_and_extra_propert
 
 def test_transaction_evidence_is_not_completion_manifest_evidence() -> None:
     assert TRANSACTION_EVIDENCE_SCHEMA_VERSIONS == {
-        "failure_evidence": "auto_research_failure_evidence_v4",
-        "resource_probe": "auto_research_resource_probe_evidence_v3",
-        "resume_evidence": "auto_research_resume_evidence_v4",
+        "failure_evidence": "auto_research_failure_evidence_v5",
+        "resource_probe": "auto_research_resource_probe_evidence_v4",
+        "resume_evidence": "auto_research_resume_evidence_v5",
     }
     assert set(TRANSACTION_EVIDENCE_SCHEMA_VERSIONS).isdisjoint(EVIDENCE_SCHEMA_VERSIONS)
     assert "effective_proxy_policy" not in CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS
@@ -312,7 +313,7 @@ def test_completion_manifest_rejects_noncompletion_evidence_kinds(kind: str) -> 
     forged = deepcopy(manifest)
     forged["entries"][0]["kind"] = kind
     with pytest.raises(ValueError):
-        validate_contract(forged, "evidence_manifest_v3.schema.json")
+        validate_contract(forged, "evidence_manifest_v4.schema.json")
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

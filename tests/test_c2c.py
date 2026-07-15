@@ -54,10 +54,17 @@ from auto_research.orchestrator import Orchestrator
 from auto_research.utils import sha256_file, write_json, write_yaml
 from auto_research.workspace import init_workspace
 from auto_research.cli import _run_c2c_command, _smoke_c2c_command
-from auto_research.command_journal import LedgerCommandJournal
-from auto_research.phase_execution import ResearchLedgerPhaseAuthority
-from auto_research.research_state import ResearchEventLedger
-from test_m114_authoritative_phase_transactions import _c2c_inputs
+from auto_research.command_journal import CommandExecutionResult, LedgerCommandJournal
+from auto_research.phase_execution import (
+    C2CFullPhaseExecutor,
+    C2CProxyPhaseExecutor,
+    PhaseArtifactInventory,
+    ResearchLedgerPhaseAuthority,
+)
+from auto_research.research_state import IntegrityError, ResearchEventLedger
+from support.authoritative_evidence import build_trial_spec_v5, record_completed_evidence_command, start_attempt_phase
+from test_m113_ledger_closure import _direction as _state_direction
+from test_m113_ledger_closure import _trial_spec_legacy as _state_trial_spec_legacy
 
 
 @pytest.fixture(autouse=True)
@@ -90,6 +97,7 @@ def _authorize_c2c_phase(
     agent: ExperimentAgent,
     *,
     phase: str,
+    candidate: dict | None = None,
     ledger: ResearchEventLedger | None = None,
     attempt: dict | None = None,
     trial_spec: dict | None = None,
@@ -98,9 +106,117 @@ def _authorize_c2c_phase(
     profile: str = "standard",
 ) -> tuple[ResearchEventLedger, dict, dict, dict, dict]:
     project_root = agent.context.project_root
+    if ledger is None and candidate is None:
+        agent._test_pending_c2c_profile = profile
+        return None, None, None, None, None
     if ledger is None:
-        attempt, trial_spec, comparison, baseline = _c2c_inputs(project_root, profile=profile)
         ledger = ResearchEventLedger(project_root)
+        direction = _state_direction()
+        candidate = candidate or {"id": "fixture-candidate", "title": "Fixture Candidate"}
+        operation = str(candidate.get("id") or "fixture-candidate")
+        config_overrides = ((candidate.get("experiment_contract") or {}).get("config_overrides") or {})
+        variant = build_variant_spec(
+            direction,
+            {
+                "variant_id": operation,
+                "variation_coordinates": {"operation": operation},
+                "intervention": {
+                    "summary": str(candidate.get("title") or operation),
+                    "algorithm_operations": [operation],
+                    "configuration": config_overrides or {"fixture": operation},
+                },
+                "hypothesis": str(candidate.get("hypothesis") or "the candidate changes the registered metric"),
+                "null_hypothesis": "the candidate does not change the registered metric",
+                "alternative_hypothesis": "the candidate changes the registered metric",
+                "controlled_variables": {"dataset": "fake", "evaluator": "fake-v1"},
+                "nuisance_variables": ["noise"],
+                "implementation_surface_ids": list(candidate.get("expected_files") or agent.context.config.get("allowed_files") or ["src/model.py"]),
+                "expected_metric_signature": {"primary": "accuracy", "direction": "increase"},
+                "falsification_conditions": ["paired delta is non-positive"],
+                "ablation": {"switch": ((candidate.get("experiment_contract") or {}).get("ablation_switch") or "disable_selected_intervention")},
+                "resource_budget": {"max_wall_seconds": 60, "max_retries": 3},
+                "failure_routing": {"implementation": "REPAIR_IMPLEMENTATION", "method": "PROPOSE_NEXT_VARIANT"},
+                "lineage": {
+                    "s2_run_id": "c2c-test-s2",
+                    "iteration": 1,
+                    "direction_spec_hash": direction["direction_spec_hash"],
+                    "feedback_from_attempt_ids": [],
+                },
+            },
+        )
+        direction_path = project_root / "literature" / "direction.json"
+        direction_path.parent.mkdir(parents=True, exist_ok=True)
+        direction_path.write_text(json.dumps(direction, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        variant_path = project_root / "plan" / "variant.json"
+        variant_path.parent.mkdir(parents=True, exist_ok=True)
+        variant_path.write_text(json.dumps(variant, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        ledger.select_direction(direction)
+        ledger.plan_variant(variant)
+        trial_spec = _state_trial_spec_legacy()
+        trial_spec["protocol"]["required_phases"] = ["proxy"] if profile == "bootstrap" else ["proxy", "full"]
+        trial_spec["protocol"]["terminal_phases"] = ["proxy"] if profile == "bootstrap" else ["full"]
+        trial_spec["protocol"]["proxy_terminal_allowed"] = profile == "bootstrap"
+        trial_spec["evidence_requirements"] = [
+            {"requirement_id": "proxy-results", "kind": "proxy_results", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_results_v1"},
+            {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_activation_evidence_v3"},
+            {"requirement_id": "proxy-baseline", "kind": "proxy_baseline_fingerprint", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_baseline_fingerprint_v3"},
+            {"requirement_id": "proxy-cache", "kind": "proxy_cache_report", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_cache_report_v3"},
+            {"requirement_id": "proxy-policy", "kind": "effective_proxy_policy", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_effective_proxy_policy_v3"},
+            {"requirement_id": "proxy-calibration", "kind": "proxy_calibration_policy", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_calibration_policy_v3"},
+            {"requirement_id": "bootstrap" if profile == "bootstrap" else "readiness", "kind": "bootstrap_completion" if profile == "bootstrap" else "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_bootstrap_completion_v3" if profile == "bootstrap" else "auto_research_full_s3_readiness_v3"},
+        ]
+        if profile == "standard":
+            trial_spec["evidence_requirements"].append(
+                {"requirement_id": "main", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_main_results_v3"}
+            )
+        trial_spec["required_artifacts"] = [item["kind"] for item in trial_spec["evidence_requirements"]]
+        trial_spec = build_trial_spec_v5(trial_spec, project_root=project_root)
+        trial_spec = agent._freeze_c2c_phase_command_plans(trial_spec, variant)
+        attempt = ledger.reserve_attempt(
+            profile=profile,
+            direction=direction,
+            variant=variant,
+            implementation_hash=canonical_hash({"impl": profile, "candidate": operation}),
+            attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full",
+            trial_spec=trial_spec,
+        )
+        attempt = start_attempt_phase(ledger, attempt, "proxy")
+        trial_spec = attempt["frozen_trial_spec"]
+        proxy_policy = trial_spec["proxy_decision_policy"]
+        comparison = {
+            "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
+            "proxy_screen": {
+                "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
+                "baseline_metrics": {"mean": 0.0, "datasets": {"fake": 0.0}},
+            },
+            "activation_smoke": {
+                "status": "passed",
+                "probe_id": "fixture-c2c-forward-probe",
+                "implementation_surface_ids": list(proxy_policy["activation_surface_ids"]),
+                "attempts": [
+                    {
+                        "status": "ok",
+                        "check_id": surface_id,
+                        "command_status": "completed",
+                        "exit_code": 0,
+                    }
+                    for surface_id in proxy_policy["activation_surface_ids"]
+                ],
+            },
+            "full_s3_readiness": {
+                "status": "ready",
+                "full_train_allowed": True,
+                "checks": [
+                    {"check_id": check_id, "status": "PASS"}
+                    for check_id in proxy_policy["readiness_check_ids"]
+                ],
+            },
+            "bootstrap": {"status": "proxy_reached"},
+            "ablation": {"metrics": {"datasets": {"fake": 0.5}}},
+            "matched_control_metrics": {"datasets": {"fake": 0.8}},
+            "coverage_metrics": {"datasets": {"fake": 1.0}},
+        }
+        baseline = {"mean": 0.0, "datasets": {"fake": 0.0}}
     assert attempt is not None and trial_spec is not None and comparison is not None and baseline is not None
     if phase == "full":
         inventory = _c2c_strict_evidence_inventory(
@@ -117,6 +233,8 @@ def _authorize_c2c_phase(
             trial_spec=trial_spec,
             inventory=inventory,
         )
+        _record_proxy_prerequisite_receipts(project_root, ledger, attempt, trial_spec)
+        record_completed_evidence_command(project_root, ledger, attempt, completion)
         attempt, route = ledger.commit_proxy_evidence(completion)
         assert route["next_action"] == "RUN_FULL"
         attempt = ledger.start_full_phase(
@@ -130,9 +248,98 @@ def _authorize_c2c_phase(
     return ledger, attempt, trial_spec, comparison, baseline
 
 
+def _record_proxy_prerequisite_receipts(
+    project_root: Path,
+    ledger: ResearchEventLedger,
+    attempt: dict,
+    trial_spec: dict,
+) -> None:
+    proxy_context = ResearchLedgerPhaseAuthority(ledger).context_for_attempt(
+        project_root,
+        attempt["attempt_id"],
+        "proxy",
+    )
+    proxy_plan = next(item for item in trial_spec["phase_contracts"] if item["phase"] == "proxy")["command_plan"]
+    journal = LedgerCommandJournal(project_root, ledger)
+    completed_specs = {
+        item["command"]["command_spec_id"]
+        for item in ledger.state()["phase_commands"].values()
+        if item["command"]["attempt_id"] == attempt["attempt_id"] and item["status"] == "completed"
+    }
+    for command_spec in proxy_plan["commands"][:-1]:
+        if command_spec["command_spec_id"] in completed_specs:
+            continue
+        journal.run_once(
+            proxy_context,
+            command_id=f"fixture-prerequisite-{command_spec['command_spec_id']}",
+            command_spec_id=command_spec["command_spec_id"],
+            argv=tuple(command_spec["argv"]),
+            cwd=command_spec["cwd"],
+            source_snapshot_hash=command_spec["source_snapshot_hash"],
+            expected_outputs=(),
+            runner=lambda: CommandExecutionResult(
+                exit_code=0,
+                stdout_hash=hashlib.sha256(b"fixture-proxy-prerequisite").hexdigest(),
+                stderr_hash=hashlib.sha256(b"").hexdigest(),
+                outputs=(),
+                stdout="fixture-proxy-prerequisite",
+                stderr="",
+                external_job_id="fixture-proxy-prerequisite",
+            ),
+        )
+
+
+def _run_authorized_c2c_candidate(agent: ExperimentAgent, *, phase: str, **kwargs):
+    context = agent._active_phase_context
+    if context is None or context.phase != phase:
+        _authorize_c2c_phase(
+            agent,
+            phase=phase,
+            candidate=kwargs.get("candidate"),
+            profile=getattr(agent, "_test_pending_c2c_profile", "standard"),
+        )
+        context = agent._active_phase_context
+    assert context is not None and context.phase == phase
+    authority = ResearchLedgerPhaseAuthority(ResearchEventLedger(agent.context.project_root))
+    result_holder: dict[str, dict] = {}
+
+    def execute(executor_context):
+        assert executor_context == context
+        method = (
+            agent._run_single_c2c_proxy_candidate
+            if phase == "proxy"
+            else agent._run_single_c2c_full_candidate
+        )
+        result_holder["result"] = method(**kwargs)
+        artifacts = []
+        for kind in context.expected_evidence_kinds:
+            relative = Path("experiment") / "attempts" / context.attempt_id / "executor-tests" / context.phase_execution_id / f"{kind}.json"
+            path = agent.context.project_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"kind": kind, "phase_execution_id": context.phase_execution_id}), encoding="utf-8")
+            artifacts.append(
+                {
+                    "kind": kind,
+                    "source_path": relative.as_posix(),
+                    "content_hash": sha256_file(path),
+                    "receipt_hash": canonical_hash(
+                        {"attempt_id": context.attempt_id, "phase_execution_id": context.phase_execution_id, "kind": kind}
+                    ),
+                    "producer_run_id": context.producer_run_id,
+                }
+            )
+        return PhaseArtifactInventory(context=context, artifacts=artifacts)
+
+    executor_type = C2CProxyPhaseExecutor if phase == "proxy" else C2CFullPhaseExecutor
+    executor_type(authority, execute).execute(context)
+    return result_holder["result"]
+
+
 def _run_c2c_proxy_then_full(agent: ExperimentAgent, **kwargs):
-    ledger, attempt, trial_spec, comparison, baseline = _authorize_c2c_phase(agent, phase="proxy")
-    proxy_result = agent._run_single_c2c_proxy_candidate(**kwargs)
+    ledger, attempt, trial_spec, comparison, baseline = _authorize_c2c_phase(
+        agent, phase="proxy", candidate=kwargs.get("candidate")
+    )
+    proxy_result = _run_authorized_c2c_candidate(agent, phase="proxy", **kwargs)
     _authorize_c2c_phase(
         agent,
         phase="full",
@@ -142,7 +349,7 @@ def _run_c2c_proxy_then_full(agent: ExperimentAgent, **kwargs):
         comparison=comparison,
         baseline=baseline,
     )
-    full_result = agent._run_single_c2c_full_candidate(**kwargs)
+    full_result = _run_authorized_c2c_candidate(agent, phase="full", **kwargs)
     return proxy_result, full_result
 
 
@@ -7141,7 +7348,7 @@ def test_c2c_feedback_bundle_preserves_failure_attribution() -> None:
     assert "dragging_datasets=mmlu-redux" in summary["summary_text"]
 
 
-def test_c2c_train_failure_with_checkpoint_continues_eval(monkeypatch, tmp_path: Path) -> None:
+def test_c2c_failed_train_checkpoint_does_not_bypass_authoritative_receipt(monkeypatch, tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
     config["llm"]["use_real_api"] = False
@@ -7165,8 +7372,10 @@ def test_c2c_train_failure_with_checkpoint_continues_eval(monkeypatch, tmp_path:
     paths = init_workspace(config, "topic", project_id="proj_recovery", simulate=False)
     context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
     agent = ExperimentAgent(context)
+    seen_steps: list[str] = []
 
     def fake_run_step(*, name, command, working_dir, retry_policy=None):
+        seen_steps.append(name)
         run_repo = Path(working_dir)
         if name == "train":
             run_id = "idea"
@@ -7192,21 +7401,20 @@ def test_c2c_train_failure_with_checkpoint_continues_eval(monkeypatch, tmp_path:
         "experiment_contract": {"config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}}},
     }
     _authorize_c2c_phase(agent, phase="full")
-    result = agent._run_single_c2c_full_candidate(
-        adapter=C2CAdapter(paths.root, config),
-        candidate=candidate,
-        index=0,
-        simulate=False,
-        baseline_mean=50.0,
-        min_delta=0.1,
-        max_regression=2.0,
-        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
-        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
-    )
-    assert result["command_status"] in {"partial", "ok"}
-    assert result["metrics"]["mean"] == 51.0
-    state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
-    assert any(action["action"] == "skip_failed_train_with_existing_final_checkpoint" for action in state["recovery_actions"])
+    with pytest.raises(IntegrityError, match="successful authoritative train receipt"):
+        _run_authorized_c2c_candidate(agent, phase="full",
+            adapter=C2CAdapter(paths.root, config),
+            candidate=candidate,
+            index=0,
+            simulate=False,
+            baseline_mean=50.0,
+            min_delta=0.1,
+            max_regression=2.0,
+            gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+            proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        )
+    assert "train" in seen_steps
+    assert not any(name.startswith("eval_") for name in seen_steps)
 
 
 def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: Path) -> None:
@@ -7290,7 +7498,7 @@ def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: 
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     _authorize_c2c_phase(agent, phase="full")
-    result = agent._run_single_c2c_full_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="full",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "idea",
@@ -7351,7 +7559,7 @@ def test_deterministic_s3_blocks_noop_candidate(monkeypatch, tmp_path: Path) -> 
 
     monkeypatch.setattr(agent.runner, "run_step", fail_run_step)
     _authorize_c2c_phase(agent, phase="proxy")
-    result = agent._run_single_c2c_proxy_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate={"id": "noop", "title": "Noop"},
         index=0,
@@ -7430,7 +7638,7 @@ def test_s3_applies_frozen_patch_archives_snapshot_and_does_not_call_llm(tmp_pat
 
     agent = ExperimentAgent(context)
     _authorize_c2c_phase(agent, phase="proxy")
-    result = agent._run_single_c2c_proxy_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate=candidate,
         index=0,
@@ -7517,7 +7725,7 @@ def test_s3_prefers_patched_repo_snapshot_over_patch_json(tmp_path: Path) -> Non
 
     agent = ExperimentAgent(context)
     _authorize_c2c_phase(agent, phase="proxy")
-    result = agent._run_single_c2c_proxy_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate=candidate,
         index=0,
@@ -7572,7 +7780,7 @@ def test_s3_blocks_outputs_written_to_original_snapshot(monkeypatch, tmp_path: P
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     _authorize_c2c_phase(agent, phase="full")
-    result = agent._run_single_c2c_full_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="full",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "polluter",
@@ -7699,7 +7907,7 @@ def test_s3_runs_ablation_switch_disabled_eval(monkeypatch, tmp_path: Path) -> N
     }
 
     _authorize_c2c_phase(agent, phase="full")
-    result = agent._run_single_c2c_full_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="full",
         adapter=C2CAdapter(paths.root, config),
         candidate=candidate,
         index=0,
@@ -7849,7 +8057,7 @@ def test_s3_rejects_validation_failed_code_patch_before_training(monkeypatch, tm
 
     monkeypatch.setattr(agent.runner, "run_step", fail_run_step)
     _authorize_c2c_phase(agent, phase="proxy")
-    result = agent._run_single_c2c_proxy_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "bad_patch",
@@ -7929,7 +8137,7 @@ def test_c2c_static_proxy_rejects_evaluator_patch_before_training(monkeypatch, t
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     _authorize_c2c_phase(agent, phase="proxy")
-    result = agent._run_single_c2c_proxy_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "eval_risk",
@@ -8035,7 +8243,7 @@ def test_c2c_proxy_carries_instrumentation_quality_repair_request(monkeypatch, t
     agent = ExperimentAgent(context)
     monkeypatch.setattr(agent.runner, "run_step", lambda **kwargs: {"step": kwargs["name"], "status": "ok", "returncode": 0, "stdout": "", "stderr": "", "attempts": []})
     _authorize_c2c_phase(agent, phase="proxy")
-    result = agent._run_single_c2c_proxy_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "quality",
@@ -8065,8 +8273,7 @@ def test_c2c_proxy_carries_instrumentation_quality_repair_request(monkeypatch, t
     assert result["failure_attribution"]["quality_repair"]["acceptance_guard"]["rerun_same_proxy_subset"] is True
 
 
-@pytest.mark.parametrize("bootstrap", [False, True], ids=["standard", "bootstrap"])
-def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch, tmp_path: Path, bootstrap: bool) -> None:
+def test_s3_replays_authoritative_proxy_receipt_without_rerun(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
     config["c2c"] = {
@@ -8094,90 +8301,76 @@ def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch,
         "allowed_files": ["rosetta/model/projector.py"],
         "allowed_prefixes": ["recipe/", "local/auto_research_runs/"],
     }
-    if bootstrap:
-        config["orchestration"] = {"profile": "bootstrap", "bootstrap": {"proxy_only": True}}
     paths = init_workspace(config, "topic", project_id="proj_proxy_resume_reuse", simulate=False)
     context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
     agent = ExperimentAgent(context)
-    adapter = C2CAdapter(paths.root, config)
-    gpu_selection = agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1})
     candidate = {
         "id": "proxy_resume",
         "title": "Proxy Resume",
         "experiment_contract": {"config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}}},
     }
-    patch = {"operations": [], "changed_files": [], "summary": "config-only cached proxy test"}
-    execution_repo = agent._prepare_c2c_execution_repo(candidate, adapter, patch)
-    execution_adapter = C2CAdapter(paths.root, {**config, "c2c": {**config["c2c"], "snapshot_path": execution_repo["repo_root"]}})
-    run_spec = execution_adapter.materialize_candidate_configs(candidate, gpu_selection)
-    patch_fingerprint = ExperimentAgent._c2c_patch_fingerprint(
-        execution_adapter,
-        {"status": "skipped", "changed_files": [], "execution_repo": execution_repo},
-        run_spec,
-    )
-    state_path = Path(run_spec["run_state_path"])
-    state_path.write_text(
-        json.dumps(
-            {
-                "candidate_id": "proxy_resume",
-                "run_id": "proxy_resume",
-                "preflight": {"status": "ok"},
-                "proxy_screen": {
-                    "enabled": True,
-                    "status": "rejected",
-                    "reason": "proxy mean delta -1.0 below hard threshold -0.3",
-                    "metrics": {"mean": 49.0, "datasets": {"mmlu-redux": 49.0}},
-                    "baseline_metrics": {"mean": 50.0, "datasets": {"mmlu-redux": 50.0}},
-                    "proxy_delta_vs_baseline": -1.0,
-                    "proxy_dataset_deltas": {"mmlu-redux": -1.0},
-                    "proxy_dataset_regressions": {"mmlu-redux": 1.0},
-                    "proxy_worst_dataset_regression": 1.0,
-                    "proxy_score": -1.5,
-                    "patch_fingerprint": patch_fingerprint,
-                },
-                "metrics": None,
-                "attempts": [],
-                "frozen_hashes": run_spec["frozen_hashes"],
-                "config_overrides": run_spec["config_overrides"],
-                "has_executable_change": True,
-                "patch_fingerprint": patch_fingerprint,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    def fail_run_step(**kwargs):
-        raise AssertionError("completed proxy_rejected run_state should be reused")
-
-    monkeypatch.setattr(agent.runner, "run_step", fail_run_step)
-    _authorize_c2c_phase(agent, phase="proxy", profile="bootstrap" if bootstrap else "standard")
-    result = agent._run_single_c2c_proxy_candidate(
-        adapter=adapter,
+    ledger, attempt, trial_spec, comparison, baseline = _authorize_c2c_phase(
+        agent,
+        phase="proxy",
         candidate=candidate,
-        index=0,
-        simulate=False,
-        baseline_mean=50.0,
-        min_delta=0.1,
-        max_regression=2.0,
-        gpu_selection=gpu_selection,
-        proxy_gpu_selection=gpu_selection,
+        profile="standard",
     )
+    comparison["proxy_screen"]["metrics"] = {"mean": -1.0, "datasets": {"fake": -1.0}}
+    inventory = _c2c_strict_evidence_inventory(
+        project_root=paths.root,
+        attempt=attempt,
+        trial_spec=trial_spec,
+        comparison_candidate=comparison,
+        baseline=baseline,
+        simulate=False,
+    )
+    completion = _stage_evidence_inventory(
+        project_root=paths.root,
+        attempt=attempt,
+        trial_spec=trial_spec,
+        inventory=inventory,
+    )
+    _record_proxy_prerequisite_receipts(paths.root, ledger, attempt, trial_spec)
+    first_receipt = record_completed_evidence_command(paths.root, ledger, attempt, completion)
+    completed = ledger.state()
 
-    assert result["decision"] == ("bootstrap_proxy_complete" if bootstrap else "proxy_rejected")
-    assert result["command_status"] == ("bootstrap_proxy_complete" if bootstrap else "proxy_rejected")
-    assert result["proxy_screen"]["proxy_delta_vs_baseline"] == -1.0
-    assert result["proxy_screen"]["comparison_baseline_mean"] == 50.0
-    assert result["proxy_screen"]["proxy_delta_vs_comparison_baseline"] == -1.0
-    assert result["proxy_screen"]["artifact_paths"]["run_state"].endswith("run_state.json")
-    assert result["patch_fingerprint"] == patch_fingerprint
-    assert result["metrics"] is None
-    saved = json.loads(state_path.read_text(encoding="utf-8"))
-    assert saved["proxy_screen"]["status"] == "rejected"
-    assert saved["patch_fingerprint"] == patch_fingerprint
-    if bootstrap:
-        assert saved["bootstrap"]["status"] == "proxy_reached"
-        assert saved["bootstrap"]["original_proxy_status"] == "rejected"
+    restarted = ResearchEventLedger(paths.root)
+    context = ResearchLedgerPhaseAuthority(restarted).context_for_attempt(paths.root, attempt["attempt_id"], "proxy")
+    command_spec = next(item for item in trial_spec["phase_contracts"] if item["phase"] == "proxy")["command_plan"]["commands"][-1]
+
+    def forbidden_rerun() -> CommandExecutionResult:
+        raise AssertionError("completed receipt replay must not rerun its command")
+
+    replay_receipt = LedgerCommandJournal(paths.root, restarted).run_once(
+        context,
+        command_id=f"fixture-proxy-{attempt['attempt_id'][:12]}",
+        command_spec_id=command_spec["command_spec_id"],
+        argv=tuple(command_spec["argv"]),
+        cwd=command_spec["cwd"],
+        source_snapshot_hash=command_spec["source_snapshot_hash"],
+        expected_outputs=tuple(item["kind"] for item in command_spec["expected_outputs"]),
+        runner=forbidden_rerun,
+    )
+    replayed = restarted.state()
+
+    assert replay_receipt == {
+        key: value
+        for key, value in first_receipt.items()
+        if key not in {"event_id", "event_hash", "sequence"}
+    }
+    assert replayed["last_sequence"] == completed["last_sequence"]
+    assert replayed["phase_commands"] == completed["phase_commands"]
+
+    finalized_attempt, route = restarted.commit_proxy_evidence(completion)
+    final_state = restarted.state()
+    assert finalized_attempt["state"] == "ABANDONED"
+    assert route["next_action"] == "PROPOSE_NEXT_VARIANT"
+    assert final_state["directions"][attempt["direction_semantic_hash"]]["budget"] == {
+        "target": 5,
+        "consumed": 0,
+        "reserved": 0,
+    }
+    assert not final_state["method_tried_history"]
 
 
 def test_s3_proxy_reuse_requires_matching_patch_fingerprint(tmp_path: Path) -> None:
@@ -8227,7 +8420,7 @@ def test_s3_proxy_reuse_requires_matching_patch_fingerprint(tmp_path: Path) -> N
         encoding="utf-8",
     )
 
-    assert agent._load_reusable_c2c_proxy_state(run_spec, "new_patch") is None
+    assert not hasattr(agent, "_load_reusable_c2c_proxy_state")
 
 
 def test_c2c_proxy_metric_near_threshold_is_repairable() -> None:
@@ -8395,54 +8588,8 @@ def test_c2c_proxy_positive_mean_with_borderline_dataset_regression_passes_with_
     assert "proxy worst dataset regression" in decision["soft_flags"][0]
 
 
-def test_c2c_cached_proxy_soft_repairable_rejudges_against_current_config() -> None:
-    cached_proxy = {
-        "status": "repairable_proxy_risk",
-        "reason": "proxy worst dataset regression 0.7812 above soft threshold 0.75",
-        "metrics": {
-            "mean": 39.2497,
-            "datasets": {
-                "ai2-arc": 39.9471,
-                "mmlu-redux": 37.4375,
-                "openbookqa": 40.3646,
-            },
-        },
-        "baseline_metrics": {
-            "mean": 38.3648,
-            "datasets": {
-                "ai2-arc": 38.0952,
-                "mmlu-redux": 35.8533,
-                "openbookqa": 41.1458,
-            },
-        },
-    }
-
-    decision = ExperimentAgent._c2c_rejudge_cached_proxy_screen(
-        cached_proxy,
-        baseline={
-            "mean": 50.06,
-            "datasets": {
-                "ai2-arc": 42.0,
-                "mmlu-redux": 42.0,
-                "openbookqa": 52.6,
-            },
-        },
-        proxy_cfg={
-            "require_paired_baseline": True,
-            "min_proxy_mean_delta": -0.3,
-            "soft_proxy_mean_delta": 0.0,
-            "max_proxy_dataset_regression": 1.5,
-            "soft_max_proxy_dataset_regression": 0.75,
-            "soft_min_proxy_score": 0.0,
-            "proxy_score_regression_weight": 0.5,
-            "repair_soft_proxy_fail": False,
-        },
-    )
-
-    assert decision is not None
-    assert decision["status"] == "passed"
-    assert decision["soft_fail"] is True
-    assert decision["proxy_delta_vs_proxy_baseline"] == 0.8849
+def test_c2c_cached_proxy_rejudge_runtime_entry_is_removed() -> None:
+    assert not hasattr(ExperimentAgent, "_c2c_rejudge_cached_proxy_screen")
 
 
 def test_c2c_proxy_metric_fallback_names_full_and_comparison_baseline() -> None:
@@ -8729,7 +8876,7 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
     assert _full_result["command_status"] == "ok"
 
 
-def test_c2c_proxy_baseline_eval_timeout_uses_configured_fallback(monkeypatch, tmp_path: Path) -> None:
+def test_c2c_proxy_baseline_eval_timeout_blocks_without_configured_fallback(monkeypatch, tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
     config["c2c"] = {
@@ -8838,14 +8985,10 @@ def test_c2c_proxy_baseline_eval_timeout_uses_configured_fallback(monkeypatch, t
     proxy = result["proxy_screen"]
 
     assert "proxy_baseline_eval_mmlu-redux" in seen_steps
-    assert "proxy_command_0" in seen_steps
+    assert "proxy_command_0" not in seen_steps
     baseline_event = next(item for item in result["command_logs"] if item["event"] == "proxy_baseline")
-    assert baseline_event["status"] == "fallback"
-    assert proxy["status"] == "passed"
-    assert proxy["proxy_baseline"]["source"] == "configured_full_baseline_subset_fallback"
-    assert proxy["proxy_delta_vs_proxy_baseline"] == 0.5
-    assert _full_result["command_status"] == "ok"
-    assert proxy["proxy_baseline"]["source"] == "configured_full_baseline_subset_fallback"
+    assert baseline_event["status"] == "blocked"
+    assert proxy["status"] != "passed"
 
 
 def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkeypatch, tmp_path: Path) -> None:
@@ -8926,7 +9069,7 @@ def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkey
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     _authorize_c2c_phase(agent, phase="proxy")
-    result = agent._run_single_c2c_proxy_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "no_effect",
@@ -9041,7 +9184,7 @@ def test_c2c_full_s3_readiness_blocks_train_when_not_ready(monkeypatch, tmp_path
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     _authorize_c2c_phase(agent, phase="proxy")
-    result = agent._run_single_c2c_proxy_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "readiness_not_ready",
@@ -9406,7 +9549,7 @@ def test_c2c_proxy_all_zero_records_eval_smoke_failure(monkeypatch, tmp_path: Pa
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     _authorize_c2c_phase(agent, phase="proxy")
-    result = agent._run_single_c2c_proxy_candidate(
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "all_zero_proxy",
