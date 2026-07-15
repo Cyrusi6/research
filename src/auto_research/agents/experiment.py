@@ -40,6 +40,7 @@ from ..domain_contracts import (
     validate_variant_identity,
 )
 from ..evidence import (
+    CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS,
     EVIDENCE_SCHEMA_VERSIONS,
     EVIDENCE_MANIFEST_SCHEMA_VERSION as STAGED_EVIDENCE_MANIFEST_SCHEMA_VERSION,
     EvidenceStore,
@@ -48,6 +49,9 @@ from ..evidence import (
     encode_canonical_evidence,
 )
 from ..research_state import IntegrityError, ResearchEventLedger
+from ..command_journal import CommandExecutionResult, LedgerCommandJournal
+from ..contract_store import ContractStore
+from ..phase_execution import ResearchLedgerPhaseAuthority
 from ..s3_validation import S3ValidationError, validate_failure_precommit, validate_trial_precommit
 from .base import AgentContext
 
@@ -58,6 +62,8 @@ class ExperimentAgent:
     def __init__(self, context: AgentContext):
         self.context = context
         self.runner = ExperimentRunner(context.config)
+        self._active_phase_context = None
+        self._active_command_journal = None
 
     def run(self, *, mode: str = "full", revisions: list[dict[str, Any]] | None = None) -> dict[str, Any]:
         env = self.runner.env_report()
@@ -133,108 +139,145 @@ class ExperimentAgent:
                 "attempt": attempt,
                 "route_outcome": route,
             }
-        if attempt["state"] in {"READY", "RESOURCE_PAUSED", "PROXY_COMPLETED"}:
-            attempt = self._prepare_attempt_execution(
-                ledger,
-                attempt,
-                resource_probe=env.get("resource_probe") if attempt["state"] == "RESOURCE_PAUSED" else None,
-                project_root=self.context.project_root,
-            )
-        elif attempt["state"] != "PROXY_RUNNING":
-            raise IntegrityError(f"attempt {attempt['attempt_id']} cannot resume execution from {attempt['state']}")
+        while True:
+            if attempt["state"] in {"READY", "RESOURCE_PAUSED", "PROXY_COMPLETED"}:
+                attempt = self._prepare_attempt_execution(
+                    ledger,
+                    attempt,
+                    resource_probe=env.get("resource_probe") if attempt["state"] == "RESOURCE_PAUSED" else None,
+                    project_root=self.context.project_root,
+                )
+            elif attempt["state"] not in {"PROXY_RUNNING", "FULL_RUNNING"}:
+                raise IntegrityError(f"attempt {attempt['attempt_id']} cannot resume execution from {attempt['state']}")
 
-        if execution.get("collector") == "c2c_small_loop":
-            result = self._run_c2c_small_loop(
-                plan,
-                execution,
-                env_record["path"],
-                revision_record["path"] if revision_record else None,
-                attempt=attempt,
-                trial_spec=trial_spec,
+            authoritative_phase = "proxy" if attempt["state"] == "PROXY_RUNNING" else "full"
+            phase_ledger = ResearchEventLedger(self.context.project_root)
+            phase_authority = ResearchLedgerPhaseAuthority(phase_ledger)
+            self._active_phase_context = phase_authority.context_for_attempt(
+                self.context.project_root,
+                attempt["attempt_id"],
+                authoritative_phase,
             )
-        elif simulate or execution.get("mode") == "simulate":
-            result = self._run_simulated(
-                plan,
-                env_record["path"],
-                revision_record["path"] if revision_record else None,
-                attempt=attempt,
-                trial_spec=trial_spec,
-            )
-        elif execution.get("collector") in {"reused_runs", "itr_quick_screen", "laps_eval"}:
-            result = {
-                "artifacts": [env_record["path"]],
-                "status": "blocked",
-                "failure_class": "integrity_failure",
-                "blocked_reason": f"collector {execution.get('collector')} does not implement the strict external evidence protocol",
-            }
-        else:
-            commands = execution.get("commands") or []
-            if execution.get("collector") != "external_manifest":
+            self._active_command_journal = LedgerCommandJournal(self.context.project_root, phase_ledger)
+
+            if execution.get("collector") == "c2c_small_loop":
+                result = self._run_c2c_small_loop(
+                    plan,
+                    execution,
+                    env_record["path"],
+                    revision_record["path"] if revision_record else None,
+                    attempt=attempt,
+                    trial_spec=trial_spec,
+                )
+            elif simulate or execution.get("mode") == "simulate":
+                result = self._run_simulated(
+                    plan,
+                    env_record["path"],
+                    revision_record["path"] if revision_record else None,
+                    attempt=attempt,
+                    trial_spec=trial_spec,
+                )
+            elif execution.get("collector") in {"reused_runs", "itr_quick_screen", "laps_eval"}:
                 result = {
                     "artifacts": [env_record["path"]],
                     "status": "blocked",
                     "failure_class": "integrity_failure",
-                    "blocked_reason": "Non-simulated generic execution requires collector=external_manifest.",
+                    "blocked_reason": f"collector {execution.get('collector')} does not implement the strict external evidence protocol",
                 }
-            elif not commands:
-                blocked_reason = execution.get("blocked_reason") or "No execution commands defined."
-                self.context.artifacts.write_text(
-                    self.stage_key,
-                    "self_heal_log.jsonl",
-                    json.dumps({"result": "blocked", "reason": blocked_reason}) + "\n",
-                    artifact_type="self_heal_log",
-                    summary="Blocked run",
-                )
-                result = {"artifacts": [env_record["path"]], "status": "blocked", "blocked_reason": blocked_reason}
             else:
-                execution_workdir = Path(execution.get("workdir") or self.context.project_root)
-                log_path = self.context.project_root / "experiment" / "logs" / "command_runs.json"
-                ensure_dir(log_path.parent)
-                run_result = self.runner.run_plan_commands(commands, execution_workdir, log_path)
-                log_record = self.context.artifacts.copy_into_stage(
-                    self.stage_key,
-                    log_path,
-                    "logs/command_runs.json",
-                    artifact_type="run_log",
-                    summary="Executed experiment commands",
-                )
-                if run_result["status"] != "ok":
-                    self.context.artifacts.write_text(
-                        self.stage_key,
-                        "self_heal_log.jsonl",
-                        json.dumps({"result": "failed", "runs": run_result["runs"]}) + "\n",
-                        artifact_type="self_heal_log",
-                        summary="Self-heal trace",
-                    )
-                    result = {
-                        "artifacts": [env_record["path"], log_record["path"]],
-                        "status": "failed",
-                        "failure_class": "implementation_failure",
-                        "failure_evidence": {
-                            "command_status": "failed",
-                            "exit_code": next((run.get("returncode") for run in run_result.get("runs") or [] if run.get("returncode") not in {None, 0}), 1),
-                            "artifact_path": log_record["path"],
-                            "reason": "Experiment command returned a non-zero exit code.",
-                        },
-                    }
-                else:
-                    try:
-                        inventory = _generic_external_evidence_inventory(
-                            project_root=self.context.project_root,
-                            attempt=attempt,
-                            execution=execution,
-                        )
-                        result = {
-                            "artifacts": [env_record["path"], log_record["path"], *[item["source_path"] for item in inventory]],
-                            "status": "completed",
-                            "evidence_inventory": inventory,
-                        }
-                    except S3ValidationError as exc:
-                        result = {"artifacts": [env_record["path"], log_record["path"]], "status": "blocked", "failure_class": "integrity_failure", "blocked_reason": str(exc)}
-        finalized = self._finalize_trial(result, attempt=attempt, trial_spec=trial_spec, ledger=ledger)
-        if ((finalized.get("route_outcome") or {}).get("next_action") == "RUN_FULL"):
-            return self.run(mode=mode, revisions=revisions)
-        return finalized
+                result = self._run_generic_external_phase(execution, env_record["path"], attempt)
+            finalized = self._finalize_trial(result, attempt=attempt, trial_spec=trial_spec, ledger=ledger)
+            if ((finalized.get("route_outcome") or {}).get("next_action") != "RUN_FULL"):
+                return finalized
+            attempt = finalized["attempt"]
+
+    def _run_generic_external_phase(
+        self,
+        execution: dict[str, Any],
+        env_record_path: str,
+        attempt: dict[str, Any],
+    ) -> dict[str, Any]:
+        commands = execution.get("commands") or []
+        if execution.get("collector") != "external_manifest":
+            return {
+                "artifacts": [env_record_path],
+                "status": "blocked",
+                "failure_class": "integrity_failure",
+                "blocked_reason": "Non-simulated generic execution requires collector=external_manifest.",
+            }
+        if not commands:
+            blocked_reason = execution.get("blocked_reason") or "No execution commands defined."
+            self.context.artifacts.write_text(
+                self.stage_key,
+                "self_heal_log.jsonl",
+                json.dumps({"result": "blocked", "reason": blocked_reason}) + "\n",
+                artifact_type="self_heal_log",
+                summary="Blocked run",
+            )
+            return {"artifacts": [env_record_path], "status": "blocked", "blocked_reason": blocked_reason}
+        execution_workdir = Path(execution.get("workdir") or self.context.project_root)
+        log_path = self.context.project_root / "experiment" / "logs" / "command_runs.json"
+        ensure_dir(log_path.parent)
+        runs: list[dict[str, Any]] = []
+        run_status = "ok"
+        for index, command in enumerate(commands):
+            step_result = self._run_authoritative_step(
+                name=f"command_{index}",
+                command=command,
+                working_dir=execution_workdir,
+            )
+            attempts = step_result.get("attempts") or []
+            last = attempts[-1] if attempts else {}
+            runs.append({
+                "command": command,
+                "returncode": int(last.get("returncode", step_result.get("returncode", 1))),
+                "stdout": str(last.get("stdout") or "")[-2000:],
+                "stderr": str(last.get("stderr") or "")[-2000:],
+            })
+            if step_result.get("status") != "ok":
+                run_status = "failed"
+                break
+        run_result = {"status": run_status, "runs": runs}
+        log_path.write_text(json.dumps(runs, indent=2) + "\n", encoding="utf-8")
+        log_record = self.context.artifacts.copy_into_stage(
+            self.stage_key,
+            log_path,
+            "logs/command_runs.json",
+            artifact_type="run_log",
+            summary="Executed experiment commands",
+        )
+        if run_result["status"] != "ok":
+            self.context.artifacts.write_text(
+                self.stage_key,
+                "self_heal_log.jsonl",
+                json.dumps({"result": "failed", "runs": run_result["runs"]}) + "\n",
+                artifact_type="self_heal_log",
+                summary="Self-heal trace",
+            )
+            return {
+                "artifacts": [env_record_path, log_record["path"]],
+                "status": "failed",
+                "failure_class": "implementation_failure",
+                "failure_evidence": {
+                    "command_status": "failed",
+                    "exit_code": next((run.get("returncode") for run in run_result.get("runs") or [] if run.get("returncode") not in {None, 0}), 1),
+                    "artifact_path": log_record["path"],
+                    "reason": "Experiment command returned a non-zero exit code.",
+                },
+            }
+        try:
+            inventory = _generic_external_evidence_inventory(
+                project_root=self.context.project_root,
+                attempt=attempt,
+                execution=execution,
+            )
+        except S3ValidationError as exc:
+            return {"artifacts": [env_record_path, log_record["path"]], "status": "blocked", "failure_class": "integrity_failure", "blocked_reason": str(exc)}
+        return {
+            "artifacts": [env_record_path, log_record["path"], *[item["source_path"] for item in inventory]],
+            "status": "completed",
+            "evidence_inventory": inventory,
+        }
 
     def _finalize_trial(
         self,
@@ -338,22 +381,35 @@ class ExperimentAgent:
             if not isinstance(resource_probe, dict):
                 raise IntegrityError("resource resume requires a current resource probe artifact")
             producer_run_id = f"resume-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}"
-            probe_payload = _identity_evidence_payload(
-                attempt=current,
-                producer_run_id=producer_run_id,
-                evidence_kind="resource_probe",
-                phase=str(current.get("paused_phase") or "proxy"),
-                fields={
-                    "resource_type": resource_probe.get("resource_type"),
-                    "resource_id": resource_probe.get("resource_id"),
-                    "required_capacity": resource_probe.get("required_capacity"),
-                    "observed_capacity": resource_probe.get("observed_capacity"),
-                    "unit": resource_probe.get("unit"),
-                    "probe_status": resource_probe.get("probe_status"),
-                    "observed_at": resource_probe.get("observed_at") or now_utc(),
-                },
-            )
-            validate_contract(probe_payload, "resource_probe_v2.schema.json")
+            probe_payload = {
+                "schema_version": "auto_research_resource_probe_evidence_v3",
+                "evidence_kind": "resource_probe",
+                "evidence_id": f"resource-probe-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}",
+                "attempt_id": current["attempt_id"],
+                "producer_run_id": producer_run_id,
+                "direction_semantic_hash": current["direction_semantic_hash"],
+                "direction_spec_hash": current["direction_spec_hash"],
+                "variant_semantic_hash": current["variant_semantic_hash"],
+                "variant_spec_hash": current["variant_spec_hash"],
+                "trial_spec_hash": current["trial_spec_hash"],
+                "protocol_hash": current["protocol_hash"],
+                "sample_manifest_hash": current["sample_manifest_hash"],
+                "evaluator_hash": current["evaluator_hash"],
+                "lifecycle_generation": current["lifecycle_generation"],
+                "implementation_hash": current["implementation_hash"],
+                "attempt_input_hash": current["attempt_input_hash"],
+                "phase": "resume",
+                "phase_execution_id": f"phase-resume-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}",
+                "phase_start_event_id": f"event:resume:{current['attempt_id']}:g{current['lifecycle_generation']}",
+                "resource_type": resource_probe.get("resource_type"),
+                "resource_id": resource_probe.get("resource_id"),
+                "required_capacity": resource_probe.get("required_capacity"),
+                "observed_capacity": resource_probe.get("observed_capacity"),
+                "unit": resource_probe.get("unit"),
+                "probe_status": resource_probe.get("probe_status"),
+                "observed_at": resource_probe.get("observed_at") or now_utc(),
+            }
+            validate_contract(probe_payload, "resource_probe_v3.schema.json")
             probe_bytes = encode_canonical_evidence(probe_payload)
             probe_hash = hashlib.sha256(probe_bytes).hexdigest()
             probe_relative_path = content_addressed_evidence_path(
@@ -388,7 +444,7 @@ class ExperimentAgent:
                 raise IntegrityError("resource resume requires a committed pause event")
             pause_evidence = pause_event["payload"]["failure_evidence"]
             resume_evidence = {
-                "schema_version": "auto_research_resume_evidence_v3",
+                "schema_version": "auto_research_resume_evidence_v4",
                 "evidence_kind": "resume_evidence",
                 "evidence_id": f"resume-evidence-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}",
                 "attempt_id": current["attempt_id"],
@@ -409,7 +465,10 @@ class ExperimentAgent:
                 "phase_execution_id": probe_payload["phase_execution_id"],
                 "phase_start_event_id": probe_payload["phase_start_event_id"],
                 "pause_event_id": pause_event["event_id"],
-                "pause_evidence_hash": canonical_hash(pause_evidence),
+                "pause_evidence_hash": hashlib.sha256(encode_canonical_evidence(pause_evidence)).hexdigest(),
+                "pause_phase": pause_evidence["phase"],
+                "pause_phase_execution_id": pause_evidence["phase_execution_id"],
+                "pause_producer_run_id": pause_evidence["producer_run_id"],
                 "resource_type": probe_payload["resource_type"],
                 "resource_id": probe_payload["resource_id"],
                 "required_capacity": probe_payload["required_capacity"],
@@ -418,6 +477,27 @@ class ExperimentAgent:
                 "probe_status": probe_payload["probe_status"],
                 "observed_at": probe_payload["observed_at"],
             }
+            resume_bytes = encode_canonical_evidence(resume_evidence)
+            resume_hash = hashlib.sha256(resume_bytes).hexdigest()
+            resume_relative_path = content_addressed_evidence_path(
+                attempt_id=current["attempt_id"],
+                producer_run_id=producer_run_id,
+                evidence_kind="resume_evidence",
+                content_hash=resume_hash,
+            )
+            try:
+                EvidenceStore(project_root).write_entry(
+                    {
+                        "relative_path": resume_relative_path,
+                        "producer_run_id": producer_run_id,
+                        "kind": "resume_evidence",
+                        "content_hash": resume_hash,
+                    },
+                    current,
+                    resume_bytes,
+                )
+            except ValueError as exc:
+                raise IntegrityError(f"resume evidence immutable write failed: {exc}") from exc
             current = ledger.resume_attempt(resume_evidence)
         if current["state"] not in {"READY", "PROXY_COMPLETED"}:
             raise IntegrityError(f"attempt {current['attempt_id']} cannot enter execution from {current['state']}")
@@ -1030,6 +1110,15 @@ class ExperimentAgent:
         trial_spec: dict[str, Any],
     ) -> dict[str, Any]:
         bootstrap_proxy_only = bootstrap_proxy_only_enabled(self.context.config)
+        authoritative_phase = "proxy" if attempt["state"] == "PROXY_RUNNING" else "full"
+        phase_ledger = ResearchEventLedger(self.context.project_root)
+        phase_authority = ResearchLedgerPhaseAuthority(phase_ledger)
+        self._active_phase_context = phase_authority.context_for_attempt(
+            self.context.project_root,
+            attempt["attempt_id"],
+            authoritative_phase,
+        )
+        self._active_command_journal = LedgerCommandJournal(self.context.project_root, phase_ledger)
         adapter = C2CAdapter(self.context.project_root, self.context.config)
         variant_spec = read_json(self.context.project_root / "plan" / "variant.json", default={}) or {}
         raw_candidates = [_c2c_candidate_from_variant_spec(variant_spec)]
@@ -1079,8 +1168,9 @@ class ExperimentAgent:
         )
         copied_sources.append(selection_record["path"])
 
+        phase_runner = self._run_single_c2c_proxy_candidate if authoritative_phase == "proxy" else self._run_single_c2c_full_candidate
         for idx, candidate in enumerate(candidates):
-            candidate_result = self._run_single_c2c_candidate(
+            candidate_result = phase_runner(
                 adapter=adapter,
                 candidate=candidate,
                 index=idx,
@@ -1290,7 +1380,7 @@ class ExperimentAgent:
             artifact_type="self_heal_log",
             summary="C2C command and patch trace",
         )
-        if not best:
+        if comparison_candidate is None:
             blocked_reason = self._c2c_blocked_reason(run_results)
             if blocked_reason:
                 return {
@@ -1337,6 +1427,51 @@ class ExperimentAgent:
             "evidence_inventory": evidence_inventory,
             "status": "ok" if comparison.get("passed") or (bootstrap_proxy_only and best_proxy) else "not_viable",
         }
+
+    def _run_authoritative_step(self, **kwargs: Any) -> dict[str, Any]:
+        context = self._active_phase_context
+        journal = self._active_command_journal
+        if context is None or journal is None:
+            raise IntegrityError("side-effect command requires authoritative phase context and Ledger journal")
+        command = kwargs.get("command")
+        argv = shlex.split(command) if isinstance(command, str) else [str(item) for item in (command or [])]
+        if not argv:
+            raise IntegrityError("authoritative command argv cannot be empty")
+        command_intent = {
+            "name": str(kwargs.get("name") or "phase-command"),
+            "argv": argv,
+            "cwd": str(kwargs.get("cwd") or self.context.project_root),
+            "phase_execution_id": context.phase_execution_id,
+        }
+        command_id = f"cmd-{context.phase}-{canonical_hash(command_intent)[:24]}"
+        result_holder: dict[str, Any] = {}
+
+        def execute() -> CommandExecutionResult:
+            result = self.runner.run_step(**kwargs)
+            result_holder["result"] = result
+            return CommandExecutionResult(
+                exit_code=int(result.get("returncode", 0 if result.get("status") == "ok" else 1)),
+                stdout_hash=canonical_hash(result.get("stdout") or ""),
+                stderr_hash=canonical_hash(result.get("stderr") or result.get("error") or ""),
+                outputs=(),
+                external_job_id=str(result.get("external_job_id")) if result.get("external_job_id") else None,
+            )
+
+        journal_result = journal.run_once(
+            context,
+            command_id=command_id,
+            argv=argv,
+            cwd=str(kwargs.get("cwd") or self.context.project_root),
+            source_snapshot_hash=context.implementation_hash,
+            expected_outputs=(),
+            runner=execute,
+        )
+        if "result" not in result_holder:
+            raise IntegrityError(
+                f"authoritative command {command_id} was not executed in this process; "
+                f"status={journal_result.get('status')} requires receipt-backed result recovery"
+            )
+        return result_holder["result"]
 
     def _c2c_proxy_gpu_policy(self, *, execution: dict[str, Any]) -> dict[str, Any]:
         experiment_policy = self.context.config.get("experiment", {}).get("gpu_policy", {})
@@ -1989,7 +2124,7 @@ class ExperimentAgent:
             ensure_dir(target.parent)
             target.write_text(str(item.get("content") or ""), encoding="utf-8")
 
-    def _run_single_c2c_candidate(
+    def _run_single_c2c_proxy_candidate(
         self,
         *,
         adapter: C2CAdapter,
@@ -2018,7 +2153,743 @@ class ExperimentAgent:
             else {"status": "skipped"}
         )
         run_spec = adapter.materialize_candidate_configs(candidate, gpu_selection, proxy_gpu_selection=proxy_gpu_selection)
-        self._write_c2c_proxy_policy_contracts(candidate=candidate, run_spec=run_spec, config=adapter.config)
+        output_pollution_before = _c2c_original_output_state(original_repo_root, run_spec)
+        execution_repo_audit = _c2c_execution_repo_path_audit(
+            original_repo_root=original_repo_root,
+            execution_repo=execution_repo,
+            run_spec=run_spec,
+        )
+        has_executable_change = bool(patch_result.get("changed_files") or run_spec.get("has_executable_change"))
+        patch_fingerprint = self._c2c_patch_fingerprint(adapter, patch_result, run_spec)
+        reusable_state = self._load_reusable_c2c_proxy_state(run_spec, patch_fingerprint)
+        cached_proxy_rejudge_action = None
+        if reusable_state:
+            cached_proxy_screen = _normalize_c2c_proxy_screen_artifacts(
+                reusable_state.get("proxy_screen") or {},
+                full_baseline=adapter.baseline,
+                run_spec=run_spec,
+            )
+            current_decision = self._c2c_rejudge_cached_proxy_screen(
+                cached_proxy_screen,
+                baseline=adapter.baseline,
+                proxy_cfg=c2c_proxy_screen_config(self.context.config),
+            )
+            if current_decision and current_decision.get("status") == "passed":
+                cached_proxy_rejudge_action = {
+                    "action": "ignore_cached_proxy_block_after_threshold_rejudge",
+                    "status": "ok",
+                    "previous_status": cached_proxy_screen.get("status"),
+                    "previous_reason": cached_proxy_screen.get("reason"),
+                    "current_status": current_decision.get("status"),
+                    "current_reason": current_decision.get("reason"),
+                    "soft_flags": current_decision.get("soft_flags") or [],
+                }
+                reusable_state = None
+            else:
+                if current_decision:
+                    cached_proxy_screen.update(current_decision)
+                    cached_proxy_screen["cached_proxy_rejudged"] = True
+                reusable_state["proxy_screen"] = cached_proxy_screen
+        run_state = {
+            "candidate_id": candidate.get("id"),
+            "run_id": run_spec["run_id"],
+            "created_at": now_utc(),
+            "preflight": None,
+            "proxy_screen": None,
+            "activation_smoke": None,
+            "full_s3_readiness": None,
+            "ablation": None,
+            "train": None,
+            "eval_by_dataset": {},
+            "ablation_eval_by_dataset": {},
+            "metrics": None,
+            "ablation_metrics": None,
+            "attempts": [],
+            "recovery_actions": [],
+            "frozen_hashes": run_spec.get("frozen_hashes", {}),
+            "config_overrides": run_spec.get("config_overrides", {}),
+            "has_executable_change": has_executable_change,
+            "patch_fingerprint": patch_fingerprint,
+            "code_snapshot": code_snapshot,
+            "execution_repo": execution_repo,
+            "execution_repo_audit": execution_repo_audit,
+            "runtime_localization": run_spec.get("runtime_localization", {}),
+        }
+        prior_phase_state = read_json(Path(run_spec["run_state_path"]), default={}) or {}
+        if isinstance(prior_phase_state, dict):
+            for key in (
+                "proxy_baseline",
+                "proxy_screen",
+                "proxy_decision_report",
+                "activation_smoke",
+                "full_s3_readiness",
+                "bootstrap",
+            ):
+                if prior_phase_state.get(key) is not None:
+                    run_state[key] = deepcopy(prior_phase_state[key])
+        prior_phase_state = read_json(Path(run_spec["run_state_path"]), default={}) or {}
+        if isinstance(prior_phase_state, dict):
+            for key in (
+                "proxy_baseline",
+                "proxy_screen",
+                "proxy_decision_report",
+                "activation_smoke",
+                "full_s3_readiness",
+                "bootstrap",
+            ):
+                if prior_phase_state.get(key) is not None:
+                    run_state[key] = deepcopy(prior_phase_state[key])
+        logs = [
+            {
+                "candidate_id": candidate.get("id"),
+                "event": "patch",
+                "patch_summary": patch.get("summary", ""),
+                "patch_result": patch_result,
+                "code_snapshot": code_snapshot,
+                "execution_repo": execution_repo,
+                "execution_repo_audit": execution_repo_audit,
+                "config_overrides": run_spec.get("config_overrides", {}),
+                "has_executable_change": has_executable_change,
+                "patch_fingerprint": patch_fingerprint,
+                "frozen_hashes": run_spec.get("frozen_hashes", {}),
+                "runtime_localization": run_spec.get("runtime_localization", {}),
+            }
+        ]
+        def refresh_execution_repo_audit(phase: str) -> dict[str, Any]:
+            audit = _c2c_execution_repo_output_audit(
+                original_repo_root=original_repo_root,
+                run_spec=run_spec,
+                before_state=output_pollution_before,
+                path_audit=execution_repo_audit,
+                phase=phase,
+            )
+            run_state["execution_repo_audit"] = audit
+            return audit
+
+        def block_for_execution_repo_audit(phase: str) -> bool:
+            nonlocal command_status
+            audit = refresh_execution_repo_audit(phase)
+            if audit.get("status") != "failed":
+                return False
+            reason = audit.get("reason") or "S3 output was written outside execution repo"
+            command_status = "blocked"
+            action = {
+                "action": "block_original_snapshot_output_pollution",
+                "status": "blocked",
+                "phase": phase,
+                "reason": reason,
+                "polluted_files": (audit.get("output_pollution") or {}).get("added_files", [])[:20],
+                "modified_files": (audit.get("output_pollution") or {}).get("modified_files", [])[:20],
+            }
+            run_state["recovery_actions"].append(action)
+            logs.append({"candidate_id": candidate.get("id"), "event": "execution_repo_audit_failed", **action, "audit": audit})
+            return True
+
+        if cached_proxy_rejudge_action:
+            run_state["recovery_actions"].append(cached_proxy_rejudge_action)
+            logs.append({"candidate_id": candidate.get("id"), "event": "proxy_cache_rejudge", **cached_proxy_rejudge_action})
+        command_status = "skipped"
+        preflight = None
+        if execution_repo_audit.get("status") == "failed":
+            metrics = None
+            command_status = "blocked"
+            reason = execution_repo_audit.get("reason") or "S3 execution repo path audit failed"
+            run_state["preflight"] = {"status": "blocked", "reason": reason}
+            run_state["recovery_actions"].append({"action": "block_execution_repo_path_audit", "status": "blocked", "reason": reason})
+            logs.append({"candidate_id": candidate.get("id"), "event": "blocked", "reason": reason, "execution_repo_audit": execution_repo_audit})
+            self._save_c2c_run_state(run_spec, run_state)
+        elif patch_result["status"] == "rejected":
+            metrics = None
+            command_status = "patch_rejected"
+            self._save_c2c_run_state(run_spec, run_state)
+        elif not simulate and not has_executable_change:
+            metrics = None
+            command_status = "blocked"
+            reason = "candidate lacks frozen executable patch or config_overrides; refusing deterministic S3 no-op run"
+            run_state["preflight"] = {"status": "blocked", "reason": reason}
+            run_state["recovery_actions"].append({"action": "block_noop_candidate", "status": "blocked", "reason": reason})
+            logs.append({"candidate_id": candidate.get("id"), "event": "blocked", "reason": reason})
+            self._save_c2c_run_state(run_spec, run_state)
+        elif not simulate and bool(c2c_proxy_screen_config(self.context.config).get("enabled", False)) and not getattr(proxy_gpu_selection, "selected_ids", []):
+            metrics = None
+            command_status = "blocked"
+            reason = "cheap proxy resource wait timed out without an available GPU; resume after GPU resources are available"
+            proxy_screen = {
+                "enabled": True,
+                "status": "resource_retry",
+                "reason": reason,
+                "repair_hint": "do not repair the S2.5 patch for this failure; rerun S3 when proxy GPU resources are available",
+                "resource_retry": True,
+                "failure_category": "s3_proxy_gpu_resource_retry",
+                "gpu_selection": {
+                    "selected_gpu_ids": list(getattr(proxy_gpu_selection, "selected_ids", []) or []),
+                    "policy": getattr(proxy_gpu_selection, "policy", {}),
+                    "snapshot": getattr(proxy_gpu_selection, "snapshot", []),
+                    "reason": getattr(proxy_gpu_selection, "reason", ""),
+                },
+            }
+            run_state["proxy_screen"] = proxy_screen
+            run_state["preflight"] = {"status": "blocked", "reason": reason}
+            run_state["recovery_actions"].append(
+                {
+                    "action": "pause_for_proxy_gpu_resources",
+                    "status": "resource_retry",
+                    "reason": reason,
+                    "gpu_selection": proxy_screen["gpu_selection"],
+                }
+            )
+            logs.append({"candidate_id": candidate.get("id"), "event": "proxy_gpu_resource_retry", "proxy_screen": proxy_screen})
+            self._save_c2c_run_state(run_spec, run_state)
+        elif simulate:
+            proxy_baseline = deepcopy(adapter.baseline)
+            offset = max(min_delta + 0.15, 0.25) if index == 0 else -0.25
+            proxy_metrics = {
+                "mean": round(float(proxy_baseline.get("mean") or 0.0) + offset, 4),
+                "datasets": {
+                    dataset_id: round(float(value) + offset, 4)
+                    for dataset_id, value in (proxy_baseline.get("datasets") or {}).items()
+                },
+            }
+            metrics = None
+            ablation = {"enabled": False, "status": "skipped", "reason": "proxy phase cannot execute ablation"}
+            run_state["proxy_screen"] = {
+                "enabled": True,
+                "status": "passed" if offset >= min_delta else "rejected",
+                "reason": "synthetic proxy phase",
+                "metrics": proxy_metrics,
+                "baseline_metrics": proxy_baseline,
+                "proxy_baseline": proxy_baseline,
+            }
+            logs.append({"candidate_id": candidate.get("id"), "event": "synthetic_proxy_results", "metrics": proxy_metrics})
+            command_status = "mocked"
+            run_state["preflight"] = {"status": "skipped", "simulate": True}
+            run_state["metrics"] = metrics
+            run_state["ablation"] = ablation
+            run_state["ablation_metrics"] = None
+            self._save_c2c_run_state(run_spec, run_state)
+        elif reusable_state:
+            metrics = reusable_state.get("metrics")
+            proxy_screen = _normalize_c2c_proxy_screen_artifacts(
+                reusable_state.get("proxy_screen") or {},
+                full_baseline=adapter.baseline,
+                run_spec=run_spec,
+            )
+            reusable_state["proxy_screen"] = proxy_screen
+            preflight = reusable_state.get("preflight")
+            run_state.update(reusable_state)
+            run_state["patch_fingerprint"] = patch_fingerprint
+            run_state["code_snapshot"] = code_snapshot
+            logs.append(
+                {
+                    "candidate_id": candidate.get("id"),
+                    "event": "reuse_proxy_screen",
+                    "status": proxy_screen.get("status"),
+                    "reason": "existing run_state has complete proxy_screen for matching frozen hashes and patch fingerprint",
+                }
+            )
+            if proxy_screen.get("status") in {"resource_retry", "blocked"}:
+                command_status = "blocked"
+            elif proxy_screen.get("status") == "rejected":
+                command_status = "proxy_rejected"
+            elif proxy_screen.get("status") == "repairable_proxy_risk":
+                command_status = "proxy_repairable"
+            else:
+                command_status = str(reusable_state.get("command_status") or "partial")
+            self._save_c2c_run_state(run_spec, run_state)
+        else:
+            metrics = None
+            preflight = adapter.preflight(run_spec, gpu_selection)
+            run_state["preflight"] = preflight
+            run_state["recovery_actions"].extend(preflight.get("recovery_actions", []))
+            logs.append({"candidate_id": candidate.get("id"), "event": "preflight", "status": preflight.get("status"), "path": str(run_spec["preflight_path"])})
+            if preflight.get("status") == "blocked":
+                command_status = "blocked"
+                self._save_c2c_run_state(run_spec, run_state)
+            else:
+                log_path = self.context.project_root / "experiment" / "logs" / f"c2c_{run_spec['run_id']}_commands.json"
+                ensure_dir(log_path.parent)
+                retry_policy = {
+                    "max_attempts": int(self.context.config.get("experiment", {}).get("self_heal", {}).get("max_attempts", 1) or 1)
+                }
+                step_runs = []
+                proxy_enabled = bool(c2c_proxy_screen_config(self.context.config).get("enabled", False))
+                for step_idx, command in enumerate(run_spec["commands"]["preflight"]):
+                    result = self._run_authoritative_step(
+                        name=f"preflight_command_{step_idx}",
+                        command=command,
+                        working_dir=adapter.repo_root,
+                        retry_policy={"max_attempts": 1},
+                    )
+                    step_runs.append(result)
+                    run_state["attempts"].append(result)
+                    if result["status"] != "ok":
+                        command_status = "failed"
+                        break
+                if command_status != "failed" and proxy_enabled:
+                    baseline_proxy = self._ensure_c2c_proxy_baseline(
+                        adapter,
+                        run_spec,
+                        proxy_gpu_selection,
+                        retry_policy,
+                        baseline_repo_state=None,
+                    )
+                    baseline_attempts = baseline_proxy.get("attempts") or []
+                    step_runs.extend(baseline_attempts)
+                    run_state["attempts"].extend(baseline_attempts)
+                    if baseline_proxy.get("status") in {"failed", "blocked"}:
+                        run_state["proxy_baseline"] = baseline_proxy
+                        command_status = "blocked"
+                        run_state["proxy_screen"] = {
+                            "enabled": True,
+                            "status": "baseline_blocked",
+                            "reason": baseline_proxy.get("reason") or "proxy baseline could not be established",
+                            "baseline_status": baseline_proxy.get("status"),
+                            "baseline_failure": baseline_proxy.get("command_failure") or {},
+                            "baseline_attempt_count": len(baseline_proxy.get("attempts") or []),
+                            "patch_fingerprint": patch_fingerprint,
+                        }
+                        logs.append({"candidate_id": candidate.get("id"), "event": "proxy_baseline", "status": baseline_proxy.get("status"), "proxy_baseline": baseline_proxy})
+                    elif baseline_proxy.get("status") in {"fallback", "cached", "ok"}:
+                        run_state["proxy_baseline"] = baseline_proxy
+                        logs.append({"candidate_id": candidate.get("id"), "event": "proxy_baseline", "status": baseline_proxy.get("status"), "proxy_baseline": baseline_proxy})
+                    if command_status not in {"failed", "blocked"} and block_for_execution_repo_audit("proxy_baseline"):
+                        metrics = None
+                    if command_status == "blocked" and isinstance(run_state.get("proxy_screen"), dict):
+                        decision_report = self._write_c2c_proxy_decision_contracts(
+                            candidate=candidate,
+                            proxy_screen=run_state["proxy_screen"],
+                            run_state=run_state,
+                            run_spec=run_spec,
+                            config=adapter.config,
+                        )
+                        logs.append(
+                            {
+                                "candidate_id": candidate.get("id"),
+                                "event": "proxy_decision",
+                                "decision": decision_report.get("decision"),
+                                "route_hint": decision_report.get("route_hint"),
+                            }
+                        )
+                if command_status not in {"failed", "blocked"}:
+                    if proxy_enabled:
+                        proxy_screen = self._run_c2c_proxy_screen(
+                            adapter=adapter,
+                            candidate=candidate,
+                            run_spec=run_spec,
+                            patch_result=patch_result,
+                            has_executable_change=has_executable_change,
+                            baseline=adapter.baseline,
+                        )
+                    else:
+                        proxy_screen = {"enabled": False, "status": "skipped", "reason": "proxy_screen disabled"}
+                    proxy_screen["patch_fingerprint"] = patch_fingerprint
+                    run_state["proxy_screen"] = proxy_screen
+                    logs.append({"candidate_id": candidate.get("id"), "event": "proxy_screen", "status": proxy_screen.get("status"), "proxy_screen": proxy_screen})
+                    proxy_attempts = proxy_screen.get("attempts") or []
+                    step_runs.extend(proxy_attempts)
+                    run_state["attempts"].extend(proxy_attempts)
+                    if proxy_screen.get("status") in {"resource_retry", "blocked"}:
+                        command_status = "blocked"
+                    elif proxy_screen.get("status") == "failed":
+                        command_status = "failed"
+                    elif proxy_screen.get("status") == "rejected":
+                        command_status = "proxy_rejected"
+                    elif proxy_screen.get("status") == "repairable_proxy_risk":
+                        command_status = "proxy_repairable"
+                    if command_status not in {"failed", "proxy_rejected", "proxy_repairable", "blocked"} and block_for_execution_repo_audit("proxy_screen"):
+                        metrics = None
+                    if command_status in {"failed", "proxy_rejected", "proxy_repairable", "blocked"}:
+                        decision_report = self._write_c2c_proxy_decision_contracts(
+                            candidate=candidate,
+                            proxy_screen=run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else proxy_screen,
+                            run_state=run_state,
+                            run_spec=run_spec,
+                            config=adapter.config,
+                        )
+                        logs.append(
+                            {
+                                "candidate_id": candidate.get("id"),
+                                "event": "proxy_decision",
+                                "decision": decision_report.get("decision"),
+                                "route_hint": decision_report.get("route_hint"),
+                            }
+                        )
+                if proxy_enabled and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
+                    activation_smoke = self._run_c2c_proxy_activation_smoke(
+                        adapter=adapter,
+                        candidate=candidate,
+                            run_spec=run_spec,
+                            gpu_selection=proxy_gpu_selection,
+                        )
+                    run_state["activation_smoke"] = activation_smoke
+                    activation_attempts = activation_smoke.get("attempts") or []
+                    step_runs.extend(activation_attempts)
+                    run_state["attempts"].extend(activation_attempts)
+                    logs.append(
+                        {
+                            "candidate_id": candidate.get("id"),
+                            "event": "activation_smoke",
+                            "status": activation_smoke.get("status"),
+                            "activation_smoke": activation_smoke,
+                        }
+                    )
+                    if activation_smoke.get("status") == "failed" and activation_smoke.get("hard_gate", True):
+                        proxy_screen = run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else {}
+                        reason = activation_smoke.get("reason") or "proxy activation smoke failed"
+                        repair_hint = activation_smoke.get("repair_hint") or "repair S2.5 patch activation before full S3"
+                        trace = activation_smoke.get("mechanism_trace") if isinstance(activation_smoke.get("mechanism_trace"), dict) else {}
+                        if trace.get("status") == "wired":
+                            if _c2c_neutral_proxy_full_s3_allowed(
+                                proxy_screen,
+                                c2c_proxy_screen_config(self.context.config),
+                            ):
+                                reason = "metric-neutral activation smoke allowed for exploratory full S3 because proxy is near-neutral and mechanism wiring is present"
+                                comparison = activation_smoke.setdefault("comparison", {})
+                                if isinstance(comparison, dict):
+                                    comparison["mechanism_wired_metric_neutral"] = True
+                                activation_smoke.update(
+                                    {
+                                        "status": "passed",
+                                        "hard_gate_overridden": True,
+                                        "reason": reason,
+                                        "full_s3_allowed_reason": reason,
+                                    }
+                                )
+                                proxy_screen.update(
+                                    {
+                                        "activation_smoke": activation_smoke,
+                                        "activation_metric_neutral_allowed_for_full_s3": True,
+                                        "neutral_proxy_policy": _c2c_neutral_proxy_policy_summary(
+                                            proxy_screen,
+                                            c2c_proxy_screen_config(self.context.config),
+                                        ),
+                                    }
+                                )
+                                run_state["activation_smoke"] = activation_smoke
+                                run_state["proxy_screen"] = proxy_screen
+                                run_state["recovery_actions"].append(
+                                    {
+                                        "action": "allow_metric_neutral_activation_for_full_s3",
+                                        "status": "warning",
+                                        "reason": reason,
+                                        "neutral_proxy_policy": proxy_screen.get("neutral_proxy_policy"),
+                                    }
+                                )
+                            else:
+                                command_status = "proxy_repairable"
+                                reason = "mechanism is wired into eval path but produced metric-neutral proxy activation smoke"
+                                repair_hint = "repair proxy effect or dataset tradeoff; eval-path wiring is present, so do not spend this repair on ablation switch plumbing"
+                                proxy_screen.update(
+                                    {
+                                        "status": "repairable_proxy_risk",
+                                        "reason": reason,
+                                        "repair_hint": repair_hint,
+                                        "repair_route": "S2_plan",
+                                        "repair_mode": "effect_first_proxy_repair",
+                                        "activation_smoke": activation_smoke,
+                                        "proxy_effect_repair_contract": _proxy_effect_repair_contract(
+                                            reason=reason,
+                                            repair_hint=repair_hint,
+                                            evidence={"activation_smoke": activation_smoke, "mechanism_trace": trace},
+                                            patch_risk=(proxy_screen.get("patch_risk") or {}),
+                                            source="proxy_activation_smoke",
+                                        ),
+                                    }
+                                )
+                                run_state["proxy_screen"] = proxy_screen
+                        else:
+                            command_status = "proxy_repairable"
+                            proxy_screen.update(
+                                {
+                                    "status": "repairable_proxy_risk",
+                                    "reason": reason,
+                                    "repair_hint": repair_hint,
+                                    "repair_route": "S2_plan",
+                                    "repair_mode": "effect_first_proxy_repair",
+                                    "activation_smoke": activation_smoke,
+                                    "proxy_effect_repair_contract": _proxy_effect_repair_contract(
+                                        reason=reason,
+                                        repair_hint=repair_hint,
+                                        evidence={"activation_smoke": activation_smoke, "mechanism_trace": trace},
+                                        patch_risk=(proxy_screen.get("patch_risk") or {}),
+                                        source="proxy_activation_smoke",
+                                    ),
+                                }
+                            )
+                            run_state["proxy_screen"] = proxy_screen
+                    if command_status not in {"failed", "proxy_rejected", "proxy_repairable", "blocked"} and block_for_execution_repo_audit("activation_smoke"):
+                        metrics = None
+                if proxy_enabled and command_status not in {"failed", "blocked"} and isinstance(run_state.get("proxy_screen"), dict) and not run_state.get("proxy_decision_report"):
+                    proxy_screen = run_state["proxy_screen"]
+                    decision_report = self._write_c2c_proxy_decision_contracts(
+                        candidate=candidate,
+                        proxy_screen=proxy_screen,
+                        run_state=run_state,
+                        run_spec=run_spec,
+                        config=adapter.config,
+                    )
+                    logs.append(
+                        {
+                            "candidate_id": candidate.get("id"),
+                            "event": "proxy_decision",
+                            "decision": decision_report.get("decision"),
+                            "route_hint": decision_report.get("route_hint"),
+                            "failure_class": decision_report.get("failure_class"),
+                        }
+                    )
+                    if decision_report.get("decision") == "blocked":
+                        command_status = "blocked"
+                        proxy_screen.update(
+                            {
+                                "status": "blocked",
+                                "reason": decision_report.get("failure_class") or "proxy decision blocked full S3",
+                                "repair_route": decision_report.get("route_hint"),
+                            }
+                        )
+                    elif decision_report.get("decision") == "proxy_repairable":
+                        command_status = "proxy_repairable"
+                        proxy_screen.update(
+                            {
+                                "status": "repairable_proxy_risk",
+                                "reason": decision_report.get("failure_class") or "proxy decision requires repair before full S3",
+                                "repair_route": decision_report.get("route_hint"),
+                                "repair_mode": decision_report.get("failure_class") or "proxy_decision_repair",
+                            }
+                        )
+                    elif decision_report.get("decision") == "proxy_rejected":
+                        command_status = "proxy_rejected"
+                        proxy_screen.update(
+                            {
+                                "status": "rejected",
+                                "reason": decision_report.get("failure_class") or "proxy decision rejected full S3",
+                                "repair_route": decision_report.get("route_hint"),
+                            }
+                        )
+                    run_state["proxy_screen"] = proxy_screen
+                proxy_screen = run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else {}
+                proxy_mean = _finite_proxy_mean(proxy_screen)
+                if bootstrap_proxy_only and proxy_enabled and proxy_mean is not None and command_status not in {"failed", "blocked"}:
+                    original_command_status = command_status
+                    command_status = "bootstrap_proxy_complete"
+                    run_state["bootstrap"] = {
+                        "profile": "bootstrap",
+                        "proxy_only": True,
+                        "status": "proxy_reached",
+                        "original_command_status": original_command_status,
+                        "original_proxy_status": proxy_screen.get("status"),
+                    }
+                    logs.append(
+                        {
+                            "candidate_id": candidate.get("id"),
+                            "event": "bootstrap_proxy_complete",
+                            "proxy_mean": proxy_mean,
+                            "original_command_status": original_command_status,
+                        }
+                    )
+                if not bootstrap_proxy_only and proxy_enabled and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
+                    readiness = self._record_c2c_full_s3_readiness(
+                        candidate=candidate,
+                        run_spec=run_spec,
+                        patch_result=patch_result,
+                        run_state=run_state,
+                        baseline=adapter.baseline,
+                        min_delta=min_delta,
+                        max_regression=max_regression,
+                    )
+                    run_state["full_s3_readiness"] = readiness
+                    logs.append(
+                        {
+                            "candidate_id": candidate.get("id"),
+                            "event": "full_s3_readiness",
+                            "status": readiness.get("status"),
+                            "worth_full_train": (readiness.get("worth_full_train") or {}).get("decision"),
+                            "full_train_allowed": readiness.get("full_train_allowed"),
+                            "readiness_report_path": (readiness.get("artifact_paths") or {}).get("project_readiness_report"),
+                        }
+                    )
+                    if readiness.get("full_train_allowed") is not True:
+                        command_status = "proxy_repairable"
+                        proxy_screen = run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else {}
+                        reason = _c2c_full_s3_readiness_block_reason(readiness)
+                        repair_hint = "repair S2.5 patch or proxy/eval wiring until full_s3_readiness.full_train_allowed=true before full S3"
+                        proxy_screen.update(
+                            {
+                                "status": "repairable_proxy_risk",
+                                "reason": reason,
+                                "repair_hint": repair_hint,
+                                "repair_route": "S2_plan",
+                                "repair_mode": "full_s3_readiness_repair",
+                                "full_s3_readiness": readiness,
+                                "proxy_effect_repair_contract": _proxy_effect_repair_contract(
+                                    reason=reason,
+                                    repair_hint=repair_hint,
+                                    evidence={
+                                        "full_s3_readiness": readiness,
+                                        "eval_smoke": readiness.get("eval_smoke") if isinstance(readiness.get("eval_smoke"), dict) else {},
+                                        "activation_smoke": readiness.get("activation_smoke") if isinstance(readiness.get("activation_smoke"), dict) else {},
+                                    },
+                                    patch_risk=((readiness.get("static_risk") or {}) if isinstance(readiness.get("static_risk"), dict) else {}),
+                                    source="full_s3_readiness",
+                                ),
+                            }
+                        )
+                        run_state["proxy_screen"] = proxy_screen
+                        run_state["recovery_actions"].append(
+                            {
+                                "action": "block_full_train_until_readiness",
+                                "status": "blocked",
+                                "reason": reason,
+                                "readiness_report_path": (readiness.get("artifact_paths") or {}).get("project_readiness_report"),
+                            }
+                        )
+                        logs.append(
+                            {
+                                "candidate_id": candidate.get("id"),
+                                "event": "full_s3_readiness_blocked_train",
+                                "status": "proxy_repairable",
+                                "reason": reason,
+                            }
+                        )
+                    if command_status == "proxy_repairable":
+                        metrics = None
+                if command_status not in {"blocked"}:
+                    refresh_execution_repo_audit("final")
+                write_json(
+                    log_path,
+                    {
+                        "status": command_status,
+                        "runs": _compact_attempts(step_runs, stdout_chars=4000, stderr_chars=4000),
+                        "full_log_note": "stdout/stderr are stored as bounded tails to keep artifacts parseable",
+                    },
+                )
+                logs.append({"candidate_id": candidate.get("id"), "event": "commands", "log_path": str(log_path), "status": command_status})
+                self._save_c2c_run_state(run_spec, run_state)
+        final_proxy = run_state.get("proxy_screen") if isinstance(run_state.get("proxy_screen"), dict) else {}
+        final_proxy_mean = _finite_proxy_mean(final_proxy)
+        if bootstrap_proxy_only and final_proxy_mean is not None and command_status not in {"failed", "blocked"}:
+            existing_bootstrap = run_state.get("bootstrap") if isinstance(run_state.get("bootstrap"), dict) else {}
+            original_command_status = existing_bootstrap.get("original_command_status") or command_status
+            command_status = "bootstrap_proxy_complete"
+            run_state["command_status"] = command_status
+            run_state["bootstrap"] = {
+                "profile": "bootstrap",
+                "proxy_only": True,
+                "status": "proxy_reached",
+                "original_command_status": original_command_status,
+                "original_proxy_status": final_proxy.get("status"),
+            }
+            self._save_c2c_run_state(run_spec, run_state)
+        mean = (metrics or {}).get("mean")
+        ablation_result = run_state.get("ablation") or {"enabled": False, "status": "skipped", "reason": "not run"}
+        dataset_regressions = self._c2c_dataset_regressions(metrics, adapter.baseline)
+        worst_regression = max(dataset_regressions.values()) if dataset_regressions else 0.0
+        ablation_comparison = (ablation_result.get("comparison") or {}) if isinstance(ablation_result, dict) else {}
+        require_ablation_support = bool(
+            self.context.config.get("c2c", {}).get("small_loop", {}).get("require_ablation_support", False)
+        )
+        mechanism_supported = bool(ablation_comparison.get("mechanism_supported"))
+        decision = (
+            "candidate_win"
+            if mean is not None and float(mean) >= baseline_mean + min_delta and worst_regression <= max_regression
+            and (not require_ablation_support or mechanism_supported)
+            else "not_viable"
+        )
+        if patch_result["status"] == "rejected":
+            decision = "patch_rejected"
+        elif preflight and preflight.get("status") == "blocked":
+            decision = "blocked"
+        elif command_status == "blocked":
+            decision = "blocked"
+        elif command_status == "proxy_rejected":
+            decision = "proxy_rejected"
+        elif command_status == "proxy_repairable":
+            decision = "proxy_repairable"
+        elif command_status == "bootstrap_proxy_complete":
+            decision = "bootstrap_proxy_complete"
+        elif metrics is None:
+            decision = "failed_no_metrics" if command_status == "failed" else "partial"
+        result = {
+            "id": candidate.get("id"),
+            "title": candidate.get("title"),
+            "hypothesis": candidate.get("hypothesis"),
+            "mechanism_type": candidate.get("mechanism_type"),
+            "run_id": run_spec["run_id"],
+            "run_root": str(run_spec["run_root"]),
+            "patch_result": _compact_patch_result_for_payload(patch_result),
+            "code_snapshot": code_snapshot,
+            "execution_repo": execution_repo,
+            "execution_repo_audit": _compact_execution_repo_audit(run_state.get("execution_repo_audit")),
+            "commands": _compact_command_plan(run_spec.get("commands") or {}),
+            "command_status": command_status,
+            "preflight": preflight,
+            "proxy_screen": _compact_proxy_screen(run_state.get("proxy_screen")),
+            "proxy_decision_report": _compact_proxy_decision_report(run_state.get("proxy_decision_report")),
+            "activation_smoke": _compact_activation_smoke(run_state.get("activation_smoke")),
+            "full_s3_readiness": _compact_full_s3_readiness(run_state.get("full_s3_readiness")),
+            "run_state_path": str(run_spec["run_state_path"]),
+            "preflight_path": str(run_spec["preflight_path"]),
+            "config_overrides": run_spec.get("config_overrides", {}),
+            "runtime_localization": run_spec.get("runtime_localization", {}),
+            "has_executable_change": has_executable_change,
+            "patch_fingerprint": patch_fingerprint,
+            "frozen_hashes": run_spec.get("frozen_hashes", {}),
+            "metrics": metrics,
+            "ablation": ablation_result,
+            "delta_vs_baseline": round(float(mean) - baseline_mean, 4) if mean is not None else None,
+            "dataset_regressions": dataset_regressions,
+            "worst_dataset_regression": worst_regression,
+            "acceptance_rule": {
+                "min_delta_to_pass": min_delta,
+                "max_dataset_regression": max_regression,
+                "baseline_mean": baseline_mean,
+                "require_ablation_support": require_ablation_support,
+            },
+            "mechanism_supported": mechanism_supported,
+            "matched_control_metrics": (
+                {"mean": adapter.baseline.get("mean"), "datasets": deepcopy(adapter.baseline.get("datasets") or {})}
+                if simulate and metrics is not None
+                else deepcopy(run_state.get("matched_control_metrics"))
+            ),
+            "coverage_metrics": (
+                {"mean": 1.0, "datasets": {dataset_id: 1.0 for dataset_id in (metrics or {}).get("datasets", {})}}
+                if simulate and metrics is not None
+                else deepcopy(run_state.get("coverage_metrics"))
+            ),
+            "decision": decision,
+            "command_logs": _compact_event_logs(logs),
+        }
+        result["failure_attribution"] = self._c2c_failure_attribution(result, adapter.baseline)
+        return result
+
+    def _run_single_c2c_full_candidate(
+        self,
+        *,
+        adapter: C2CAdapter,
+        candidate: dict[str, Any],
+        index: int,
+        simulate: bool,
+        baseline_mean: float,
+        min_delta: float,
+        max_regression: float,
+        gpu_selection: Any,
+        proxy_gpu_selection: Any,
+    ) -> dict[str, Any]:
+        bootstrap_proxy_only = bootstrap_proxy_only_enabled(self.context.config)
+        patch = self._load_frozen_c2c_patch(candidate)
+        original_repo_root = adapter.repo_root
+        execution_repo = self._prepare_c2c_execution_repo(candidate, adapter, patch)
+        if execution_repo.get("status") == "ok":
+            adapter = C2CAdapter(
+                self.context.project_root,
+                _config_with_c2c_snapshot_path(self.context.config, execution_repo["repo_root"]),
+            )
+        patch_result = self._apply_frozen_c2c_patch(candidate, adapter, patch, execution_repo=execution_repo)
+        code_snapshot = (
+            archive_patched_code_snapshot(self.context.artifacts, adapter, candidate, patch_result)
+            if patch_result.get("status") in {"applied", "snapshot_applied"}
+            else {"status": "skipped"}
+        )
+        run_spec = adapter.materialize_candidate_configs(candidate, gpu_selection, proxy_gpu_selection=proxy_gpu_selection)
         output_pollution_before = _c2c_original_output_state(original_repo_root, run_spec)
         execution_repo_audit = _c2c_execution_repo_path_audit(
             original_repo_root=original_repo_root,
@@ -2152,7 +3023,7 @@ class ExperimentAgent:
             run_state["recovery_actions"].append({"action": "block_noop_candidate", "status": "blocked", "reason": reason})
             logs.append({"candidate_id": candidate.get("id"), "event": "blocked", "reason": reason})
             self._save_c2c_run_state(run_spec, run_state)
-        elif not simulate and bool(c2c_proxy_screen_config(self.context.config).get("enabled", False)) and not getattr(proxy_gpu_selection, "selected_ids", []):
+        elif not simulate and False and not getattr(proxy_gpu_selection, "selected_ids", []):
             metrics = None
             command_status = "blocked"
             reason = "cheap proxy resource wait timed out without an available GPU; resume after GPU resources are available"
@@ -2246,9 +3117,9 @@ class ExperimentAgent:
                     "max_attempts": int(self.context.config.get("experiment", {}).get("self_heal", {}).get("max_attempts", 1) or 1)
                 }
                 step_runs = []
-                proxy_enabled = bool(c2c_proxy_screen_config(self.context.config).get("enabled", False))
+                proxy_enabled = False
                 for step_idx, command in enumerate(run_spec["commands"]["preflight"]):
-                    result = self.runner.run_step(
+                    result = self._run_authoritative_step(
                         name=f"preflight_command_{step_idx}",
                         command=command,
                         working_dir=adapter.repo_root,
@@ -2624,7 +3495,7 @@ class ExperimentAgent:
                             ],
                         )
                         run_state["full_s3_decision"] = full_s3_decision
-                    train_result = self.runner.run_step(
+                    train_result = self._run_authoritative_step(
                         name="train",
                         command=run_spec["commands"]["train"],
                         working_dir=adapter.repo_root,
@@ -2647,7 +3518,7 @@ class ExperimentAgent:
                             )
                             recovery_gpu_ids = list(getattr(recovery_selection, "selected_ids", []) or []) or [gpu_selection.selected_ids[0]]
                             recovery_command = adapter._candidate_commands(run_spec["train_config"], run_spec["eval_configs"], recovery_gpu_ids)["train"]
-                            recovery_result = self.runner.run_step(
+                            recovery_result = self._run_authoritative_step(
                                 name="train_recovery_reduced_concurrency",
                                 command=recovery_command,
                                 working_dir=adapter.repo_root,
@@ -2682,7 +3553,7 @@ class ExperimentAgent:
                                 "config_changes": memory_safe.get("config_changes") or {},
                             }
                             if memory_safe.get("status") == "materialized":
-                                recovery_result = self.runner.run_step(
+                                recovery_result = self._run_authoritative_step(
                                     name="train_recovery_memory_safe",
                                     command=str(memory_safe["command"]),
                                     working_dir=adapter.repo_root,
@@ -2709,7 +3580,7 @@ class ExperimentAgent:
                         eval_items = list(run_spec.get("eval_configs", {}).items())
                         for eval_idx, command in enumerate(eval_commands):
                             dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
-                            result = self.runner.run_step(
+                            result = self._run_authoritative_step(
                                 name=f"eval_{dataset}",
                                 command=command,
                                 working_dir=adapter.repo_root,
@@ -3115,7 +3986,7 @@ class ExperimentAgent:
         rendered_commands = self._c2c_proxy_commands(adapter, run_spec, proxy_cfg)
         if rendered_commands:
             for idx, command in enumerate(rendered_commands):
-                result = self.runner.run_step(
+                result = self._run_authoritative_step(
                     name=f"proxy_command_{idx}",
                     command=command,
                     working_dir=adapter.repo_root,
@@ -3225,7 +4096,7 @@ class ExperimentAgent:
         command_failed = False
         for eval_idx, command in enumerate((activation_spec.get("commands") or {}).get("eval") or []):
             dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
-            result = self.runner.run_step(
+            result = self._run_authoritative_step(
                 name=f"activation_smoke_eval_{dataset}",
                 command=command,
                 working_dir=adapter.repo_root,
@@ -3277,7 +4148,7 @@ class ExperimentAgent:
         status = "ok"
         for eval_idx, command in enumerate((ablation_spec.get("commands") or {}).get("eval") or []):
             dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
-            result = self.runner.run_step(
+            result = self._run_authoritative_step(
                 name=f"ablation_eval_{dataset}",
                 command=command,
                 working_dir=adapter.repo_root,
@@ -3456,7 +4327,7 @@ class ExperimentAgent:
             baseline_spec = adapter.materialize_proxy_baseline_configs(gpu_selection)
             attempts: list[dict[str, Any]] = []
             for step_idx, command in enumerate(baseline_spec["commands"]["preflight"]):
-                result = self.runner.run_step(
+                result = self._run_authoritative_step(
                     name=f"proxy_baseline_preflight_{step_idx}",
                     command=command,
                     working_dir=adapter.repo_root,
@@ -3471,7 +4342,7 @@ class ExperimentAgent:
                         reason=f"proxy baseline preflight {step_idx} failed",
                         failed_step=result,
                     )
-            train_result = self.runner.run_step(
+            train_result = self._run_authoritative_step(
                 name="proxy_baseline_train",
                 command=baseline_spec["commands"]["train"],
                 working_dir=adapter.repo_root,
@@ -3489,7 +4360,7 @@ class ExperimentAgent:
             eval_items = list(baseline_spec.get("eval_configs", {}).items())
             for eval_idx, command in enumerate(baseline_spec["commands"]["eval"]):
                 dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
-                result = self.runner.run_step(
+                result = self._run_authoritative_step(
                     name=f"proxy_baseline_eval_{dataset}",
                     command=command,
                     working_dir=adapter.repo_root,
@@ -6722,7 +7593,7 @@ def _failure_evidence_from_result(
     if evidence_kind == "resource_probe":
         try:
             probe_payload = json.loads(raw_bytes.decode("utf-8"))
-            validate_contract(probe_payload, "resource_probe_v2.schema.json")
+            validate_contract(probe_payload, "resource_probe_v3.schema.json")
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return None
         for key in [
@@ -6763,7 +7634,7 @@ def _failure_evidence_from_result(
     if not isinstance(phase_execution, dict):
         return None
     evidence = {
-        "schema_version": "auto_research_failure_evidence_v3",
+        "schema_version": "auto_research_failure_evidence_v4",
         "evidence_kind": "failure_evidence",
         "evidence_id": f"failure-evidence-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}",
         "attempt_id": attempt["attempt_id"],
@@ -6776,7 +7647,9 @@ def _failure_evidence_from_result(
         "protocol_hash": attempt["protocol_hash"],
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
-        "cross_references": {},
+        "cross_references": {
+            "resource_probe_hash" if failure_class in {"resource_pause", "oom_retry"} else "command_result_evidence_hash": log_hash
+        },
         "lifecycle_generation": attempt["lifecycle_generation"],
         "implementation_hash": attempt["implementation_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
@@ -6795,6 +7668,27 @@ def _failure_evidence_from_result(
     if not evidence["reason"]:
         return None
     if not evidence["command_status"]:
+        return None
+    evidence_bytes = encode_canonical_evidence(evidence)
+    evidence_hash = hashlib.sha256(evidence_bytes).hexdigest()
+    evidence_relative_path = content_addressed_evidence_path(
+        attempt_id=attempt["attempt_id"],
+        producer_run_id=producer_run_id,
+        evidence_kind="failure_evidence",
+        content_hash=evidence_hash,
+    )
+    try:
+        EvidenceStore(project_root).write_entry(
+            {
+                "relative_path": evidence_relative_path,
+                "producer_run_id": producer_run_id,
+                "kind": "failure_evidence",
+                "content_hash": evidence_hash,
+            },
+            attempt,
+            evidence_bytes,
+        )
+    except ValueError:
         return None
     return evidence
 
@@ -6933,7 +7827,7 @@ def _identity_evidence_payload(
         raise S3ValidationError(f"{phase} evidence requires an authoritative PhaseExecutionManifest")
     evidence_id = f"evidence:{evidence_kind}:{producer_run_id}"
     return {
-        "schema_version": EVIDENCE_SCHEMA_VERSIONS[evidence_kind],
+        "schema_version": CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS[evidence_kind],
         "evidence_kind": evidence_kind,
         "evidence_id": evidence_id,
         "attempt_id": attempt["attempt_id"],
@@ -7026,8 +7920,16 @@ def _c2c_strict_evidence_inventory(
     metric_id = trial_spec["primary_metric_id"]
     phase_contract = next(item for item in trial_spec["phase_contracts"] if item["phase"] == phase)
     dataset_ids = list(phase_contract["datasets"])
-    candidate_datasets = ((comparison_candidate.get("metrics") or {}).get("datasets") or {})
-    baseline_datasets = baseline.get("datasets") if isinstance(baseline.get("datasets"), dict) else {}
+    if phase == "proxy":
+        proxy_screen = comparison_candidate.get("proxy_screen") if isinstance(comparison_candidate.get("proxy_screen"), dict) else {}
+        candidate_datasets = ((proxy_screen.get("metrics") or {}).get("datasets") or {})
+        proxy_baseline = proxy_screen.get("baseline_metrics")
+        if not isinstance(proxy_baseline, dict):
+            proxy_baseline = proxy_screen.get("proxy_baseline")
+        baseline_datasets = ((proxy_baseline or {}).get("datasets") or {}) if isinstance(proxy_baseline, dict) else {}
+    else:
+        candidate_datasets = ((comparison_candidate.get("metrics") or {}).get("datasets") or {})
+        baseline_datasets = baseline.get("datasets") if isinstance(baseline.get("datasets"), dict) else {}
     ablation_datasets = ((((comparison_candidate.get("ablation") or {}).get("metrics") or {}).get("datasets")) or {})
     matched_datasets = ((comparison_candidate.get("matched_control_metrics") or {}).get("datasets") or {})
     coverage_datasets = ((comparison_candidate.get("coverage_metrics") or {}).get("datasets") or {})
@@ -7072,11 +7974,6 @@ def _c2c_strict_evidence_inventory(
         payloads["proxy_baseline_fingerprint"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_baseline_fingerprint", phase="proxy", fields={"baseline_hash": baseline_hash, "dataset_ids": dataset_ids, "seeds": seeds, "fingerprint_inputs": fingerprint_inputs})
         baseline_fingerprint_hash = hashlib.sha256(encode_canonical_evidence(payloads["proxy_baseline_fingerprint"])).hexdigest()
         payloads["proxy_cache_report"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_cache_report", phase="proxy", fields={"cross_references": {"proxy_baseline_fingerprint_hash": baseline_fingerprint_hash}, "cache_key": canonical_hash({"attempt": attempt["attempt_id"], "phase_execution": phase_execution["phase_execution_id"]}), "baseline_hash": baseline_hash, "cache_entry_hash": baseline_hash, "status": "created"})
-        policy_body = {"required_phases": trial_spec["protocol"]["required_phases"], "proxy_terminal_allowed": trial_spec["protocol"]["proxy_terminal_allowed"], "decision_threshold": 0.0}
-        payloads["effective_proxy_policy"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="effective_proxy_policy", phase="proxy", fields={"policy_hash": canonical_hash(policy_body), **policy_body})
-        effective_hash = hashlib.sha256(encode_canonical_evidence(payloads["effective_proxy_policy"])).hexdigest()
-        calibration_body = {"cross_references": {"proxy_baseline_fingerprint_hash": baseline_fingerprint_hash, "effective_proxy_policy_hash": effective_hash}, "status": "calibrated", "calibration_metric": metric_id, "calibration_value": 1.0}
-        payloads["proxy_calibration_policy"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_calibration_policy", phase="proxy", fields={"calibration_hash": canonical_hash(calibration_body), **calibration_body})
         activation_hash = hashlib.sha256(encode_canonical_evidence(payloads["activation_evidence"])).hexdigest()
         proxy_results_hash = hashlib.sha256(encode_canonical_evidence(payloads["proxy_results"])).hexdigest()
         proxy_references = {"activation_evidence_hash": activation_hash, "proxy_results_hash": proxy_results_hash}
@@ -7126,29 +8023,43 @@ def _generic_external_evidence_inventory(
         manifest = json.loads(raw.decode("utf-8"))
     except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise S3ValidationError(f"external phase manifest rejected: {exc}") from exc
-    validate_contract(manifest, "phase_execution_manifest_v1.schema.json")
     phase = "proxy" if attempt["state"] == "PROXY_RUNNING" else "full" if attempt["state"] == "FULL_RUNNING" else None
     phase_execution = (attempt.get("phase_executions") or {}).get(phase) if phase else None
     if not isinstance(phase_execution, dict):
         raise S3ValidationError("external phase manifest requires an authoritative running phase")
-    expected = {
-        "attempt_id": attempt["attempt_id"],
-        "direction_semantic_hash": attempt["direction_semantic_hash"],
-        "direction_spec_hash": attempt["direction_spec_hash"],
-        "variant_semantic_hash": attempt["variant_semantic_hash"],
-        "variant_spec_hash": attempt["variant_spec_hash"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
-        "phase": phase,
-        "phase_execution_id": phase_execution["phase_execution_id"],
-        "phase_start_event_id": phase_execution["phase_start_event_id"],
-        "producer_run_id": phase_execution["producer_run_id"],
-    }
-    for key, value in expected.items():
-        if manifest.get(key) != value:
-            raise S3ValidationError(f"external phase manifest {key} mismatch")
+    frozen_trial_spec = attempt.get("frozen_trial_spec")
+    if not isinstance(frozen_trial_spec, dict):
+        raise S3ValidationError("external phase manifest requires the frozen TrialSpec")
+    required_wrapper_fields = {"sample_contract_ref", "evaluator_contract_ref", "artifacts"}
+    if set(manifest) != set(phase_execution) | required_wrapper_fields:
+        raise S3ValidationError("external phase manifest fields do not match PhaseExecutionManifest v2 wrapper")
+    authoritative_manifest = {key: manifest[key] for key in phase_execution}
+    try:
+        validate_contract(authoritative_manifest, "phase_execution_manifest_v2.schema.json")
+    except ValueError as exc:
+        raise S3ValidationError(f"external PhaseExecutionManifest v2 rejected: {exc}") from exc
+    if authoritative_manifest != phase_execution:
+        raise S3ValidationError("external PhaseExecutionManifest v2 differs from Ledger phase authorization")
+    sample_contract_ref = frozen_trial_spec.get("sample_manifest_ref")
+    evaluator_contract_ref = (frozen_trial_spec.get("execution_contract") or {}).get("evaluator_manifest_ref")
+    if manifest["sample_contract_ref"] != sample_contract_ref:
+        raise S3ValidationError("external phase manifest sample ContractRef mismatch")
+    if manifest["evaluator_contract_ref"] != evaluator_contract_ref:
+        raise S3ValidationError("external phase manifest evaluator ContractRef mismatch")
+    contract_store = ContractStore(project_root)
+    try:
+        contract_store.read_contract(
+            sample_contract_ref,
+            contract_kind="sample_manifest",
+            schema_file="sample_manifest_v2.schema.json",
+        )
+        contract_store.read_contract(
+            evaluator_contract_ref,
+            contract_kind="evaluator_manifest",
+            schema_file="evaluator_manifest_v2.schema.json",
+        )
+    except (TypeError, ValueError, KeyError) as exc:
+        raise S3ValidationError(f"external phase manifest ContractRef rejected: {exc}") from exc
     artifacts = manifest.get("artifacts")
     if not isinstance(artifacts, list) or not artifacts:
         raise S3ValidationError("external phase manifest must declare produced artifacts")
@@ -7161,6 +8072,8 @@ def _generic_external_evidence_inventory(
             raise S3ValidationError(f"duplicate external evidence kind: {artifact['kind']}")
         seen.add(artifact["kind"])
         inventory.append({key: str(artifact[key]) for key in ("kind", "source_path", "producer_run_id")})
+    if seen != set(phase_execution["expected_evidence_kinds"]):
+        raise S3ValidationError("external artifact kinds do not match authorized expected_evidence_kinds")
     return inventory
 
 
@@ -7239,14 +8152,3 @@ def _trial_execution_view(trial_spec: dict[str, Any]) -> dict[str, Any]:
             criteria["matched_coverage_ablation_required"] = True
     view["acceptance_criteria"] = criteria
     return view
-
-
-def _event_bound_evidence_manifest(
-    *,
-    project_root: Path,
-    trial_spec: dict[str, Any],
-    attempt: dict[str, Any],
-    raw_artifacts: dict[str, str],
-) -> dict[str, Any]:
-    del project_root, trial_spec, attempt, raw_artifacts
-    raise S3ValidationError("fixed-path evidence collection was removed; execution must submit an explicit staged inventory")

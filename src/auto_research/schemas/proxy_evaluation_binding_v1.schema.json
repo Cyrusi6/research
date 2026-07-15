@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "binding_hash", "policy_hash", "attempt_id", "direction_semantic_hash", "direction_spec_hash", "variant_semantic_hash", "variant_spec_hash", "trial_spec_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "phase_execution_id", "phase_start_event_id", "producer_run_id", "command_plan_hash", "phase_contract_hash", "sample_contract_ref", "evaluator_contract_ref", "provenance_mode", "expected_evidence_kinds"],
+  "properties": {
+    "schema_version": {"const": "auto_research_proxy_evaluation_binding_v1"},
+    "binding_hash": {"$ref": "#/$defs/hash"}, "policy_hash": {"$ref": "#/$defs/hash"},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "direction_semantic_hash": {"$ref": "#/$defs/hash"}, "direction_spec_hash": {"$ref": "#/$defs/hash"},
+    "variant_semantic_hash": {"$ref": "#/$defs/hash"}, "variant_spec_hash": {"$ref": "#/$defs/hash"},
+    "trial_spec_hash": {"$ref": "#/$defs/hash"}, "implementation_hash": {"$ref": "#/$defs/hash"}, "attempt_input_hash": {"$ref": "#/$defs/hash"},
+    "lifecycle_generation": {"type": "integer", "minimum": 0},
+    "phase_execution_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "phase_start_event_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"},
+    "producer_run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "command_plan_hash": {"$ref": "#/$defs/hash"}, "phase_contract_hash": {"$ref": "#/$defs/hash"},
+    "sample_contract_ref": {"type": "object", "minProperties": 1}, "evaluator_contract_ref": {"type": "object", "minProperties": 1},
+    "provenance_mode": {"enum": ["synthetic", "local-external", "production"]},
+    "expected_evidence_kinds": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+}

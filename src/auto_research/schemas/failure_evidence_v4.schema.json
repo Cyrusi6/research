@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "evidence_kind",
+    "evidence_id",
+    "attempt_id",
+    "producer_run_id",
+    "direction_semantic_hash",
+    "direction_spec_hash",
+    "variant_semantic_hash",
+    "variant_spec_hash",
+    "trial_spec_hash",
+    "protocol_hash",
+    "sample_manifest_hash",
+    "evaluator_hash",
+    "cross_references",
+    "lifecycle_generation",
+    "implementation_hash",
+    "attempt_input_hash",
+    "phase",
+    "phase_execution_id",
+    "phase_start_event_id",
+    "source_state",
+    "source_phase",
+    "failure_class",
+    "command_status",
+    "exit_code",
+    "reason",
+    "observed_at",
+    "log_hash"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "auto_research_failure_evidence_v4"
+    },
+    "evidence_kind": {
+      "const": "failure_evidence"
+    },
+    "evidence_id": {
+      "type": "string",
+      "minLength": 8
+    },
+    "attempt_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "producer_run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "direction_semantic_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "direction_spec_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "variant_semantic_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "variant_spec_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "trial_spec_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "protocol_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "sample_manifest_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "evaluator_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "cross_references": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command_result_evidence_hash"],
+          "properties": {
+            "command_result_evidence_hash": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["resource_probe_hash"],
+          "properties": {
+            "resource_probe_hash": {
+              "$ref": "#/$defs/sha256"
+            }
+          }
+        }
+      ]
+    },
+    "lifecycle_generation": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "implementation_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "attempt_input_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "phase": {
+      "enum": ["implementation", "activation", "proxy", "full"]
+    },
+    "phase_execution_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "phase_start_event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
+    },
+    "source_state": {
+      "enum": ["IMPLEMENTING", "READY", "PROXY_RUNNING", "PROXY_COMPLETED", "FULL_RUNNING"]
+    },
+    "source_phase": {
+      "enum": ["implementation", "activation", "proxy", "full"]
+    },
+    "failure_class": {
+      "enum": [
+        "implementation_failure",
+        "activation_failure",
+        "resource_pause",
+        "oom_retry",
+        "integrity_failure",
+        "safety_failure"
+      ]
+    },
+    "command_status": {
+      "enum": ["failed", "resource_paused", "integrity_blocked"]
+    },
+    "exit_code": {
+      "type": "integer"
+    },
+    "reason": {
+      "type": "string",
+      "minLength": 1
+    },
+    "observed_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "log_hash": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "failure_class": {
+            "enum": ["resource_pause", "oom_retry"]
+          }
+        },
+        "required": ["failure_class"]
+      },
+      "then": {
+        "properties": {
+          "cross_references": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["resource_probe_hash"],
+            "properties": {
+              "resource_probe_hash": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          },
+          "command_status": {
+            "const": "resource_paused"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "cross_references": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["command_result_evidence_hash"],
+            "properties": {
+              "command_result_evidence_hash": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    }
+  }
+}

@@ -16,7 +16,9 @@ from auto_research.domain_contracts import (
     validate_trial_spec,
 )
 from auto_research.evidence import (
+    CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS,
     EVIDENCE_SCHEMA_VERSIONS,
+    TRANSACTION_EVIDENCE_SCHEMA_VERSIONS,
     content_addressed_evidence_path,
     encode_canonical_evidence,
     evidence_content_hash,
@@ -84,9 +86,18 @@ def _trial_spec_legacy(*, objective: str = "maximize", datasets: tuple[str, ...]
 
 
 
-def _trial_spec(*, objective: str = "maximize", datasets: tuple[str, ...] = ("d1",), seeds: tuple[int, ...] = (7,)) -> dict:
-    from support.authoritative_evidence import upgrade_trial_spec_v4
-    return upgrade_trial_spec_v4(_trial_spec_legacy(objective=objective, datasets=datasets, seeds=seeds))
+def _trial_spec(
+    *,
+    objective: str = "maximize",
+    datasets: tuple[str, ...] = ("d1",),
+    seeds: tuple[int, ...] = (7,),
+    project_root: Path | None = None,
+) -> dict:
+    from support.authoritative_evidence import build_trial_spec_v5
+    return build_trial_spec_v5(
+        _trial_spec_legacy(objective=objective, datasets=datasets, seeds=seeds),
+        project_root=project_root,
+    )
 
 def _attempt(spec: dict) -> dict:
     attempt = {
@@ -215,7 +226,7 @@ def test_trial_spec_provenance_mutations_are_rejected_after_valid_baseline(mutat
     validate_trial_spec(spec)
     changed = deepcopy(spec)
     if mutation == "sample_id":
-        changed["sample_manifest"]["datasets"][0]["ordered_sample_ids"][0] = "f" * 64
+        changed["sample_manifest"]["datasets"][0]["ordered_sample_ids"][1] = changed["sample_manifest"]["datasets"][0]["ordered_sample_ids"][0]
     elif mutation == "sample_artifact_hash":
         changed["sample_manifest"]["artifact_hash"] = "f" * 64
     elif mutation == "evaluator_source":
@@ -227,7 +238,7 @@ def test_trial_spec_provenance_mutations_are_rejected_after_valid_baseline(mutat
 
 
 def test_all_evidence_kind_schemas_are_closed_and_versioned() -> None:
-    for kind, version in EVIDENCE_SCHEMA_VERSIONS.items():
+    for kind, version in CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS.items():
         schema_name = f"{kind}_v{version.rsplit('_v', 1)[1]}.schema.json"
         schema = json.loads((__import__("pathlib").Path(__file__).parents[1] / "src/auto_research/schemas" / schema_name).read_text())
         assert schema["additionalProperties"] is False
@@ -252,13 +263,8 @@ def _nonquantitative_payload(kind: str) -> dict:
         "activation_evidence": {"probe_id": "forward-probe", "status": "passed", "command_status": "completed", "exit_code": 0, "implementation_surface_ids": ["src/model.py"]},
         "proxy_baseline_fingerprint": {"baseline_hash": "9" * 64, "dataset_ids": ["d1"], "seeds": [7], "fingerprint_inputs": {"sample_manifest_hash": "7" * 64, "evaluator_hash": "8" * 64, "protocol_hash": "6" * 64, "phase_execution_id": "phase-proxy-0001"}},
         "proxy_cache_report": {"cross_references": {"proxy_baseline_fingerprint_hash": "a" * 64}, "cache_key": "b" * 64, "baseline_hash": "9" * 64, "cache_entry_hash": "c" * 64, "status": "hit"},
-        "effective_proxy_policy": {"policy_hash": "d" * 64, "required_phases": ["proxy", "full"], "proxy_terminal_allowed": False, "decision_threshold": 0.1},
-        "proxy_calibration_policy": {"cross_references": {"proxy_baseline_fingerprint_hash": "a" * 64, "effective_proxy_policy_hash": "d" * 64}, "calibration_hash": "e" * 64, "status": "calibrated", "calibration_metric": "score", "calibration_value": 0.9},
         "full_s3_readiness": {"cross_references": {"activation_evidence_hash": "a" * 64, "proxy_results_hash": "b" * 64}, "ready": True, "checks": [{"check_id": "activation", "status": "PASS"}]},
         "bootstrap_completion": {"cross_references": {"activation_evidence_hash": "a" * 64, "proxy_results_hash": "b" * 64}, "completion_status": "verified"},
-        "failure_evidence": {"lifecycle_generation": 0, "implementation_hash": "9" * 64, "attempt_input_hash": "a" * 64, "phase": "full", "source_state": "FULL_RUNNING", "source_phase": "full", "failure_class": "resource_pause", "command_status": "resource_paused", "exit_code": 137, "reason": "oom", "observed_at": "2026-07-14T00:00:00Z", "log_hash": "b" * 64},
-        "resource_probe": {"resource_type": "gpu_memory", "resource_id": "gpu:0", "required_capacity": 10, "observed_capacity": 12, "unit": "bytes", "probe_status": "available", "observed_at": "2026-07-14T00:00:00Z"},
-        "resume_evidence": {"cross_references": {"resource_probe_hash": "a" * 64}, "lifecycle_generation": 1, "implementation_hash": "9" * 64, "attempt_input_hash": "a" * 64, "phase": "resume", "pause_event_id": "event:pause:1", "pause_evidence_hash": "b" * 64, "resource_type": "gpu_memory", "resource_id": "gpu:0", "required_capacity": 10, "observed_capacity": 12, "unit": "bytes", "probe_status": "available", "observed_at": "2026-07-14T00:00:00Z"},
     }
     base.update(extras[kind])
     return base
@@ -277,6 +283,36 @@ def test_nonquantitative_evidence_schema_baseline_then_version_and_extra_propert
     extra["forged"] = True
     with pytest.raises(ValueError):
         validate_contract(extra, schema_name)
+
+
+def test_transaction_evidence_is_not_completion_manifest_evidence() -> None:
+    assert TRANSACTION_EVIDENCE_SCHEMA_VERSIONS == {
+        "failure_evidence": "auto_research_failure_evidence_v4",
+        "resource_probe": "auto_research_resource_probe_evidence_v3",
+        "resume_evidence": "auto_research_resume_evidence_v4",
+    }
+    assert set(TRANSACTION_EVIDENCE_SCHEMA_VERSIONS).isdisjoint(EVIDENCE_SCHEMA_VERSIONS)
+    assert "effective_proxy_policy" not in CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS
+    assert "proxy_calibration_policy" not in CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        "effective_proxy_policy",
+        "proxy_calibration_policy",
+        "failure_evidence",
+        "resource_probe",
+        "resume_evidence",
+    ],
+)
+def test_completion_manifest_rejects_noncompletion_evidence_kinds(kind: str) -> None:
+    spec = _trial_spec()
+    manifest, _ = _main_inventory(spec, {("d1", 7): (0.0, 1.0)})
+    forged = deepcopy(manifest)
+    forged["entries"][0]["kind"] = kind
+    with pytest.raises(ValueError):
+        validate_contract(forged, "evidence_manifest_v3.schema.json")
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

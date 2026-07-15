@@ -2904,4 +2904,66 @@ S3 now follows `execute -> explicit inventory -> immutable ingest -> shared prec
 
 `proxy_full` is now a two-transaction state machine: proxy start, current-generation immutable evidence commit, reducer-derived proxy route, then (only for `RUN_FULL`) full start and finalization. Event v5 and AttemptRecord v5 bind phase execution identity to implementation/input generation; TrialSpec v4 registers phase-specific datasets, roles, seeds, metrics, evidence requirements, and terminal semantics. Generic external commands and the C2C adapter return explicit inventories rather than directory scans, while bootstrap produces only proxy-terminal evidence. EvidenceStore is the common secure reader/writer for content-addressed Attempt artifacts. Native Unified S1 producer/Core and real GPU training are not part of this milestone.
 
-Validation completed with `552 passed, 2 skipped` in each of the normal, proxy-cleared, and empty-HOME/no-Codex environments. The non-simulated Generic external-manifest path and C2C strict adapter use production evidence ingestion; five-variant regression loops are labeled synthetic and are not presented as real GPU or scientific results.
+This section records the M1.1.4 migration checkpoint. Its Event v5, AttemptRecord v5, TrialSpec v4, and phase-manifest contracts are superseded by the M1.1.5-Final authority below; current acceptance must not be inferred from the historical checkpoint text.
+
+## 2026-07-15 — M1.1.5 S3 physical phase transactions
+
+S3 now enforces the physical order `ProxyPhaseStarted → proxy commands → ProxyEvidenceCommitted → reducer RouteOutcome → FullPhaseStarted → full commands → AttemptFinalized`. Proxy rejection never starts full execution. Attempt-scoped proxy rows are distinct from full rows, and bootstrap terminates at verified proxy evidence without touching the standard five-outcome budget. Content-addressed contracts, phase receipts, and typed failure/resource evidence provide the recovery boundary; SQLite remains authoritative and JSON files remain rebuildable projections.
+
+## 2026-07-15 — M1.1.5-Final authoritative phase and command closure
+
+### Stage Truth
+
+- S2 freezes TrialSpec v5, including phase contracts, immutable sample/evaluator ContractRefs, acceptance constraints, and a runtime-identity-free `ProxyDecisionPolicy v1`.
+- `ProxyPhaseStarted` derives `ProxyEvaluationBinding v1` and `PhaseExecutionManifest v2` from the latest SQLite Attempt. The binding supplies generation, implementation/input identity, phase execution, command plan, ContractRefs, provenance, and exact evidence kinds.
+- S3 adapters produce only phase-scoped inventories and raw evidence. Common Core owns ingest, decoding, proxy classification, TrialResult classification, budget, route, and aggregate.
+- Event v6 SQLite remains the sole fact source. AttemptRecord v6, ResearchState v6, TrialResult, ProxyOutcome, RouteOutcome, aggregate, TrialSpec JSON, and command receipts are immutable artifacts or rebuildable projections, never competing control stores.
+
+### Proxy/Full Barrier
+
+```text
+AttemptReserved
+→ ProxyPhaseStarted
+→ PhaseCommandStarted(proxy)
+→ PhaseCommandCompleted(proxy)
+→ ProxyEvidenceCommitted
+→ reducer ProxyOutcome / RouteOutcome
+→ FullPhaseStarted only for RUN_FULL
+→ PhaseCommandStarted(full)
+→ PhaseCommandCompleted(full)
+→ AttemptFinalized
+```
+
+- The pure classifier uses only frozen ProxyDecisionPolicy, Ledger-generated ProxyEvaluationBinding, exact EvidenceManifest, and immutable raw bytes.
+- Exact dataset × seed × metric × role coverage, paired delta, per-dataset regression, activation surfaces, readiness checks, and evidence kinds are enforced identically at precommit, transaction, rebuild, and Gate.
+- Producer-authored policy/calibration/decision/summary artifacts are diagnostic and are rejected if inserted into the authoritative inventory.
+- A valid scientific proxy rejection commits `PROPOSE_NEXT_VARIANT`, releases the slot, consumes no five-variant outcome, creates no FullPhaseStarted event, and invokes no full train/eval/ablation callback.
+- Bootstrap uses `terminal_bootstrap`, executes proxy-only commands/evidence, routes `FINISH_RUN` only after verified completion, and does not affect standard history or aggregate.
+
+### Command and Crash Recovery
+
+- Every side effect requires a fresh `PhaseAuthorization` from SQLite. Boolean, `None`, caller mapping, stale generation, mismatched command plan, or forged proxy authorization stops before the runner.
+- `PhaseCommandStarted` is committed before execution. `PhaseRunReceipt v2` records Started event identity, command/phase/generation, timestamps, output hashes, external job, and provenance. `PhaseCommandCompleted` references the verified receipt.
+- Completed commands reuse their receipts. A receipt written before a DB completion event is reconciled without rerunning. Started commands without a trustworthy receipt or attachable external job become `PhaseCommandUnknownOutcome`.
+- Crash after proxy commit rebuilds the same RUN_FULL authorization; crash after full evidence ingest reuses immutable evidence; crash after DB finalization rebuilds one result/route/budget projection.
+- Implementation repair changes implementation/input identity and reruns proxy. Full resource resume advances generation but preserves the committed proxy outcome and returns to `PROXY_COMPLETED` with full pending.
+
+### Failure and Provenance
+
+- FailureEvidence v4, ResumeEvidence v4, ResourceProbe v3, and CommandResultEvidence v1 are content-addressed and validated from raw bytes by public APIs, reducer/rebuild, and Gate.
+- Pause requires an insufficient probe with observed capacity below required capacity. Resume requires an available matching probe with sufficient capacity and the original pause event. Cross-Attempt, zero-exit, mismatched-resource, or altered evidence is rejected.
+- ContractStore replaces mutable sample/evaluator canonical paths. Reservation and phase start verify immutable ContractRefs, safe paths, source/sample identities, evaluator file hashes, dependencies, and provenance.
+- Local non-simulated subprocess tests prove production-component wiring only. Synthetic E2E remains labeled synthetic; neither is a claim of scientific success or real GPU training.
+
+### Removed Runtime Surface
+
+- Removed readers/schemas: Event v5, AttemptRecord v5, ResearchState v5, TrialSpec v4, PhaseExecutionManifest v1, FailureEvidence v3, ResumeEvidence v3, ResourceProbe v2, ProxyDecisionContract v1, ProxyOutcome v1/v2, EffectiveProxyPolicy v3, and ProxyCalibrationPolicy v3.
+- Removed authority: mutable sample/evaluator paths, producer proxy thresholds/decisions, fixed result discovery, arbitrary hash lookup, phase validation spoofing, phase-agnostic production C2C execution, and caller-authored result/failure/resume decisions.
+- Native Unified S1 Producer/Core and real external Codex S1 smoke are not part of this stage update.
+
+### Final Acceptance
+
+- `TMPDIR=$PWD/.tmp-final2-normal uv run pytest -q --tb=short`: `633 passed, 2 skipped`.
+- With upper/lowercase proxy variables removed: `633 passed, 2 skipped`.
+- With empty `HOME`, isolated empty HF caches, and a `PATH` without Codex: `633 passed, 2 skipped`.
+- The only red signature found during final closure was a hermetic-test defect: four non-simulated C2C tests depended on the host HF cache. The tests now provision a temporary fake cache explicitly; C2C production preflight still blocks a genuinely missing required cache.

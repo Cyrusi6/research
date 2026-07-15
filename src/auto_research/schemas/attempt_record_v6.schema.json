@@ -46,7 +46,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_attempt_v5"
+      "const": "auto_research_attempt_v6"
     },
     "attempt_id": {
       "type": "string",
@@ -296,174 +296,22 @@
       ],
       "properties": {
         "proxy": {
-          "anyOf": [
+          "oneOf": [
             {
               "type": "null"
             },
             {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "schema_version",
-                "phase",
-                "phase_execution_id",
-                "phase_start_event_id",
-                "producer_run_id",
-                "lifecycle_generation",
-                "implementation_hash",
-                "attempt_input_hash",
-                "attempt_id",
-                "direction_semantic_hash",
-                "direction_spec_hash",
-                "variant_semantic_hash",
-                "variant_spec_hash",
-                "trial_spec_hash"
-              ],
-              "properties": {
-                "schema_version": {
-                  "const": "auto_research_phase_execution_manifest_v1"
-                },
-                "phase": {
-                  "enum": [
-                    "proxy",
-                    "full"
-                  ]
-                },
-                "phase_execution_id": {
-                  "type": "string",
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
-                },
-                "phase_start_event_id": {
-                  "type": "string",
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
-                },
-                "producer_run_id": {
-                  "type": "string",
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
-                },
-                "lifecycle_generation": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "implementation_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "attempt_input_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "attempt_id": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "direction_semantic_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "direction_spec_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "variant_semantic_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "variant_spec_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "trial_spec_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                }
-              }
+              "$ref": "phase_execution_manifest_v2.schema.json"
             }
           ]
         },
         "full": {
-          "anyOf": [
+          "oneOf": [
             {
               "type": "null"
             },
             {
-              "type": "object",
-              "additionalProperties": false,
-              "required": [
-                "schema_version",
-                "phase",
-                "phase_execution_id",
-                "phase_start_event_id",
-                "producer_run_id",
-                "lifecycle_generation",
-                "implementation_hash",
-                "attempt_input_hash",
-                "attempt_id",
-                "direction_semantic_hash",
-                "direction_spec_hash",
-                "variant_semantic_hash",
-                "variant_spec_hash",
-                "trial_spec_hash"
-              ],
-              "properties": {
-                "schema_version": {
-                  "const": "auto_research_phase_execution_manifest_v1"
-                },
-                "phase": {
-                  "enum": [
-                    "proxy",
-                    "full"
-                  ]
-                },
-                "phase_execution_id": {
-                  "type": "string",
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
-                },
-                "phase_start_event_id": {
-                  "type": "string",
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
-                },
-                "producer_run_id": {
-                  "type": "string",
-                  "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
-                },
-                "lifecycle_generation": {
-                  "type": "integer",
-                  "minimum": 0
-                },
-                "implementation_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "attempt_input_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "attempt_id": {
-                  "type": "string",
-                  "minLength": 1
-                },
-                "direction_semantic_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "direction_spec_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "variant_semantic_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "variant_spec_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                },
-                "trial_spec_hash": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
-                }
-              }
+              "$ref": "phase_execution_manifest_v2.schema.json"
             }
           ]
         }

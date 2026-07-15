@@ -9,197 +9,213 @@ from auto_research.phase_execution import (
     AuthoritativePhaseContext,
     C2CFullPhaseExecutor,
     C2CProxyPhaseExecutor,
-    GenericExternalPhaseExecutor,
     PhaseArtifactInventory,
-    PhaseExecutor,
+    PhaseAuthorization,
+    ResearchLedgerPhaseAuthority,
     SyntheticPhaseExecutor,
     TypedPhaseFailure,
 )
+from auto_research.agents.experiment import ExperimentAgent
+from auto_research.research_state import IntegrityError
 
 
-def _context(tmp_path: Path, *, phase: str = "proxy") -> AuthoritativePhaseContext:
-    authorization = None
-    if phase == "full":
-        authorization = {
-            "event_id": "event:proxy-committed",
-            "event_hash": "f" * 64,
-            "outcome_hash": "e" * 64,
-            "decision": "RUN_FULL",
-        }
-    return AuthoritativePhaseContext(
-        project_root=tmp_path,
+def _authorization(*, phase: str = "proxy") -> PhaseAuthorization:
+    full = phase == "full"
+    return PhaseAuthorization(
         attempt_id="attempt-0001",
-        direction_semantic_hash="1" * 64,
-        direction_spec_hash="2" * 64,
-        variant_semantic_hash="3" * 64,
-        variant_spec_hash="4" * 64,
-        trial_spec_hash="5" * 64,
         lifecycle_generation=2,
-        implementation_hash="6" * 64,
-        attempt_input_hash="7" * 64,
         phase=phase,
         phase_execution_id=f"phase-{phase}-0001",
         phase_start_event_id=f"event:{phase}-started",
+        phase_start_event_hash="a" * 64,
+        phase_start_sequence=3,
         producer_run_id=f"producer-{phase}-0001",
-        proxy_authorization=authorization,
+        implementation_hash="6" * 64,
+        attempt_input_hash="7" * 64,
+        trial_spec_hash="5" * 64,
+        command_plan_hash="8" * 64,
+        phase_contract_hash="9" * 64,
+        expected_evidence_kinds=("proxy_results",) if phase == "proxy" else ("main_results",),
+        adapter_identity="adapter-c2c-001",
+        provenance_mode="local_external",
+        state="FULL_RUNNING" if full else "PROXY_RUNNING",
+        proxy_commit_event_id="event:proxy-committed" if full else None,
+        proxy_commit_event_hash="b" * 64 if full else None,
+        proxy_outcome_hash="c" * 64 if full else None,
     )
 
 
-def _inventory(context: AuthoritativePhaseContext, *, kind: str = "main_results") -> PhaseArtifactInventory:
-    return PhaseArtifactInventory.from_artifacts(
+def _context(tmp_path: Path, *, phase: str = "proxy") -> AuthoritativePhaseContext:
+    authorization = _authorization(phase=phase)
+    attempt = {
+        "attempt_id": authorization.attempt_id,
+        "direction_semantic_hash": "1" * 64,
+        "direction_spec_hash": "2" * 64,
+        "variant_semantic_hash": "3" * 64,
+        "variant_spec_hash": "4" * 64,
+        "trial_spec_hash": authorization.trial_spec_hash,
+        "lifecycle_generation": authorization.lifecycle_generation,
+        "implementation_hash": authorization.implementation_hash,
+        "attempt_input_hash": authorization.attempt_input_hash,
+    }
+    return AuthoritativePhaseContext.from_authorization(tmp_path, attempt, authorization)
+
+
+def _inventory(context: AuthoritativePhaseContext) -> PhaseArtifactInventory:
+    kind = context.expected_evidence_kinds[0]
+    return PhaseArtifactInventory(
         context,
-        [
-            {
-                "kind": kind,
-                "source_path": f"experiment/staging/{context.producer_run_id}/{kind}.json",
-                "producer_run_id": context.producer_run_id,
-            }
-        ],
+        ({
+            "kind": kind,
+            "source_path": f"experiment/attempts/{context.attempt_id}/{kind}.json",
+            "content_hash": "d" * 64,
+            "receipt_hash": "e" * 64,
+            "producer_run_id": context.producer_run_id,
+        },),
     )
 
 
-def test_authority_checker_runs_before_phase_runner(tmp_path: Path) -> None:
+class Authority:
+    def __init__(self, authorization):
+        self.authorization = authorization
+        self.calls = 0
+
+    def authorize_phase(self, context):
+        self.calls += 1
+        return self.authorization
+
+
+def test_executor_rechecks_exact_sqlite_authorization_before_and_after_runner(tmp_path: Path) -> None:
+    context = _context(tmp_path)
+    authority = Authority(_authorization())
+    calls: list[str] = []
+    executor = C2CProxyPhaseExecutor(authority, lambda received: calls.append("runner") or _inventory(received))
+    assert executor.execute(context).context == context
+    assert calls == ["runner"]
+    assert authority.calls == 2
+
+
+@pytest.mark.parametrize("verdict", [True, None, False, {"state": "PROXY_RUNNING"}])
+def test_bool_none_or_mapping_authority_is_fail_closed(tmp_path: Path, verdict) -> None:
     context = _context(tmp_path)
     calls: list[str] = []
 
-    def checker(received: AuthoritativePhaseContext) -> bool:
-        calls.append("authority")
-        assert received == context
-        return True
+    class Forged:
+        def authorize_phase(self, received):
+            return verdict
 
-    def runner(received: AuthoritativePhaseContext) -> PhaseArtifactInventory:
-        calls.append("runner")
-        return _inventory(received, kind="proxy_results")
-
-    result = C2CProxyPhaseExecutor(authority_checker=checker, runner=runner).execute(context)
-
-    assert calls == ["authority", "runner"]
-    assert result.context == context
-    assert isinstance(C2CProxyPhaseExecutor(checker, runner), PhaseExecutor)
-
-
-def test_rejected_authority_never_invokes_runner(tmp_path: Path) -> None:
-    calls: list[str] = []
-
-    def runner(context: AuthoritativePhaseContext) -> PhaseArtifactInventory:
-        calls.append("runner")
-        return _inventory(context)
-
-    executor = GenericExternalPhaseExecutor(authority_checker=lambda context: False, runner=runner)
-
-    with pytest.raises(TypedPhaseFailure) as raised:
-        executor.execute(_context(tmp_path))
-
-    assert raised.value.failure_class == "authority_rejected"
-    assert raised.value.retryable is False
+    with pytest.raises(TypedPhaseFailure, match="PhaseAuthorization"):
+        C2CProxyPhaseExecutor(Forged(), lambda received: calls.append("runner") or _inventory(received)).execute(context)
     assert calls == []
 
 
-def test_authority_identity_drift_is_rejected_before_runner(tmp_path: Path) -> None:
+def test_authorization_generation_drift_blocks_runner(tmp_path: Path) -> None:
     context = _context(tmp_path)
-    authoritative = replace(context, lifecycle_generation=context.lifecycle_generation + 1)
+    drifted = replace(_authorization(), lifecycle_generation=3)
     calls: list[str] = []
-    executor = SyntheticPhaseExecutor(
-        authority_checker=lambda received: authoritative,
-        runner=lambda received: calls.append("runner") or _inventory(received),
-    )
-
-    with pytest.raises(TypedPhaseFailure, match="different phase identity") as raised:
-        executor(context)
-
-    assert raised.value.failure_class == "authority_identity_mismatch"
+    with pytest.raises(TypedPhaseFailure, match="differs"):
+        SyntheticPhaseExecutor(Authority(drifted), lambda received: calls.append("runner") or _inventory(received)).execute(context)
     assert calls == []
 
 
-def test_authority_checker_must_return_explicit_supported_verdict(tmp_path: Path) -> None:
-    executor = SyntheticPhaseExecutor(
-        authority_checker=lambda received: 1,
-        runner=lambda received: _inventory(received),
-    )
-
-    with pytest.raises(TypedPhaseFailure) as raised:
-        executor.execute(_context(tmp_path))
-
-    assert raised.value.failure_class == "invalid_authority_verdict"
-
-
-def test_full_context_requires_committed_run_full_proxy_authorization(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="requires proxy authorization"):
-        replace(_context(tmp_path), phase="full", phase_execution_id="phase-full-0001")
-
-    with pytest.raises(ValueError, match="RUN_FULL"):
+def test_full_requires_committed_proxy_authorization(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="committed proxy"):
         replace(
-            _context(tmp_path, phase="full"),
-            proxy_authorization={
-                "event_id": "event:proxy-rejected",
-                "outcome_hash": "e" * 64,
-                "decision": "RETURN_S2",
-            },
+            _authorization(phase="full"),
+            proxy_commit_event_id=None,
+            proxy_commit_event_hash=None,
+            proxy_outcome_hash=None,
         )
 
 
-def test_c2c_shells_accept_only_their_authoritative_phase(tmp_path: Path) -> None:
-    checker = lambda context: None
-    runner = lambda context: _inventory(context)
-
-    with pytest.raises(TypedPhaseFailure) as proxy_failure:
-        C2CProxyPhaseExecutor(checker, runner).execute(_context(tmp_path, phase="full"))
-    with pytest.raises(TypedPhaseFailure) as full_failure:
-        C2CFullPhaseExecutor(checker, runner).execute(_context(tmp_path))
-
-    assert proxy_failure.value.failure_class == "phase_mismatch"
-    assert full_failure.value.failure_class == "phase_mismatch"
+def test_phase_specific_executor_rejects_wrong_phase_before_runner(tmp_path: Path) -> None:
+    context = _context(tmp_path, phase="full")
+    calls: list[str] = []
+    with pytest.raises(TypedPhaseFailure, match="requires proxy"):
+        C2CProxyPhaseExecutor(Authority(_authorization(phase="full")), lambda received: calls.append("runner") or _inventory(received)).execute(context)
+    assert calls == []
 
 
-def test_inventory_is_bound_to_exact_phase_identity(tmp_path: Path) -> None:
+def test_inventory_requires_exact_authorized_kinds_and_receipt_hash(tmp_path: Path) -> None:
     context = _context(tmp_path)
-    other = replace(context, phase_execution_id="phase-proxy-0002")
-    executor = SyntheticPhaseExecutor(
-        authority_checker=lambda received: received,
-        runner=lambda received: _inventory(other),
-    )
-
-    with pytest.raises(TypedPhaseFailure) as raised:
-        executor.execute(context)
-
-    assert raised.value.failure_class == "artifact_identity_mismatch"
+    with pytest.raises(ValueError, match="exactly"):
+        PhaseArtifactInventory(context, ())
+    with pytest.raises(ValueError, match="not authorized"):
+        PhaseArtifactInventory(context, ({
+            "kind": "main_results", "source_path": "safe/main.json", "content_hash": "d" * 64,
+            "receipt_hash": "e" * 64, "producer_run_id": context.producer_run_id,
+        },))
 
 
-def test_inventory_rejects_duplicate_kind_wrong_producer_and_unsafe_path(tmp_path: Path) -> None:
+def test_research_ledger_authority_reconstructs_exact_v2_authorization(tmp_path: Path) -> None:
+    expected = _authorization()
     context = _context(tmp_path)
-    valid = {
-        "kind": "proxy_results",
-        "source_path": "runner/proxy.json",
-        "producer_run_id": context.producer_run_id,
+    manifest = {
+        "schema_version": "auto_research_phase_execution_manifest_v2",
+        "phase_execution_id": expected.phase_execution_id,
+        "producer_run_id": expected.producer_run_id,
+        "command_plan_hash": expected.command_plan_hash,
+        "phase_contract_hash": expected.phase_contract_hash,
+        "expected_evidence_kinds": list(expected.expected_evidence_kinds),
+        "provenance_mode": expected.provenance_mode,
     }
-    with pytest.raises(ValueError, match="duplicate artifact kind"):
-        PhaseArtifactInventory(context, [valid, valid])
-    with pytest.raises(ValueError, match="producer_run_id"):
-        PhaseArtifactInventory(context, [{**valid, "producer_run_id": "producer-other-0001"}])
-    with pytest.raises(ValueError, match="safe project-relative"):
-        PhaseArtifactInventory(context, [{**valid, "source_path": "../proxy.json"}])
+
+    class Ledger:
+        def state(self):
+            return {"attempts": {expected.attempt_id: {
+                "attempt_id": expected.attempt_id, "lifecycle_generation": expected.lifecycle_generation,
+                "implementation_hash": expected.implementation_hash, "attempt_input_hash": expected.attempt_input_hash,
+                "trial_spec_hash": expected.trial_spec_hash, "state": expected.state,
+                "frozen_trial_spec": {"execution_contract": {"runtime_config": {"collector": "c2c-001"}}},
+                "phase_executions": {"proxy": {"phase_start_event_id": expected.phase_start_event_id}},
+            }}}
+
+        def events(self):
+            return [{
+                "event_id": expected.phase_start_event_id, "event_hash": expected.phase_start_event_hash,
+                "sequence": expected.phase_start_sequence, "event_type": "ProxyPhaseStarted",
+                "payload": {"phase_execution_manifest": manifest},
+            }]
+
+    assert ResearchLedgerPhaseAuthority(Ledger()).authorize_phase(context) == expected
 
 
-def test_inventory_manifest_matches_phase_execution_schema_surface(tmp_path: Path) -> None:
-    context = _context(tmp_path)
-    manifest = _inventory(context, kind="proxy_results").to_manifest()
+def test_research_ledger_authority_rejects_v1_manifest(tmp_path: Path) -> None:
+    expected = _authorization()
 
-    assert manifest["schema_version"] == "auto_research_phase_execution_manifest_v1"
-    assert manifest["attempt_id"] == context.attempt_id
-    assert manifest["phase_execution_id"] == context.phase_execution_id
-    assert manifest["phase_start_event_id"] == context.phase_start_event_id
-    assert manifest["artifacts"][0]["producer_run_id"] == context.producer_run_id
+    class Ledger:
+        def state(self):
+            return {"attempts": {expected.attempt_id: {
+                "attempt_id": expected.attempt_id, "lifecycle_generation": expected.lifecycle_generation,
+                "implementation_hash": expected.implementation_hash, "attempt_input_hash": expected.attempt_input_hash,
+                "trial_spec_hash": expected.trial_spec_hash, "state": expected.state,
+                "phase_executions": {"proxy": {"phase_start_event_id": expected.phase_start_event_id}},
+            }}}
+
+        def events(self):
+            return [{"event_id": expected.phase_start_event_id, "event_hash": "a" * 64, "sequence": 3,
+                     "event_type": "ProxyPhaseStarted", "payload": {"phase_execution_manifest": {"schema_version": "auto_research_phase_execution_manifest_v1"}}}]
+
+    with pytest.raises(ValueError, match="v2"):
+        ResearchLedgerPhaseAuthority(Ledger()).authorize_phase(_context(tmp_path))
 
 
-def test_untyped_runner_exception_becomes_typed_phase_failure(tmp_path: Path) -> None:
-    def runner(context: AuthoritativePhaseContext) -> PhaseArtifactInventory:
-        raise OSError("command unavailable")
+def test_experiment_side_effect_without_ledger_context_is_fail_closed(tmp_path: Path) -> None:
+    agent = object.__new__(ExperimentAgent)
+    agent._active_phase_context = None
+    agent._active_command_journal = None
+    calls: list[str] = []
 
-    executor = GenericExternalPhaseExecutor(authority_checker=lambda context: True, runner=runner)
+    class Runner:
+        def run_step(self, **kwargs):
+            calls.append("runner")
+            return {"status": "ok", "returncode": 0}
 
-    with pytest.raises(TypedPhaseFailure) as raised:
-        executor.execute(_context(tmp_path))
+    agent.runner = Runner()
+    with pytest.raises(IntegrityError, match="authoritative phase context"):
+        agent._run_authoritative_step(name="full-train", command="true", cwd=tmp_path)
+    assert calls == []
 
-    assert raised.value.failure_class == "phase_execution_failed"
-    assert raised.value.retryable is True
-    assert raised.value.details["exception_type"] == "OSError"
+
+def test_phase_agnostic_c2c_production_entry_is_removed() -> None:
+    assert not hasattr(ExperimentAgent, "_run_single_c2c_candidate")

@@ -21,21 +21,24 @@
     "implementation_hash",
     "attempt_input_hash",
     "phase",
+    "phase_execution_id",
+    "phase_start_event_id",
     "pause_event_id",
     "pause_evidence_hash",
+    "pause_phase",
+    "pause_phase_execution_id",
+    "pause_producer_run_id",
     "resource_type",
     "resource_id",
     "required_capacity",
     "observed_capacity",
     "unit",
     "probe_status",
-    "observed_at",
-    "phase_execution_id",
-    "phase_start_event_id"
+    "observed_at"
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_resume_evidence_v3"
+      "const": "auto_research_resume_evidence_v4"
     },
     "evidence_kind": {
       "const": "resume_evidence"
@@ -53,47 +56,36 @@
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
     },
     "direction_semantic_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "direction_spec_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "variant_semantic_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "variant_spec_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "trial_spec_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "protocol_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "sample_manifest_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "evaluator_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "cross_references": {
       "type": "object",
-      "required": [
-        "resource_probe_hash"
-      ],
       "additionalProperties": false,
+      "required": ["resource_probe_hash"],
       "properties": {
         "resource_probe_hash": {
-          "type": "string",
-          "pattern": "^[a-f0-9]{64}$"
+          "$ref": "#/$defs/sha256"
         }
       }
     },
@@ -102,32 +94,42 @@
       "minimum": 0
     },
     "implementation_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "attempt_input_hash": {
-      "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "$ref": "#/$defs/sha256"
     },
     "phase": {
       "const": "resume"
     },
+    "phase_execution_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "phase_start_event_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
+    },
     "pause_event_id": {
       "type": "string",
-      "minLength": 8
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
     },
     "pause_evidence_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "pause_phase": {
+      "enum": ["implementation", "activation", "proxy", "full"]
+    },
+    "pause_phase_execution_id": {
       "type": "string",
-      "pattern": "^[a-f0-9]{64}$"
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "pause_producer_run_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
     },
     "resource_type": {
-      "enum": [
-        "gpu_memory",
-        "system_memory",
-        "disk",
-        "network",
-        "quota"
-      ]
+      "enum": ["gpu_memory", "system_memory", "disk", "network", "quota"]
     },
     "resource_id": {
       "type": "string",
@@ -142,11 +144,7 @@
       "minimum": 0
     },
     "unit": {
-      "enum": [
-        "bytes",
-        "count",
-        "bytes_per_second"
-      ]
+      "enum": ["bytes", "count", "bytes_per_second"]
     },
     "probe_status": {
       "const": "available"
@@ -154,14 +152,12 @@
     "observed_at": {
       "type": "string",
       "format": "date-time"
-    },
-    "phase_execution_id": {
+    }
+  },
+  "$defs": {
+    "sha256": {
       "type": "string",
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
-    },
-    "phase_start_event_id": {
-      "type": "string",
-      "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
+      "pattern": "^[a-f0-9]{64}$"
     }
   }
 }

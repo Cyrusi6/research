@@ -194,9 +194,9 @@ def _trial_spec_legacy() -> dict:
 
 
 
-def _trial_spec() -> dict:
-    from support.authoritative_evidence import upgrade_trial_spec_v4
-    return upgrade_trial_spec_v4(_trial_spec_legacy())
+def _trial_spec(project_root: Path | None = None) -> dict:
+    from support.authoritative_evidence import build_trial_spec_v5
+    return build_trial_spec_v5(_trial_spec_legacy(), project_root=project_root)
 
 def _running_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
     from support.authoritative_evidence import start_attempt_phase
@@ -211,7 +211,7 @@ def _running_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
         variant=variant,
         implementation_hash=canonical_hash({"implementation": 1}),
         attempt_kind="full",
-        trial_spec=_trial_spec(),
+        trial_spec=_trial_spec(tmp_path),
     )
     return ledger, start_attempt_phase(ledger, attempt, "full")
 
@@ -257,8 +257,14 @@ def _forged_trial(tmp_path: Path, attempt: dict) -> dict:
 def _scoped_artifact(tmp_path: Path, attempt: dict, producer_run_id: str, kind: str, payload: dict) -> str:
     raw = encode_canonical_evidence(payload)
     digest = hashlib.sha256(raw).hexdigest()
-    path = tmp_path / content_addressed_evidence_path(
-        attempt_id=attempt["attempt_id"], producer_run_id=producer_run_id, evidence_kind=kind, content_hash=digest
+    path = (
+        tmp_path
+        / "experiment"
+        / "attempts"
+        / attempt["attempt_id"]
+        / producer_run_id
+        / kind
+        / f"{digest}.json"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(raw)
@@ -273,49 +279,10 @@ def _failure_evidence(
     exit_code: int | None,
     resource_type: str = "gpu_memory",
 ) -> dict:
-    producer_run_id = f"producer-{attempt['lifecycle_generation']:02d}"
     source_phase = "activation" if failure_class == "activation_failure" else "full"
-    command_status = "failed"
-    if failure_class in {"resource_pause", "oom_retry"}:
-        command_status = "resource_paused"
-        probe = {
-            "schema_version": "auto_research_resource_probe_evidence_v2",
-            "evidence_kind": "resource_probe",
-            "evidence_id": f"resource-probe-{attempt['lifecycle_generation']}",
-            "attempt_id": attempt["attempt_id"],
-            "producer_run_id": producer_run_id,
-            "direction_semantic_hash": attempt["direction_semantic_hash"],
-            "direction_spec_hash": attempt["direction_spec_hash"],
-            "variant_semantic_hash": attempt["variant_semantic_hash"],
-            "variant_spec_hash": attempt["variant_spec_hash"],
-            "trial_spec_hash": attempt["trial_spec_hash"],
-            "protocol_hash": attempt["protocol_hash"],
-            "sample_manifest_hash": attempt["sample_manifest_hash"],
-            "evaluator_hash": attempt["evaluator_hash"],
-            "cross_references": {},
-            "resource_type": resource_type,
-            "resource_id": "resource-0",
-            "required_capacity": 10.0,
-            "observed_capacity": 1.0,
-            "unit": "bytes",
-            "probe_status": "insufficient",
-            "observed_at": "2026-07-14T00:00:00Z",
-            "lifecycle_generation": attempt["lifecycle_generation"],
-            "implementation_hash": attempt["implementation_hash"],
-            "attempt_input_hash": attempt["attempt_input_hash"],
-            "phase": "full",
-            "phase_execution_id": attempt["phase_executions"]["full"]["phase_execution_id"],
-            "phase_start_event_id": attempt["phase_executions"]["full"]["phase_start_event_id"],
-        }
-        log_hash = _scoped_artifact(tmp_path, attempt, producer_run_id, "resource_probe", probe)
-    else:
-        log_hash = _scoped_artifact(
-            tmp_path, attempt, producer_run_id, "failure_evidence", {"failure": failure_class}
-        )
-    return {
-        "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION,
-        "evidence_kind": "failure_evidence",
-        "evidence_id": f"failure-evidence-{attempt['lifecycle_generation']}",
+    execution = attempt["phase_executions"]["full"]
+    producer_run_id = execution["producer_run_id"]
+    identity = {
         "attempt_id": attempt["attempt_id"],
         "producer_run_id": producer_run_id,
         "direction_semantic_hash": attempt["direction_semantic_hash"],
@@ -326,13 +293,57 @@ def _failure_evidence(
         "protocol_hash": attempt["protocol_hash"],
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
-        "cross_references": {},
         "lifecycle_generation": attempt["lifecycle_generation"],
         "implementation_hash": attempt["implementation_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
         "phase": source_phase,
-        "phase_execution_id": attempt["phase_executions"]["full"]["phase_execution_id"],
-        "phase_start_event_id": attempt["phase_executions"]["full"]["phase_start_event_id"],
+        "phase_execution_id": execution["phase_execution_id"],
+        "phase_start_event_id": execution["phase_start_event_id"],
+    }
+    if failure_class in {"resource_pause", "oom_retry"}:
+        probe = {
+            "schema_version": "auto_research_resource_probe_evidence_v3",
+            "evidence_kind": "resource_probe",
+            "evidence_id": f"resource-probe-{attempt['lifecycle_generation']}",
+            **{**identity, "phase": "full"},
+            "resource_type": resource_type,
+            "resource_id": "resource-0",
+            "required_capacity": 10.0,
+            "observed_capacity": 1.0,
+            "unit": "bytes",
+            "probe_status": "insufficient",
+            "observed_at": "2026-07-14T00:00:00Z",
+        }
+        referenced_hash = _scoped_artifact(tmp_path, attempt, producer_run_id, "resource_probe", probe)
+        cross_references = {"resource_probe_hash": referenced_hash}
+        command_status = "resource_paused"
+        log_hash = referenced_hash
+    else:
+        receipt = {
+            "schema_version": "auto_research_command_result_evidence_v1",
+            "evidence_kind": "command_result_evidence",
+            "evidence_id": f"command-result-{attempt['lifecycle_generation']}",
+            **identity,
+            "command_id": f"command-failure-{attempt['lifecycle_generation']:04d}",
+            "command": ["python", "failure_fixture.py", "--phase", source_phase],
+            "working_directory": "runner",
+            "started_at": "2026-07-14T00:00:00Z",
+            "finished_at": "2026-07-14T00:00:01Z",
+            "command_status": "failed",
+            "exit_code": exit_code,
+            "stdout_hash": "a" * 64,
+            "stderr_hash": "b" * 64,
+        }
+        referenced_hash = _scoped_artifact(tmp_path, attempt, producer_run_id, "command_result_evidence", receipt)
+        cross_references = {"command_result_evidence_hash": referenced_hash}
+        command_status = "failed"
+        log_hash = receipt["stderr_hash"]
+    evidence = {
+        "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION,
+        "evidence_kind": "failure_evidence",
+        "evidence_id": f"failure-evidence-{attempt['lifecycle_generation']}",
+        **identity,
+        "cross_references": cross_references,
         "source_state": attempt["state"],
         "source_phase": source_phase,
         "failure_class": failure_class,
@@ -342,29 +353,31 @@ def _failure_evidence(
         "observed_at": "2026-07-14T00:00:00Z",
         "log_hash": log_hash,
     }
+    _scoped_artifact(tmp_path, attempt, producer_run_id, "failure_evidence", evidence)
+    return evidence
 
 
 def _resume_evidence(tmp_path: Path, ledger: ResearchEventLedger, attempt: dict, *, resource_type: str) -> dict:
     producer_run_id = f"resume-producer-{attempt['lifecycle_generation']}"
     probe = {
-        "schema_version": "auto_research_resource_probe_evidence_v2", "evidence_kind": "resource_probe",
+        "schema_version": "auto_research_resource_probe_evidence_v3", "evidence_kind": "resource_probe",
         "evidence_id": f"resume-probe-{attempt['lifecycle_generation']}", "attempt_id": attempt["attempt_id"],
         "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"],
         "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"],
         "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"],
         "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"],
-        "evaluator_hash": attempt["evaluator_hash"], "cross_references": {}, "resource_type": resource_type,
+        "evaluator_hash": attempt["evaluator_hash"], "resource_type": resource_type,
         "resource_id": "resource-0", "required_capacity": 10.0, "observed_capacity": 20.0, "unit": "bytes",
         "probe_status": "available", "observed_at": "2026-07-14T00:01:00Z",
         "lifecycle_generation": attempt["lifecycle_generation"], "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"], "phase": attempt["paused_phase"],
-        "phase_execution_id": attempt["phase_executions"][attempt["paused_phase"]]["phase_execution_id"],
-        "phase_start_event_id": attempt["phase_executions"][attempt["paused_phase"]]["phase_start_event_id"],
+        "attempt_input_hash": attempt["attempt_input_hash"], "phase": "resume",
+        "phase_execution_id": f"phase-resume-{attempt['lifecycle_generation']:04d}",
+        "phase_start_event_id": f"event:resume:{attempt['lifecycle_generation']}",
     }
     probe_hash = _scoped_artifact(tmp_path, attempt, producer_run_id, "resource_probe", probe)
     pause_event = next(event for event in reversed(ledger.events()) if event["event_type"] == "AttemptDispositioned")
     pause_evidence = pause_event["payload"]["failure_evidence"]
-    return {
+    evidence = {
         "schema_version": RESUME_EVIDENCE_SCHEMA_VERSION,
         "evidence_kind": "resume_evidence", "evidence_id": f"resume-evidence-{attempt['lifecycle_generation']}",
         "attempt_id": attempt["attempt_id"],
@@ -377,13 +390,18 @@ def _resume_evidence(tmp_path: Path, ledger: ResearchEventLedger, attempt: dict,
         "implementation_hash": attempt["implementation_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
         "phase": "resume",
-        "phase_execution_id": attempt["phase_executions"][attempt["paused_phase"]]["phase_execution_id"],
-        "phase_start_event_id": attempt["phase_executions"][attempt["paused_phase"]]["phase_start_event_id"],
-        "pause_event_id": pause_event["event_id"], "pause_evidence_hash": canonical_hash(pause_evidence),
+        "phase_execution_id": probe["phase_execution_id"],
+        "phase_start_event_id": probe["phase_start_event_id"],
+        "pause_event_id": pause_event["event_id"], "pause_evidence_hash": hashlib.sha256(encode_canonical_evidence(pause_evidence)).hexdigest(),
+        "pause_phase": pause_evidence["phase"],
+        "pause_phase_execution_id": pause_evidence["phase_execution_id"],
+        "pause_producer_run_id": pause_evidence["producer_run_id"],
         "resource_type": resource_type, "resource_id": "resource-0", "required_capacity": 10.0,
         "observed_capacity": 20.0, "unit": "bytes", "probe_status": "available",
         "observed_at": "2026-07-14T00:01:00Z",
     }
+    _scoped_artifact(tmp_path, attempt, producer_run_id, "resume_evidence", evidence)
+    return evidence
 
 
 def test_identity_only_artifact_cannot_finalize_with_forged_observations(tmp_path: Path) -> None:
@@ -429,7 +447,7 @@ def test_attempt_reserved_reducer_rejects_noncanonical_initial_record(
         variant=variant,
         implementation_hash=canonical_hash({"implementation": 1}),
         attempt_kind="full",
-        trial_spec=_trial_spec(),
+        trial_spec=_trial_spec(tmp_path),
     )
     events = ledger.events()
     state = initial_state(tmp_path.name)

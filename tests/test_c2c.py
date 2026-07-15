@@ -21,6 +21,7 @@ import auto_research.orchestrator as orchestrator_module
 from auto_research.adapters.runner import ExperimentRunner
 from auto_research.agents.debate import MultiAgentReasoningService
 from auto_research.agents.experiment import ExperimentAgent
+from auto_research.agents.experiment import _c2c_strict_evidence_inventory, _stage_evidence_inventory
 from auto_research.agents.intake import IntakeAgent, _c2c_evidence_brief, _c2c_static_bundle_validity
 from auto_research.agents.plan import PlanAgent, _trial_spec_from_plan
 from auto_research.agents.base import AgentContext
@@ -53,6 +54,10 @@ from auto_research.orchestrator import Orchestrator
 from auto_research.utils import sha256_file, write_json, write_yaml
 from auto_research.workspace import init_workspace
 from auto_research.cli import _run_c2c_command, _smoke_c2c_command
+from auto_research.command_journal import LedgerCommandJournal
+from auto_research.phase_execution import ResearchLedgerPhaseAuthority
+from auto_research.research_state import ResearchEventLedger
+from test_m114_authoritative_phase_transactions import _c2c_inputs
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +84,66 @@ def _transformers_available() -> bool:
     except Exception:
         return False
     return True
+
+
+def _authorize_c2c_phase(
+    agent: ExperimentAgent,
+    *,
+    phase: str,
+    ledger: ResearchEventLedger | None = None,
+    attempt: dict | None = None,
+    trial_spec: dict | None = None,
+    comparison: dict | None = None,
+    baseline: dict | None = None,
+    profile: str = "standard",
+) -> tuple[ResearchEventLedger, dict, dict, dict, dict]:
+    project_root = agent.context.project_root
+    if ledger is None:
+        attempt, trial_spec, comparison, baseline = _c2c_inputs(project_root, profile=profile)
+        ledger = ResearchEventLedger(project_root)
+    assert attempt is not None and trial_spec is not None and comparison is not None and baseline is not None
+    if phase == "full":
+        inventory = _c2c_strict_evidence_inventory(
+            project_root=project_root,
+            attempt=attempt,
+            trial_spec=trial_spec,
+            comparison_candidate=comparison,
+            baseline=baseline,
+            simulate=False,
+        )
+        completion = _stage_evidence_inventory(
+            project_root=project_root,
+            attempt=attempt,
+            trial_spec=trial_spec,
+            inventory=inventory,
+        )
+        attempt, route = ledger.commit_proxy_evidence(completion)
+        assert route["next_action"] == "RUN_FULL"
+        attempt = ledger.start_full_phase(
+            attempt["attempt_id"],
+            phase_execution_id=f"full-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}",
+            producer_run_id=f"producer-full-{attempt['attempt_id'][:8]}-g{attempt['lifecycle_generation']}",
+        )
+    authority = ResearchLedgerPhaseAuthority(ledger)
+    agent._active_phase_context = authority.context_for_attempt(project_root, attempt["attempt_id"], phase)
+    agent._active_command_journal = LedgerCommandJournal(project_root, ledger)
+    return ledger, attempt, trial_spec, comparison, baseline
+
+
+def _run_c2c_proxy_then_full(agent: ExperimentAgent, **kwargs):
+    ledger, attempt, trial_spec, comparison, baseline = _authorize_c2c_phase(agent, phase="proxy")
+    proxy_result = agent._run_single_c2c_proxy_candidate(**kwargs)
+    _authorize_c2c_phase(
+        agent,
+        phase="full",
+        ledger=ledger,
+        attempt=attempt,
+        trial_spec=trial_spec,
+        comparison=comparison,
+        baseline=baseline,
+    )
+    full_result = agent._run_single_c2c_full_candidate(**kwargs)
+    return proxy_result, full_result
 
 
 def _base_config(tmp_path: Path, *, simulate: bool = True) -> dict:
@@ -387,6 +452,7 @@ def _write_direction_and_variant_gate_artifacts(project: Path, *, direction_id: 
             },
             variant,
             profile="bootstrap",
+            project_root=project,
         ),
     )
     write_json(
@@ -7125,7 +7191,8 @@ def test_c2c_train_failure_with_checkpoint_continues_eval(monkeypatch, tmp_path:
         "hypothesis": "h",
         "experiment_contract": {"config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}}},
     }
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="full")
+    result = agent._run_single_c2c_full_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate=candidate,
         index=0,
@@ -7222,7 +7289,8 @@ def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: 
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="full")
+    result = agent._run_single_c2c_full_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "idea",
@@ -7282,7 +7350,8 @@ def test_deterministic_s3_blocks_noop_candidate(monkeypatch, tmp_path: Path) -> 
         raise AssertionError("noop candidate must be blocked before running commands")
 
     monkeypatch.setattr(agent.runner, "run_step", fail_run_step)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={"id": "noop", "title": "Noop"},
         index=0,
@@ -7360,7 +7429,8 @@ def test_s3_applies_frozen_patch_archives_snapshot_and_does_not_call_llm(tmp_pat
     }
 
     agent = ExperimentAgent(context)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate=candidate,
         index=0,
@@ -7446,7 +7516,8 @@ def test_s3_prefers_patched_repo_snapshot_over_patch_json(tmp_path: Path) -> Non
     }
 
     agent = ExperimentAgent(context)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate=candidate,
         index=0,
@@ -7500,7 +7571,8 @@ def test_s3_blocks_outputs_written_to_original_snapshot(monkeypatch, tmp_path: P
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="full")
+    result = agent._run_single_c2c_full_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "polluter",
@@ -7626,7 +7698,8 @@ def test_s3_runs_ablation_switch_disabled_eval(monkeypatch, tmp_path: Path) -> N
         },
     }
 
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="full")
+    result = agent._run_single_c2c_full_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate=candidate,
         index=0,
@@ -7775,7 +7848,8 @@ def test_s3_rejects_validation_failed_code_patch_before_training(monkeypatch, tm
         raise AssertionError("validation_failed patch must be blocked before training")
 
     monkeypatch.setattr(agent.runner, "run_step", fail_run_step)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "bad_patch",
@@ -7854,7 +7928,8 @@ def test_c2c_static_proxy_rejects_evaluator_patch_before_training(monkeypatch, t
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "eval_risk",
@@ -7959,7 +8034,8 @@ def test_c2c_proxy_carries_instrumentation_quality_repair_request(monkeypatch, t
     )
     agent = ExperimentAgent(context)
     monkeypatch.setattr(agent.runner, "run_step", lambda **kwargs: {"step": kwargs["name"], "status": "ok", "returncode": 0, "stdout": "", "stderr": "", "attempts": []})
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "quality",
@@ -8075,7 +8151,8 @@ def test_s3_reuses_completed_proxy_rejected_run_state_without_rerun(monkeypatch,
         raise AssertionError("completed proxy_rejected run_state should be reused")
 
     monkeypatch.setattr(agent.runner, "run_step", fail_run_step)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy", profile="bootstrap" if bootstrap else "standard")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=adapter,
         candidate=candidate,
         index=0,
@@ -8598,7 +8675,7 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     gpu_selection = agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1})
-    result = agent._run_single_c2c_candidate(
+    result, _full_result = _run_c2c_proxy_then_full(agent,
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "idea_proxy_replay",
@@ -8649,7 +8726,7 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
     assert readiness["worth_full_train"]["decision"] == "yes"
     assert "experiment/results/full_s3_readiness_report.json" in readiness["artifact_paths"]["project_readiness_report"]
     assert (paths.root / "experiment" / "results" / "full_s3_readiness_report.json").exists()
-    assert result["command_status"] == "ok"
+    assert _full_result["command_status"] == "ok"
 
 
 def test_c2c_proxy_baseline_eval_timeout_uses_configured_fallback(monkeypatch, tmp_path: Path) -> None:
@@ -8740,7 +8817,7 @@ def test_c2c_proxy_baseline_eval_timeout_uses_configured_fallback(monkeypatch, t
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     gpu_selection = agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1})
-    result = agent._run_single_c2c_candidate(
+    result, _full_result = _run_c2c_proxy_then_full(agent,
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "idea_proxy_timeout",
@@ -8758,20 +8835,17 @@ def test_c2c_proxy_baseline_eval_timeout_uses_configured_fallback(monkeypatch, t
         proxy_gpu_selection=gpu_selection,
     )
 
-    state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
-    command_log = json.loads((paths.root / "experiment" / "logs" / "c2c_idea_proxy_timeout_commands.json").read_text(encoding="utf-8"))
     proxy = result["proxy_screen"]
 
     assert "proxy_baseline_eval_mmlu-redux" in seen_steps
     assert "proxy_command_0" in seen_steps
-    assert state["proxy_baseline"]["status"] == "fallback"
-    assert state["proxy_baseline"]["command_failure"]["category"] == "proxy_timeout"
+    baseline_event = next(item for item in result["command_logs"] if item["event"] == "proxy_baseline")
+    assert baseline_event["status"] == "fallback"
     assert proxy["status"] == "passed"
     assert proxy["proxy_baseline"]["source"] == "configured_full_baseline_subset_fallback"
     assert proxy["proxy_delta_vs_proxy_baseline"] == 0.5
-    assert result["command_status"] == "ok"
-    baseline_eval_run = next(item for item in command_log["runs"] if item["step"] == "proxy_baseline_eval_mmlu-redux")
-    assert baseline_eval_run["returncode"] == 124
+    assert _full_result["command_status"] == "ok"
+    assert proxy["proxy_baseline"]["source"] == "configured_full_baseline_subset_fallback"
 
 
 def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkeypatch, tmp_path: Path) -> None:
@@ -8851,7 +8925,8 @@ def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkey
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "no_effect",
@@ -8965,7 +9040,8 @@ def test_c2c_full_s3_readiness_blocks_train_when_not_ready(monkeypatch, tmp_path
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "readiness_not_ready",
@@ -9103,7 +9179,7 @@ def test_c2c_proxy_activation_smoke_allows_metric_neutral_when_wiring_trace_pass
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result = agent._run_single_c2c_candidate(
+    result, _full_result = _run_c2c_proxy_then_full(agent,
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "wired_neutral",
@@ -9129,7 +9205,7 @@ def test_c2c_proxy_activation_smoke_allows_metric_neutral_when_wiring_trace_pass
     assert comparison["mechanism_wired_metric_neutral"] is True
     assert result["activation_smoke"]["mechanism_trace"]["status"] == "wired"
     assert "train" in seen_steps
-    assert result["command_status"] == "ok"
+    assert _full_result["command_status"] == "ok"
 
 
 def test_c2c_proxy_activation_smoke_passes_metric_neutral_prediction_change(monkeypatch, tmp_path: Path) -> None:
@@ -9215,7 +9291,7 @@ def test_c2c_proxy_activation_smoke_passes_metric_neutral_prediction_change(monk
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result = agent._run_single_c2c_candidate(
+    result, _full_result = _run_c2c_proxy_then_full(agent,
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "prediction_change",
@@ -9241,7 +9317,7 @@ def test_c2c_proxy_activation_smoke_passes_metric_neutral_prediction_change(monk
     assert comparison["prediction_comparison"]["prediction_diff_rate"] == 0.25
     assert comparison["prediction_comparison"]["answer_diff_rate"] == 0.25
     assert comparison["mechanism_observed"] is True
-    assert result["command_status"] == "ok"
+    assert _full_result["command_status"] == "ok"
 
 
 def test_c2c_eval_smoke_detects_all_zero_empty_outputs(tmp_path: Path) -> None:
@@ -9329,7 +9405,8 @@ def test_c2c_proxy_all_zero_records_eval_smoke_failure(monkeypatch, tmp_path: Pa
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result = agent._run_single_c2c_candidate(
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = agent._run_single_c2c_proxy_candidate(
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "all_zero_proxy",

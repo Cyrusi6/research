@@ -40,7 +40,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
     ],
     "S2_plan": [
         ("plan/variant.json", "variant_v4.schema.json"),
-        ("plan/trial_spec.json", "trial_spec_v4.schema.json"),
+        ("plan/trial_spec.json", "trial_spec_v5.schema.json"),
         ("plan/s2_planner/candidate_pool.json", "s2_candidate_pool.schema.json"),
         ("plan/s2_planner/feedback_context.json", "s2_feedback_context.schema.json"),
         ("plan/s2_planner/adaptive_policy.json", "s2_adaptive_policy.schema.json"),
@@ -64,7 +64,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
     ],
     "orchestration": [
         ("meta/route_outcome.json", "route_outcome_v4.schema.json"),
-        ("meta/research_state.json", "research_state_v5.schema.json"),
+        ("meta/research_state.json", "research_state_v6.schema.json"),
         ("meta/iteration_trace.jsonl", None),
     ],
 }

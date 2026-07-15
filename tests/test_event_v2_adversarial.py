@@ -12,7 +12,6 @@ from auto_research.research_state import IntegrityError, ResearchEventLedger
 from test_authoritative_state_machine import (
     _complete,
     _direction,
-    _failure_evidence,
     _initialize,
     _reserve,
     _trial_spec,
@@ -22,7 +21,7 @@ from test_m113_ledger_closure import (
     _failure_evidence as _canonical_failure_evidence,
     _resume_evidence,
 )
-from support.authoritative_evidence import start_attempt_phase
+from support.authoritative_evidence import build_failure_evidence_v4, start_attempt_phase
 
 
 def _start_execution(ledger: ResearchEventLedger, attempt: dict) -> dict:
@@ -38,7 +37,11 @@ def _reserve_proxy(ledger: ResearchEventLedger, direction: dict, variant: dict) 
         variant=variant,
         implementation_hash=canonical_hash({"variant": variant["variant_spec_hash"]}),
         attempt_kind="proxy",
-        trial_spec=_trial_spec(profile="standard", attempt_kind="proxy"),
+        trial_spec=_trial_spec(
+            profile="standard",
+            attempt_kind="proxy",
+            project_root=ledger.project_root,
+        ),
     )
 
 
@@ -59,7 +62,14 @@ def test_repair_revision_can_reenter_same_proxy_running_transition(tmp_path: Pat
     variant = _variant(direction, 1)
     attempt = _reserve_proxy(ledger, direction, variant)
     running = _start_execution(ledger, attempt)
-    failed, _ = ledger.disposition_failure(_failure_evidence(ledger, running, "activation_failure", suffix="first"))
+    failed, _ = ledger.disposition_failure(
+        build_failure_evidence_v4(
+            tmp_path,
+            running,
+            failure_class="activation_failure",
+            suffix="first",
+        )
+    )
     repaired = _repair(ledger, failed, 2)
     rerun = _start_execution(ledger, repaired)
     assert rerun["state"] == "PROXY_RUNNING"
@@ -74,10 +84,24 @@ def test_same_failure_class_in_new_revision_creates_new_disposition_event(tmp_pa
     variant = _variant(direction, 1)
     attempt = _reserve_proxy(ledger, direction, variant)
     first_running = _start_execution(ledger, attempt)
-    first_failed, _ = ledger.disposition_failure(_failure_evidence(ledger, first_running, "activation_failure", suffix="first"))
+    first_failed, _ = ledger.disposition_failure(
+        build_failure_evidence_v4(
+            tmp_path,
+            first_running,
+            failure_class="activation_failure",
+            suffix="first",
+        )
+    )
     repaired = _repair(ledger, first_failed, 2)
     second_running = _start_execution(ledger, repaired)
-    second_failed, _ = ledger.disposition_failure(_failure_evidence(ledger, second_running, "activation_failure", suffix="second"))
+    second_failed, _ = ledger.disposition_failure(
+        build_failure_evidence_v4(
+            tmp_path,
+            second_running,
+            failure_class="activation_failure",
+            suffix="second",
+        )
+    )
     events = [event for event in ledger.events() if event["event_type"] == "AttemptDispositioned"]
     assert len(events) == 2
     assert events[0]["event_id"] != events[1]["event_id"]
@@ -183,7 +207,14 @@ def test_three_repair_generations_keep_one_attempt_and_consume_once(tmp_path: Pa
     attempt = _reserve(ledger, direction, variant)
     for revision in (2, 3):
         running = _start_execution(ledger, ledger.state()["attempts"][attempt["attempt_id"]])
-        failed, _ = ledger.disposition_failure(_failure_evidence(ledger, running, "activation_failure", suffix=str(revision)))
+        failed, _ = ledger.disposition_failure(
+            build_failure_evidence_v4(
+                tmp_path,
+                running,
+                failure_class="activation_failure",
+                suffix=str(revision),
+            )
+        )
         _repair(ledger, failed, revision)
     current = ledger.state()["attempts"][attempt["attempt_id"]]
     completed, _ = _complete(ledger, current, outcome="accepted")
@@ -206,7 +237,11 @@ def test_concurrent_plan_and_reserve_enforces_single_execution_slot(tmp_path: Pa
         local = ResearchEventLedger(tmp_path)
         try:
             local.plan_variant(variant)
-            spec = _trial_spec(profile="standard", attempt_kind="full")
+            spec = _trial_spec(
+                profile="standard",
+                attempt_kind="full",
+                project_root=tmp_path,
+            )
             return local.reserve_attempt(
                 profile="standard",
                 direction=direction,

@@ -102,13 +102,8 @@
               "activation_evidence",
               "proxy_baseline_fingerprint",
               "proxy_cache_report",
-              "effective_proxy_policy",
-              "proxy_calibration_policy",
               "full_s3_readiness",
               "bootstrap_completion",
-              "failure_evidence",
-              "resource_probe",
-              "resume_evidence",
               "proxy_results"
             ]
           },

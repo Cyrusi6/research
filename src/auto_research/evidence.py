@@ -9,6 +9,7 @@ import os
 import re
 import uuid
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 from typing import Any, Mapping
 
@@ -28,18 +29,24 @@ EVIDENCE_SCHEMA_VERSIONS = {
     "activation_evidence": "auto_research_activation_evidence_v3",
     "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v3",
     "proxy_cache_report": "auto_research_proxy_cache_report_v3",
-    "effective_proxy_policy": "auto_research_effective_proxy_policy_v3",
-    "proxy_calibration_policy": "auto_research_proxy_calibration_policy_v3",
     "full_s3_readiness": "auto_research_full_s3_readiness_v3",
     "bootstrap_completion": "auto_research_bootstrap_completion_v3",
-    "failure_evidence": "auto_research_failure_evidence_v3",
-    "resource_probe": "auto_research_resource_probe_evidence_v2",
-    "resume_evidence": "auto_research_resume_evidence_v3",
+}
+
+TRANSACTION_EVIDENCE_SCHEMA_VERSIONS = {
+    "failure_evidence": "auto_research_failure_evidence_v4",
+    "resource_probe": "auto_research_resource_probe_evidence_v3",
+    "resume_evidence": "auto_research_resume_evidence_v4",
+}
+
+CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS = {
+    **EVIDENCE_SCHEMA_VERSIONS,
+    **TRANSACTION_EVIDENCE_SCHEMA_VERSIONS,
 }
 
 _SCHEMA_FILES = {
     kind: f"{kind}_v{version.rsplit('_v', 1)[1]}.schema.json"
-    for kind, version in EVIDENCE_SCHEMA_VERSIONS.items()
+    for kind, version in CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS.items()
 }
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
 _SAFE_EXECUTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$")
@@ -235,7 +242,7 @@ def evidence_content_hash(payload: Mapping[str, Any]) -> str:
 def content_addressed_evidence_path(
     *, attempt_id: str, producer_run_id: str, evidence_kind: str, content_hash: str
 ) -> str:
-    if evidence_kind not in EVIDENCE_SCHEMA_VERSIONS:
+    if evidence_kind not in CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS:
         raise ValueError(f"unsupported evidence kind: {evidence_kind}")
     if not _SHA256.fullmatch(content_hash):
         raise ValueError("content hash must be lowercase SHA-256")
@@ -413,44 +420,10 @@ def _validate_evidence_semantics(payload: Mapping[str, Any]) -> None:
         for key in ("sample_manifest_hash", "evaluator_hash", "protocol_hash"):
             if inputs[key] != payload[key]:
                 raise ValueError(f"proxy baseline {key} cross-reference mismatch")
-    elif kind == "effective_proxy_policy":
-        body = {
-            "required_phases": payload["required_phases"],
-            "proxy_terminal_allowed": payload["proxy_terminal_allowed"],
-            "decision_threshold": payload["decision_threshold"],
-        }
-        if payload["policy_hash"] != canonical_hash(body):
-            raise ValueError("effective proxy policy hash is not reproducible")
-    elif kind == "proxy_calibration_policy":
-        body = {
-            "status": payload["status"],
-            "calibration_metric": payload["calibration_metric"],
-            "calibration_value": payload["calibration_value"],
-            "cross_references": payload["cross_references"],
-        }
-        if payload["calibration_hash"] != canonical_hash(body):
-            raise ValueError("proxy calibration hash is not reproducible")
     elif kind == "activation_evidence":
         passed = payload["status"] == "passed"
         if passed != (payload["command_status"] == "completed" and payload["exit_code"] == 0):
             raise ValueError("activation status contradicts command evidence")
-    elif kind == "failure_evidence":
-        expected_status = {
-            "implementation_failure": "failed",
-            "activation_failure": "failed",
-            "resource_pause": "resource_paused",
-            "oom_retry": "resource_paused",
-            "integrity_failure": "integrity_blocked",
-            "safety_failure": "integrity_blocked",
-        }[payload["failure_class"]]
-        if payload["command_status"] != expected_status:
-            raise ValueError("failure class contradicts command status")
-        if payload["exit_code"] == 0:
-            raise ValueError("failure evidence cannot report a successful exit code")
-    elif kind in {"resource_probe", "resume_evidence"}:
-        available = payload["observed_capacity"] >= payload["required_capacity"]
-        if (payload["probe_status"] == "available") != available:
-            raise ValueError("resource probe status contradicts observed capacity")
 
 
 def _observation_identity(observation: Mapping[str, Any]) -> tuple[Any, ...]:
@@ -465,14 +438,19 @@ def _observation_identity(observation: Mapping[str, Any]) -> tuple[Any, ...]:
 
 
 def _validate_schema(payload: Any, schema_name: str) -> None:
-    schema = json.loads((_schema_dir() / schema_name).read_text(encoding="utf-8"))
-    errors = sorted(Draft202012Validator(schema).iter_errors(payload), key=lambda error: list(error.absolute_path))
+    errors = sorted(_schema_validator(schema_name).iter_errors(payload), key=lambda error: list(error.absolute_path))
     if errors:
         messages = []
         for error in errors[:20]:
             location = ".".join(str(item) for item in error.absolute_path) or "$"
             messages.append(f"{location}: {error.message}")
         raise ValueError("; ".join(messages))
+
+
+@lru_cache(maxsize=None)
+def _schema_validator(schema_name: str) -> Draft202012Validator:
+    schema = json.loads((_schema_dir() / schema_name).read_text(encoding="utf-8"))
+    return Draft202012Validator(schema)
 
 
 def _schema_dir() -> Path:

@@ -6,10 +6,12 @@ import hashlib
 import json
 import math
 from copy import deepcopy
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 from jsonschema import Draft202012Validator
+from referencing import Registry, Resource
 
 from .evidence import (
     EVIDENCE_MANIFEST_SCHEMA_VERSION,
@@ -19,8 +21,8 @@ from .evidence import (
 
 DIRECTION_SCHEMA_VERSION = "auto_research_direction_v3"
 VARIANT_SCHEMA_VERSION = "auto_research_variant_v4"
-ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v5"
-TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v4"
+ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v6"
+TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v5"
 TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v5"
 ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v4"
 CONSTRAINT_RESULT_SCHEMA_VERSION = "auto_research_constraint_result_v2"
@@ -202,7 +204,7 @@ def validate_variant_identity(direction: dict[str, Any], spec: dict[str, Any], *
 
 
 def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
-    validate_contract(trial_spec, "trial_spec_v4.schema.json")
+    validate_contract(trial_spec, "trial_spec_v5.schema.json")
     datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
     manifest_datasets = {item["dataset_id"] for item in trial_spec["sample_manifest"]["datasets"]}
     if datasets != manifest_datasets:
@@ -218,19 +220,10 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
             raise ValueError("sample_count must equal ordered sample identity count")
         if len(set(provenance["ordered_sample_ids"])) != len(provenance["ordered_sample_ids"]):
             raise ValueError("ordered sample identities must be unique")
-        expected_content_hash = canonical_hash(
-            {
-                "dataset_id": provenance["dataset_id"],
-                "source_revision": provenance["source_revision"],
-                "split": provenance["split"],
-                "ordered_sample_ids": provenance["ordered_sample_ids"],
-            }
-        )
-        if provenance["content_hash"] != expected_content_hash or dataset["sample_hash"] != expected_content_hash:
+        if dataset["sample_hash"] != provenance["content_digest"]:
             raise ValueError("sample content provenance hash mismatch")
-    manifest_body = _without(trial_spec["sample_manifest"], "artifact_hash")
-    if trial_spec["sample_manifest"]["artifact_hash"] != canonical_hash(manifest_body):
-        raise ValueError("sample manifest artifact hash mismatch")
+    if trial_spec["sample_manifest_ref"]["contract_kind"] != "sample_manifest":
+        raise ValueError("sample manifest ContractRef kind mismatch")
     metrics = {item["metric_id"]: item for item in trial_spec["metrics"]}
     if trial_spec["primary_metric_id"] not in metrics:
         raise ValueError("TrialSpec primary_metric_id is not registered")
@@ -251,6 +244,8 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
         raise ValueError("runtime_config_hash mismatch")
     if runtime["evaluator_hash"] != canonical_hash(runtime["evaluator_provenance"]):
         raise ValueError("evaluator_hash must bind complete evaluator provenance")
+    if runtime["evaluator_manifest_ref"]["contract_kind"] != "evaluator_manifest":
+        raise ValueError("evaluator manifest ContractRef kind mismatch")
     required_phases = set(trial_spec["protocol"]["required_phases"])
     terminal_phases = set(trial_spec["protocol"]["terminal_phases"])
     if not terminal_phases.issubset(required_phases):
@@ -278,8 +273,6 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
         "activation_evidence": "auto_research_activation_evidence_v3",
         "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v3",
         "proxy_cache_report": "auto_research_proxy_cache_report_v3",
-        "effective_proxy_policy": "auto_research_effective_proxy_policy_v3",
-        "proxy_calibration_policy": "auto_research_proxy_calibration_policy_v3",
         "full_s3_readiness": "auto_research_full_s3_readiness_v3",
         "bootstrap_completion": "auto_research_bootstrap_completion_v3",
     }
@@ -293,6 +286,31 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
         for item in trial_spec["acceptance_constraints"]
     ):
         raise ValueError("TrialSpec requires a hard primary minimum_mean_delta constraint")
+    required_phases = set(trial_spec["protocol"]["required_phases"])
+    proxy_policy = trial_spec.get("proxy_decision_policy")
+    if "proxy" in required_phases:
+        from .proxy_classifier import validate_proxy_decision_policy
+
+        if not isinstance(proxy_policy, dict):
+            raise ValueError("proxy TrialSpec requires frozen ProxyDecisionPolicy")
+        validate_proxy_decision_policy(proxy_policy)
+        expected_mode = "terminal_bootstrap" if trial_spec["protocol"]["proxy_terminal_allowed"] else "gate_to_full"
+        if proxy_policy["mode"] != expected_mode:
+            raise ValueError("ProxyDecisionPolicy mode disagrees with protocol")
+        proxy_phase = phase_contracts["proxy"]
+        expected = {
+            "datasets": sorted(proxy_phase["datasets"]),
+            "seeds": sorted(proxy_phase["seeds"]),
+            "metric_ids": sorted(proxy_phase["metrics"]),
+            "roles": sorted(proxy_phase["roles"]),
+            "evidence_kinds": sorted(proxy_phase["evidence_kinds"]),
+            "primary_metric_id": trial_spec["primary_metric_id"],
+        }
+        for key, value in expected.items():
+            if proxy_policy[key] != value:
+                raise ValueError(f"ProxyDecisionPolicy {key} disagrees with proxy phase contract")
+    elif proxy_policy is not None:
+        raise ValueError("full-only TrialSpec cannot carry ProxyDecisionPolicy")
 
 
 def validate_execution_observation(observation: dict[str, Any]) -> None:
@@ -454,14 +472,25 @@ def validate_trial_result(
 
 
 def validate_contract(payload: Any, schema_name: str) -> None:
-    schema = json.loads((_schema_dir() / schema_name).read_text(encoding="utf-8"))
-    errors = sorted(Draft202012Validator(schema).iter_errors(payload), key=lambda error: list(error.absolute_path))
+    schema, registry = _compiled_schema(schema_name)
+    errors = sorted(Draft202012Validator(schema, registry=registry).iter_errors(payload), key=lambda error: list(error.absolute_path))
     if errors:
         messages = []
         for error in errors[:20]:
             location = ".".join(str(item) for item in error.absolute_path) or "$"
             messages.append(f"{location}: {error.message}")
         raise ValueError("; ".join(messages))
+
+
+@lru_cache(maxsize=None)
+def _compiled_schema(schema_name: str) -> tuple[dict[str, Any], Registry]:
+    schema_dir = _schema_dir()
+    schema = json.loads((schema_dir / schema_name).read_text(encoding="utf-8"))
+    registry = Registry()
+    for path in schema_dir.glob("*.schema.json"):
+        resource = Resource.from_contents(json.loads(path.read_text(encoding="utf-8")))
+        registry = registry.with_resource(path.name, resource)
+    return schema, registry
 
 
 def contract_errors(payload: Any, schema_name: str) -> list[str]:

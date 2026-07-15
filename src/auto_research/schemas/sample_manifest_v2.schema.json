@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "manifest_id", "provenance_mode", "datasets"],
+  "properties": {
+    "schema_version": {"const": "auto_research_sample_manifest_v2"},
+    "manifest_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"},
+    "provenance_mode": {"enum": ["real", "synthetic"]},
+    "datasets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["dataset_id", "source_revision", "split", "sample_count", "ordered_sample_ids", "source_blobs", "content_digest"],
+        "properties": {
+          "dataset_id": {"type": "string", "minLength": 1},
+          "source_revision": {"type": "string", "minLength": 1},
+          "split": {"type": "string", "minLength": 1},
+          "sample_count": {"type": "integer", "minimum": 1},
+          "ordered_sample_ids": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/hash"}
+          },
+          "source_blobs": {
+            "type": "array",
+            "minItems": 1,
+            "items": {"$ref": "#/$defs/blob"}
+          },
+          "content_digest": {"$ref": "#/$defs/hash"}
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "algorithm", "digest", "size_bytes", "relative_path"],
+      "properties": {
+        "schema_version": {"const": "auto_research_contract_blob_v1"},
+        "algorithm": {"const": "sha256"},
+        "digest": {"$ref": "#/$defs/hash"},
+        "size_bytes": {"type": "integer", "minimum": 0},
+        "relative_path": {"type": "string", "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"}
+      }
+    }
+  }
+}

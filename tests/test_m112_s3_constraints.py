@@ -55,13 +55,13 @@ def test_trial_spec_hash_changes_for_every_authoritative_field(mutate) -> None:
     assert trial_spec_hash(changed) != trial_spec_hash(original)
 
 
-def test_trial_spec_v4_is_closed_and_old_version_is_rejected() -> None:
+def test_trial_spec_v5_is_closed_and_v4_is_rejected() -> None:
     spec = _contract_trial_spec()
     spec["unexpected"] = True
     with pytest.raises(ValueError, match="Additional properties"):
         validate_trial_spec(spec)
     spec = _contract_trial_spec()
-    spec["schema_version"] = "auto_research_trial_spec_v3"
+    spec["schema_version"] = "auto_research_trial_spec_v4"
     with pytest.raises(ValueError, match=TRIAL_SPEC_SCHEMA_VERSION):
         validate_trial_spec(spec)
 

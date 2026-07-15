@@ -1,6 +1,6 @@
-# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.4
+# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.5-Final
 
-The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M1.1.4 does not restore their legacy readers, route policy, schemas, or artifact mirrors. Valid behavior is covered through the current canonical contracts and SQLite Event v5 state layer.
+The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M1.1.5-Final does not restore their legacy readers, route policy, schemas, or artifact mirrors. Valid behavior is covered through the current canonical contracts and SQLite Event v6 state/command layer.
 
 ## Migration Classes
 
@@ -11,7 +11,7 @@ The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M
 | Proxy/full execution, all-zero/neutral proxy, ablation, paired baseline, readiness, artifact lock | Yes | Existing C2C proxy, hook, manifest, Gate, and pipeline tests plus strict TrialResult tests | Retained as execution/Gate evidence. Routing authority moved from mutable proxy/main-results files to the committed attempt transaction. |
 | Codex S2/S2.5 session persistence and duplicate session recovery | Yes | Existing C2C planner and code-patch persistence tests in `tests/test_c2c.py` | Retained. A repeated scientific variant is rejected; IDs can no longer disguise duplication. |
 | Snapshot pollution, replay, stale route-invalidated artifacts | Yes | Event tamper, crash-before-projection, rebuild, audit, and replay tests | Replaced mutable snapshot authority with hash-chained SQLite events and rebuildable projections. |
-| S1/S2/S3 negative Gate paths and strict falsifiability/ablation fields | Yes | `tests/test_validators.py`, `tests/test_stage_contracts.py`, strict schema tests | Rewritten against DirectionSpec v3, VariantSpec v4, TrialSpec v4, TrialResult v5, immutable evidence, and pre-agent missing-input blocking. |
+| S1/S2/S3 negative Gate paths and strict falsifiability/ablation fields | Yes | `tests/test_validators.py`, `tests/test_stage_contracts.py`, strict schema tests | Rewritten against DirectionSpec v3, VariantSpec v4, TrialSpec v5, TrialResult v5, immutable evidence, and pre-agent missing-input blocking. |
 | Feedback attribution and adaptive history | Yes | State-machine semantic duplicate tests and existing `tests/test_s2_feedback_policy.py` | Method history reads only verified standard outcomes; implementation/resource history and planner feedback remain separate. |
 | Legacy `route_policy` branch-by-branch decisions | No | Unified reducer route tests | Obsolete because multiple route authorities caused conflicting counters and non-atomic decisions. `RouteOutcome v4` is reducer-derived. |
 | Legacy direction/idea fallback, v1 variant loading, candidate/next-variant execution inputs | No | Runtime `rg` assertion in `tests/test_authoritative_state_machine.py` | Obsolete under the breaking canonical switch. Old workspaces must rerun from S1. |
@@ -130,7 +130,7 @@ git diff --unified=0 71d38750a9bf193f24556222776fff3030a18bee..80d6b7ec38c61f8e1
 | 97 | `tests/test_validators.py::test_s3_gate_fails_below_acceptance_threshold` | Canonical replacement | `tests/test_route_policy.py::test_first_four_method_outcomes_route_to_next_variant` and aggregate outcome selection in `tests/test_s3_precommit_orchestration.py::test_direction_aggregate_selects_best_accepted_delta_not_highest_absolute_candidate`. Gates are not weakened. |
 | 98 | `tests/test_validators.py::test_s3_gate_fails_when_s2_5_artifact_lock_changes` | Canonical replacement | `tests/test_s3_precommit_orchestration.py::test_s3_precommit_rejects_invalid_trial_without_finalization_or_budget_change`, `tests/test_c2c.py::test_frozen_patch_guard_requires_sha_and_restores_added_files`. |
 
-The M1.1.4 full suite is the migration acceptance criterion. Tests are neither skipped nor weakened to preserve old artifacts; assertions target Event v5 phase transactions, lifecycle generations, semantic/spec identity, evidence-derived observations, strict precommit Gate behavior, exact completion replay, bootstrap isolation, and the five-outcome reducer invariant.
+The original 98-name table remains the historical behavior migration map. Its canonical replacements now target Event v6 phase/command transactions, lifecycle generations, semantic/spec identity, evidence-derived observations, strict precommit/rebuild/Gate equality, exact completion replay, bootstrap isolation, and the five-outcome reducer invariant. Tests are not redirected to legacy artifacts or weakened schemas.
 
 ## M1.1.2 RouteOutcome authority and hermetic audit
 
@@ -149,4 +149,57 @@ Tests that previously constructed `ExecutionObservation` or a completed `TrialRe
 
 ## M1.1.4 phase-transaction migration
 
-The existing 98-name mapping remains authoritative. Its canonical replacements now run on Event v5, AttemptRecord v5, TrialSpec v4, EvidenceManifest v3, ExecutionObservation v4, and TrialResult v5. Proxy/full regressions additionally map to `tests/test_m114_authoritative_phase_transactions.py`: current-generation binding, reducer-derived proxy decisions, full-command gating, bootstrap proxy-only evidence, symlink-ancestor rejection, explicit completion event IDs, exact historical replay, global execution width, and strict Generic external manifests. No removed fixed-path reader or TrialResult completion overload was restored.
+The existing 98-name mapping remains authoritative for the behavior it preserves, but its M1.1.4 contract versions are historical. Current replacements run on Event v6, AttemptRecord v6, ResearchState v6, TrialSpec v5, PhaseExecutionManifest v2, EvidenceManifest v3, ExecutionObservation v4, and TrialResult v5. Proxy/full regressions additionally map to `tests/test_m114_authoritative_phase_transactions.py`: current-generation binding, reducer-derived proxy decisions, full-command gating, bootstrap proxy-only evidence, symlink-ancestor rejection, explicit completion event IDs, exact historical replay, global execution width, immutable ContractRefs, and strict Generic external manifests. No removed fixed-path reader or TrialResult completion overload was restored.
+
+## M1.1.5 physical-phase migration
+
+The M1.1.4 canonical behavior mappings remain valid. Fixtures now create TrialSpec v5 ContractRefs, phase-scoped evidence, Ledger-derived phase authorization, and typed Failure/Resume v4 bytes. No production fallback from full aggregates, producer policy, mutable sample/evaluator files, or phase-agnostic execution was restored.
+
+### M1.1.5-Final canonical replacement map
+
+| Removed/bypassed behavior | Canonical replacement tests | Preserved invariant |
+|---|---|---|
+| Phase-agnostic C2C call executes proxy and full together | `tests/test_m115_physical_phase_chain.py::test_full_callbacks_observe_committed_proxy_and_full_phase_started`; `tests/test_m115_phase_executor.py::test_phase_agnostic_c2c_production_entry_is_removed` | Full side effects require committed proxy `RUN_FULL` and `FullPhaseStarted` |
+| Proxy rows relabeled from full aggregates | `tests/test_m115_physical_phase_chain.py::test_proxy_inventory_uses_proxy_command_metrics_not_full_aggregate` | Proxy classification uses actual proxy command bytes |
+| Caller/producer threshold or proxy decision authority | `tests/test_m115_proxy_classifier.py::test_frozen_policy_passes_exact_paired_coverage_without_producer_policy`; `tests/test_m115_proxy_classifier.py::test_producer_policy_is_rejected_as_unregistered_extra_evidence` | Threshold and route come only from frozen ProxyDecisionPolicy and reducer |
+| Incomplete/duplicate/extra proxy coverage | `tests/test_m115_proxy_classifier.py::test_proxy_attacks_fail_after_valid_baseline`; `tests/test_m115_proxy_classifier.py::test_dataset_regression_blocks_full_even_when_aggregate_passes` | Exact paired dataset × seed × metric × role coverage and per-dataset regression |
+| Runtime identity embedded in preregistered proxy policy | `tests/test_m115_proxy_classifier.py::test_trial_spec_v5_freezes_policy_and_proxy_start_binds_runtime_identity` | Policy is scientific; ProxyEvaluationBinding supplies runtime identity |
+| Boolean, `None`, or caller mapping accepted as authority | `tests/test_m115_phase_executor.py::test_bool_none_or_mapping_authority_is_fail_closed`; `tests/test_m115_phase_executor.py::test_experiment_side_effect_without_ledger_context_is_fail_closed` | Production runner accepts only exact SQLite-derived PhaseAuthorization |
+| Stale generation/context executes a command | `tests/test_m115_phase_executor.py::test_authorization_generation_drift_blocks_runner`; `tests/test_m114_authoritative_phase_transactions.py::test_repair_generation_rejects_old_generation_completion` | Current lifecycle/implementation/input identity is mandatory |
+| PhaseExecutionManifest v1 runtime reader | `tests/test_m115_phase_executor.py::test_research_ledger_authority_rejects_v1_manifest`; `tests/test_m114_authoritative_phase_transactions.py::test_generic_external_manifest_rejects_non_authoritative_v2_bindings` | Only v2 manifest and frozen ContractRefs authorize execution |
+| Mutable sample/evaluator paths or self-declared digests | `tests/test_m115_contract_reservation.py::test_plan_contract_refs_are_immutable_and_reservation_rebuilds`; `tests/test_m114_authoritative_phase_transactions.py::test_real_evaluator_manifest_tamper_rejects_reservation_without_write` | Reservation verifies content-addressed source/sample bytes |
+| Contract path escape, symlink, hard-link, or hash drift | `tests/test_m115_contract_journal.py::test_contract_store_rejects_claimed_digest_and_symlink_path`; `tests/test_m115_contract_journal.py::test_contract_store_rejects_leaf_symlink_and_hard_link`; `tests/test_m115_contract_reservation.py::test_contract_path_attacks_reject_reservation_without_event` | ContractStore reads one safe immutable object |
+| Mutable journal as second fact store | `tests/test_m115_contract_journal.py::test_ledger_journal_executes_completed_command_exactly_once` | Command Started/Completed lifecycle is Event v6 authority |
+| Rerun after Started with no trustworthy result | `tests/test_m115_contract_journal.py::test_started_without_receipt_becomes_unknown_and_never_reruns` | Unknown side-effect outcome is explicit and fail closed |
+| Rerun after receipt write but before DB completion | `tests/test_m115_contract_journal.py::test_receipt_after_side_effect_before_db_can_be_reconciled_without_rerun` | Content-addressed receipt is reconciled exactly once |
+| Same command ID reused for different intent | `tests/test_m115_contract_journal.py::test_command_id_reuse_with_different_intent_is_integrity_conflict` | Command replay is idempotent only for canonical-equal intent |
+| Arbitrary JSON/log routes implementation repair | `tests/test_m115_failure_validation.py::test_non_resource_failure_requires_exact_canonical_command_receipt` | Non-resource failure requires typed current nonzero-exit command evidence |
+| Available resource probe creates pause | `tests/test_m115_failure_validation.py::test_resource_pause_requires_insufficient_probe_and_strict_capacity_gap` | Pause requires insufficient capacity below the frozen requirement |
+| Mismatched probe or pause evidence resumes Attempt | `tests/test_m115_failure_validation.py::test_resume_rejects_resource_identity_phase_and_producer_attacks`; `tests/test_m114_authoritative_phase_transactions.py::test_resume_rejects_probe_with_other_attempt_identity` | Resume binds the original pause, resource, Attempt, phase, and producer |
+| Reducer trusts rehashed Failure/Resume event payload | `tests/test_m115_failure_resume_reducer.py::test_rebuild_rejects_rehashed_failure_semantic_mutation`; `tests/test_m115_failure_resume_reducer.py::test_rebuild_rejects_failure_and_resume_raw_byte_drift` | Rebuild rereads immutable bytes and repeats semantic validation |
+| Full resource resume loses proxy authorization or reruns proxy | `tests/test_m115_failure_resume_reducer.py::test_full_resource_resume_retains_proxy_authorization_and_restarts_only_full` | New generation resumes from proxy-completed/full-pending |
+| Full starts after proxy science rejection | `tests/test_m114_authoritative_phase_transactions.py::test_proxy_reject_prevents_full_start_and_releases_reservation`; `tests/test_m115_final_e2e.py::test_c2c_non_simulated_physical_proxy_barrier` | Reject routes next variant, releases slot, consumes zero, invokes full zero times |
+| Bootstrap uses full artifacts or standard budget/history | `tests/test_m115_final_e2e.py::test_c2c_non_simulated_bootstrap_is_proxy_only_and_budget_isolated`; `tests/test_s3_proxy_gate.py::test_s3_bootstrap_gate_is_repeatable_read_only_and_budget_isolated` | Bootstrap is proxy terminal and standard-budget isolated |
+| Global TrialSpec projection controls historical replay | `tests/test_m114_authoritative_phase_transactions.py::test_exact_replay_uses_attempt_scoped_trial_spec_not_global_projection` | Replay uses Attempt-scoped frozen TrialSpec and historical operation result |
+| Caller event ID is ignored | `tests/test_m114_authoritative_phase_transactions.py::test_complete_attempt_honors_explicit_event_id` | Same ID/same intent replays; same ID/different intent conflicts |
+| Extra but valid evidence accepted before Gate failure | `tests/test_m114_authoritative_phase_transactions.py::test_unregistered_optional_evidence_is_rejected_before_commit`; `tests/test_s3_proxy_gate.py::test_bootstrap_completion_rejects_noncompletion_authoritative_kind` | Exact evidence set is enforced before any authoritative write |
+| Rehashed producer-derived proxy/result fields survive rebuild | `tests/test_m114_authoritative_phase_transactions.py::test_rebuild_rejects_forged_proxy_outcome_derivatives`; `tests/test_m114_authoritative_phase_transactions.py::test_reducer_rejects_forged_finalization_derivatives` | Reducer recomputes proxy and TrialResult derivatives from immutable evidence |
+| Generic external command bypasses ContractStore/authority | `tests/test_m114_authoritative_phase_transactions.py::test_generic_non_simulate_external_manifest_commits_strict_trial`; `tests/test_m115_final_e2e.py::test_generic_full_only_uses_authority_journal_and_gate` | Generic production-component path uses manifest v2, journal, immutable evidence, Ledger, and Gate |
+| Sixth standard execution reaches command/artifact creation | `tests/test_m115_final_e2e.py::test_generic_non_simulated_five_variants_and_sixth_precommand_rejection`; `tests/test_m115_final_e2e.py::test_c2c_non_simulated_five_variants_have_physical_proxy_full_order` | Five unique outcomes consume exactly five slots; sixth is rejected before command |
+
+### Deleted contract migration
+
+The runtime intentionally rejects and does not migrate Event v5, AttemptRecord v5, ResearchState v5, TrialSpec v4, PhaseExecutionManifest v1, FailureEvidence v3, ResumeEvidence v3, ResourceProbe v2, ProxyDecisionContract v1, ProxyOutcome v1/v2, EffectiveProxyPolicy v3, and ProxyCalibrationPolicy v3. Tests that mention these versions do so only as explicit negative attacks. Historical workspaces must rerun from S1.
+
+### Scope labels
+
+- `tests/test_m115_final_e2e.py` local subprocess cases are **non-simulated production-component** checks: they exercise ExperimentAgent, phase executor, Ledger command events, ContractStore, EvidenceStore, reducer/rebuild, and Gate without GPU requirements. They are not claims of scientific success.
+- Existing Generic/C2C five-variant simulation tests remain **synthetic** and prove deterministic state/budget/evidence behavior only.
+- Native Unified S1 Producer/Core and real external Codex S1 smoke are not migrated or claimed by M1.1.5-Final.
+
+### Final hermetic migration
+
+- `tests/test_m115_final_e2e.py` now provisions its own temporary C2C dataset cache. The non-simulated tests no longer pass only because `/root/.cache`, the invoking user's HF cache, or another host cache happens to exist.
+- `tests/test_resources.py::test_scan_reusable_runs_skips_directories_that_disappear_during_walk` replaces the racy project-wide `Path.rglob()` behavior with a filesystem-race-tolerant scan.
+- `tests/test_resources.py::test_scan_reusable_runs_ignores_project_temp_directory` ensures concurrent pytest `.tmp` trees are not interpreted as reusable scientific runs.
+- Final normal, proxy-cleared, and empty-HOME/no-Codex suites each report `633 passed, 2 skipped, 0 failed`; the two skips remain the pre-existing optional torch/transformers dynamic skips.

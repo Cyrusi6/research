@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -10,6 +11,7 @@ from auto_research.agents.experiment import (
     _stage_evidence_inventory,
 )
 from auto_research.agents.plan import _trial_spec_from_plan
+from auto_research.contract_store import ContractStore
 from auto_research.domain_contracts import canonical_hash, trial_spec_hash
 from auto_research.evidence import EVIDENCE_SCHEMA_VERSIONS, encode_canonical_evidence
 from auto_research.s3_validation import S3ValidationError, _validate_trial_spec_projection_drift
@@ -41,6 +43,34 @@ def _plan() -> dict:
         "execution": {"mode": "simulate", "collector": "generic", "commands": []},
         "resource_budget": {"wall_clock_minutes": 20},
     }
+
+
+def _real_plan(project_root: Path) -> dict:
+    sample_bytes = b'{"id":"sample-a","value":1}\n'
+    sample_path = project_root / "samples" / "dataset-a.jsonl"
+    sample_path.parent.mkdir(parents=True, exist_ok=True)
+    sample_path.write_bytes(sample_bytes)
+    evaluator_path = project_root / "evaluator.py"
+    evaluator_path.write_text("def evaluate(value):\n    return float(value)\n", encoding="utf-8")
+    plan = _plan()
+    plan["datasets"] = [{
+        "name": "dataset-a",
+        "split": "validation",
+        "sample_count": 1,
+        "source_revision": "fixture-source-v1",
+        "ordered_sample_ids": [hashlib.sha256(sample_bytes).hexdigest()],
+    }]
+    plan["execution"] = {
+        "mode": "real",
+        "collector": "external_manifest",
+        "commands": ["true"],
+        "workdir": str(project_root),
+        "phase_manifest_path": "runner/phase_manifest.json",
+        "evaluator_id": "fixture-evaluator",
+        "evaluator_source_paths": ["evaluator.py"],
+        "dependency_payloads": [{"name": "python", "lock": "fixture-lock-v1"}],
+    }
+    return plan
 
 
 def _attempt(trial_spec: dict) -> dict:
@@ -121,7 +151,7 @@ def _row(attempt: dict, *, role: str, value: float) -> dict:
 
 
 def test_identity_only_main_evidence_cannot_create_observations(tmp_path: Path) -> None:
-    trial_spec = _trial_spec_from_plan(_plan(), _variant())
+    trial_spec = _trial_spec_from_plan(_plan(), _variant(), project_root=tmp_path)
     attempt = _attempt(trial_spec)
     source = tmp_path / "runner" / "main.json"
     source.parent.mkdir(parents=True, exist_ok=True)
@@ -137,8 +167,29 @@ def test_identity_only_main_evidence_cannot_create_observations(tmp_path: Path) 
     assert not (tmp_path / "experiment" / "attempts").exists()
 
 
+def test_real_generic_trial_spec_uses_readable_content_addressed_contracts(tmp_path: Path) -> None:
+    trial_spec = _trial_spec_from_plan(_real_plan(tmp_path), _variant(), project_root=tmp_path)
+    store = ContractStore(tmp_path)
+
+    sample_manifest = store.read_contract(
+        trial_spec["sample_manifest_ref"],
+        contract_kind="sample_manifest",
+        schema_file="sample_manifest_v2.schema.json",
+    )
+    evaluator_manifest = store.read_contract(
+        trial_spec["execution_contract"]["evaluator_manifest_ref"],
+        contract_kind="evaluator_manifest",
+        schema_file="evaluator_manifest_v2.schema.json",
+    )
+
+    assert sample_manifest["provenance_mode"] == "real"
+    assert evaluator_manifest["provenance_mode"] == "real"
+    assert store.read_bytes(evaluator_manifest["source_blobs"][0]) == (tmp_path / "evaluator.py").read_bytes()
+    assert all((tmp_path / ref["relative_path"]).is_file() for ref in sample_manifest["datasets"][0]["source_blobs"])
+
+
 def test_only_explicit_inventory_is_staged_even_when_legacy_fixed_path_exists(tmp_path: Path) -> None:
-    trial_spec = _trial_spec_from_plan(_plan(), _variant())
+    trial_spec = _trial_spec_from_plan(_plan(), _variant(), project_root=tmp_path)
     attempt = _attempt(trial_spec)
     legacy = tmp_path / "experiment" / "results" / "main_results.json"
     legacy.parent.mkdir(parents=True, exist_ok=True)
@@ -155,7 +206,7 @@ def test_only_explicit_inventory_is_staged_even_when_legacy_fixed_path_exists(tm
 
 
 def test_staged_rows_are_attempt_scoped_and_content_addressed(tmp_path: Path) -> None:
-    trial_spec = _trial_spec_from_plan(_plan(), _variant())
+    trial_spec = _trial_spec_from_plan(_plan(), _variant(), project_root=tmp_path)
     attempt = _attempt(trial_spec)
     payload = _measurement(attempt, rows=[_row(attempt, role="baseline", value=0.0), _row(attempt, role="candidate", value=1.0)])
     source = tmp_path / "runner" / "main.json"
@@ -181,7 +232,7 @@ def test_staged_rows_are_attempt_scoped_and_content_addressed(tmp_path: Path) ->
 
 
 def test_cross_attempt_inventory_is_rejected(tmp_path: Path) -> None:
-    trial_spec = _trial_spec_from_plan(_plan(), _variant())
+    trial_spec = _trial_spec_from_plan(_plan(), _variant(), project_root=tmp_path)
     attempt = _attempt(trial_spec)
     payload = _measurement(attempt, rows=[_row(attempt, role="baseline", value=0.0), _row(attempt, role="candidate", value=1.0)])
     payload["attempt_id"] = "attempt-other"
@@ -199,7 +250,7 @@ def test_cross_attempt_inventory_is_rejected(tmp_path: Path) -> None:
 
 
 def test_missing_trial_spec_projection_is_integrity_error(tmp_path: Path) -> None:
-    trial_spec = _trial_spec_from_plan(_plan(), _variant())
+    trial_spec = _trial_spec_from_plan(_plan(), _variant(), project_root=tmp_path)
     errors: list[str] = []
 
     _validate_trial_spec_projection_drift(errors, tmp_path, deepcopy(trial_spec))

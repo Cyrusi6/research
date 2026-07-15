@@ -11,15 +11,22 @@ from pathlib import Path
 
 import pytest
 
-from auto_research.agents.experiment import ExperimentAgent, _c2c_strict_evidence_inventory, _stage_evidence_inventory
+from auto_research.agents.experiment import (
+    ExperimentAgent,
+    _c2c_strict_evidence_inventory,
+    _generic_external_evidence_inventory,
+    _stage_evidence_inventory,
+)
 from auto_research.agents.plan import _trial_spec_from_plan
 from auto_research.agents.base import AgentContext
 from auto_research.artifacts import ArtifactManager
+from auto_research.contract_store import ContractStore
 from auto_research.llm import ModelClient
 from auto_research.validators import run_stage_gate
 from auto_research.domain_contracts import canonical_hash
 from auto_research.evidence import content_addressed_evidence_path, encode_canonical_evidence
 from auto_research.research_state import IntegrityError, ResearchEventLedger, _event_hash, canonical_json
+from auto_research.s3_validation import S3ValidationError
 from test_m112_ledger_authority import _direction as named_direction
 from test_m112_ledger_authority import _variant as named_variant
 from test_m112_experiment_flow import _authoritative_direction_and_variant
@@ -28,20 +35,25 @@ from test_m113_ledger_closure import (
     _failure_evidence,
     _resume_evidence,
     _running_attempt,
+    _scoped_artifact,
     _trial_spec,
+    _trial_spec_legacy,
     _valid_completion,
     _variant,
 )
 
 
 def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dict, dict, dict]:
-    from support.authoritative_evidence import start_attempt_phase, upgrade_trial_spec_v4
+    from support.authoritative_evidence import start_attempt_phase, build_trial_spec_v5
     ledger = ResearchEventLedger(tmp_path)
     direction = _direction()
     variant = _variant(direction)
+    variant_path = tmp_path / "plan" / "variant.json"
+    variant_path.parent.mkdir(parents=True, exist_ok=True)
+    variant_path.write_text(json.dumps(variant, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     ledger.select_direction(direction)
     ledger.plan_variant(variant)
-    trial_spec = upgrade_trial_spec_v4(_trial_spec())
+    trial_spec = _trial_spec_legacy()
     trial_spec["protocol"]["required_phases"] = ["proxy"] if profile == "bootstrap" else ["proxy", "full"]
     trial_spec["protocol"]["terminal_phases"] = ["proxy"] if profile == "bootstrap" else ["full"]
     trial_spec["protocol"]["proxy_terminal_allowed"] = profile == "bootstrap"
@@ -57,12 +69,16 @@ def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dic
     if profile == "standard":
         trial_spec["evidence_requirements"].append({"requirement_id": "main", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_main_results_v3"})
     trial_spec["required_artifacts"] = [item["kind"] for item in trial_spec["evidence_requirements"]]
-    trial_spec = upgrade_trial_spec_v4(trial_spec)
+    trial_spec = build_trial_spec_v5(trial_spec, project_root=tmp_path)
     attempt = ledger.reserve_attempt(profile=profile, direction=direction, variant=variant, implementation_hash=canonical_hash({"impl": profile}), attempt_kind="bootstrap_proxy" if profile == "bootstrap" else "proxy_full", trial_spec=trial_spec)
     attempt = start_attempt_phase(ledger, attempt, "proxy")
     trial_spec = deepcopy(attempt["frozen_trial_spec"])
     comparison = {
         "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
+        "proxy_screen": {
+            "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
+            "baseline_metrics": {"mean": 0.0, "datasets": {"fake": 0.0}},
+        },
         "ablation": {"metrics": {"datasets": {"fake": 0.5}}},
         "matched_control_metrics": {"datasets": {"fake": 0.8}},
         "coverage_metrics": {"datasets": {"fake": 1.0}},
@@ -197,6 +213,7 @@ def test_resume_rejects_probe_with_other_attempt_identity(tmp_path: Path) -> Non
     new_path = root / f"{new_hash}.json"
     new_path.write_bytes(raw)
     evidence["cross_references"]["resource_probe_hash"] = new_hash
+    _scoped_artifact(tmp_path, paused, producer, "resume_evidence", evidence)
     with pytest.raises(IntegrityError, match="identity|attempt"):
         ledger.resume_attempt(evidence)
 
@@ -209,7 +226,7 @@ def test_exact_replay_uses_attempt_scoped_trial_spec_not_global_projection(tmp_p
     variant_b = named_variant(direction_b, "variant-b")
     ledger.select_direction(direction_b)
     ledger.plan_variant(variant_b)
-    trial_spec_b = deepcopy(_trial_spec())
+    trial_spec_b = deepcopy(_trial_spec(tmp_path))
     trial_spec_b["protocol"]["protocol_id"] = "m114-full-b"
     ledger.reserve_attempt(
         profile="standard", direction=direction_b, variant=variant_b,
@@ -230,12 +247,12 @@ def test_bootstrap_and_standard_cannot_both_be_active(tmp_path: Path) -> None:
     ledger.plan_variant(variant)
     ledger.reserve_attempt(
         profile="bootstrap", direction=direction, variant=variant,
-        implementation_hash=canonical_hash({"bootstrap": 1}), attempt_kind="bootstrap_proxy", trial_spec=_trial_spec(),
+        implementation_hash=canonical_hash({"bootstrap": 1}), attempt_kind="bootstrap_proxy", trial_spec=_trial_spec(tmp_path),
     )
     with pytest.raises(IntegrityError, match="execution_width=1"):
         ledger.reserve_attempt(
             profile="standard", direction=direction, variant=variant,
-            implementation_hash=canonical_hash({"standard": 1}), attempt_kind="full", trial_spec=_trial_spec(),
+            implementation_hash=canonical_hash({"standard": 1}), attempt_kind="full", trial_spec=_trial_spec(tmp_path),
         )
 
 
@@ -322,10 +339,19 @@ def test_generic_non_simulate_external_manifest_commits_strict_trial(tmp_path: P
     direction, variant = _authoritative_direction_and_variant()
     project_root = tmp_path / "generic-real"
     project_root.mkdir()
+    sample_bytes = b'{"id":"sample-1","label":1}\n'
+    sample_source = project_root / "samples" / "dataset-a.jsonl"
+    sample_source.parent.mkdir(parents=True)
+    sample_source.write_bytes(sample_bytes)
+    evaluator_source = project_root / "evaluator.py"
+    evaluator_source.write_text(
+        "def evaluate(baseline, candidate):\n    return candidate - baseline\n",
+        encoding="utf-8",
+    )
     plan = {
         "hypotheses": [{"id": "H1", "statement": "candidate improves accuracy"}],
         "baselines": [{"name": "baseline"}],
-        "datasets": [{"name": "dataset-a", "split": "validation", "sample_count": 1, "source_revision": "local-fixture-v1", "ordered_sample_ids": ["1" * 64]}],
+        "datasets": [{"name": "dataset-a", "split": "validation", "sample_count": 1, "source_revision": "local-fixture-v1", "ordered_sample_ids": [hashlib.sha256(sample_bytes).hexdigest()]}],
         "metrics": [{"name": "accuracy", "primary": True, "higher_is_better": True}],
         "statistical_testing": {"seeds": [7], "aggregation": "mean", "require_complete_seed_coverage": True},
         "acceptance_criteria": {"minimum_mean_delta": 0.1, "maximum_dataset_regression": 0.0},
@@ -333,11 +359,26 @@ def test_generic_non_simulate_external_manifest_commits_strict_trial(tmp_path: P
         "execution": {
             "mode": "real", "collector": "external_manifest", "commands": [f"{sys.executable} producer.py"],
             "workdir": str(project_root), "phase_manifest_path": "runner/phase_manifest.json",
-            "evaluator_id": "fixture-evaluator", "evaluator_source_digest": "a" * 64, "dependency_digest": "b" * 64,
+            "evaluator_id": "fixture-evaluator", "evaluator_source_paths": ["evaluator.py"],
+            "dependency_payloads": [{"name": "python", "version": f"{sys.version_info.major}.{sys.version_info.minor}"}],
         },
         "resource_budget": {"wall_clock_minutes": 5},
     }
     trial_spec = _trial_spec_from_plan(plan, variant, project_root=project_root)
+    contract_store = ContractStore(project_root)
+    sample_manifest = contract_store.read_contract(
+        trial_spec["sample_manifest_ref"],
+        contract_kind="sample_manifest",
+        schema_file="sample_manifest_v2.schema.json",
+    )
+    evaluator_manifest = contract_store.read_contract(
+        trial_spec["execution_contract"]["evaluator_manifest_ref"],
+        contract_kind="evaluator_manifest",
+        schema_file="evaluator_manifest_v2.schema.json",
+    )
+    assert sample_manifest["datasets"][0]["ordered_sample_ids"] == [hashlib.sha256(sample_bytes).hexdigest()]
+    assert contract_store.read_bytes(evaluator_manifest["source_blobs"][0]) == evaluator_source.read_bytes()
+    assert evaluator_manifest["provenance_mode"] == "real"
     projections = {
         "literature/direction.json": direction,
         "plan/variant.json": variant,
@@ -363,7 +404,7 @@ for role,value in [('baseline',0.5),('candidate',0.8)]: rows.append({'phase':'fu
 main={'schema_version':'auto_research_main_results_v3','evidence_kind':'main_results','evidence_id':'evidence-main-real',**identity,'rows':rows}
 activation={'schema_version':'auto_research_activation_evidence_v3','evidence_kind':'activation_evidence','evidence_id':'evidence-activation-real',**identity,'probe_id':'forward-probe-real','status':'passed','command_status':'completed','exit_code':0,'implementation_surface_ids':['src/router.py']}
 (root/'runner').mkdir(); (root/'runner/main.json').write_text(json.dumps(main,sort_keys=True,separators=(',',':'))); (root/'runner/activation.json').write_text(json.dumps(activation,sort_keys=True,separators=(',',':')))
-manifest={'schema_version':'auto_research_phase_execution_manifest_v1','attempt_id':attempt['attempt_id'],'direction_semantic_hash':attempt['direction_semantic_hash'],'direction_spec_hash':attempt['direction_spec_hash'],'variant_semantic_hash':attempt['variant_semantic_hash'],'variant_spec_hash':attempt['variant_spec_hash'],'trial_spec_hash':attempt['trial_spec_hash'],'lifecycle_generation':attempt['lifecycle_generation'],'implementation_hash':attempt['implementation_hash'],'attempt_input_hash':attempt['attempt_input_hash'],'phase':'full','phase_execution_id':phase['phase_execution_id'],'phase_start_event_id':phase['phase_start_event_id'],'producer_run_id':producer,'artifacts':[{'kind':'main_results','source_path':'runner/main.json','producer_run_id':producer},{'kind':'activation_evidence','source_path':'runner/activation.json','producer_run_id':producer}]}
+manifest={**phase,'sample_contract_ref':attempt['frozen_trial_spec']['sample_manifest_ref'],'evaluator_contract_ref':attempt['frozen_trial_spec']['execution_contract']['evaluator_manifest_ref'],'artifacts':[{'kind':'main_results','source_path':'runner/main.json','producer_run_id':producer},{'kind':'activation_evidence','source_path':'runner/activation.json','producer_run_id':producer}]}
 (root/'runner/phase_manifest.json').write_text(json.dumps(manifest,sort_keys=True,separators=(',',':')))
 """,
         encoding="utf-8",
@@ -380,8 +421,51 @@ manifest={'schema_version':'auto_research_phase_execution_manifest_v1','attempt_
     assert run_stage_gate("S3_experiment", project_root, config).to_dict()["status"] == "PASS"
 
 
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        (lambda manifest: manifest.update(schema_version="auto_research_phase_execution_manifest_v1"), "PhaseExecutionManifest v2"),
+        (lambda manifest: manifest.update(command_plan_hash="0" * 64), "Ledger phase authorization"),
+        (lambda manifest: manifest.update(sample_contract_ref=manifest["evaluator_contract_ref"]), "sample ContractRef mismatch"),
+        (lambda manifest: manifest.update(expected_evidence_kinds=["unexpected_results"]), "Ledger phase authorization"),
+    ],
+)
+def test_generic_external_manifest_rejects_non_authoritative_v2_bindings(
+    tmp_path: Path,
+    mutation,
+    message: str,
+) -> None:
+    _, attempt = _running_attempt(tmp_path)
+    phase_manifest = deepcopy(attempt["phase_executions"]["full"])
+    producer_run_id = phase_manifest["producer_run_id"]
+    artifacts = [
+        {"kind": kind, "source_path": f"runner/{kind}.json", "producer_run_id": producer_run_id}
+        for kind in phase_manifest["expected_evidence_kinds"]
+    ]
+    manifest = {
+        **phase_manifest,
+        "sample_contract_ref": deepcopy(attempt["frozen_trial_spec"]["sample_manifest_ref"]),
+        "evaluator_contract_ref": deepcopy(attempt["frozen_trial_spec"]["execution_contract"]["evaluator_manifest_ref"]),
+        "artifacts": artifacts,
+    }
+    manifest_path = tmp_path / "runner" / "phase_manifest.json"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    execution = {"phase_manifest_path": "runner/phase_manifest.json"}
+    assert {item["kind"] for item in _generic_external_evidence_inventory(project_root=tmp_path, attempt=attempt, execution=execution)} == set(
+        phase_manifest["expected_evidence_kinds"]
+    )
+
+    mutation(manifest)
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")), encoding="utf-8")
+    with pytest.raises(S3ValidationError, match=message):
+        _generic_external_evidence_inventory(project_root=tmp_path, attempt=attempt, execution=execution)
+
+
 def test_real_evaluator_manifest_tamper_rejects_reservation_without_write(tmp_path: Path) -> None:
     direction, variant = _authoritative_direction_and_variant()
+    evaluator_source = tmp_path / "evaluator.py"
+    evaluator_source.write_text("def evaluate(value):\n    return value\n", encoding="utf-8")
     plan = {
         "hypotheses": [{"id": "H1", "statement": "candidate improves accuracy"}],
         "baselines": [{"name": "baseline"}],
@@ -393,7 +477,7 @@ def test_real_evaluator_manifest_tamper_rejects_reservation_without_write(tmp_pa
         "execution": {
             "mode": "real", "collector": "external_manifest", "commands": ["true"], "workdir": str(tmp_path),
             "phase_manifest_path": "runner/phase_manifest.json", "evaluator_id": "fixture-evaluator",
-            "evaluator_source_digest": "a" * 64, "dependency_digest": "b" * 64,
+            "evaluator_source_paths": ["evaluator.py"], "dependency_payloads": [{"lock": "fixture-v1"}],
         },
         "resource_budget": {"wall_clock_minutes": 5},
     }
@@ -402,8 +486,10 @@ def test_real_evaluator_manifest_tamper_rejects_reservation_without_write(tmp_pa
     ledger.select_direction(direction)
     ledger.plan_variant(variant)
     before = ledger.state()
-    (tmp_path / "plan/evaluator_manifest.json").write_text("{}", encoding="utf-8")
-    with pytest.raises(IntegrityError, match="evaluator manifest artifact hash or content mismatch"):
+    evaluator_ref = trial_spec["execution_contract"]["evaluator_manifest_ref"]["blob"]
+    evaluator_path = tmp_path / evaluator_ref["relative_path"]
+    evaluator_path.write_bytes(evaluator_path.read_bytes() + b" ")
+    with pytest.raises(IntegrityError, match="ContractRef rejected"):
         ledger.reserve_attempt(
             profile="standard", direction=direction, variant=variant,
             implementation_hash=canonical_hash({"implementation": "fixture"}),
@@ -433,7 +519,7 @@ def test_proxy_evidence_transaction_gates_full_without_budget_consumption(tmp_pa
 
 def test_proxy_reject_prevents_full_start_and_releases_reservation(tmp_path: Path) -> None:
     attempt, trial_spec, comparison, baseline = _c2c_inputs(tmp_path)
-    comparison["metrics"]["datasets"]["fake"] = -1.0
+    comparison["proxy_screen"]["metrics"]["datasets"]["fake"] = -1.0
     ledger = ResearchEventLedger(tmp_path)
     inventory = _c2c_strict_evidence_inventory(
         project_root=tmp_path, attempt=attempt, trial_spec=trial_spec,

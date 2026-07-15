@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "phase_execution_id", "phase_start_event_id", "proxy_decision_policy_hash", "proxy_evaluation_binding_hash", "evidence_manifest_hash", "evidence_set_hash", "observed_delta", "dataset_deltas", "worst_dataset_regression", "constraint_results", "activation_surface_ids", "readiness_check_ids", "evidence_ids", "decision", "reason_codes"],
+  "properties": {
+    "schema_version": {"const": "auto_research_proxy_outcome_v3"},
+    "attempt_id": {"type": "string", "minLength": 1}, "lifecycle_generation": {"type": "integer", "minimum": 0},
+    "implementation_hash": {"$ref": "#/$defs/hash"}, "attempt_input_hash": {"$ref": "#/$defs/hash"},
+    "phase_execution_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "phase_start_event_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"},
+    "proxy_decision_policy_hash": {"$ref": "#/$defs/hash"}, "proxy_evaluation_binding_hash": {"$ref": "#/$defs/hash"}, "evidence_manifest_hash": {"$ref": "#/$defs/hash"}, "evidence_set_hash": {"$ref": "#/$defs/hash"},
+    "observed_delta": {"type": "number"}, "dataset_deltas": {"type": "object", "minProperties": 1, "additionalProperties": {"type": "number"}},
+    "worst_dataset_regression": {"type": "number", "minimum": 0},
+    "constraint_results": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "constraint_result_v2.schema.json"}},
+    "activation_surface_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "readiness_check_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "evidence_ids": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "string", "minLength": 8}},
+    "decision": {"enum": ["RUN_FULL", "PROPOSE_NEXT_VARIANT", "FINISH_RUN"]},
+    "reason_codes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+}

@@ -1,96 +1,166 @@
 # Authoritative S1-S3 Contracts
 
-## Canonical Artifacts
+## Canonical Authority
 
-| Concept | Version | Canonical path | Authority |
+| Concept | Version | Canonical location | Meaning |
 |---|---|---|---|
-| Direction | `DirectionSpec v3` | `literature/direction.json` | Complete research-direction specification with separate semantic/spec hashes |
-| Variant | `VariantSpec v4` | `plan/variant.json` | One scientific intervention bound to the complete DirectionSpec |
-| Trial | `TrialSpec v4` | frozen in `AttemptReserved`; immutable attempt-scoped projection | Complete preregistered protocol, phase contracts, content-addressed samples, evaluator provenance, metrics, acceptance, roles, seeds, and evidence requirements |
-| Event | `Event v5` | `meta/research_events.sqlite3` | The only authoritative S1-S3 transaction store; SQLite WAL with a hash chain |
-| Attempt | `AttemptRecord v5` | `meta/attempts/<attempt_id>.json` | Rebuildable attempt lifecycle and phase-execution projection |
-| Result | `TrialResult v5` | `experiment/results/trial_result.json` | Rebuildable projection derived only from current-generation immutable row-level evidence |
-| Route | `RouteOutcome v4` | `meta/route_outcome.json` | Rebuildable deterministic route projection |
-| Aggregate | `DirectionOutcomeAggregate v1` | `meta/direction_outcome_aggregate.json` | Exactly five verified standard outcomes and deterministic selection status |
+| Direction | `DirectionSpec v3` | `literature/direction.json` | Complete research direction with separate semantic and full-spec identities |
+| Variant | `VariantSpec v4` | `plan/variant.json` | One scientific intervention bound to the current DirectionSpec |
+| Trial | `TrialSpec v5` | frozen in `AttemptReserved`; projected under `plan/attempts/<attempt_id>/trial_spec/<trial_spec_hash>.json` | Preregistered protocol, phase contracts, acceptance, proxy policy, and immutable sample/evaluator references |
+| Event | `Event v6` | `meta/research_events.sqlite3` | Sole S1-S3 authority: SQLite WAL, continuous sequence, and hash chain |
+| Attempt | `AttemptRecord v6` | `meta/attempts/<attempt_id>.json` | Rebuildable lifecycle, reservation, phase, implementation-revision, and command projection |
+| Result | `TrialResult v5` | diagnostic projection under `experiment/results/` | Reducer-generated result decoded from immutable evidence |
+| Observation | `ExecutionObservation v4` | embedded in TrialResult | Deterministically decoded row-level measurement with evidence and phase identity |
+| Evidence manifest | `EvidenceManifest v3` | event-bound/projected | Exact registered evidence set for one authoritative transaction |
+| Route | `RouteOutcome v4` | `meta/route_outcome.json` | Reducer-derived control projection bound to a source event and sequence |
+| Proxy outcome | `ProxyOutcome v3` | event-bound/projected | Reducer-derived proxy classification and authorization decision |
+| Aggregate | `DirectionOutcomeAggregate v1` | `meta/direction_outcome_aggregate.json` | Exactly five verified standard outcomes |
 
-`meta/research_state.json`, attempt views, TrialResult, RouteOutcome, aggregate, scorecards, Gate reports, and human-readable result files are projections or diagnostics. Deleting them does not delete authority; `ResearchEventLedger.rebuild()` reconstructs them from SQLite. Older Event/Attempt/TrialResult workspaces are rejected with a breaking-schema error and must restart from S1.
+`meta/research_state.json`, Attempt JSON, TrialResult JSON, RouteOutcome JSON, proxy reports, aggregates, Gate reports, scorecards, and summaries are projections or diagnostics. Runtime decisions read SQLite through `ResearchEventLedger`; damaged, missing, future-sequence, or stale projections can be isolated and rebuilt. A workspace using an older Event/Attempt/State/TrialSpec contract is rejected with `BreakingSchemaError` and must rerun from S1. There is no dual read or automatic migration.
 
-## Identity Boundaries
+## Scientific and Contract Identity
 
-- `direction_semantic_hash` identifies the scientific direction without IDs, display names, run IDs, or iteration metadata.
-- `direction_spec_hash` locks every authoritative DirectionSpec field except the hash fields themselves.
-- `variant_semantic_hash` identifies the scientific method from intervention operations/configuration, real variation values, controls, ablation, implementation surfaces, expected metrics, hypotheses, and falsification conditions. Changing only IDs or lineage cannot create a new method.
-- `variant_spec_hash` locks the complete VariantSpec. `VariantSpec.lineage.direction_spec_hash` must equal the current complete DirectionSpec hash.
-- `implementation_hash` binds the frozen patch, actual file contents, and implementation manifest.
-- `attempt_input_hash` binds implementation, protocol, sample manifest, seeds, runtime config, and evaluator identity.
+- `direction_semantic_hash` excludes IDs, names, iteration, and run lineage; it identifies the scientific direction.
+- `direction_spec_hash` locks the complete authoritative DirectionSpec.
+- `variant_semantic_hash` is derived from intervention operations/configuration, controls, ablation, implementation surfaces, metric expectations, hypotheses, and falsification. ID/lineage/nonce-only changes do not create a new method.
+- `variant_spec_hash` locks the complete VariantSpec and its DirectionSpec lineage.
+- `implementation_hash` binds the frozen patch, resulting files, and implementation manifest.
+- `trial_spec_hash` locks TrialSpec v5, including phase contracts, acceptance constraints, immutable ContractRefs, and ProxyDecisionPolicy.
+- `attempt_input_hash` binds implementation, frozen TrialSpec, runtime configuration, evaluator identity, seeds, and sample provenance.
 
-Canonical JSON sorts object keys and rejects NaN/Inf. A repair keeps direction, variant, and attempt identity fixed; only a new implementation revision and its derived input hash may change.
+Canonical JSON sorts object keys and rejects non-finite numbers. Attempt and TrialResult bind complete spec hashes, not only semantic hashes.
 
-Real TrialSpecs bind immutable sample and evaluator manifest projections. Reservation rereads their bytes through the same symlink-safe store, verifies ordered sample identities/source revisions and evaluator source/config/dependency digests, and rejects drift before writing `AttemptReserved`. Synthetic provenance is explicitly marked and cannot be mixed with real samples.
+## Frozen Trial and ContractStore
 
-## Event Transactions
+TrialSpec v5 freezes before reservation:
 
-Every event uses `Event v5` with a strict event-type enum, type-specific payload schema, validated ID, continuous sequence, `previous_event_hash`, and `event_hash`. Append performs duplicate-ID checking, sequence allocation, schema/transition validation, reduction, invariant checking, and durable insertion under one SQLite `BEGIN IMMEDIATE` transaction.
+- protocol, datasets, metrics, primary metric, objective, aggregation, statistical testing, and seeds;
+- required roles, acceptance constraints, required artifacts, and exact evidence requirements;
+- per-phase datasets, seeds, roles, metrics, evidence kinds, terminal semantics, and budget semantics;
+- `ProxyDecisionPolicy v1` when a proxy phase is required;
+- a `ContractRef v1` to immutable `SampleManifest v2` bytes;
+- evaluator provenance resolved from immutable evaluator source/config/dependency bytes.
 
-For `proxy_full`, proxy and full are separate authority transactions. `ProxyPhaseStarted` freezes the phase execution identity; `ProxyEvidenceCommitted` decodes current-generation proxy rows and derives `ProxyOutcome`, route, and `PROXY_COMPLETED` without consuming budget. Only a committed `RUN_FULL` route permits `FullPhaseStarted`. Finalization binds the committed proxy event/hash, and full evidence cannot replace or repackage proxy evidence.
+`ContractStore` uses content-addressed files and safe path resolution. Reservation rereads the referenced bytes inside the authoritative transaction and verifies path, hash, schema, kind, source revision, ordered sample identities, evaluator file hashes, configuration, dependencies, and provenance. Ancestor/leaf symlinks, path escape, hard-link substitution, and hash drift fail closed. Mutable `plan/sample_manifest.json` and `plan/evaluator_manifest.json` are not authority.
 
-Rebuild rejects schema mismatch, sequence gaps/duplicates, duplicate IDs, hash-chain damage, event-hash damage, illegal transitions, and invalid state invariants with `IntegrityError`. The same event ID and same type/payload is idempotent; a conflicting payload is an integrity failure.
+Synthetic sample/evaluator provenance is explicit. Local non-simulated subprocess tests prove production-component wiring and evidence handling; they are not real GPU training or scientific success.
 
-Attempt finalization is one domain transaction: verified TrialResult, terminal attempt state, reservation release, budget consumption, deterministic route, and the fifth-outcome aggregate are committed in one event. A crash after database commit but before projection writes rebuilds one result and one route without double counting.
+## Frozen Proxy Policy and Runtime Binding
 
-## Attempt Lifecycle
+`ProxyDecisionPolicy v1` is scientific policy frozen in TrialSpec v5. It contains:
 
-The constrained states are `PLANNED`, `IMPLEMENTING`, `IMPLEMENTATION_REPAIR`, `READY`, `PROXY_RUNNING`, `PROXY_COMPLETED`, `FULL_RUNNING`, `METHOD_COMPLETED`, `RESOURCE_PAUSED`, `INTEGRITY_BLOCKED`, and `ABANDONED`. `METHOD_FAILED` was removed because it had no unique authoritative event semantics. Each legal edge has explicit preconditions; terminal states cannot transition out.
+- primary metric, objective, paired aggregation;
+- exact datasets, seeds, metrics, and roles;
+- aggregate improvement and per-dataset maximum-regression thresholds;
+- required activation surfaces and readiness check IDs;
+- the exact authoritative evidence-kind set;
+- `gate_to_full` or `terminal_bootstrap` mode;
+- deterministic science-reject, integrity-failure, and resource-failure semantics;
+- a canonical policy hash.
 
-Reservation occurs only after the frozen patch, TrialSpec/protocol, sample manifest, runtime config, seeds, and evaluator are known. Repair and resource pause retain their reservation. Releasing it requires explicit `AttemptAbandoned`, and an abandoned attempt can never submit an outcome. Crash/resume reuses the same attempt ID. Bootstrap and standard identities include profile and attempt kind, so they cannot collide.
+It deliberately excludes Attempt, generation, implementation, producer, and phase-execution identity.
 
-## S3 Commit Order
+`ProxyEvaluationBinding v1` is generated by the Ledger in the `ProxyPhaseStarted` transaction. It binds the frozen policy hash to the current Attempt, direction/variant/trial identities, lifecycle generation, implementation/input hashes, phase execution and start event, producer run, command-plan and phase-contract hashes, sample/evaluator ContractRefs, provenance mode, and expected evidence kinds. It is embedded in `PhaseExecutionManifest v2` and independently rederived during reducer/rebuild.
 
-S3 uses: prepare/reserve → typed draft observations → uncommitted TrialResult draft → pure pre-commit validation → atomic ledger commit → projection generation. Gate/pre-commit rejection writes no event and changes no budget, method history, route, snapshot, or canonical TrialResult. Invalid drafts may be written only under `experiment/quarantine/`.
+The single pure proxy classifier is shared by proxy precommit, `ProxyEvidenceCommitted`, reducer/rebuild, and Gate audit. It reads only the frozen policy, Ledger binding, exact EvidenceManifest, and immutable raw bytes. It rejects missing, duplicate, extra, or aggregate-expanded rows; validates exact dataset × seed × metric × role coverage; computes paired deltas and per-dataset regression; and derives activation/readiness from command receipts and raw checks. Producer-authored effective policy, calibration, threshold, decision, constraints, summary, or route has no authority and cannot enter the authoritative evidence set.
 
-`ExecutionObservation v2` records phase, command status, dataset, metric, finite value, sample/evaluator hashes, seed, and raw artifact hash. The deterministic classifier—not the caller—derives method evaluability and outcome. Dataset coverage, required phases, command completion, hashes, raw artifacts, attempt state, and TrialResult completeness must agree.
+A complete scientific proxy miss commits `ProxyEvidenceCommitted`, routes `PROPOSE_NEXT_VARIANT`, releases the reservation, consumes no five-variant outcome, and never starts full execution. Missing, malformed, damaged, or identity-conflicting evidence is an integrity failure, not a scientific rejection.
 
-## Standard Five-Variant Loop
+## Physical Phase Transactions
 
-The reducer maintains `0 <= consumed`, `0 <= reserved`, and `consumed + reserved <= target == 5`, and enforces `execution_width=1`.
+A `proxy_full` Attempt follows this authority order:
 
-1. One unchanged direction runs five sequential, semantically unique standard variants.
-2. Patch/static/activation failures, resource pauses, and OOM retries do not consume outcomes; their reservation remains until repair or explicit abandonment.
-3. Only a verified `method_evaluable=true` TrialResult consumes one slot.
-4. Outcomes 1–4 always route `PROPOSE_NEXT_VARIANT`, including accepted outcomes.
-5. Outcome 5 atomically creates an aggregate and closes the direction. Any accepted variant yields `FINISH_DIRECTION`; five non-accepted outcomes yield `START_NEW_DIRECTION`.
-6. No sixth reservation, patch, run, or outcome can be created. A closed semantic direction cannot be silently reopened.
-7. Aggregate selection uses the preregistered primary objective and deterministic tie-break when comparable; otherwise selection is explicitly `inconclusive`.
+```text
+AttemptReserved / READY
+→ ProxyPhaseStarted
+→ PhaseCommandStarted(proxy)
+→ PhaseCommandCompleted(proxy)
+→ ProxyEvidenceCommitted
+→ reducer-derived ProxyOutcome and RouteOutcome
+→ FullPhaseStarted only when decision=RUN_FULL
+→ PhaseCommandStarted(full)
+→ PhaseCommandCompleted(full)
+→ AttemptFinalized
+```
 
-Scientific tried history contains only standard budget-consuming method outcomes for duplicate prevention. Planner feedback references prior attempt IDs but never transfers an earlier attempt's outcome to a new variant.
+`AuthoritativePhaseContext` and `PhaseAuthorization` are derived from current SQLite state. Production executors reject `None`, booleans, caller mappings, stale generations, stale implementation/input hashes, mismatched command plans, and forged proxy authorization. Every side-effecting command revalidates authority immediately before execution.
 
-## Bootstrap Profile
+`PhaseExecutionManifest v2` freezes phase identity, command plan, adapter/provenance mode, expected evidence kinds, ProxyEvaluationBinding, and—only for full after proxy—a reference to the committed proxy authorization. Generic full-only execution may omit proxy authorization only when the frozen protocol says it is full-only. Bootstrap uses `terminal_bootstrap` and cannot receive `FullPhaseStarted`.
 
-Bootstrap performs exactly one cached-S0 cheap proxy with `attempt_kind=bootstrap_proxy` and `consumes_direction_budget=false`. Only a verified, method-evaluable proxy can route `FINISH_RUN`; resource, implementation, and integrity failures route `PAUSE_RESOURCE`, `REPAIR_IMPLEMENTATION`, and `BLOCK_INTEGRITY`. Switching the same project to standard creates a separate standard attempt and begins with `consumed=0`.
+The executors are phase-specific: `C2CProxyPhaseExecutor`, `C2CFullPhaseExecutor`, `GenericExternalPhaseExecutor`, and `SyntheticPhaseExecutor`. The production flow does not use a phase-agnostic C2C runner and does not recursively rerun the whole ExperimentAgent pipeline.
 
-## Removed Contracts
+## Ledger Command Lifecycle
 
-There is no v1 dual-read, mirror, migration, fallback, or inference from `ideas`, `plan.yaml`, mutable summaries, or route files. Removed runtime authorities include `literature/ideas.json`, both `direction_decision.json` paths, `plan/candidate_ideas.json`, both `next_variant.json` paths, legacy direction/variant readers, legacy route fallback, legacy attempt ledger, and C2C debate execution. Missing v3/v4 authority requires rerunning from S1.
+Command execution is part of Event v6 authority:
 
-## M1.1.1 Lifecycle and Commit Hardening
+- `PhaseCommandStarted` freezes command ID/hash, argv/cwd/source snapshot, phase identity, authorization hash, expected outputs, provenance, external-job policy, and idempotency key before a side effect.
+- `PhaseRunReceipt v2` is content-addressed and binds the Started event ID/hash, Attempt/generation/phase identity, command identity, timestamps, exit status, stdout/stderr hashes, external job identity, and exact output hashes.
+- `PhaseCommandCompleted` commits the verified receipt reference.
+- `PhaseCommandUnknownOutcome` records a started command whose result cannot be attached or proven; the command is not silently rerun.
 
-- Every attempt carries `lifecycle_generation`. Implementation revision and resource resume advance the generation while preserving attempt, direction, and variant identity.
-- Transition and disposition identities bind attempt ID, generation, implementation/input hashes, expected source state, requested operation or failure, and phase. Replays are idempotent only for the same generation and operation.
-- `AttemptDispositioned` stores structured failure facts; `AttemptFinalized` stores a validated TrialResult. Callers cannot supply target state, budget changes, route actions, aggregate, or direction status.
-- The reducer independently derives all RouteOutcome fields and late replay returns the route associated with the original event, never the global latest route.
-- TrialResult validation is repeated inside the same `BEGIN IMMEDIATE` transaction that appends finalization. Identity, frozen TrialSpec, observations, seeds, datasets, roles, phases, raw artifacts, protocol evidence, budget, and duplicate semantic variants are checked again.
-- Projection writers take a project-level exclusive lock, reread the latest committed SQLite state, and never publish an older sequence.
+Recovery rules are fail closed:
 
-## M1.1.2 Frozen Trial and Route Authority
+1. A completed command reuses its committed receipt and does not run again.
+2. A durable receipt written after the side effect but before the Completed event is verified and reconciled without rerunning.
+3. A started command with an attachable external job resumes by job identity.
+4. A started command without a trusted receipt or attachable job becomes an unknown outcome.
+5. Only the absence of a Started event permits first execution.
 
-- Reservation accepts the complete TrialSpec and freezes it in the event. Protocol, sample manifest, acceptance contract, evaluator, runtime, seeds, and derived hashes cannot drift during repair or resume.
-- `FailureEvidence v2` is the only entry to repair, resource pause, or integrity block. `ResumeEvidence v2` is the only entry from resource pause to ready. Both validate generation, source state/phase, input identity, and real artifact hashes transactionally.
-- `ConstraintResult v2` is classifier-owned. Missing required evidence is non-evaluable and zero-write; a complete hard-constraint failure is a budget-consuming rejected outcome; accepted requires the primary criterion and every hard constraint to pass.
-- The Orchestrator queries the historical operation result bound to the committed event ID and sequence. Mutable result and route projections cannot override SQLite control authority.
-- Standard execution width is project-global. An active standard reservation prevents selecting or reserving another direction until it is finalized or explicitly abandoned.
+A normal process crash preserves generation, phase execution ID, and producer run. A committed resource pause/resume advances lifecycle generation.
 
-## Completion Replay and Evidence Scope
+## Evidence, Finalization, and Reducer Closure
 
-`CompletionEvidence v1` contains only the current Attempt identity, frozen TrialSpec hash, and an explicit inventory of immutable Attempt-scoped artifacts. Finalization computes a fingerprint over the lifecycle generation, implementation/input identities, producer run IDs, EvidenceManifest hash, and all content hashes. An exact replay revalidates the immutable bytes and returns the historical TrialResult, RouteOutcome, and aggregate without a new event. A different fingerprint, missing bytes, or hash drift is an integrity failure with zero writes.
+Adapters return an explicit `PhaseArtifactInventory`; they do not scan fixed result directories. Each authoritative item has one precise path/hash/kind and a PhaseRunReceipt reference. The inventory kind set must exactly equal the frozen phase contract: required kinds cannot be missing, optional-but-unregistered kinds cannot be added, and each kind appears at most once.
 
-Generic and C2C adapters may still emit human-readable diagnostic summaries, but those files use diagnostic schema names and never enter the authoritative inventory unless independently emitted in the strict evidence contract. Gate, budget, replay, and routing query SQLite and the committed content-addressed evidence only.
+Quantitative rows are Attempt-, generation-, implementation-, input-, phase-, phase-execution-, producer-, dataset-, metric-, role-, and seed-scoped. Observations are decoded by Common Core from the same immutable bytes used for hashing and schema validation. Callers cannot submit observations, constraints, primary summaries, pass/fail, outcome, budget, or route.
+
+`CompletionEvidence v2` carries only authoritative identity and immutable inventory. The Ledger rereads the current Attempt and frozen TrialSpec, validates exact evidence and phase semantics, decodes observations, recomputes constraints, completeness, summary, hard-pass state, and outcome, and atomically commits `AttemptFinalized`, TrialResult, reservation release, budget change, RouteOutcome, and any fifth-outcome aggregate. Reducer/rebuild and Gate repeat the same raw-byte semantics; mutating event-derived observations, constraints, outcome, summary, manifest, or evidence bytes causes `IntegrityError`.
+
+Exact completion replay revalidates the committed fingerprint and immutable bytes, then returns the historical Attempt/TrialResult/Route/Aggregate without a new event. The same event ID with a different request or a different completion fingerprint is an integrity conflict.
+
+## Failure and Resume v4
+
+`FailureEvidence v4`, `ResumeEvidence v4`, `ResourceProbe v3`, and `CommandResultEvidence v1` are immutable, content-addressed transaction evidence. Public APIs, reducer/rebuild, and audit call the same raw-byte validator.
+
+- Implementation and activation failures require a current-phase nonzero-exit command receipt and class-specific evidence.
+- Resource pause requires `probe_status=insufficient` and `observed_capacity < required_capacity` for the current Attempt/resource/phase.
+- Resume requires `probe_status=available`, sufficient capacity, the same resource identity, and the committed pause event.
+- Arbitrary logs, zero-exit failures, cross-Attempt probes, altered bytes, or mismatched generation/implementation/input identity are rejected.
+
+Implementation repair preserves Attempt and Variant identity, changes implementation/input hashes, advances generation, clears old proxy authorization, and reruns proxy. Proxy resource resume advances generation and resets proxy to pending. Full resource resume preserves the committed proxy outcome and restores `PROXY_COMPLETED` with proxy completed/full pending, so full can restart without rerunning proxy. Full-only resume returns ready with full pending.
+
+## Budget, Routing, and Bootstrap
+
+The reducer maintains `0 <= consumed`, `0 <= reserved`, and `consumed + reserved <= target == 5`, with project-wide execution width one across executable standard and bootstrap Attempts.
+
+- Only a verified standard method-evaluable TrialResult consumes one outcome.
+- Outcomes 1–4 route `PROPOSE_NEXT_VARIANT` even when accepted.
+- Outcome 5 creates an aggregate containing exactly five unique standard outcomes and closes or exhausts the direction.
+- A sixth reservation, patch, command, artifact creation, or outcome is rejected before execution.
+- Proxy science rejection, implementation/activation failure, resource pause, integrity block, and explicit abandonment do not consume a method outcome.
+- Bootstrap is `bootstrap + bootstrap_proxy`, uses proxy-terminal evidence, routes `FINISH_RUN` only after verified completion, consumes no standard budget, creates no standard tried-history entry, and creates no direction aggregate.
+
+RouteOutcome is reducer-owned and bound to its source event, sequence, Attempt, identity, budget snapshot, artifacts, and idempotency key. Orchestrator queries the committed Ledger operation result; diagnostic result/route JSON cannot override SQLite control authority.
+
+## Crash Matrix
+
+| Crash point | Authoritative recovery |
+|---|---|
+| After phase start, before command start | No Started event exists; the authorized command may start once |
+| After `PhaseCommandStarted`, before side effect outcome is known | Attach by external job identity or record unknown outcome; never silently rerun |
+| After side effect and receipt write, before `PhaseCommandCompleted` | Verify and reconcile the content-addressed receipt; do not rerun |
+| After proxy commit, before full start | Rebuild committed ProxyOutcome/route; create at most one FullPhaseStarted |
+| After full evidence ingest, before finalization | Reuse immutable orphaned evidence and complete once after validation |
+| After SQLite finalization, before projection | Rebuild exactly one TrialResult, route, aggregate, and budget state |
+| During full resource pause/resume | Keep committed proxy authorization; new generation restarts only full |
+| During implementation repair | Invalidate old generation authority and evidence; rerun proxy |
+
+## Deleted Runtime Contracts
+
+The current runtime does not read or migrate the replaced Event v5, AttemptRecord v5, ResearchState v5, TrialSpec v4, PhaseExecutionManifest v1, FailureEvidence v3, ResumeEvidence v3, ResourceProbe v2, ProxyDecisionContract v1, ProxyOutcome v1/v2, EffectiveProxyPolicy v3, or ProxyCalibrationPolicy v3 contracts.
+
+It also does not use mutable sample/evaluator canonical paths, fixed result/evidence discovery, arbitrary hash glob lookup, producer-authored proxy decisions, caller-authored TrialResult/failure/resume outcomes, a phase-agnostic production C2C runner, validation-only phase spoofing, legacy direction/variant/route readers, or compatibility fallback. Historical documentation may mention these names only as removed designs.
+
+## Scope Boundary
+
+M1.1.5-Final closes authority integration for phase execution, proxy policy, immutable contracts, command lifecycle, evidence classification, failure/resume, reducer/rebuild, and S3 Gate. It does not start Native Unified S1 Producer/Core, does not run real external Codex S1 smoke, and does not claim local subprocess or synthetic tests as real scientific or GPU-training success.

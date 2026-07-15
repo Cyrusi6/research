@@ -56,8 +56,8 @@ def _attempt(trial_spec: dict) -> dict:
     }
 
 
-def test_plan_builds_complete_frozen_trial_spec() -> None:
-    trial_spec = _trial_spec_from_plan(_plan(), _variant())
+def test_plan_builds_complete_frozen_trial_spec(tmp_path: Path) -> None:
+    trial_spec = _trial_spec_from_plan(_plan(), _variant(), project_root=tmp_path)
 
     assert trial_spec["schema_version"] == TRIAL_SPEC_SCHEMA_VERSION
     assert trial_spec["primary_metric_id"] == "accuracy"
@@ -71,16 +71,18 @@ def test_plan_builds_complete_frozen_trial_spec() -> None:
     }
     assert [item["dataset_id"] for item in trial_spec["sample_manifest"]["datasets"]] == ["dataset-a"]
     assert trial_spec["sample_manifest"]["datasets"][0]["ordered_sample_ids"]
-    assert trial_spec["sample_manifest"]["datasets"][0]["content_hash"]
+    assert trial_spec["sample_manifest"]["datasets"][0]["content_digest"]
+    assert trial_spec["sample_manifest_ref"]["contract_kind"] == "sample_manifest"
+    assert trial_spec["execution_contract"]["evaluator_manifest_ref"]["contract_kind"] == "evaluator_manifest"
     assert trial_spec["datasets"][0]["dataset_id"] == "dataset-a"
     assert trial_spec["required_artifacts"] == ["main_results", "ablation_results"]
     assert {item["kind"] for item in trial_spec["evidence_requirements"]} >= {"main_results", "activation_evidence", "ablation_results"}
     validate_trial_spec(trial_spec)
 
 
-def test_trial_spec_authoritative_fields_are_deep_copied() -> None:
+def test_trial_spec_authoritative_fields_are_deep_copied(tmp_path: Path) -> None:
     plan = _plan()
-    trial_spec = _trial_spec_from_plan(plan, _variant())
+    trial_spec = _trial_spec_from_plan(plan, _variant(), project_root=tmp_path)
     plan["datasets"][0]["name"] = "mutated"
     plan["statistical_testing"]["seeds"].append(99)
 
@@ -101,10 +103,14 @@ class _ResumeLedger:
         return {"attempts": {self.attempt["attempt_id"]: deepcopy(self.attempt)}}
 
     def events(self) -> list[dict]:
+        paused_phase = self.attempt["paused_phase"]
+        phase_execution = self.attempt["phase_executions"][paused_phase]
         pause_evidence = {
             "attempt_id": self.attempt["attempt_id"],
             "failure_class": "resource_pause",
-            "producer_run_id": f"pause-{self.attempt['lifecycle_generation']}",
+            "phase": paused_phase,
+            "phase_execution_id": phase_execution["phase_execution_id"],
+            "producer_run_id": phase_execution["producer_run_id"],
         }
         return [{"event_id": f"event:pause:{self.attempt['lifecycle_generation']}", "event_type": "AttemptDispositioned", "payload": {"failure_evidence": pause_evidence}}]
 
@@ -247,8 +253,8 @@ def test_real_experiment_agent_three_resource_resumes_then_single_commit(monkeyp
     plan = _plan()
     plan["ablation_matrix"] = []
     plan["statistical_testing"] = {"seeds": [7], "method": "none", "require_complete_seed_coverage": True}
-    trial_spec = _trial_spec_from_plan(plan, variant)
     project_root = tmp_path / "project"
+    trial_spec = _trial_spec_from_plan(plan, variant, project_root=project_root)
     write_json(project_root / "literature" / "direction.json", direction)
     write_json(project_root / "plan" / "variant.json", variant)
     write_json(project_root / "plan" / "trial_spec.json", trial_spec)
@@ -292,7 +298,7 @@ def test_real_experiment_agent_three_resource_resumes_then_single_commit(monkeyp
     def resource_then_success(self, plan_payload, env_source, revision_source, *, attempt, trial_spec):
         calls["count"] += 1
         if calls["count"] <= 3:
-            producer_run_id = f"resource-pause-{calls['count']}-{attempt['attempt_id'][:12]}"
+            producer_run_id = attempt["phase_executions"]["full"]["producer_run_id"]
             probe = experiment_module._identity_evidence_payload(
                 attempt=attempt,
                 producer_run_id=producer_run_id,
@@ -308,21 +314,20 @@ def test_real_experiment_agent_three_resource_resumes_then_single_commit(monkeyp
                     "observed_at": f"2026-07-14T00:00:0{calls['count']}Z",
                 },
             )
-            record = artifacts.write_json(
-                self.stage_key,
-                f"results/resource_pause_{calls['count']}.json",
-                probe,
-                artifact_type="resource_failure",
-                summary="Hermetic resource pause evidence",
-            )
+            probe["schema_version"] = "auto_research_resource_probe_evidence_v3"
+            probe.pop("cross_references")
+            relative_path = f"experiment/results/resource_pause_{calls['count']}.json"
+            artifact_path = project_root / relative_path
+            artifact_path.parent.mkdir(parents=True, exist_ok=True)
+            artifact_path.write_bytes(experiment_module.encode_canonical_evidence(probe))
             return {
-                "artifacts": [record["path"]],
+                "artifacts": [relative_path],
                 "status": "resource_paused",
                 "failure_class": "resource_pause",
                 "failure_evidence": {
                     "command_status": "resource_paused",
                     "exit_code": 137,
-                    "artifact_path": record["path"],
+                    "artifact_path": relative_path,
                     "producer_run_id": producer_run_id,
                     "reason": "Hermetic resource probe reported temporary exhaustion.",
                 },

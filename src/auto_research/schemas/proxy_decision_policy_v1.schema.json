@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "policy_hash", "primary_metric_id", "objective", "aggregation", "datasets", "seeds", "metric_ids", "roles", "aggregate_improvement_threshold", "per_dataset_maximum_regression", "activation_surface_ids", "readiness_check_ids", "evidence_kinds", "mode", "route_semantics"],
+  "properties": {
+    "schema_version": {"const": "auto_research_proxy_decision_policy_v1"},
+    "policy_hash": {"$ref": "#/$defs/hash"},
+    "primary_metric_id": {"type": "string", "minLength": 1},
+    "objective": {"enum": ["maximize", "minimize"]},
+    "aggregation": {"const": "paired_mean"},
+    "datasets": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "seeds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}},
+    "metric_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "roles": {"type": "array", "minItems": 2, "maxItems": 2, "uniqueItems": true, "items": {"enum": ["baseline", "candidate"]}},
+    "aggregate_improvement_threshold": {"type": "number"},
+    "per_dataset_maximum_regression": {"type": "number", "minimum": 0},
+    "activation_surface_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "readiness_check_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "evidence_kinds": {"type": "array", "minItems": 3, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "mode": {"enum": ["gate_to_full", "terminal_bootstrap"]},
+    "route_semantics": {
+      "type": "object", "additionalProperties": false,
+      "required": ["science_reject", "integrity_failure", "resource_failure"],
+      "properties": {
+        "science_reject": {"enum": ["PROPOSE_NEXT_VARIANT", "FINISH_RUN"]},
+        "integrity_failure": {"const": "BLOCK_INTEGRITY"},
+        "resource_failure": {"const": "PAUSE_RESOURCE"}
+      }
+    }
+  },
+  "$defs": {"hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+}

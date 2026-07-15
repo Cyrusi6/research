@@ -6,6 +6,7 @@
     "schema_version",
     "protocol",
     "sample_manifest",
+    "sample_manifest_ref",
     "datasets",
     "metrics",
     "primary_metric_id",
@@ -15,11 +16,12 @@
     "execution_contract",
     "required_artifacts",
     "evidence_requirements",
-    "phase_contracts"
+    "phase_contracts",
+    "proxy_decision_policy"
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_trial_spec_v4"
+      "const": "auto_research_trial_spec_v5"
     },
     "protocol": {
       "type": "object",
@@ -75,17 +77,15 @@
         "schema_version",
         "manifest_id",
         "provenance_mode",
-        "datasets",
-        "artifact_path",
-        "artifact_hash"
+        "datasets"
       ],
       "properties": {
         "schema_version": {
-          "const": "auto_research_sample_manifest_v1"
+          "const": "auto_research_sample_manifest_v2"
         },
         "manifest_id": {
           "type": "string",
-          "minLength": 1
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
         },
         "provenance_mode": {
           "enum": [
@@ -105,7 +105,8 @@
               "split",
               "sample_count",
               "ordered_sample_ids",
-              "content_hash"
+              "source_blobs",
+              "content_digest"
             ],
             "properties": {
               "dataset_id": {
@@ -128,24 +129,21 @@
                 "type": "array",
                 "minItems": 1,
                 "items": {
-                  "type": "string",
-                  "pattern": "^[a-f0-9]{64}$"
+                  "$ref": "#/$defs/hash"
                 }
               },
-              "content_hash": {
-                "type": "string",
-                "pattern": "^[a-f0-9]{64}$"
+              "source_blobs": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "$ref": "#/$defs/contract_blob"
+                }
+              },
+              "content_digest": {
+                "$ref": "#/$defs/hash"
               }
             }
           }
-        },
-        "artifact_path": {
-          "type": "string",
-          "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
-        },
-        "artifact_hash": {
-          "type": "string",
-          "pattern": "^[a-f0-9]{64}$"
         }
       }
     },
@@ -388,6 +386,7 @@
         "runtime_config",
         "runtime_config_hash",
         "evaluator_provenance",
+        "evaluator_manifest_ref",
         "evaluator_hash",
         "command_contract_hash"
       ],
@@ -404,15 +403,22 @@
           "additionalProperties": false,
           "required": [
             "schema_version",
-            "provenance_mode",
             "evaluator_id",
+            "provenance_mode",
+            "source_blobs",
+            "dependency_blobs",
+            "config_blob",
+            "config_digest",
             "source_digest",
-            "config_hash",
             "dependency_digest"
           ],
           "properties": {
             "schema_version": {
-              "const": "auto_research_evaluator_provenance_v1"
+              "const": "auto_research_evaluator_manifest_v2"
+            },
+            "evaluator_id": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
             },
             "provenance_mode": {
               "enum": [
@@ -420,40 +426,32 @@
                 "synthetic"
               ]
             },
-            "evaluator_id": {
-              "type": "string",
-              "minLength": 1
+            "source_blobs": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/contract_blob"
+              }
+            },
+            "dependency_blobs": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/contract_blob"
+              }
+            },
+            "config_blob": {
+              "$ref": "#/$defs/contract_blob"
+            },
+            "config_digest": {
+              "$ref": "#/$defs/hash"
             },
             "source_digest": {
-              "type": "string",
-              "pattern": "^[a-f0-9]{64}$"
-            },
-            "config_hash": {
-              "type": "string",
-              "pattern": "^[a-f0-9]{64}$"
+              "$ref": "#/$defs/hash"
             },
             "dependency_digest": {
-              "type": "string",
-              "pattern": "^[a-f0-9]{64}$"
-            },
-            "artifact_path": {
-              "type": "string",
-              "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
-            },
-            "artifact_hash": {
-              "type": "string",
-              "pattern": "^[a-f0-9]{64}$"
+              "$ref": "#/$defs/hash"
             }
-          },
-          "allOf": [
-            {
-              "if": {
-                "properties": {"provenance_mode": {"const": "real"}},
-                "required": ["provenance_mode"]
-              },
-              "then": {"required": ["artifact_path", "artifact_hash"]}
-            }
-          ]
+          }
         },
         "evaluator_hash": {
           "type": "string",
@@ -462,6 +460,57 @@
         "command_contract_hash": {
           "type": "string",
           "pattern": "^[a-f0-9]{64}$"
+        },
+        "evaluator_manifest_ref": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "contract_kind",
+            "blob"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": "auto_research_contract_ref_v1"
+            },
+            "contract_kind": {
+              "enum": [
+                "sample_manifest",
+                "evaluator_manifest"
+              ]
+            },
+            "blob": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "schema_version",
+                "algorithm",
+                "digest",
+                "size_bytes",
+                "relative_path"
+              ],
+              "properties": {
+                "schema_version": {
+                  "const": "auto_research_contract_blob_v1"
+                },
+                "algorithm": {
+                  "const": "sha256"
+                },
+                "digest": {
+                  "type": "string",
+                  "pattern": "^[a-f0-9]{64}$"
+                },
+                "size_bytes": {
+                  "type": "integer",
+                  "minimum": 1
+                },
+                "relative_path": {
+                  "type": "string",
+                  "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"
+                }
+              }
+            }
+          }
         }
       }
     },
@@ -622,6 +671,103 @@
           "consumes_direction_budget": {
             "type": "boolean"
           }
+        }
+      }
+    },
+    "proxy_decision_policy": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "proxy_decision_policy_v1.schema.json"
+        }
+      ]
+    },
+    "sample_manifest_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "contract_kind",
+        "blob"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "auto_research_contract_ref_v1"
+        },
+        "contract_kind": {
+          "enum": [
+            "sample_manifest",
+            "evaluator_manifest"
+          ]
+        },
+        "blob": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "algorithm",
+            "digest",
+            "size_bytes",
+            "relative_path"
+          ],
+          "properties": {
+            "schema_version": {
+              "const": "auto_research_contract_blob_v1"
+            },
+            "algorithm": {
+              "const": "sha256"
+            },
+            "digest": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "size_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "relative_path": {
+              "type": "string",
+              "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "hash": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "contract_blob": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "algorithm",
+        "digest",
+        "size_bytes",
+        "relative_path"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "auto_research_contract_blob_v1"
+        },
+        "algorithm": {
+          "const": "sha256"
+        },
+        "digest": {
+          "$ref": "#/$defs/hash"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "relative_path": {
+          "type": "string",
+          "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"
         }
       }
     }

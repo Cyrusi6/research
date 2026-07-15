@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -174,15 +176,28 @@ def _python_has_laps_dependencies(python_bin: str) -> bool:
 
 def _scan_reusable_runs(root: Path) -> list[dict[str, Any]]:
     records = []
-    for log in root.rglob("eval.log"):
-        record = _parse_eval_log(log)
-        if record:
-            records.append(record)
-    for log in root.rglob("eval_*.log"):
+    for log in _iter_eval_logs(root):
         record = _parse_eval_log(log)
         if record:
             records.append(record)
     return sorted(records, key=lambda item: item.get("rsum", 0), reverse=True)
+
+
+def _iter_eval_logs(root: Path) -> Iterator[Path]:
+    ignored_directories = {".git", ".pytest_cache", ".tmp", ".venv", "__pycache__"}
+    for directory, directory_names, file_names in os.walk(root, topdown=True, onerror=lambda _error: None, followlinks=False):
+        directory_names[:] = [name for name in directory_names if name not in ignored_directories]
+        directory_path = Path(directory)
+        for file_name in file_names:
+            if file_name != "eval.log" and not (file_name.startswith("eval_") and file_name.endswith(".log")):
+                continue
+            log_path = directory_path / file_name
+            try:
+                if log_path.is_symlink():
+                    continue
+            except OSError:
+                continue
+            yield log_path
 
 
 def _parse_eval_log(log_path: Path) -> dict[str, Any] | None:
@@ -199,7 +214,7 @@ def _parse_eval_log(log_path: Path) -> dict[str, Any] | None:
     vit_match = re.search(r"vit_type='([^']+)'", text)
     run_dir = log_path.parent
     model_best = run_dir / "model_best.pth"
-    results_files = [str(path) for path in run_dir.glob("results_*.npy")]
+    results_files = _safe_glob_paths(run_dir, "results_*.npy")
     if not model_best.exists():
         for parent in [run_dir.parent, run_dir.parent.parent]:
             candidate = parent / "model_best.pth"
@@ -208,7 +223,7 @@ def _parse_eval_log(log_path: Path) -> dict[str, Any] | None:
                 break
     if not results_files:
         for parent in [run_dir.parent, run_dir.parent.parent]:
-            results_files = [str(path) for path in parent.glob("results_*.npy")]
+            results_files = _safe_glob_paths(parent, "results_*.npy")
             if results_files:
                 break
     return {
@@ -224,6 +239,13 @@ def _parse_eval_log(log_path: Path) -> dict[str, Any] | None:
         "t2i": _triplet(t2i_match),
         "ready": bool(model_best.exists()),
     }
+
+
+def _safe_glob_paths(directory: Path, pattern: str) -> list[str]:
+    try:
+        return [str(path) for path in directory.glob(pattern)]
+    except OSError:
+        return []
 
 
 def _best_reusable_itr_runs(records: list[dict[str, Any]]) -> list[dict[str, Any]]:

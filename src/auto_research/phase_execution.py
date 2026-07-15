@@ -1,4 +1,4 @@
-"""Strict execution shells for authoritative experiment phases."""
+"""Fail-closed execution shells for authoritative experiment phases."""
 
 from __future__ import annotations
 
@@ -8,11 +8,14 @@ from pathlib import Path, PurePosixPath
 from types import MappingProxyType
 from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
+from .domain_contracts import canonical_hash
 
 _SHA256_RE = re.compile(r"^[a-f0-9]{64}$")
-_EXECUTION_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$")
+_SAFE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$")
 _EVENT_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$")
 _PHASES = {"proxy", "full"}
+_PROVENANCE_MODES = {"synthetic", "local_external", "production"}
+_PHASE_STATES = {"proxy": "PROXY_RUNNING", "full": "FULL_RUNNING"}
 _IDENTITY_FIELDS = (
     "attempt_id",
     "direction_semantic_hash",
@@ -31,8 +34,113 @@ _IDENTITY_FIELDS = (
 
 
 @dataclass(frozen=True)
+class PhaseAuthorization:
+    """Exact authorization read from the authoritative SQLite ledger."""
+
+    attempt_id: str
+    lifecycle_generation: int
+    phase: str
+    phase_execution_id: str
+    phase_start_event_id: str
+    phase_start_event_hash: str
+    phase_start_sequence: int
+    producer_run_id: str
+    implementation_hash: str
+    attempt_input_hash: str
+    trial_spec_hash: str
+    command_plan_hash: str
+    phase_contract_hash: str
+    expected_evidence_kinds: tuple[str, ...]
+    adapter_identity: str
+    provenance_mode: str
+    state: str
+    proxy_authorization_required: bool = True
+    proxy_commit_event_id: str | None = None
+    proxy_commit_event_hash: str | None = None
+    proxy_outcome_hash: str | None = None
+
+    def __post_init__(self) -> None:
+        if not self.attempt_id:
+            raise ValueError("authorization attempt_id must be non-empty")
+        if self.phase not in _PHASES:
+            raise ValueError("authorization phase must be proxy or full")
+        if self.state != _PHASE_STATES[self.phase]:
+            raise ValueError("authorization state does not match phase")
+        if isinstance(self.lifecycle_generation, bool) or self.lifecycle_generation < 0:
+            raise ValueError("authorization lifecycle_generation is invalid")
+        if isinstance(self.phase_start_sequence, bool) or self.phase_start_sequence < 1:
+            raise ValueError("authorization phase_start_sequence is invalid")
+        for value, label in (
+            (self.phase_execution_id, "phase_execution_id"),
+            (self.producer_run_id, "producer_run_id"),
+            (self.adapter_identity, "adapter_identity"),
+        ):
+            if not _SAFE_ID_RE.fullmatch(value):
+                raise ValueError(f"authorization {label} is invalid")
+        if not _EVENT_ID_RE.fullmatch(self.phase_start_event_id):
+            raise ValueError("authorization phase_start_event_id is invalid")
+        for field_name in (
+            "phase_start_event_hash",
+            "implementation_hash",
+            "attempt_input_hash",
+            "trial_spec_hash",
+            "command_plan_hash",
+            "phase_contract_hash",
+        ):
+            if not _SHA256_RE.fullmatch(getattr(self, field_name)):
+                raise ValueError(f"authorization {field_name} must be SHA-256")
+        if self.provenance_mode not in _PROVENANCE_MODES:
+            raise ValueError("authorization provenance_mode is invalid")
+        kinds = tuple(self.expected_evidence_kinds)
+        if not kinds or any(not isinstance(kind, str) or not kind for kind in kinds) or len(kinds) != len(set(kinds)):
+            raise ValueError("authorization expected_evidence_kinds must be unique and non-empty")
+        object.__setattr__(self, "expected_evidence_kinds", tuple(sorted(kinds)))
+        proxy_fields = (self.proxy_commit_event_id, self.proxy_commit_event_hash, self.proxy_outcome_hash)
+        if not isinstance(self.proxy_authorization_required, bool):
+            raise ValueError("proxy_authorization_required must be boolean")
+        if self.phase == "full" and self.proxy_authorization_required:
+            if any(value is None for value in proxy_fields):
+                raise ValueError("full authorization requires committed proxy identity")
+            if not _EVENT_ID_RE.fullmatch(str(self.proxy_commit_event_id)):
+                raise ValueError("proxy commit event id is invalid")
+            if not _SHA256_RE.fullmatch(str(self.proxy_commit_event_hash)) or not _SHA256_RE.fullmatch(str(self.proxy_outcome_hash)):
+                raise ValueError("proxy authorization hashes are invalid")
+        elif any(value is not None for value in proxy_fields):
+            raise ValueError("proxy phase cannot carry full authorization")
+
+    @property
+    def authorization_hash(self) -> str:
+        return canonical_hash(self.as_dict())
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "lifecycle_generation": self.lifecycle_generation,
+            "phase": self.phase,
+            "phase_execution_id": self.phase_execution_id,
+            "phase_start_event_id": self.phase_start_event_id,
+            "phase_start_event_hash": self.phase_start_event_hash,
+            "phase_start_sequence": self.phase_start_sequence,
+            "producer_run_id": self.producer_run_id,
+            "implementation_hash": self.implementation_hash,
+            "attempt_input_hash": self.attempt_input_hash,
+            "trial_spec_hash": self.trial_spec_hash,
+            "command_plan_hash": self.command_plan_hash,
+            "phase_contract_hash": self.phase_contract_hash,
+            "expected_evidence_kinds": list(self.expected_evidence_kinds),
+            "adapter_identity": self.adapter_identity,
+            "provenance_mode": self.provenance_mode,
+            "state": self.state,
+            "proxy_authorization_required": self.proxy_authorization_required,
+            "proxy_commit_event_id": self.proxy_commit_event_id,
+            "proxy_commit_event_hash": self.proxy_commit_event_hash,
+            "proxy_outcome_hash": self.proxy_outcome_hash,
+        }
+
+
+@dataclass(frozen=True)
 class AuthoritativePhaseContext:
-    """Immutable phase identity expected to match the SQLite authority exactly."""
+    """Immutable phase context constructed from a Ledger authorization."""
 
     project_root: Path
     attempt_id: str
@@ -48,20 +156,21 @@ class AuthoritativePhaseContext:
     phase_execution_id: str
     phase_start_event_id: str
     producer_run_id: str
-    proxy_authorization: Mapping[str, Any] | None = None
+    command_plan_hash: str
+    phase_contract_hash: str
+    expected_evidence_kinds: tuple[str, ...]
+    adapter_identity: str
+    provenance_mode: str
+    authorization_hash: str
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "project_root", Path(self.project_root).resolve())
-        if not isinstance(self.attempt_id, str) or not self.attempt_id:
+        if not self.attempt_id:
             raise ValueError("attempt_id must be non-empty")
         for field_name in (
-            "direction_semantic_hash",
-            "direction_spec_hash",
-            "variant_semantic_hash",
-            "variant_spec_hash",
-            "trial_spec_hash",
-            "implementation_hash",
-            "attempt_input_hash",
+            "direction_semantic_hash", "direction_spec_hash", "variant_semantic_hash", "variant_spec_hash",
+            "trial_spec_hash", "implementation_hash", "attempt_input_hash", "command_plan_hash",
+            "phase_contract_hash", "authorization_hash",
         ):
             if not _SHA256_RE.fullmatch(getattr(self, field_name)):
                 raise ValueError(f"{field_name} must be a lowercase SHA-256 digest")
@@ -69,37 +178,49 @@ class AuthoritativePhaseContext:
             raise ValueError("lifecycle_generation must be a non-negative integer")
         if self.phase not in _PHASES:
             raise ValueError("phase must be proxy or full")
-        if not _EXECUTION_ID_RE.fullmatch(self.phase_execution_id):
-            raise ValueError("phase_execution_id is invalid")
+        for value, label in ((self.phase_execution_id, "phase_execution_id"), (self.producer_run_id, "producer_run_id"), (self.adapter_identity, "adapter_identity")):
+            if not _SAFE_ID_RE.fullmatch(value):
+                raise ValueError(f"{label} is invalid")
         if not _EVENT_ID_RE.fullmatch(self.phase_start_event_id):
             raise ValueError("phase_start_event_id is invalid")
-        if not _EXECUTION_ID_RE.fullmatch(self.producer_run_id):
-            raise ValueError("producer_run_id is invalid")
-        authorization = _normalize_proxy_authorization(self.proxy_authorization)
-        object.__setattr__(self, "proxy_authorization", authorization)
-        if self.phase == "full" and authorization is None:
-            raise ValueError("full phase context requires proxy authorization")
+        if self.provenance_mode not in _PROVENANCE_MODES:
+            raise ValueError("provenance_mode is invalid")
+        kinds = tuple(self.expected_evidence_kinds)
+        if not kinds or len(kinds) != len(set(kinds)):
+            raise ValueError("expected_evidence_kinds must be unique and non-empty")
+        object.__setattr__(self, "expected_evidence_kinds", tuple(sorted(kinds)))
 
     @classmethod
-    def from_attempt(
+    def from_authorization(
         cls,
         project_root: Path,
         attempt: Mapping[str, Any],
-        phase: str,
+        authorization: PhaseAuthorization,
     ) -> AuthoritativePhaseContext:
-        phase_executions = attempt.get("phase_executions")
-        execution = phase_executions.get(phase) if isinstance(phase_executions, Mapping) else None
-        if not isinstance(execution, Mapping):
-            raise ValueError(f"attempt has no authoritative {phase} phase execution")
-        values = {field_name: attempt[field_name] for field_name in _IDENTITY_FIELDS[:9]}
+        for field_name in ("attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "trial_spec_hash"):
+            if attempt.get(field_name) != getattr(authorization, field_name):
+                raise ValueError(f"attempt {field_name} differs from Ledger authorization")
         return cls(
             project_root=project_root,
-            **values,
-            phase=phase,
-            phase_execution_id=execution["phase_execution_id"],
-            phase_start_event_id=execution["phase_start_event_id"],
-            producer_run_id=execution["producer_run_id"],
-            proxy_authorization=attempt.get("committed_proxy_outcome") if phase == "full" else None,
+            attempt_id=authorization.attempt_id,
+            direction_semantic_hash=attempt["direction_semantic_hash"],
+            direction_spec_hash=attempt["direction_spec_hash"],
+            variant_semantic_hash=attempt["variant_semantic_hash"],
+            variant_spec_hash=attempt["variant_spec_hash"],
+            trial_spec_hash=authorization.trial_spec_hash,
+            lifecycle_generation=authorization.lifecycle_generation,
+            implementation_hash=authorization.implementation_hash,
+            attempt_input_hash=authorization.attempt_input_hash,
+            phase=authorization.phase,
+            phase_execution_id=authorization.phase_execution_id,
+            phase_start_event_id=authorization.phase_start_event_id,
+            producer_run_id=authorization.producer_run_id,
+            command_plan_hash=authorization.command_plan_hash,
+            phase_contract_hash=authorization.phase_contract_hash,
+            expected_evidence_kinds=authorization.expected_evidence_kinds,
+            adapter_identity=authorization.adapter_identity,
+            provenance_mode=authorization.provenance_mode,
+            authorization_hash=authorization.authorization_hash,
         )
 
     def identity(self) -> dict[str, Any]:
@@ -108,8 +229,6 @@ class AuthoritativePhaseContext:
 
 @dataclass(frozen=True)
 class PhaseArtifactInventory:
-    """Artifacts produced by exactly one authoritative phase execution."""
-
     context: AuthoritativePhaseContext
     artifacts: Sequence[Mapping[str, str]]
 
@@ -119,96 +238,104 @@ class PhaseArtifactInventory:
         normalized: list[Mapping[str, str]] = []
         seen: set[str] = set()
         for artifact in self.artifacts:
-            if not isinstance(artifact, Mapping) or set(artifact) != {"kind", "source_path", "producer_run_id"}:
-                raise ValueError("artifact entries require exactly kind, source_path, and producer_run_id")
-            kind = artifact.get("kind")
-            source_path = artifact.get("source_path")
-            producer_run_id = artifact.get("producer_run_id")
-            if not isinstance(kind, str) or not kind:
-                raise ValueError("artifact kind must be non-empty")
+            required = {"kind", "source_path", "content_hash", "receipt_hash", "producer_run_id"}
+            if not isinstance(artifact, Mapping) or set(artifact) != required:
+                raise ValueError("artifact entries require kind, source_path, content_hash, receipt_hash, producer_run_id")
+            kind = artifact["kind"]
             if kind in seen:
-                raise ValueError(f"duplicate artifact kind: {kind}")
-            if not isinstance(source_path, str) or not _safe_relative_path(source_path):
-                raise ValueError(f"artifact source_path is not a safe project-relative path: {source_path!r}")
-            if producer_run_id != self.context.producer_run_id:
-                raise ValueError("artifact producer_run_id does not match phase context")
+                raise ValueError("artifact kinds must be unique")
+            if kind not in self.context.expected_evidence_kinds:
+                raise ValueError("artifact kind was not authorized")
+            if not _safe_relative_path(artifact["source_path"]):
+                raise ValueError("artifact source_path must be safe and relative")
+            if not _SHA256_RE.fullmatch(artifact["content_hash"]) or not _SHA256_RE.fullmatch(artifact["receipt_hash"]):
+                raise ValueError("artifact hashes must be SHA-256")
+            if artifact["producer_run_id"] != self.context.producer_run_id:
+                raise ValueError("artifact producer_run_id differs from phase context")
             seen.add(kind)
-            normalized.append(
-                MappingProxyType(
-                    {"kind": kind, "source_path": source_path, "producer_run_id": producer_run_id}
-                )
-            )
-        if not normalized:
-            raise ValueError("phase artifact inventory must not be empty")
+            normalized.append(MappingProxyType(dict(artifact)))
+        if seen != set(self.context.expected_evidence_kinds):
+            raise ValueError("artifact inventory must exactly match authorized evidence kinds")
         object.__setattr__(self, "artifacts", tuple(normalized))
-
-    @classmethod
-    def from_artifacts(
-        cls,
-        context: AuthoritativePhaseContext,
-        artifacts: Sequence[Mapping[str, str]],
-    ) -> PhaseArtifactInventory:
-        return cls(context=context, artifacts=artifacts)
-
-    def to_manifest(self) -> dict[str, Any]:
-        return {
-            "schema_version": "auto_research_phase_execution_manifest_v1",
-            **self.context.identity(),
-            "artifacts": [dict(artifact) for artifact in self.artifacts],
-        }
 
 
 class TypedPhaseFailure(RuntimeError):
-    """Typed executor failure suitable for deterministic failure routing."""
-
-    def __init__(
-        self,
-        failure_class: str,
-        message: str,
-        *,
-        phase: str | None = None,
-        executor: str | None = None,
-        retryable: bool = False,
-        details: Mapping[str, Any] | None = None,
-    ) -> None:
-        if not isinstance(failure_class, str) or not failure_class:
-            raise ValueError("failure_class must be non-empty")
-        if not isinstance(message, str) or not message:
-            raise ValueError("message must be non-empty")
-        if phase is not None and phase not in _PHASES:
-            raise ValueError("failure phase must be proxy or full")
+    def __init__(self, failure_class: str, message: str, *, phase: str, executor: str, retryable: bool = False, details: Mapping[str, Any] | None = None):
         super().__init__(message)
         self.failure_class = failure_class
         self.phase = phase
         self.executor = executor
-        self.retryable = bool(retryable)
-        self.details = MappingProxyType(dict(details or {}))
-
-    def as_dict(self) -> dict[str, Any]:
-        return {
-            "failure_class": self.failure_class,
-            "message": str(self),
-            "phase": self.phase,
-            "executor": self.executor,
-            "retryable": self.retryable,
-            "details": dict(self.details),
-        }
+        self.retryable = retryable
+        self.details = dict(details or {})
 
 
 @runtime_checkable
-class PhaseAuthorityChecker(Protocol):
-    """Injected adapter that verifies a phase identity against SQLite authority."""
+class PhaseAuthority(Protocol):
+    def authorize_phase(self, context: AuthoritativePhaseContext) -> PhaseAuthorization: ...
 
-    def __call__(self, context: AuthoritativePhaseContext) -> AuthoritativePhaseContext | bool | None:
-        ...
+
+@dataclass(frozen=True)
+class ResearchLedgerPhaseAuthority:
+    """Reads the latest attempt and phase-start event from SQLite on every check."""
+
+    ledger: Any
+
+    def context_for_attempt(self, project_root: Path, attempt_id: str, phase: str) -> AuthoritativePhaseContext:
+        authorization, attempt = self._read_authorization(attempt_id, phase)
+        return AuthoritativePhaseContext.from_authorization(project_root, attempt, authorization)
+
+    def authorize_phase(self, context: AuthoritativePhaseContext) -> PhaseAuthorization:
+        authorization, _ = self._read_authorization(context.attempt_id, context.phase)
+        if authorization.authorization_hash != context.authorization_hash:
+            raise ValueError("phase context does not match latest SQLite authorization")
+        return authorization
+
+    def _read_authorization(self, attempt_id: str, phase: str) -> tuple[PhaseAuthorization, Mapping[str, Any]]:
+        state = self.ledger.state()
+        attempt = (state.get("attempts") or {}).get(attempt_id)
+        if not isinstance(attempt, Mapping):
+            raise ValueError("authoritative attempt is missing")
+        execution = ((attempt.get("phase_executions") or {}).get(phase))
+        if not isinstance(execution, Mapping):
+            raise ValueError("authoritative phase execution is missing")
+        event = next(
+            (
+                item for item in reversed(self.ledger.events())
+                if item.get("event_id") == execution.get("phase_start_event_id")
+            ),
+            None,
+        )
+        if not isinstance(event, Mapping) or event.get("event_type") != ("ProxyPhaseStarted" if phase == "proxy" else "FullPhaseStarted"):
+            raise ValueError("authoritative phase-start event is missing")
+        manifest = (event.get("payload") or {}).get("phase_execution_manifest")
+        if not isinstance(manifest, Mapping) or manifest.get("schema_version") != "auto_research_phase_execution_manifest_v2":
+            raise ValueError("authoritative PhaseExecutionManifest v2 is required")
+        proxy = attempt.get("committed_proxy_outcome") if phase == "full" else None
+        runtime = attempt["frozen_trial_spec"]["execution_contract"]["runtime_config"]
+        collector = str(runtime.get("collector") or "generic")
+        adapter_identity = "adapter-" + re.sub(r"[^A-Za-z0-9_-]", "-", collector).strip("-")
+        if len(adapter_identity) < 8:
+            adapter_identity = "adapter-generic"
+        authorization = PhaseAuthorization(
+            attempt_id=attempt["attempt_id"], lifecycle_generation=attempt["lifecycle_generation"], phase=phase,
+            phase_execution_id=manifest["phase_execution_id"], phase_start_event_id=event["event_id"],
+            phase_start_event_hash=event["event_hash"], phase_start_sequence=event["sequence"],
+            producer_run_id=manifest["producer_run_id"], implementation_hash=attempt["implementation_hash"],
+            attempt_input_hash=attempt["attempt_input_hash"], trial_spec_hash=attempt["trial_spec_hash"],
+            command_plan_hash=manifest["command_plan_hash"], phase_contract_hash=manifest["phase_contract_hash"],
+            expected_evidence_kinds=tuple(manifest["expected_evidence_kinds"]), adapter_identity=adapter_identity[:127],
+            provenance_mode=manifest["provenance_mode"].replace("-", "_"), state=attempt["state"],
+            proxy_authorization_required=phase != "full" or attempt.get("attempt_kind") == "proxy_full",
+            proxy_commit_event_id=proxy.get("event_id") if isinstance(proxy, Mapping) else None,
+            proxy_commit_event_hash=proxy.get("event_hash") if isinstance(proxy, Mapping) else None,
+            proxy_outcome_hash=proxy.get("outcome_hash") if isinstance(proxy, Mapping) else None,
+        )
+        return authorization, attempt
 
 
 @runtime_checkable
 class PhaseExecutor(Protocol):
-    """Protocol implemented by all strict phase execution shells."""
-
-    def execute(self, context: AuthoritativePhaseContext) -> PhaseArtifactInventory:
-        ...
+    def execute(self, context: AuthoritativePhaseContext) -> PhaseArtifactInventory: ...
 
 
 PhaseRunner = Callable[[AuthoritativePhaseContext], PhaseArtifactInventory]
@@ -216,92 +343,38 @@ PhaseRunner = Callable[[AuthoritativePhaseContext], PhaseArtifactInventory]
 
 @dataclass(frozen=True)
 class _StrictPhaseExecutor:
-    authority_checker: PhaseAuthorityChecker
+    authority: PhaseAuthority
     runner: PhaseRunner
     executor_name: str = field(init=False, default="phase")
     required_phase: str | None = field(init=False, default=None)
 
     def execute(self, context: AuthoritativePhaseContext) -> PhaseArtifactInventory:
         if not isinstance(context, AuthoritativePhaseContext):
-            raise TypedPhaseFailure(
-                "invalid_phase_context",
-                "executor requires AuthoritativePhaseContext",
-                executor=self.executor_name,
-            )
+            raise TypeError("context must be AuthoritativePhaseContext")
         if self.required_phase is not None and context.phase != self.required_phase:
-            raise TypedPhaseFailure(
-                "phase_mismatch",
-                f"{self.executor_name} requires {self.required_phase} context",
-                phase=context.phase,
-                executor=self.executor_name,
-            )
-        self._check_authority(context)
-        try:
-            inventory = self.runner(context)
-        except TypedPhaseFailure:
-            raise
-        except Exception as error:
-            raise TypedPhaseFailure(
-                "phase_execution_failed",
-                f"{self.executor_name} runner failed: {error}",
-                phase=context.phase,
-                executor=self.executor_name,
-                retryable=True,
-                details={"exception_type": type(error).__name__},
-            ) from error
-        if not isinstance(inventory, PhaseArtifactInventory):
-            raise TypedPhaseFailure(
-                "invalid_artifact_inventory",
-                "runner must return PhaseArtifactInventory",
-                phase=context.phase,
-                executor=self.executor_name,
-            )
-        if inventory.context != context:
-            raise TypedPhaseFailure(
-                "artifact_identity_mismatch",
-                "artifact inventory is bound to a different phase identity",
-                phase=context.phase,
-                executor=self.executor_name,
-            )
+            raise TypedPhaseFailure("phase_mismatch", f"{self.executor_name} requires {self.required_phase}", phase=context.phase, executor=self.executor_name)
+        authorization = self._authorize(context)
+        if authorization.authorization_hash != context.authorization_hash:
+            raise TypedPhaseFailure("authority_identity_mismatch", "Ledger authorization differs from phase context", phase=context.phase, executor=self.executor_name)
+        inventory = self.runner(context)
+        if not isinstance(inventory, PhaseArtifactInventory) or inventory.context != context:
+            raise TypedPhaseFailure("artifact_identity_mismatch", "runner returned inventory for a different phase", phase=context.phase, executor=self.executor_name)
+        self._authorize(context)
         return inventory
 
     def __call__(self, context: AuthoritativePhaseContext) -> PhaseArtifactInventory:
         return self.execute(context)
 
-    def _check_authority(self, context: AuthoritativePhaseContext) -> None:
+    def _authorize(self, context: AuthoritativePhaseContext) -> PhaseAuthorization:
         try:
-            verdict = self.authority_checker(context)
+            authorization = self.authority.authorize_phase(context)
         except TypedPhaseFailure:
             raise
         except Exception as error:
-            raise TypedPhaseFailure(
-                "authority_check_failed",
-                f"SQLite phase authority check failed: {error}",
-                phase=context.phase,
-                executor=self.executor_name,
-                details={"exception_type": type(error).__name__},
-            ) from error
-        if verdict is False:
-            raise TypedPhaseFailure(
-                "authority_rejected",
-                "SQLite authority rejected the phase identity",
-                phase=context.phase,
-                executor=self.executor_name,
-            )
-        if isinstance(verdict, AuthoritativePhaseContext) and verdict != context:
-            raise TypedPhaseFailure(
-                "authority_identity_mismatch",
-                "SQLite authority returned a different phase identity",
-                phase=context.phase,
-                executor=self.executor_name,
-            )
-        if verdict is not None and verdict is not True and not isinstance(verdict, AuthoritativePhaseContext):
-            raise TypedPhaseFailure(
-                "invalid_authority_verdict",
-                "authority checker returned an unsupported verdict",
-                phase=context.phase,
-                executor=self.executor_name,
-            )
+            raise TypedPhaseFailure("authority_check_failed", f"SQLite phase authority check failed: {error}", phase=context.phase, executor=self.executor_name) from error
+        if not isinstance(authorization, PhaseAuthorization):
+            raise TypedPhaseFailure("invalid_authority_verdict", "authority must return PhaseAuthorization", phase=context.phase, executor=self.executor_name)
+        return authorization
 
 
 @dataclass(frozen=True)
@@ -326,33 +399,6 @@ class SyntheticPhaseExecutor(_StrictPhaseExecutor):
     executor_name: str = field(init=False, default="synthetic")
 
 
-def _normalize_proxy_authorization(value: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
-    if value is None:
-        return None
-    if not isinstance(value, Mapping):
-        raise ValueError("proxy_authorization must be a mapping")
-    required = {"event_id", "outcome_hash", "decision"}
-    if not required.issubset(value):
-        raise ValueError("proxy_authorization requires event_id, outcome_hash, and decision")
-    if set(value) - (required | {"event_hash"}):
-        raise ValueError("proxy_authorization contains unsupported fields")
-    if value.get("decision") != "RUN_FULL":
-        raise ValueError("full phase requires RUN_FULL proxy authorization")
-    event_id = value.get("event_id")
-    outcome_hash = value.get("outcome_hash")
-    if not isinstance(event_id, str) or not _EVENT_ID_RE.fullmatch(event_id):
-        raise ValueError("proxy_authorization event_id is invalid")
-    if not isinstance(outcome_hash, str) or not _SHA256_RE.fullmatch(outcome_hash):
-        raise ValueError("proxy_authorization outcome_hash is invalid")
-    event_hash = value.get("event_hash")
-    if event_hash is not None and (not isinstance(event_hash, str) or not _SHA256_RE.fullmatch(event_hash)):
-        raise ValueError("proxy_authorization event_hash is invalid")
-    normalized = {"event_id": event_id, "outcome_hash": outcome_hash, "decision": "RUN_FULL"}
-    if event_hash is not None:
-        normalized["event_hash"] = event_hash
-    return MappingProxyType(normalized)
-
-
 def _safe_relative_path(value: str) -> bool:
     if not value or "\\" in value:
         return False
@@ -361,13 +407,7 @@ def _safe_relative_path(value: str) -> bool:
 
 
 __all__ = [
-    "AuthoritativePhaseContext",
-    "C2CFullPhaseExecutor",
-    "C2CProxyPhaseExecutor",
-    "GenericExternalPhaseExecutor",
-    "PhaseArtifactInventory",
-    "PhaseAuthorityChecker",
-    "PhaseExecutor",
-    "SyntheticPhaseExecutor",
+    "AuthoritativePhaseContext", "C2CFullPhaseExecutor", "C2CProxyPhaseExecutor", "GenericExternalPhaseExecutor",
+    "PhaseArtifactInventory", "PhaseAuthorization", "PhaseAuthority", "PhaseExecutor", "ResearchLedgerPhaseAuthority", "SyntheticPhaseExecutor",
     "TypedPhaseFailure",
 ]

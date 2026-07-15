@@ -16,6 +16,7 @@ from typing import Any
 from ..adapters.runner import ExperimentRunner
 from ..c2c import C2CAdapter, c2c_idea_novelty_report, c2c_implementation_scope_report, is_c2c_project, normalize_c2c_mechanism_fields
 from ..code_patch import CodePatchAgent
+from ..contract_store import ContractStore, canonical_contract_bytes
 from ..direction_contracts import (
     build_planner_decision_artifact,
     build_variant_contract,
@@ -44,6 +45,7 @@ from ..s2_feedback_policy import (
 from ..utils import compact_markdown, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, write_yaml
 from ..domain_contracts import TRIAL_SPEC_SCHEMA_VERSION, canonical_hash, canonical_json, validate_trial_spec
 from ..evidence import EVIDENCE_SCHEMA_VERSIONS
+from ..proxy_classifier import build_proxy_decision_policy
 from ..research_state import ResearchEventLedger
 from .base import AgentContext
 
@@ -3616,8 +3618,8 @@ def _c2c_evaluator_provenance(repo_root: Path, c2c_config: dict[str, Any], *, si
     if simulate:
         return {
             "evaluator_id": "c2c-small-loop-synthetic-evaluator",
-            "evaluator_source_digest": canonical_hash({"adapter": "c2c_small_loop", "mode": "synthetic"}),
-            "dependency_digest": canonical_hash({"dependencies": [], "mode": "synthetic"}),
+            "evaluator_source_payloads": [{"adapter": "c2c_small_loop", "mode": "synthetic"}],
+            "dependency_payloads": [{"dependencies": [], "mode": "synthetic"}],
         }
     configured = c2c_config.get("evaluator_provenance") if isinstance(c2c_config.get("evaluator_provenance"), dict) else {}
     evaluator_paths = configured.get("source_paths") or ["script/evaluation", "rosetta/model"]
@@ -3643,10 +3645,135 @@ def _c2c_evaluator_provenance(repo_root: Path, c2c_config: dict[str, Any], *, si
         raise ValueError("real C2C TrialSpec requires explicit evaluator dependency provenance")
     return {
         "evaluator_id": str(configured.get("evaluator_id") or "c2c-unified-evaluator"),
-        "evaluator_source_digest": canonical_hash(source_entries),
-        "dependency_digest": canonical_hash(dependency_manifest),
-        "dependencies": deepcopy(dependency_manifest),
+        "evaluator_source_files": source_entries,
+        "dependency_payloads": deepcopy(dependency_manifest),
     }
+
+
+def _store_trial_contracts(
+    *,
+    project_root: Path,
+    raw_datasets: list[Any],
+    datasets: list[dict[str, Any]],
+    metrics: list[dict[str, Any]],
+    execution: dict[str, Any],
+    variant: dict[str, Any],
+    provenance_mode: str,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], dict[str, Any]]:
+    ensure_dir(project_root)
+    store = ContractStore(project_root)
+    sample_datasets: list[dict[str, Any]] = []
+    for source_value, dataset in zip(raw_datasets, datasets):
+        source = source_value if isinstance(source_value, dict) else {}
+        sample_ids = source.get("ordered_sample_ids") or [
+            canonical_hash(
+                {
+                    "dataset_id": dataset["dataset_id"],
+                    "split": dataset["split"],
+                    "ordinal": ordinal,
+                    "mode": provenance_mode,
+                }
+            )
+            for ordinal in range(dataset["sample_count"])
+        ]
+        if len(sample_ids) != dataset["sample_count"]:
+            raise ValueError(f"TrialSpec dataset {dataset['dataset_id']} sample IDs must match sample_count")
+        if any(not isinstance(item, str) or re.fullmatch(r"[a-f0-9]{64}", item) is None for item in sample_ids):
+            raise ValueError(f"TrialSpec dataset {dataset['dataset_id']} requires content-addressed ordered_sample_ids")
+        source_revision = str(
+            source.get("source_revision")
+            or ("synthetic-v1" if provenance_mode == "synthetic" else "")
+        )
+        if not source_revision:
+            raise ValueError(f"real TrialSpec dataset {dataset['dataset_id']} requires source_revision")
+        sample_source = {
+            "dataset_id": dataset["dataset_id"],
+            "source_revision": source_revision,
+            "split": dataset["split"],
+            "ordered_sample_ids": sample_ids,
+        }
+        source_blob = store.put_bytes(canonical_contract_bytes(sample_source))
+        content_digest = store.digest_referenced_bytes([source_blob])
+        dataset["sample_hash"] = content_digest
+        sample_datasets.append(
+            {
+                **sample_source,
+                "sample_count": dataset["sample_count"],
+                "source_blobs": [source_blob],
+                "content_digest": content_digest,
+            }
+        )
+    sample_manifest = {
+        "schema_version": "auto_research_sample_manifest_v2",
+        "manifest_id": f"{variant.get('variant_id')}:sample-manifest",
+        "provenance_mode": provenance_mode,
+        "datasets": sample_datasets,
+    }
+    sample_ref = store.put_contract(
+        sample_manifest,
+        contract_kind="sample_manifest",
+        schema_file="sample_manifest_v2.schema.json",
+    )
+
+    source_blobs: list[dict[str, Any]] = []
+    if provenance_mode == "real":
+        configured_files = execution.get("evaluator_source_files") or []
+        if not configured_files:
+            configured_paths = execution.get("evaluator_source_paths") or []
+            workdir = Path(str(execution.get("workdir") or project_root)).resolve()
+            for relative in configured_paths:
+                candidate = (workdir / str(relative)).resolve()
+                try:
+                    candidate.relative_to(workdir)
+                except ValueError as exc:
+                    raise ValueError("evaluator source path escapes execution workdir") from exc
+                paths = [candidate] if candidate.is_file() else sorted(path for path in candidate.rglob("*") if path.is_file()) if candidate.is_dir() else []
+                configured_files.extend({"path": path.relative_to(workdir).as_posix(), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in paths)
+        workdir = Path(str(execution.get("workdir") or project_root)).resolve()
+        for entry in configured_files:
+            if not isinstance(entry, dict) or not entry.get("path"):
+                raise ValueError("real evaluator source entries require paths")
+            path = (workdir / str(entry["path"])).resolve()
+            try:
+                path.relative_to(workdir)
+            except ValueError as exc:
+                raise ValueError("evaluator source path escapes execution workdir") from exc
+            raw = path.read_bytes()
+            if entry.get("sha256") and hashlib.sha256(raw).hexdigest() != entry["sha256"]:
+                raise ValueError("evaluator source changed after provenance enumeration")
+            source_blobs.append(store.put_bytes(raw))
+        if not source_blobs:
+            raise ValueError("real TrialSpec requires readable evaluator source files")
+    else:
+        payloads = execution.get("evaluator_source_payloads") or [{"collector": execution.get("collector"), "mode": "synthetic"}]
+        source_blobs = [store.put_bytes(canonical_contract_bytes(item)) for item in payloads]
+
+    dependency_payloads = execution.get("dependency_payloads")
+    if dependency_payloads is None:
+        dependency_payloads = execution.get("dependencies") or []
+    dependency_blobs = [store.put_bytes(canonical_contract_bytes(item)) for item in dependency_payloads]
+    evaluator_config = {"metrics": metrics, "runtime": execution}
+    config_blob = store.put_bytes(canonical_contract_bytes(evaluator_config))
+    evaluator_id = str(execution.get("evaluator_id") or execution.get("collector") or "synthetic-evaluator")
+    if len(evaluator_id) < 8:
+        evaluator_id = f"{evaluator_id}-evaluator"
+    evaluator_manifest = {
+        "schema_version": "auto_research_evaluator_manifest_v2",
+        "evaluator_id": evaluator_id,
+        "provenance_mode": provenance_mode,
+        "source_blobs": source_blobs,
+        "dependency_blobs": dependency_blobs,
+        "config_blob": config_blob,
+        "config_digest": store.digest_referenced_bytes([config_blob]),
+        "source_digest": store.digest_referenced_bytes(source_blobs),
+        "dependency_digest": store.digest_referenced_bytes(dependency_blobs),
+    }
+    evaluator_ref = store.put_contract(
+        evaluator_manifest,
+        contract_kind="evaluator_manifest",
+        schema_file="evaluator_manifest_v2.schema.json",
+    )
+    return sample_manifest, sample_ref, evaluator_manifest, evaluator_ref
 
 
 def _trial_spec_from_plan(
@@ -3781,8 +3908,6 @@ def _trial_spec_from_plan(
         proxy_evidence = [
             ("proxy-baseline", "proxy_baseline_fingerprint"),
             ("proxy-cache", "proxy_cache_report"),
-            ("effective-policy", "effective_proxy_policy"),
-            ("calibration-policy", "proxy_calibration_policy"),
         ]
         evidence_requirements.extend(
             {"requirement_id": requirement_id, "kind": kind, "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS[kind]}
@@ -3794,64 +3919,41 @@ def _trial_spec_from_plan(
             evidence_requirements.append({"requirement_id": "full-readiness", "kind": "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["full_s3_readiness"]})
     runtime_config = deepcopy(execution)
     provenance_mode = "synthetic" if execution.get("mode") == "simulate" else "real"
-    if provenance_mode == "real":
-        missing_evaluator = [
-            field
-            for field in ("evaluator_id", "evaluator_source_digest", "dependency_digest")
-            if not execution.get(field)
-        ]
-        if missing_evaluator:
-            raise ValueError(f"real TrialSpec requires explicit evaluator provenance: {', '.join(missing_evaluator)}")
-    evaluator_identity = {
-        "schema_version": "auto_research_evaluator_provenance_v1",
-        "provenance_mode": provenance_mode,
-        "evaluator_id": str(execution.get("evaluator_id") or execution.get("collector") or "synthetic-evaluator"),
-        "source_digest": str(execution.get("evaluator_source_digest") or canonical_hash({"collector": execution.get("collector"), "mode": provenance_mode})),
-        "config_hash": canonical_hash({"metrics": metrics, "runtime": execution}),
-        "dependency_digest": str(execution.get("dependency_digest") or canonical_hash({"dependencies": execution.get("dependencies") or [], "mode": provenance_mode})),
-    }
-    if provenance_mode == "real":
-        evaluator_identity["artifact_path"] = "plan/evaluator_manifest.json"
-        evaluator_identity["artifact_hash"] = canonical_hash(evaluator_identity)
     command_contract = deepcopy(execution.get("commands") or [])
     dataset_ids = [item["dataset_id"] for item in datasets]
-    sample_manifest_datasets = []
-    for source, dataset in zip(raw_datasets, datasets):
-        source = source if isinstance(source, dict) else {}
-        if provenance_mode == "real" and (not source.get("source_revision") or not source.get("ordered_sample_ids")):
-            raise ValueError(f"real TrialSpec dataset {dataset['dataset_id']} requires source_revision and ordered_sample_ids")
-        sample_ids = source.get("ordered_sample_ids") or [
-            canonical_hash({"dataset_id": dataset["dataset_id"], "split": dataset["split"], "ordinal": ordinal, "mode": provenance_mode})
-            for ordinal in range(dataset["sample_count"])
-        ]
-        if len(sample_ids) != dataset["sample_count"]:
-            raise ValueError(f"TrialSpec dataset {dataset['dataset_id']} sample IDs must match sample_count")
-        provenance = {
-            "dataset_id": dataset["dataset_id"],
-            "source_revision": str(source.get("source_revision") or ("synthetic-v1" if provenance_mode == "synthetic" else "registered-revision")),
-            "split": dataset["split"],
-            "ordered_sample_ids": sample_ids,
-        }
-        content_hash = canonical_hash(provenance)
-        dataset["sample_hash"] = content_hash
-        sample_manifest_datasets.append(
-            {
-                **provenance,
-                "sample_count": dataset["sample_count"],
-                "content_hash": content_hash,
-            }
+    if project_root is None:
+        raise ValueError("TrialSpec production requires a project_root for immutable ContractStore manifests")
+    sample_manifest, sample_manifest_ref, evaluator_manifest, evaluator_manifest_ref = _store_trial_contracts(
+        project_root=project_root,
+        raw_datasets=raw_datasets,
+        datasets=datasets,
+        metrics=metrics,
+        execution=execution,
+        variant=variant,
+        provenance_mode=provenance_mode,
+    )
+    proxy_decision_policy = None
+    if "proxy" in required_phases:
+        proxy_evidence_kinds = sorted(
+            item["kind"]
+            for item in evidence_requirements
+            if "proxy" in item["applicable_phases"] or "always" in item["applicable_phases"]
         )
-    sample_manifest_identity = {
-        "schema_version": "auto_research_sample_manifest_v1",
-        "manifest_id": f"{variant.get('variant_id')}:sample-manifest",
-        "provenance_mode": provenance_mode,
-        "datasets": sample_manifest_datasets,
-        "artifact_path": "plan/sample_manifest.json",
-    }
-    sample_manifest_body = {
-        **sample_manifest_identity,
-        "artifact_hash": canonical_hash(sample_manifest_identity),
-    }
+        proxy_decision_policy = build_proxy_decision_policy(
+            primary_metric_id=primary_metric_id,
+            objective=primary[0]["objective"],
+            aggregation="paired_mean",
+            datasets=[item["dataset_id"] for item in datasets],
+            seeds=seeds,
+            metric_ids=[primary_metric_id],
+            roles=["baseline", "candidate"],
+            aggregate_improvement_threshold=float(minimum_delta),
+            per_dataset_maximum_regression=float(maximum_regression if isinstance(maximum_regression, (int, float)) and not isinstance(maximum_regression, bool) else 0.0),
+            activation_surface_ids=list(variant.get("implementation_surface_ids") or ["c2c-surface"]),
+            readiness_check_ids=[] if proxy_terminal else ["proxy-ready-for-full"],
+            evidence_kinds=proxy_evidence_kinds,
+            mode="terminal_bootstrap" if proxy_terminal else "gate_to_full",
+        )
     trial_spec = {
         "schema_version": TRIAL_SPEC_SCHEMA_VERSION,
         "protocol": {
@@ -3861,7 +3963,8 @@ def _trial_spec_from_plan(
             "proxy_terminal_allowed": proxy_terminal,
             "aggregation": "mean",
         },
-        "sample_manifest": sample_manifest_body,
+        "sample_manifest": sample_manifest,
+        "sample_manifest_ref": sample_manifest_ref,
         "datasets": datasets,
         "metrics": metrics,
         "primary_metric_id": primary_metric_id,
@@ -3875,8 +3978,9 @@ def _trial_spec_from_plan(
         "execution_contract": {
             "runtime_config": runtime_config,
             "runtime_config_hash": canonical_hash(runtime_config),
-            "evaluator_provenance": evaluator_identity,
-            "evaluator_hash": canonical_hash(evaluator_identity),
+            "evaluator_provenance": evaluator_manifest,
+            "evaluator_manifest_ref": evaluator_manifest_ref,
+            "evaluator_hash": canonical_hash(evaluator_manifest),
             "command_contract_hash": canonical_hash(command_contract),
         },
         "required_artifacts": required_artifacts,
@@ -3887,7 +3991,7 @@ def _trial_spec_from_plan(
                 "datasets": dataset_ids,
                 "seeds": seeds,
                 "roles": ["baseline", "candidate"] if phase == "proxy" else list(dict.fromkeys(required_roles)),
-                "metrics": [item["metric_id"] for item in metrics],
+                "metrics": [primary_metric_id],
                 "evidence_kinds": [
                     item["kind"]
                     for item in evidence_requirements
@@ -3898,19 +4002,9 @@ def _trial_spec_from_plan(
             }
             for phase in required_phases
         ],
+        "proxy_decision_policy": proxy_decision_policy,
     }
     validate_trial_spec(trial_spec)
-    if project_root is not None:
-        sample_path = project_root / trial_spec["sample_manifest"]["artifact_path"]
-        ensure_dir(sample_path.parent)
-        sample_body = {key: value for key, value in trial_spec["sample_manifest"].items() if key != "artifact_hash"}
-        sample_path.write_text(canonical_json(sample_body), encoding="utf-8")
-        evaluator = trial_spec["execution_contract"]["evaluator_provenance"]
-        if evaluator["provenance_mode"] == "real":
-            evaluator_path = project_root / evaluator["artifact_path"]
-            ensure_dir(evaluator_path.parent)
-            evaluator_body = {key: value for key, value in evaluator.items() if key != "artifact_hash"}
-            evaluator_path.write_text(canonical_json(evaluator_body), encoding="utf-8")
     return trial_spec
 
 def _parse_json_object(text: str) -> dict[str, Any] | None:

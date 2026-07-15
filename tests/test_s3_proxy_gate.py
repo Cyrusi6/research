@@ -27,30 +27,16 @@ _BOOTSTRAP_EVIDENCE_KINDS = (
     "activation_evidence",
     "proxy_baseline_fingerprint",
     "proxy_cache_report",
-    "effective_proxy_policy",
-    "proxy_calibration_policy",
     "bootstrap_completion",
 )
 
 
-def _bootstrap_trial_spec() -> dict:
-    trial_spec = _trial_spec(profile="bootstrap", attempt_kind="bootstrap_proxy")
-    trial_spec["required_artifacts"] = list(_BOOTSTRAP_EVIDENCE_KINDS)
-    trial_spec["evidence_requirements"] = [
-        {
-            "requirement_id": kind.replace("_", "-"),
-            "kind": kind,
-            "required": True,
-            "applicable_phases": ["proxy"] if kind != "activation_evidence" else ["always"],
-            "schema_version": EVIDENCE_SCHEMA_VERSIONS[kind],
-        }
-        for kind in _BOOTSTRAP_EVIDENCE_KINDS
-    ]
-    return trial_spec
+def _bootstrap_trial_spec(project_root: Path) -> dict:
+    return _trial_spec(profile="bootstrap", attempt_kind="bootstrap_proxy", project_root=project_root)
 
 
 def _reserve_bootstrap(ledger: ResearchEventLedger, direction: dict, variant: dict) -> tuple[dict, dict]:
-    trial_spec = _bootstrap_trial_spec()
+    trial_spec = _bootstrap_trial_spec(ledger.project_root)
     write_json(ledger.project_root / "plan" / "trial_spec.json", trial_spec)
     attempt = ledger.reserve_attempt(
         profile="bootstrap",
@@ -72,7 +58,13 @@ def _bootstrap_inventory(root: Path, attempt: dict, trial_spec: dict) -> list[di
         project_root=root,
         attempt=attempt,
         trial_spec=trial_spec,
-        comparison_candidate={"metrics": {"mean": 1.0, "datasets": {"fake": 1.0}}},
+        comparison_candidate={
+            "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
+            "proxy_screen": {
+                "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
+                "baseline_metrics": {"mean": 0.0, "datasets": {"fake": 0.0}},
+            },
+        },
         baseline={"mean": 0.0, "datasets": {"fake": 0.0}},
         simulate=True,
     )
@@ -151,6 +143,49 @@ def test_s3_bootstrap_gate_is_repeatable_read_only_and_budget_isolated(tmp_path:
     assert state["last_route_outcome"]["next_action"] == "FINISH_RUN"
     assert state["last_route_outcome"]["source"]["attempt_id"] == attempt["attempt_id"]
     assert sum(event["event_type"] == "AttemptFinalized" for event in after_events) == 1
+
+
+@pytest.mark.parametrize(
+    "extra_kind",
+    [
+        "effective_proxy_policy",
+        "proxy_calibration_policy",
+        "failure_evidence",
+        "resource_probe",
+        "resume_evidence",
+    ],
+)
+def test_bootstrap_completion_rejects_noncompletion_authoritative_kind(tmp_path: Path, extra_kind: str) -> None:
+    direction = _direction()
+    variant = _variant(direction, 1)
+    write_json(tmp_path / "literature" / "direction.json", direction)
+    write_json(tmp_path / "plan" / "variant.json", variant)
+    ledger = ResearchEventLedger(tmp_path)
+    _initialize(ledger, direction, variant)
+    attempt, trial_spec = _reserve_bootstrap(ledger, direction, variant)
+    attempt = start_attempt_phase(ledger, attempt, "proxy")
+    completion = _stage_evidence_inventory(
+        project_root=tmp_path,
+        attempt=attempt,
+        trial_spec=trial_spec,
+        inventory=_bootstrap_inventory(tmp_path, attempt, trial_spec),
+    )
+    invalid = deepcopy(completion)
+    invalid["entries"].append(
+        {
+            **deepcopy(invalid["entries"][0]),
+            "evidence_id": f"evidence:{extra_kind}",
+            "kind": extra_kind,
+        }
+    )
+    before_events = ledger.events()
+    before_state = ledger.state()
+
+    with pytest.raises(IntegrityError):
+        ledger.complete_attempt(invalid)
+
+    assert ledger.events() == before_events
+    assert ledger.state() == before_state
 
 
 @pytest.mark.parametrize("missing_kind", _BOOTSTRAP_EVIDENCE_KINDS)

@@ -97,7 +97,7 @@ def test_audit_up_to_current_includes_current_stage_but_not_unreached_s2_5(tmp_p
     assert {"stage": "S3_experiment", "reason": "not_reached"} in report["skipped_stages"]
 
 
-def test_audit_full_scope_keeps_legacy_full_requirements(tmp_path: Path) -> None:
+def test_audit_full_scope_keeps_current_full_requirements(tmp_path: Path) -> None:
     project = tmp_path / "proj"
     project.mkdir()
 
@@ -106,3 +106,10 @@ def test_audit_full_scope_keeps_legacy_full_requirements(tmp_path: Path) -> None
     assert report["gate"] == "fail"
     assert report["expected_stages"] == ["S1_literature", "S2_plan", "S2_5_patch", "S3_experiment", "orchestration"]
     assert "experiment/results/c2c_proxy_decision_report.json" in report["by_stage"]["S3_experiment"]["missing"]
+
+
+def test_audit_uses_current_trial_and_state_schemas() -> None:
+    assert ("plan/trial_spec.json", "trial_spec_v5.schema.json") in STAGE_ARTIFACT_REQUIREMENTS["S2_plan"]
+    assert ("meta/research_state.json", "research_state_v6.schema.json") in STAGE_ARTIFACT_REQUIREMENTS["orchestration"]
+    assert all(schema != "trial_spec_v4.schema.json" for requirements in STAGE_ARTIFACT_REQUIREMENTS.values() for _, schema in requirements)
+    assert all(schema != "research_state_v5.schema.json" for requirements in STAGE_ARTIFACT_REQUIREMENTS.values() for _, schema in requirements)

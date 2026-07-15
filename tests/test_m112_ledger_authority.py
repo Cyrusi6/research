@@ -58,11 +58,14 @@ def _reserved(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
     variant = _variant(direction, "variant-a")
     ledger.select_direction(direction)
     ledger.plan_variant(variant)
-    attempt = ledger.reserve_attempt(profile="standard", direction=direction, variant=variant, implementation_hash=canonical_hash({"impl": 1}), attempt_kind="full", trial_spec=_trial_spec())
+    attempt = ledger.reserve_attempt(profile="standard", direction=direction, variant=variant, implementation_hash=canonical_hash({"impl": 1}), attempt_kind="full", trial_spec=_trial_spec(project_root=tmp_path))
     return ledger, attempt
 
 
 def _failure(root: Path, attempt: dict, index: int, *, failure_class: str = "resource_pause") -> dict:
+    if failure_class == "resource_pause":
+        from test_m115_failure_resume_reducer import _resource_pause
+        return _resource_pause(root, attempt)[0]
     return _canonical_failure_evidence(
         root,
         attempt,
@@ -73,7 +76,12 @@ def _failure(root: Path, attempt: dict, index: int, *, failure_class: str = "res
 
 
 def _resume(root: Path, ledger: ResearchEventLedger, attempt: dict, index: int) -> dict:
-    return _canonical_resume_evidence(root, ledger, attempt, resource_type="system_memory")
+    from auto_research.failure_validation import canonical_evidence_bytes, evidence_bytes_hash
+    from test_m115_failure_resume_reducer import _resume as canonical_resume
+    pause_event = next(event for event in reversed(ledger.events()) if event["event_type"] == "AttemptDispositioned")
+    pause_failure = pause_event["payload"]["failure_evidence"]
+    pause_hash = evidence_bytes_hash(canonical_evidence_bytes(pause_failure))
+    return canonical_resume(root, attempt, pause_event, pause_failure, pause_hash)
 
 
 @pytest.mark.parametrize("forged", ["IMPLEMENTATION_REPAIR", "RESOURCE_PAUSED", "INTEGRITY_BLOCKED", "ABANDONED", "METHOD_COMPLETED"])
@@ -127,10 +135,10 @@ def test_project_execution_width_blocks_second_direction_reservation(tmp_path: P
     first_variant, second_variant = _variant(first, "first-v"), _variant(second, "second-v")
     ledger.select_direction(first); ledger.plan_variant(first_variant)
     ledger.select_direction(second); ledger.plan_variant(second_variant)
-    ledger.reserve_attempt(profile="standard", direction=first, variant=first_variant, implementation_hash=canonical_hash({"impl": 1}), attempt_kind="full", trial_spec=_trial_spec())
+    ledger.reserve_attempt(profile="standard", direction=first, variant=first_variant, implementation_hash=canonical_hash({"impl": 1}), attempt_kind="full", trial_spec=_trial_spec(project_root=tmp_path))
     before = ledger.events()
     with pytest.raises(IntegrityError, match="project execution_width=1"):
-        ledger.reserve_attempt(profile="standard", direction=second, variant=second_variant, implementation_hash=canonical_hash({"impl": 2}), attempt_kind="full", trial_spec=_trial_spec())
+        ledger.reserve_attempt(profile="standard", direction=second, variant=second_variant, implementation_hash=canonical_hash({"impl": 2}), attempt_kind="full", trial_spec=_trial_spec(project_root=tmp_path))
     assert ledger.events() == before
 
 
