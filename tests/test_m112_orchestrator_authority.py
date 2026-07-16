@@ -13,7 +13,6 @@ from auto_research.orchestrator import Orchestrator
 from auto_research.research_state import IntegrityError, ResearchEventLedger
 from test_authoritative_state_machine import _direction, _initialize, _reserve, _variant
 from test_m113_ledger_closure import _failure_evidence as _canonical_failure_evidence
-from test_m113_ledger_closure import _resume_evidence as _canonical_resume_evidence
 from test_pipeline import _mock_generic_s1_codex, _test_config
 from support.authoritative_evidence import start_attempt_phase
 
@@ -120,8 +119,9 @@ def test_orchestrator_rejects_wrong_committed_sequence(tmp_path: Path) -> None:
 
 def test_orchestrator_rejects_late_result_after_newer_attempt_route(tmp_path: Path) -> None:
     ledger, first_attempt, first_route, first_sequence = _routed_result(tmp_path)
-    first_attempt = ledger.resume_attempt(
-        _canonical_resume_evidence(tmp_path, ledger, first_attempt, resource_type="system_memory")
+    first_attempt = ledger.resume_resource_attempt(
+        first_attempt["attempt_id"],
+        measurement_provider=lambda resource_type, resource_id, unit: 20.0,
     )
     current_attempt = start_attempt_phase(ledger, first_attempt, "full")
     ledger.disposition_failure(_failure_evidence(ledger, current_attempt, "activation_failure"))

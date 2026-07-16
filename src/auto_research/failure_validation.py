@@ -8,7 +8,7 @@ import math
 from copy import deepcopy
 from datetime import datetime
 from functools import lru_cache
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any, Mapping
 
 from jsonschema import Draft202012Validator
@@ -19,7 +19,6 @@ from .domain_contracts import (
     RESUME_EVIDENCE_SCHEMA_VERSION,
 )
 
-COMMAND_RESULT_SCHEMA_VERSION = "auto_research_command_result_evidence_v1"
 FAILURE_EVIDENCE_SCHEMA = f"{FAILURE_EVIDENCE_SCHEMA_VERSION.removeprefix('auto_research_')}.schema.json"
 RESOURCE_PROBE_SCHEMA = f"{RESOURCE_PROBE_SCHEMA_VERSION.removeprefix('auto_research_').replace('_evidence_', '_')}.schema.json"
 RESUME_EVIDENCE_SCHEMA = f"{RESUME_EVIDENCE_SCHEMA_VERSION.removeprefix('auto_research_')}.schema.json"
@@ -70,7 +69,7 @@ def validate_failure_evidence(
     expected_identity: Mapping[str, Any],
     failure_raw: bytes,
     *,
-    command_result_raw: bytes | None = None,
+    phase_run_receipt_raw: bytes | None = None,
     resource_probe_raw: bytes | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Validate one failure from canonical bytes against exact phase authority."""
@@ -84,7 +83,7 @@ def validate_failure_evidence(
         raise ValueError("failure source_phase does not match authoritative phase")
 
     if failure["failure_class"] in _RESOURCE_FAILURE_CLASSES:
-        if command_result_raw is not None:
+        if phase_run_receipt_raw is not None:
             raise ValueError("resource failure must not substitute a command receipt for a resource probe")
         if resource_probe_raw is None:
             raise ValueError("resource failure requires canonical resource probe bytes")
@@ -102,18 +101,18 @@ def validate_failure_evidence(
 
     if resource_probe_raw is not None:
         raise ValueError("non-resource failure must not substitute a resource probe for a command receipt")
-    if command_result_raw is None:
-        raise ValueError("non-resource failure requires canonical command receipt bytes")
+    if phase_run_receipt_raw is None:
+        raise ValueError("non-resource failure requires canonical PhaseRunReceipt bytes")
     receipt = _decode_canonical(
-        command_result_raw,
-        "command_result_evidence_v1.schema.json",
-        label="command receipt",
+        phase_run_receipt_raw,
+        "phase_run_receipt_v4.schema.json",
+        label="PhaseRunReceipt",
     )
-    _match_identity(receipt, expected, label="command receipt")
+    _match_receipt_identity(receipt, expected)
     _match_digest(
-        failure["cross_references"]["command_result_evidence_hash"],
-        command_result_raw,
-        label="command receipt",
+        failure["cross_references"]["phase_run_receipt_hash"],
+        phase_run_receipt_raw,
+        label="PhaseRunReceipt",
     )
     _validate_failed_receipt(receipt)
     expected_status = {
@@ -128,7 +127,18 @@ def validate_failure_evidence(
         raise ValueError("failure exit_code does not match canonical command receipt")
     if failure["log_hash"] != receipt["stderr_hash"]:
         raise ValueError("failure log_hash does not match canonical command stderr")
-    return {"failure_evidence": deepcopy(failure), "command_result_evidence": deepcopy(receipt)}
+    if failure["receipt_hash"] != evidence_bytes_hash(phase_run_receipt_raw):
+        raise ValueError("failure receipt_hash does not match canonical PhaseRunReceipt")
+    return {"failure_evidence": deepcopy(failure), "phase_run_receipt": deepcopy(receipt)}
+
+
+def _match_receipt_identity(receipt: Mapping[str, Any], expected: Mapping[str, Any]) -> None:
+    for field_name in (
+        "attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash",
+        "phase_execution_id", "phase_start_event_id", "producer_run_id",
+    ):
+        if receipt.get(field_name) != expected[field_name]:
+            raise ValueError(f"PhaseRunReceipt {field_name} mismatch")
 
 
 def validate_resume_evidence(
@@ -290,15 +300,12 @@ def _match_digest(expected_hash: str, raw: bytes, *, label: str) -> None:
 
 
 def _validate_failed_receipt(receipt: Mapping[str, Any]) -> None:
-    if receipt["command_status"] != "failed" or receipt["exit_code"] == 0:
-        raise ValueError("canonical command receipt does not prove command failure")
-    working_directory = PurePosixPath(receipt["working_directory"])
-    if working_directory.is_absolute() or not working_directory.parts or "." in working_directory.parts or ".." in working_directory.parts:
-        raise ValueError("command working_directory must be safe and project-relative")
+    if receipt["exit_code"] == 0:
+        raise ValueError("canonical PhaseRunReceipt does not prove command failure")
     started = _parse_datetime(receipt["started_at"], label="command started_at")
-    finished = _parse_datetime(receipt["finished_at"], label="command finished_at")
+    finished = _parse_datetime(receipt["completed_at"], label="command completed_at")
     if finished < started:
-        raise ValueError("command receipt finished_at precedes started_at")
+        raise ValueError("PhaseRunReceipt completed_at precedes started_at")
 
 
 def _validate_insufficient_probe(probe: Mapping[str, Any]) -> None:

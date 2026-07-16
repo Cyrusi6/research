@@ -21,7 +21,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_trial_spec_v6"
+      "const": "auto_research_trial_spec_v7"
     },
     "protocol": {
       "type": "object",
@@ -81,7 +81,7 @@
       ],
       "properties": {
         "schema_version": {
-          "const": "auto_research_sample_manifest_v3"
+          "const": "auto_research_sample_manifest_v4"
         },
         "manifest_id": {
           "type": "string",
@@ -105,8 +105,10 @@
               "split",
               "sample_count",
               "ordered_sample_ids",
-              "source_blobs",
-              "content_digest"
+              "raw_sample_refs",
+              "content_digest",
+              "record_format",
+              "canonicalization_contract"
             ],
             "properties": {
               "dataset_id": {
@@ -132,15 +134,21 @@
                   "$ref": "#/$defs/hash"
                 }
               },
-              "source_blobs": {
+              "content_digest": {
+                "$ref": "#/$defs/hash"
+              },
+              "raw_sample_refs": {
                 "type": "array",
                 "minItems": 1,
                 "items": {
                   "$ref": "#/$defs/contract_blob"
                 }
               },
-              "content_digest": {
-                "$ref": "#/$defs/hash"
+              "record_format": {
+                "const": "jsonl-record-bytes-v1"
+              },
+              "canonicalization_contract": {
+                "const": "preserve-selected-record-bytes-v1"
               }
             }
           }
@@ -682,7 +690,7 @@
             "type": "boolean"
           },
           "command_plan": {
-            "$ref": "phase_command_plan_v1.schema.json"
+            "$ref": "phase_command_plan_v2.schema.json"
           },
           "command_plan_ref": {
             "$ref": "#/$defs/contract_blob"

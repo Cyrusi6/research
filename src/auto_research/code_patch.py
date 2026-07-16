@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from .adapters.runner import ExperimentRunner, GpuSelection
 from .artifacts import ArtifactManager
 from .c2c import C2CAdapter, c2c_candidate_config_overrides, c2c_idea_novelty_report, repo_snapshot_manifest
 from .llm import codex_subprocess_env
+from .research_state import ResearchEventLedger
 from .s2_planner_contracts import build_s2_5_patch_gate_report
 from .utils import ensure_dir, now_utc, read_json, read_yaml, repo_root, sanitize_filename, sha256_file, write_json, write_yaml
 
@@ -4458,15 +4460,16 @@ def _runtime_smoke_check(repo_root: Path, python_cmd: str, config: dict[str, Any
                     "selected_gpu_ids": selected_gpu_ids,
                 }
 
-            command = _disable_wandb_for_command(command)
+            command_argv, command_env, command_display = _runtime_smoke_command(command)
             try:
                 result = subprocess.run(
-                    command,
+                    command_argv,
                     cwd=smoke_repo,
                     capture_output=True,
                     text=True,
-                    shell=True,
+                    shell=False,
                     timeout=timeout_seconds,
+                    env=command_env,
                 )
             except subprocess.TimeoutExpired as exc:
                 stdout = _validation_output_excerpt(_decode_timeout_output(exc.stdout))
@@ -4478,7 +4481,7 @@ def _runtime_smoke_check(repo_root: Path, python_cmd: str, config: dict[str, Any
                     "failure_category": "runtime_smoke_timeout",
                     "stdout": stdout,
                     "stderr": stderr,
-                    "command": _validation_output_excerpt(command, max_chars=1200),
+                    "command": _validation_output_excerpt(command_display, max_chars=1200),
                     "attempts": attempts,
                     "selected_gpu_ids": selected_gpu_ids,
                     "timeout_seconds": timeout_seconds,
@@ -4495,7 +4498,7 @@ def _runtime_smoke_check(repo_root: Path, python_cmd: str, config: dict[str, Any
                 "gpu_total_mb": attempt_plan.get("memory_total_mb"),
                 "returncode": result.returncode,
                 "failure_category": category,
-                "command": _validation_output_excerpt(command, max_chars=800),
+                "command": _validation_output_excerpt(command_display, max_chars=800),
                 "stdout_tail": str(stdout or "")[-1200:],
                 "stderr_tail": str(stderr or "")[-1200:],
             }
@@ -4507,7 +4510,7 @@ def _runtime_smoke_check(repo_root: Path, python_cmd: str, config: dict[str, Any
                 "failure_category": category,
                 "stdout": stdout,
                 "stderr": stderr,
-                "command": _validation_output_excerpt(command, max_chars=1200),
+                "command": _validation_output_excerpt(command_display, max_chars=1200),
                 "train_samples": _runtime_smoke_train_samples(smoke_cfg),
                 "selected_gpu_ids": selected_gpu_ids,
                 "gpu_selection": {
@@ -5118,14 +5121,29 @@ def _is_relative_to(path: Path, base: Path) -> bool:
         return False
 
 
-def _disable_wandb_for_command(command: str) -> str:
-    prefix = (
-        "WANDB_DISABLED=true "
-        "WANDB_MODE=disabled "
-        "WANDB_START_METHOD=thread "
-        "WANDB_REQUIRE_SERVICE=false "
+def _runtime_smoke_command(command: Any) -> tuple[list[str], dict[str, str], str]:
+    if not isinstance(command, dict):
+        raise TypeError("C2C runtime smoke requires a typed command with argv and environment")
+    argv = command.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) and item for item in argv):
+        raise ValueError("C2C runtime smoke command argv must be a non-empty string array")
+    inherited = command.get("inherited_environment") or []
+    if not isinstance(inherited, list) or not all(isinstance(item, str) and item for item in inherited):
+        raise ValueError("C2C runtime smoke inherited_environment must be a string array")
+    overrides = command.get("environment") or {}
+    if not isinstance(overrides, dict) or not all(isinstance(key, str) and isinstance(value, str) for key, value in overrides.items()):
+        raise ValueError("C2C runtime smoke environment must be a string mapping")
+    env = {name: os.environ[name] for name in inherited if name in os.environ}
+    env.update(overrides)
+    env.update(
+        {
+            "WANDB_DISABLED": "true",
+            "WANDB_MODE": "disabled",
+            "WANDB_START_METHOD": "thread",
+            "WANDB_REQUIRE_SERVICE": "false",
+        }
     )
-    return f"{prefix}{command}"
+    return list(argv), env, shlex.join(argv)
 
 
 def _runtime_smoke_adapter_config(
@@ -6096,7 +6114,7 @@ def _load_previous_patch_failures(project_root: Path) -> dict[str, Any]:
                 continue
             key = sanitize_filename(str(entry.get("candidate_id") or entry.get("title") or "candidate"))
             failures[key] = _compact_previous_patch_failure(project_root, entry)
-    failures.update(_load_previous_proxy_patch_failures(project_root))
+    failures.update(_load_authoritative_attempt_failures(project_root))
     return failures
 
 
@@ -6150,38 +6168,51 @@ def _compact_previous_patch_failure(project_root: Path, entry: dict[str, Any]) -
     return payload
 
 
-def _load_previous_proxy_patch_failures(project_root: Path) -> dict[str, Any]:
-    result_path = project_root / "experiment" / "results" / "main_results.json"
-    if not result_path.exists():
-        result_path = project_root / "experiment" / "results" / "c2c_main_results.json"
-    if not result_path.exists():
+def _load_authoritative_attempt_failures(project_root: Path) -> dict[str, Any]:
+    if not (project_root / "meta" / "research_events.sqlite3").exists():
         return {}
-    try:
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return {}
+    state = ResearchEventLedger(project_root).state()
+    attempts = state.get("attempts") if isinstance(state.get("attempts"), dict) else {}
     failures: dict[str, Any] = {}
-    for candidate in payload.get("candidate_results") or []:
-        if not isinstance(candidate, dict) or candidate.get("decision") not in {"proxy_rejected", "proxy_repairable"}:
+    ranked: dict[str, tuple[tuple[int, str, str], dict[str, Any]]] = {}
+    for operation in (state.get("operation_events") or {}).values():
+        if not isinstance(operation, dict):
             continue
-        key = sanitize_filename(str(candidate.get("id") or candidate.get("title") or "candidate"))
-        proxy_screen = candidate.get("proxy_screen") or {}
-        attribution = candidate.get("failure_attribution") or {}
-        proxy_effect_repair_contract = (
-            attribution.get("proxy_effect_repair_contract")
-            or proxy_screen.get("proxy_effect_repair_contract")
-            or {}
+        payload = operation.get("payload") if isinstance(operation.get("payload"), dict) else {}
+        evidence = payload.get("failure_evidence") if isinstance(payload.get("failure_evidence"), dict) else {}
+        if evidence.get("failure_class") not in {"implementation_failure", "activation_failure"}:
+            continue
+        attempt = attempts.get(evidence.get("attempt_id")) if isinstance(attempts, dict) else None
+        if not isinstance(attempt, dict):
+            continue
+        key = sanitize_filename(str(attempt.get("variant_id") or "candidate"))
+        rank = (
+            int(evidence.get("lifecycle_generation") or 0),
+            str(evidence.get("observed_at") or ""),
+            str(operation.get("event_id") or ""),
         )
-        failures[key] = {
-            "status": candidate.get("decision"),
-            "reason": proxy_screen.get("reason") or attribution.get("primary_failure") or candidate.get("decision"),
-            "changed_files": ((candidate.get("patch_result") or {}).get("changed_files") or []),
-            "proxy_screen": proxy_screen,
-            "patch_risk": attribution.get("patch_risk") or {},
-            "proxy_effect_repair_contract": proxy_effect_repair_contract,
-            "quality_repair": attribution.get("quality_repair") or proxy_screen.get("quality_repair") or {},
-            "repair_hint": proxy_screen.get("repair_hint") or "Repair the S2.5 patch so it clears cheap proxy before full S3.",
+        failure = {
+            "status": "implementation_repair",
+            "reason": evidence.get("reason") or evidence.get("failure_class"),
+            "failure_class": evidence.get("failure_class"),
+            "attempt_id": attempt.get("attempt_id"),
+            "variant_id": attempt.get("variant_id"),
+            "variant_semantic_hash": attempt.get("variant_semantic_hash"),
+            "variant_spec_hash": attempt.get("variant_spec_hash"),
+            "lifecycle_generation": evidence.get("lifecycle_generation"),
+            "implementation_hash": evidence.get("implementation_hash"),
+            "attempt_input_hash": evidence.get("attempt_input_hash"),
+            "source_state": evidence.get("source_state"),
+            "source_phase": evidence.get("source_phase"),
+            "evidence_id": evidence.get("evidence_id"),
+            "receipt_hash": evidence.get("receipt_hash"),
+            "command_id": evidence.get("command_id"),
+            "changed_files": [],
+            "repair_hint": "Repair the same implementation revision from the immutable failure receipt without changing the VariantSpec.",
         }
+        if key not in ranked or rank > ranked[key][0]:
+            ranked[key] = (rank, failure)
+    failures.update({key: value for key, (_, value) in ranked.items()})
     return failures
 
 

@@ -68,7 +68,7 @@ def test_sample_v3_and_evaluator_v2_bind_cas_references(tmp_path: Path) -> None:
     evaluator_blob = store.put_bytes(b'{"evaluator":"v2"}')
     evaluator_config = store.put_bytes(b'{"metric":"accuracy"}')
     sample_manifest = {
-        "schema_version": "auto_research_sample_manifest_v3",
+        "schema_version": "auto_research_sample_manifest_v4",
         "manifest_id": "samples-m115",
         "provenance_mode": "real",
         "datasets": [{
@@ -76,9 +76,11 @@ def test_sample_v3_and_evaluator_v2_bind_cas_references(tmp_path: Path) -> None:
             "source_revision": "revision-1",
             "split": "test",
             "sample_count": 1,
-            "ordered_sample_ids": ["1" * 64],
-            "source_blobs": [sample_blob],
+            "ordered_sample_ids": [sample_blob["digest"]],
+            "raw_sample_refs": [sample_blob],
             "content_digest": sample_blob["digest"],
+            "record_format": "jsonl-record-bytes-v1",
+            "canonicalization_contract": "preserve-selected-record-bytes-v1",
         }],
     }
     evaluator_manifest = {
@@ -92,25 +94,25 @@ def test_sample_v3_and_evaluator_v2_bind_cas_references(tmp_path: Path) -> None:
         "source_digest": evaluator_blob["digest"],
         "dependency_digest": contract_digest(b""),
     }
-    validate_schema(sample_manifest, "sample_manifest_v3.schema.json")
+    validate_schema(sample_manifest, "sample_manifest_v4.schema.json")
     validate_schema(evaluator_manifest, "evaluator_manifest_v2.schema.json")
-    assert store.read_json(store.put_json(sample_manifest, schema_file="sample_manifest_v3.schema.json")) == sample_manifest
+    assert store.read_json(store.put_json(sample_manifest, schema_file="sample_manifest_v4.schema.json")) == sample_manifest
     assert store.read_json(store.put_json(evaluator_manifest, schema_file="evaluator_manifest_v2.schema.json")) == evaluator_manifest
     sample_ref = store.put_contract(
         sample_manifest,
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v3.schema.json",
+        schema_file="sample_manifest_v4.schema.json",
     )
     assert store.read_contract(
         sample_ref,
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v3.schema.json",
+        schema_file="sample_manifest_v4.schema.json",
     ) == sample_manifest
     with pytest.raises(ValueError, match="kind mismatch"):
         store.read_contract(
             sample_ref,
             contract_kind="evaluator_manifest",
-            schema_file="sample_manifest_v3.schema.json",
+            schema_file="sample_manifest_v4.schema.json",
         )
 
     evaluator_manifest["source_digest"] = "9" * 64
@@ -239,7 +241,7 @@ def test_ledger_journal_executes_completed_command_exactly_once(tmp_path: Path) 
     assert first["status"] == second["status"] == "completed"
     assert calls == ["run"]
     assert ledger.authorization_calls == 3
-    receipt = ContractStore(tmp_path).read_json(first["receipt"], schema_file="phase_run_receipt_v3.schema.json")
+    receipt = ContractStore(tmp_path).read_json(first["receipt"], schema_file="phase_run_receipt_v4.schema.json")
     assert receipt["phase_start_event_id"] == context.phase_start_event_id
     assert receipt["producer_run_id"] == context.producer_run_id
 

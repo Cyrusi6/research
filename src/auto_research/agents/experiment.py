@@ -10,10 +10,11 @@ import copy
 import math
 import shutil
 import re
+import stat
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 from copy import deepcopy
 
 
@@ -56,8 +57,9 @@ from ..evidence import (
     stage_completion_evidence,
 )
 from ..research_state import IntegrityError, ResearchEventLedger
-from ..command_journal import CommandExecutionResult, LedgerCommandJournal
+from ..command_journal import CommandExecutionResult, CommandJournalResult, LedgerCommandJournal
 from ..contract_store import ContractStore
+from ..phase_receipts import C2C_RAW_OUTPUT_SPECS_ENV, validate_phase_run_receipt
 from ..phase_execution import (
     C2CFullPhaseExecutor,
     C2CProxyPhaseExecutor,
@@ -76,9 +78,15 @@ from .base import AgentContext
 class ExperimentAgent:
     stage_key = "S3_experiment"
 
-    def __init__(self, context: AgentContext):
+    def __init__(
+        self,
+        context: AgentContext,
+        *,
+        resource_measurement_provider: Callable[[str, str, str], float] | None = None,
+    ):
         self.context = context
         self.runner = ExperimentRunner(context.config)
+        self._resource_measurement_provider = resource_measurement_provider
         self._active_phase_context = None
         self._active_command_journal = None
 
@@ -100,6 +108,20 @@ class ExperimentAgent:
         ledger = ResearchEventLedger(self.context.project_root)
         profile = str(((self.context.config.get("orchestration") or {}).get("profile") or "standard")).lower()
         existing_attempt = self._existing_attempt_for_restart(ledger, direction, variant, profile=profile)
+        if existing_attempt is not None and existing_attempt["state"] == "METHOD_COMPLETED":
+            return self._historical_finalized_result(ledger, existing_attempt)
+        if existing_attempt is not None and existing_attempt["state"] == "INTEGRITY_BLOCKED":
+            state = ledger.state()
+            route = state.get("last_route_outcome")
+            if not isinstance(route, dict) or route.get("source", {}).get("attempt_id") != existing_attempt["attempt_id"]:
+                raise IntegrityError("INTEGRITY_BLOCKED Attempt lacks its authoritative RouteOutcome")
+            return {
+                "status": "blocked",
+                "attempt": existing_attempt,
+                "route_outcome": deepcopy(route),
+                "blocked_reason": "authoritative command outcome is unknown",
+                "artifacts": [],
+            }
         if existing_attempt is not None:
             trial_spec = deepcopy(existing_attempt["frozen_trial_spec"])
         else:
@@ -169,7 +191,6 @@ class ExperimentAgent:
                 attempt = self._prepare_attempt_execution(
                     ledger,
                     attempt,
-                    resource_probe=env.get("resource_probe") if attempt["state"] == "RESOURCE_PAUSED" else None,
                     project_root=self.context.project_root,
                 )
             elif attempt["state"] not in {"PROXY_RUNNING", "FULL_RUNNING"}:
@@ -184,6 +205,20 @@ class ExperimentAgent:
                 authoritative_phase,
             )
             self._active_command_journal = LedgerCommandJournal(self.context.project_root, phase_ledger)
+            resource_result = phase_ledger.pause_if_resources_unavailable(
+                attempt["attempt_id"],
+                measurement_provider=self._resource_measurement_provider,
+            )
+            if resource_result is not None:
+                paused_attempt, paused_route = resource_result
+                return {
+                    "status": "blocked",
+                    "blocked_reason": "frozen phase resource requirement is currently unavailable",
+                    "failure_class": "resource_pause",
+                    "attempt": paused_attempt,
+                    "route_outcome": paused_route,
+                    "artifacts": [env_record["path"]],
+                }
 
             if simulate or execution.get("mode") == "simulate":
                 if execution.get("collector") == "c2c_small_loop":
@@ -242,11 +277,39 @@ class ExperimentAgent:
             and attempt.get("profile") == profile
             and attempt.get("direction_spec_hash") == direction.get("direction_spec_hash")
             and attempt.get("variant_spec_hash") == variant.get("variant_spec_hash")
-            and attempt.get("state") not in {"METHOD_COMPLETED", "ABANDONED", "INTEGRITY_BLOCKED"}
+            and attempt.get("state") != "ABANDONED"
         ]
         if len(candidates) > 1:
             raise IntegrityError("multiple active Attempts match the current direction and variant")
         return deepcopy(candidates[0]) if candidates else None
+
+    @staticmethod
+    def _historical_finalized_result(ledger: ResearchEventLedger, attempt: dict[str, Any]) -> dict[str, Any]:
+        event = next(
+            (
+                item
+                for item in reversed(ledger.events())
+                if item["event_type"] == "AttemptFinalized"
+                and (item.get("payload") or {}).get("trial_result", {}).get("attempt_id") == attempt["attempt_id"]
+            ),
+            None,
+        )
+        if event is None:
+            raise IntegrityError("METHOD_COMPLETED Attempt lacks its authoritative AttemptFinalized event")
+        historical = ledger.query_operation_result(event["event_id"])
+        if historical.get("trial_result") is None or historical.get("route_outcome") is None:
+            raise IntegrityError("AttemptFinalized historical result is incomplete")
+        return {
+            "status": "completed",
+            "attempt": historical["attempt"],
+            "trial_result": historical["trial_result"],
+            "route_outcome": historical["route_outcome"],
+            "aggregate": historical["aggregate"],
+            "committed_event_id": historical["event_id"],
+            "committed_event_sequence": historical["sequence"],
+            "committed_attempt_id": attempt["attempt_id"],
+            "artifacts": [],
+        }
 
     def _bind_new_trial_spec_execution_authority(self, trial_spec: dict[str, Any]) -> dict[str, Any]:
         frozen = deepcopy(trial_spec)
@@ -276,7 +339,7 @@ class ExperimentAgent:
             plan_hashes[str(phase_contract["phase"])] = command_plan_hash
         frozen["phase_contracts"] = phase_contracts
         frozen["execution_contract"]["phase_command_plan_hashes"] = plan_hashes
-        validate_contract(frozen, "trial_spec_v6.schema.json")
+        validate_contract(frozen, "trial_spec_v7.schema.json")
         write_json(self.context.project_root / "plan" / "trial_spec.json", frozen)
         return frozen
 
@@ -420,19 +483,153 @@ class ExperimentAgent:
             and self._active_phase_context is not None
             and self._active_phase_context.provenance_mode != "synthetic"
         ):
-            phase = str(self._active_phase_context.phase)
-            receipt = self._run_authoritative_step(
-                name="collect-evidence",
-                command=["auto-research-adapter", "c2c", phase, "collect-evidence"],
-                working_dir=self.context.project_root,
-                retry_policy={"max_attempts": 1},
-                authoritative_output_factory=lambda: inventory,
-                internal_output_command=True,
-            )
-            if receipt.get("status") != "ok":
-                raise IntegrityError(f"C2C {phase} evidence collection command failed")
-            result["evidence_inventory"] = [dict(item) for item in receipt.get("evidence_inventory") or []]
+            result["evidence_inventory"] = self._commit_c2c_evidence_derivation(inventory)
         return result
+
+    def _commit_c2c_evidence_derivation(self, inventory: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Commit a receipt-bound pure Core transform after all physical phase commands."""
+        context = self._active_phase_context
+        journal = self._active_command_journal
+        if context is None or journal is None:
+            raise IntegrityError("C2C evidence derivation requires authoritative phase state")
+        require_executor_capability(context)
+        frozen_plan = ContractStore(self.context.project_root).read_json(
+            context.command_plan_hash,
+            schema_file="phase_command_plan_v2.schema.json",
+        )
+        derivation_spec_id = f"{context.phase}-derive-evidence"
+        matches = [item for item in frozen_plan["commands"] if item["command_spec_id"] == derivation_spec_id]
+        if len(matches) != 1:
+            raise IntegrityError("C2C phase lacks its frozen evidence derivation command")
+        command_spec = matches[0]
+        current_attempt = ResearchEventLedger(self.context.project_root).state()["attempts"][context.attempt_id]
+        completed = _current_authoritative_phase_command_receipts(
+            self.context.project_root,
+            attempt=current_attempt,
+            phase=context.phase,
+        )
+        if context.phase == "full" and current_attempt.get("attempt_kind") == "proxy_full":
+            completed = [
+                {
+                    **item,
+                    "raw_outputs": [
+                        output for output in item.get("raw_outputs") or [] if output.get("role") == "baseline"
+                    ],
+                }
+                for item in _current_authoritative_phase_command_receipts(
+                    self.context.project_root,
+                    attempt=current_attempt,
+                    phase="proxy",
+                )
+            ] + completed
+        completed_specs = {item["command_spec_id"] for item in completed}
+        missing_dependencies = sorted(set(command_spec["dependencies"]) - completed_specs)
+        if missing_dependencies:
+            raise IntegrityError(f"C2C evidence derivation has incomplete physical dependencies: {missing_dependencies}")
+        by_kind = {str(item["kind"]): item for item in inventory}
+        expected = command_spec["expected_outputs"]
+        if len(by_kind) != len(inventory) or set(by_kind) != {item["kind"] for item in expected}:
+            raise IntegrityError("C2C evidence derivation inventory differs from the frozen exact output set")
+        store = ContractStore(self.context.project_root)
+        evidence_store = EvidenceStore(self.context.project_root)
+
+        def derive() -> CommandExecutionResult:
+            outputs = []
+            for output in expected:
+                raw = evidence_store.read_staged_source(str(by_kind[output["kind"]]["source_path"]))
+                outputs.append({
+                    "kind": output["kind"],
+                    "schema_version": output["schema_version"],
+                    "contract_ref": store.put_bytes(raw),
+                })
+            decoder_ref = store.put_bytes(Path(__file__).read_bytes())
+            source_commands = [
+                {
+                    "command_id": item["command_id"],
+                    "command_hash": item["command_hash"],
+                    "receipt_ref": deepcopy(item["receipt_ref"]),
+                    "receipt_hash": item["receipt_hash"],
+                    "output_ref": deepcopy(raw_output["contract_ref"]),
+                    "output_hash": raw_output["content_hash"],
+                }
+                for item in completed
+                for raw_output in item.get("raw_outputs") or []
+            ]
+            if not source_commands:
+                raise IntegrityError("C2C evidence derivation requires physical raw receipt outputs")
+            derivation_manifest = {
+                "schema_version": "auto_research_evidence_derivation_manifest_v1",
+                "derivation_id": f"derive:{context.phase}:{context.phase_execution_id}",
+                "attempt_id": context.attempt_id,
+                "lifecycle_generation": context.lifecycle_generation,
+                "phase": context.phase,
+                "phase_execution_id": context.phase_execution_id,
+                "implementation_hash": context.implementation_hash,
+                "attempt_input_hash": context.attempt_input_hash,
+                "trial_spec_hash": context.trial_spec_hash,
+                "protocol_hash": current_attempt["protocol_hash"],
+                "sample_manifest_hash": current_attempt["sample_manifest_hash"],
+                "evaluator_hash": current_attempt["evaluator_hash"],
+                "source_commands": source_commands,
+                "decoder": {
+                    "decoder_id": "c2c-physical-output-decoder",
+                    "decoder_version": "1",
+                    "source_ref": decoder_ref,
+                    "source_hash": decoder_ref["digest"],
+                },
+                "normalized_outputs": [
+                    {
+                        "kind": output["kind"],
+                        "contract_ref": deepcopy(output["contract_ref"]),
+                        "content_hash": output["contract_ref"]["digest"],
+                    }
+                    for output in outputs
+                ],
+            }
+            derivation_ref = store.put_json(
+                derivation_manifest,
+                schema_file="evidence_derivation_manifest_v1.schema.json",
+            )
+            summary = json.dumps(
+                {
+                    "derivation": "c2c-receipt-bound-core-v1",
+                    "phase_execution_id": context.phase_execution_id,
+                    "source_receipt_hashes": [item["receipt_hash"] for item in completed],
+                    "output_hashes": [item["contract_ref"]["digest"] for item in outputs],
+                    "derivation_ref": derivation_ref,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            return CommandExecutionResult(
+                exit_code=0,
+                stdout_hash=hashlib.sha256(summary.encode("utf-8")).hexdigest(),
+                stderr_hash=hashlib.sha256(b"").hexdigest(),
+                outputs=tuple(outputs),
+                external_job_id=f"core-derivation-{context.phase_execution_id}",
+                stdout=summary,
+                stderr="",
+            )
+
+        command_id = f"cmd-{context.phase}-{canonical_hash({'spec': derivation_spec_id, 'execution': context.phase_execution_id})[:24]}"
+        journal_result = journal.run_once(
+            context,
+            command_id=command_id,
+            command_spec_id=derivation_spec_id,
+            argv=tuple(command_spec["argv"]),
+            cwd=command_spec["cwd"],
+            source_snapshot_hash=command_spec["source_snapshot_hash"],
+            expected_outputs=tuple(item["kind"] for item in expected),
+            environment=command_spec["environment"],
+            inherited_environment=command_spec["inherited_environment"],
+            retry_policy=command_spec["retry_policy"],
+            resource_policy=command_spec["resource_policy"],
+            resume_policy=command_spec["resume_policy"],
+            runner=derive,
+        )
+        if not isinstance(journal_result, CommandJournalResult):
+            raise IntegrityError("C2C evidence derivation entered an unknown command outcome")
+        return [dict(item) for item in journal_result.artifact_inventory.artifacts]
 
     def _freeze_c2c_phase_command_plans(
         self,
@@ -513,7 +710,7 @@ class ExperimentAgent:
             plan_hashes[phase] = command_plan_hash
         frozen["phase_contracts"] = phase_contracts
         frozen["execution_contract"]["phase_command_plan_hashes"] = plan_hashes
-        validate_contract(frozen, "trial_spec_v6.schema.json")
+        validate_contract(frozen, "trial_spec_v7.schema.json")
         write_json(self.context.project_root / "plan" / "trial_spec.json", frozen)
         return frozen
 
@@ -590,7 +787,7 @@ class ExperimentAgent:
             )["train"]
             recovery_values.append({
                 "command_spec_id": "full-train_recovery_reduced_concurrency",
-                "argv": shlex.split(reduced_command),
+                **deepcopy(reduced_command),
                 "cwd": str(adapter.repo_root),
                 "dependencies": ["full-train"],
                 "expected_outputs": [],
@@ -600,7 +797,7 @@ class ExperimentAgent:
         if memory_safe.get("status") == "materialized":
             recovery_values.append({
                 "command_spec_id": "full-train_recovery_memory_safe",
-                "argv": shlex.split(str(memory_safe["command"])),
+                **deepcopy(memory_safe["command"]),
                 "cwd": str(adapter.repo_root),
                 "dependencies": ["full-train"],
                 "expected_outputs": [],
@@ -618,7 +815,7 @@ class ExperimentAgent:
 
     def _c2c_command_spec_values(
         self,
-        commands: list[tuple[str, str]],
+        commands: list[tuple[str, dict[str, Any]]],
         *,
         phase: str,
         cwd: Path,
@@ -626,16 +823,22 @@ class ExperimentAgent:
         values = [
             {
                 "command_spec_id": sanitize_filename(f"{phase}-{name}"),
-                "argv": shlex.split(command),
+                **deepcopy(command),
                 "cwd": str(cwd),
                 "expected_outputs": [],
+                "resource_policy": (
+                    {"resource_class": "gpu_memory", "minimum_capacity": 8 * 1024 * 1024 * 1024, "unit": "bytes"}
+                    if any(token in name for token in ("train", "eval", "activation", "proxy_command"))
+                    else {"resource_class": "cpu", "minimum_capacity": 1, "unit": "count"}
+                ),
             }
             for name, command in commands
         ]
         values.append({
-            "command_spec_id": f"{phase}-collect-evidence",
-            "argv": ["auto-research-adapter", "c2c", phase, "collect-evidence"],
+            "command_spec_id": f"{phase}-derive-evidence",
+            "argv": ["auto-research-core", "derive-c2c-evidence", phase],
             "cwd": str(self.context.project_root),
+            "dependencies": [values[-1]["command_spec_id"]] if values else [],
         })
         return values
 
@@ -647,6 +850,8 @@ class ExperimentAgent:
         trial_spec: dict[str, Any],
         ledger: ResearchEventLedger,
     ) -> dict[str, Any]:
+        if isinstance(result.get("route_outcome"), dict) and isinstance(result.get("attempt"), dict):
+            return result
         raw_artifacts: dict[str, str] = {}
         for rel_path in result.get("artifacts") or []:
             artifact_path = self.context.project_root / rel_path
@@ -724,172 +929,23 @@ class ExperimentAgent:
         result["committed_attempt_id"] = completed_attempt["attempt_id"]
         return result
 
-    @staticmethod
     def _prepare_attempt_execution(
+        self,
         ledger: ResearchEventLedger,
         attempt: dict[str, Any],
         *,
-        resource_probe: dict[str, Any] | None,
         project_root: Path,
     ) -> dict[str, Any]:
+        del project_root
         current = attempt
         if hasattr(ledger, "state"):
             state = ledger.state()
             current = (state.get("attempts") or {}).get(attempt["attempt_id"], attempt)
         if current["state"] == "RESOURCE_PAUSED":
-            if not isinstance(resource_probe, dict):
-                raise IntegrityError("resource resume requires a current resource probe artifact")
-            producer_run_id = f"resume-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}"
-            core_probe_receipt = {
-                "schema_version": "auto_research_core_resource_probe_receipt_v1",
-                "attempt_id": current["attempt_id"],
-                "lifecycle_generation": current["lifecycle_generation"],
-                "implementation_hash": current["implementation_hash"],
-                "attempt_input_hash": current["attempt_input_hash"],
-                "resource_type": resource_probe.get("resource_type"),
-                "resource_id": resource_probe.get("resource_id"),
-                "required_capacity": resource_probe.get("required_capacity"),
-                "observed_capacity": resource_probe.get("observed_capacity"),
-                "unit": resource_probe.get("unit"),
-                "probe_status": resource_probe.get("probe_status"),
-                "observed_at": resource_probe.get("observed_at") or now_utc(),
-            }
-            core_probe_ref = ContractStore(project_root).put_bytes(encode_canonical_evidence(core_probe_receipt))
-            probe_command_id = f"core-resource-probe-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}"
-            probe_command_hash = canonical_hash({"command_id": probe_command_id, "receipt": core_probe_ref["digest"]})
-            probe_plan_hash = canonical_hash({
-                "operation": "resume-resource-probe",
-                "trial_spec_hash": current["trial_spec_hash"],
-                "paused_phase": current.get("paused_phase"),
-            })
-            probe_payload = {
-                "schema_version": "auto_research_resource_probe_evidence_v4",
-                "evidence_kind": "resource_probe",
-                "evidence_id": f"resource-probe-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}",
-                "attempt_id": current["attempt_id"],
-                "producer_run_id": producer_run_id,
-                "direction_semantic_hash": current["direction_semantic_hash"],
-                "direction_spec_hash": current["direction_spec_hash"],
-                "variant_semantic_hash": current["variant_semantic_hash"],
-                "variant_spec_hash": current["variant_spec_hash"],
-                "trial_spec_hash": current["trial_spec_hash"],
-                "protocol_hash": current["protocol_hash"],
-                "sample_manifest_hash": current["sample_manifest_hash"],
-                "evaluator_hash": current["evaluator_hash"],
-                "lifecycle_generation": current["lifecycle_generation"],
-                "implementation_hash": current["implementation_hash"],
-                "attempt_input_hash": current["attempt_input_hash"],
-                "phase": "resume",
-                "phase_execution_id": f"phase-resume-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}",
-                "phase_start_event_id": f"event:resume:{current['attempt_id']}:g{current['lifecycle_generation']}",
-                "resource_type": resource_probe.get("resource_type"),
-                "resource_id": resource_probe.get("resource_id"),
-                "required_capacity": resource_probe.get("required_capacity"),
-                "observed_capacity": resource_probe.get("observed_capacity"),
-                "unit": resource_probe.get("unit"),
-                "probe_status": resource_probe.get("probe_status"),
-                "observed_at": resource_probe.get("observed_at") or now_utc(),
-                "command_id": probe_command_id,
-                "command_hash": probe_command_hash,
-                "command_plan_hash": probe_plan_hash,
-                "receipt_ref": core_probe_ref,
-                "receipt_hash": core_probe_ref["digest"],
-            }
-            validate_contract(probe_payload, "resource_probe_v4.schema.json")
-            probe_bytes = encode_canonical_evidence(probe_payload)
-            probe_hash = hashlib.sha256(probe_bytes).hexdigest()
-            probe_relative_path = content_addressed_evidence_path(
-                attempt_id=current["attempt_id"],
-                producer_run_id=producer_run_id,
-                evidence_kind="resource_probe",
-                content_hash=probe_hash,
+            current = ledger.resume_resource_attempt(
+                current["attempt_id"],
+                measurement_provider=self._resource_measurement_provider,
             )
-            try:
-                EvidenceStore(project_root).write_entry(
-                    {
-                        "relative_path": probe_relative_path,
-                        "producer_run_id": producer_run_id,
-                        "kind": "resource_probe",
-                        "content_hash": probe_hash,
-                    },
-                    current,
-                    probe_bytes,
-                )
-            except ValueError as exc:
-                raise IntegrityError(f"resource probe immutable write failed: {exc}") from exc
-            pause_event = next(
-                (
-                    event for event in reversed(ledger.events())
-                    if event["event_type"] == "AttemptDispositioned"
-                    and (event.get("payload") or {}).get("failure_evidence", {}).get("attempt_id") == current["attempt_id"]
-                    and (event.get("payload") or {}).get("failure_evidence", {}).get("failure_class") in {"resource_pause", "oom_retry"}
-                ),
-                None,
-            )
-            if pause_event is None:
-                raise IntegrityError("resource resume requires a committed pause event")
-            pause_evidence = pause_event["payload"]["failure_evidence"]
-            resume_evidence = {
-                "schema_version": RESUME_EVIDENCE_SCHEMA_VERSION,
-                "evidence_kind": "resume_evidence",
-                "evidence_id": f"resume-evidence-{current['attempt_id'][:12]}-g{current['lifecycle_generation']}",
-                "attempt_id": current["attempt_id"],
-                "producer_run_id": producer_run_id,
-                "direction_semantic_hash": current["direction_semantic_hash"],
-                "direction_spec_hash": current["direction_spec_hash"],
-                "variant_semantic_hash": current["variant_semantic_hash"],
-                "variant_spec_hash": current["variant_spec_hash"],
-                "trial_spec_hash": current["trial_spec_hash"],
-                "protocol_hash": current["protocol_hash"],
-                "sample_manifest_hash": current["sample_manifest_hash"],
-                "evaluator_hash": current["evaluator_hash"],
-                "cross_references": {"resource_probe_hash": probe_hash},
-                "lifecycle_generation": current["lifecycle_generation"],
-                "implementation_hash": current["implementation_hash"],
-                "attempt_input_hash": current["attempt_input_hash"],
-                "phase": "resume",
-                "phase_execution_id": probe_payload["phase_execution_id"],
-                "phase_start_event_id": probe_payload["phase_start_event_id"],
-                "pause_event_id": pause_event["event_id"],
-                "pause_evidence_hash": hashlib.sha256(encode_canonical_evidence(pause_evidence)).hexdigest(),
-                "pause_phase": pause_evidence["phase"],
-                "pause_phase_execution_id": pause_evidence["phase_execution_id"],
-                "pause_producer_run_id": pause_evidence["producer_run_id"],
-                "resource_type": probe_payload["resource_type"],
-                "resource_id": probe_payload["resource_id"],
-                "required_capacity": probe_payload["required_capacity"],
-                "observed_capacity": probe_payload["observed_capacity"],
-                "unit": probe_payload["unit"],
-                "probe_status": probe_payload["probe_status"],
-                "observed_at": probe_payload["observed_at"],
-                "command_id": probe_payload["command_id"],
-                "command_hash": probe_payload["command_hash"],
-                "command_plan_hash": probe_payload["command_plan_hash"],
-                "receipt_ref": probe_payload["receipt_ref"],
-                "receipt_hash": probe_payload["receipt_hash"],
-            }
-            resume_bytes = encode_canonical_evidence(resume_evidence)
-            resume_hash = hashlib.sha256(resume_bytes).hexdigest()
-            resume_relative_path = content_addressed_evidence_path(
-                attempt_id=current["attempt_id"],
-                producer_run_id=producer_run_id,
-                evidence_kind="resume_evidence",
-                content_hash=resume_hash,
-            )
-            try:
-                EvidenceStore(project_root).write_entry(
-                    {
-                        "relative_path": resume_relative_path,
-                        "producer_run_id": producer_run_id,
-                        "kind": "resume_evidence",
-                        "content_hash": resume_hash,
-                    },
-                    current,
-                    resume_bytes,
-                )
-            except ValueError as exc:
-                raise IntegrityError(f"resume evidence immutable write failed: {exc}") from exc
-            current = ledger.resume_attempt(resume_evidence)
         if current["state"] not in {"READY", "PROXY_COMPLETED"}:
             raise IntegrityError(f"attempt {current['attempt_id']} cannot enter execution from {current['state']}")
         proxy_state = (current.get("phases") or {}).get("proxy")
@@ -1794,11 +1850,30 @@ class ExperimentAgent:
             project_root=self.context.project_root,
             attempt=attempt,
             trial_spec=trial_spec,
-            comparison_candidate=comparison_candidate,
-            baseline=execution.get("baseline") or adapter.baseline,
+            comparison_candidate=comparison_candidate if (simulate or mock_results) else None,
+            baseline=(execution.get("baseline") or adapter.baseline) if (simulate or mock_results) else {},
             simulate=simulate or mock_results,
             authoritative_command_receipts=(
-                _current_authoritative_phase_command_receipts(
+                (
+                    [
+                        {
+                            **item,
+                            "raw_outputs": [
+                                output
+                                for output in item.get("raw_outputs") or []
+                                if output.get("role") == "baseline"
+                            ],
+                        }
+                        for item in _current_authoritative_phase_command_receipts(
+                            self.context.project_root,
+                            attempt=attempt,
+                            phase="proxy",
+                        )
+                    ]
+                    if authoritative_phase == "full" and attempt.get("attempt_kind") == "proxy_full"
+                    else []
+                )
+                + _current_authoritative_phase_command_receipts(
                     self.context.project_root,
                     attempt=attempt,
                     phase=authoritative_phase,
@@ -1836,9 +1911,17 @@ class ExperimentAgent:
         except TypedPhaseFailure as error:
             raise IntegrityError(str(error)) from error
         authoritative_output_factory = kwargs.pop("authoritative_output_factory", None)
-        internal_output_command = bool(kwargs.pop("internal_output_command", False))
         command = kwargs.get("command")
-        argv = shlex.split(command) if isinstance(command, str) else [str(item) for item in (command or [])]
+        if isinstance(command, str):
+            raise IntegrityError("authoritative commands must use typed argv; shell strings are forbidden")
+        if isinstance(command, dict):
+            argv = [str(item) for item in command.get("argv") or []]
+            supplied_environment = {str(key): str(value) for key, value in dict(command.get("environment") or {}).items()}
+            inherited_environment = sorted(str(item) for item in command.get("inherited_environment") or ["HOME", "PATH", "TMPDIR"])
+        else:
+            argv = [str(item) for item in (command or [])]
+            supplied_environment = {}
+            inherited_environment = ["HOME", "PATH", "TMPDIR"]
         if not argv:
             raise IntegrityError("authoritative command argv cannot be empty")
         cwd = str(kwargs.get("working_dir") or kwargs.get("cwd") or self.context.project_root)
@@ -1851,7 +1934,7 @@ class ExperimentAgent:
         command_id = f"cmd-{context.phase}-{canonical_hash(command_intent)[:24]}"
         frozen_plan = ContractStore(self.context.project_root).read_json(
             context.command_plan_hash,
-            schema_file="phase_command_plan_v1.schema.json",
+            schema_file="phase_command_plan_v2.schema.json",
         )
         expected_spec_id = kwargs.pop("command_spec_id", None)
         frozen_adapter_id = str((frozen_plan.get("adapter_identity") or {}).get("adapter_id") or "")
@@ -1863,35 +1946,36 @@ class ExperimentAgent:
             if (expected_spec_id is None or item["command_spec_id"] == expected_spec_id)
             and item["argv"] == argv
             and item["cwd"] == cwd
+            and item["environment"] == supplied_environment
+            and item["inherited_environment"] == inherited_environment
         ]
         if len(candidates) != 1:
             raise IntegrityError(
                 "authoritative command does not match exactly one frozen command spec: "
                 f"expected_spec_id={expected_spec_id!r} argv={argv!r} cwd={cwd!r} "
-                f"frozen={[(item['command_spec_id'], item['argv'], item['cwd']) for item in frozen_plan['commands']]!r}"
+                f"environment={supplied_environment!r} inherited={inherited_environment!r} "
+                f"frozen={[(item['command_spec_id'], item['argv'], item['cwd'], item['environment'], item['inherited_environment']) for item in frozen_plan['commands']]!r}"
             )
         command_spec = candidates[0]
-        if internal_output_command and command_spec["argv"][:3] != ["auto-research-adapter", "c2c", context.phase]:
-            raise IntegrityError("internal authoritative output command is not permitted by the frozen adapter command spec")
         expected_outputs = tuple(output["kind"] for output in command_spec["expected_outputs"])
         runner_kwargs = dict(kwargs)
-        runner_kwargs["command"] = shlex.join(command_spec["argv"])
+        runner_kwargs.pop("command", None)
+        runner_kwargs["argv"] = list(command_spec["argv"])
+        runner_kwargs["environment"] = dict(command_spec["environment"])
+        runner_kwargs["inherited_environment"] = tuple(command_spec["inherited_environment"])
         runner_kwargs["working_dir"] = Path(command_spec["cwd"])
         runner_kwargs.pop("cwd", None)
         runner_kwargs["retry_policy"] = dict(command_spec["retry_policy"])
 
         def execute() -> CommandExecutionResult:
-            result = (
-                {"status": "ok", "returncode": 0, "stdout": "authoritative adapter output collection completed", "stderr": ""}
-                if internal_output_command
-                else self.runner.run_step(**runner_kwargs)
-            )
+            result = self.runner.run_step(**runner_kwargs)
             exit_code = int(result.get("returncode", 0 if result.get("status") == "ok" else 1))
             attempts = result.get("attempts") if isinstance(result.get("attempts"), list) else []
             last_attempt = attempts[-1] if attempts and isinstance(attempts[-1], dict) else {}
             stdout = str(result.get("stdout") or last_attempt.get("stdout") or "")
             stderr = str(result.get("stderr") or result.get("error") or last_attempt.get("stderr") or "")
             output_refs: list[dict[str, Any]] = []
+            raw_output_refs: list[dict[str, Any]] = []
             if expected_outputs and exit_code == 0:
                 if not callable(authoritative_output_factory):
                     raise IntegrityError("authoritative command outputs require an in-transaction output producer")
@@ -1909,11 +1993,17 @@ class ExperimentAgent:
                         "schema_version": expected["schema_version"],
                         "contract_ref": contract_store.put_bytes(raw),
                     })
+            if exit_code == 0:
+                raw_output_refs = self._capture_c2c_raw_outputs(
+                    command_spec=command_spec,
+                    cwd=Path(command_spec["cwd"]),
+                )
             return CommandExecutionResult(
                 exit_code=exit_code,
                 stdout_hash=hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
                 stderr_hash=hashlib.sha256(stderr.encode("utf-8")).hexdigest(),
                 outputs=tuple(output_refs),
+                raw_outputs=tuple(raw_output_refs),
                 external_job_id=str(result.get("external_job_id")) if result.get("external_job_id") else None,
                 stdout=stdout,
                 stderr=stderr,
@@ -1927,11 +2017,27 @@ class ExperimentAgent:
             cwd=cwd,
             source_snapshot_hash=command_spec["source_snapshot_hash"],
             expected_outputs=expected_outputs,
+            environment=command_spec["environment"],
+            inherited_environment=command_spec["inherited_environment"],
             retry_policy=command_spec["retry_policy"],
             resource_policy=command_spec["resource_policy"],
             resume_policy=command_spec["resume_policy"],
             runner=execute,
         )
+        if not isinstance(journal_result, CommandJournalResult):
+            state = ResearchEventLedger(self.context.project_root).state()
+            current_attempt = state["attempts"][context.attempt_id]
+            route = state.get("last_route_outcome")
+            if not isinstance(route, dict) or route.get("source", {}).get("attempt_id") != context.attempt_id:
+                raise IntegrityError("unknown command outcome did not produce an authoritative RouteOutcome")
+            return {
+                "status": "blocked",
+                "failure_class": "integrity_failure",
+                "blocked_reason": str(journal_result.get("unknown_reason") or "command outcome is unknown"),
+                "attempt": deepcopy(current_attempt),
+                "route_outcome": deepcopy(route),
+                "artifacts": [],
+            }
         recovered = journal_result.execution_result.as_runner_result()
         recovered["attempts"] = [{
             "returncode": recovered["returncode"],
@@ -1939,6 +2045,7 @@ class ExperimentAgent:
             "stderr": recovered["stderr"],
         }]
         recovered["evidence_inventory"] = [dict(item) for item in journal_result.artifact_inventory.artifacts]
+        recovered["raw_outputs"] = [dict(item) for item in journal_result.receipt.get("raw_outputs") or []]
         command_record = journal.ledger.phase_command(command_id)
         if not isinstance(command_record, dict) or command_record.get("status") != "completed":
             raise IntegrityError("completed authoritative command projection is unavailable")
@@ -1952,8 +2059,155 @@ class ExperimentAgent:
             "completed_event_id": command_record["completed_event_id"],
             "completed_event_hash": command_record["completed_event_hash"],
             "exit_code": journal_result.receipt["exit_code"],
+            "raw_outputs": deepcopy(journal_result.receipt.get("raw_outputs") or []),
         }
         return recovered
+
+    def _capture_c2c_raw_outputs(
+        self,
+        *,
+        command_spec: dict[str, Any],
+        cwd: Path,
+    ) -> list[dict[str, Any]]:
+        encoded = (command_spec.get("environment") or {}).get(C2C_RAW_OUTPUT_SPECS_ENV)
+        if encoded is None:
+            return []
+        try:
+            specs = json.loads(encoded)
+        except (TypeError, json.JSONDecodeError) as error:
+            raise IntegrityError("frozen C2C raw output specs are malformed") from error
+        if not isinstance(specs, list) or any(not isinstance(item, dict) for item in specs):
+            raise IntegrityError("frozen C2C raw output specs must be an object array")
+        store = ContractStore(self.context.project_root)
+        captured: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for spec in specs:
+            output_id = str(spec.get("output_id") or "")
+            if not output_id or output_id in seen:
+                raise IntegrityError("frozen C2C raw output_id values must be unique")
+            seen.add(output_id)
+            locator = str(spec.get("locator") or "")
+            locator_type = str(spec.get("locator_type") or "")
+            required = spec.get("required", True) is True
+            target = self._safe_c2c_output_path(cwd, locator)
+            if not target.exists():
+                if required:
+                    raise IntegrityError(f"successful C2C command omitted frozen raw output: {locator}")
+                continue
+            if locator_type == "file":
+                reference = store.put_bytes(self._read_c2c_output_file_once(cwd, locator))
+            elif locator_type == "tree":
+                reference = self._snapshot_c2c_output_tree(store, cwd, locator)
+            else:
+                raise IntegrityError("frozen C2C raw output locator_type is unsupported")
+            captured.append({
+                "output_id": output_id,
+                "kind": str(spec.get("kind") or ""),
+                "schema_version": str(spec.get("schema_version") or ""),
+                "contract_ref": reference,
+                "locator": locator,
+                "locator_type": locator_type,
+                "dataset_id": spec.get("dataset_id"),
+                "role": spec.get("role"),
+            })
+        return captured
+
+    @staticmethod
+    def _safe_c2c_output_path(cwd: Path, locator: str) -> Path:
+        relative = Path(locator)
+        if not locator or relative.is_absolute() or ".." in relative.parts:
+            raise IntegrityError("C2C raw output locator must remain repository-relative")
+        root = cwd.absolute()
+        target = root / relative
+        current = root
+        for component in relative.parts:
+            current /= component
+            if not current.exists():
+                break
+            try:
+                mode = current.lstat().st_mode
+            except OSError as error:
+                raise IntegrityError(f"C2C raw output locator is unavailable: {error}") from error
+            if stat.S_ISLNK(mode):
+                raise IntegrityError("C2C raw output locator contains a symlink component")
+        return target
+
+    @classmethod
+    def _read_c2c_output_file_once(cls, cwd: Path, locator: str) -> bytes:
+        relative = PurePosixPath(locator)
+        if relative.is_absolute() or not relative.parts or "." in relative.parts or ".." in relative.parts:
+            raise IntegrityError("C2C raw output locator must remain repository-relative")
+        parent_fd: int | None = None
+        try:
+            parent_fd = os.open(cwd, os.O_RDONLY | os.O_DIRECTORY)
+            for component in relative.parts[:-1]:
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+                os.close(parent_fd)
+                parent_fd = next_fd
+            file_fd = os.open(
+                relative.parts[-1],
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except OSError as error:
+            if parent_fd is not None:
+                os.close(parent_fd)
+            raise IntegrityError(f"C2C raw output cannot be opened safely: {locator}: {error}") from error
+        try:
+            metadata = os.fstat(file_fd)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise IntegrityError(f"C2C raw output must be a unique regular file: {locator}")
+            chunks: list[bytes] = []
+            while True:
+                chunk = os.read(file_fd, 65536)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(file_fd)
+            if parent_fd is not None:
+                os.close(parent_fd)
+
+    @classmethod
+    def _snapshot_c2c_output_tree(
+        cls,
+        store: ContractStore,
+        cwd: Path,
+        locator: str,
+    ) -> dict[str, Any]:
+        root = cls._safe_c2c_output_path(cwd, locator)
+        if not root.is_dir():
+            raise IntegrityError(f"C2C checkpoint output is not a directory: {locator}")
+        files: list[dict[str, Any]] = []
+        for path in sorted(root.rglob("*")):
+            relative = path.relative_to(cwd).as_posix()
+            mode = path.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                raise IntegrityError("C2C checkpoint output contains a symlink")
+            if stat.S_ISDIR(mode):
+                continue
+            if not stat.S_ISREG(mode):
+                raise IntegrityError("C2C checkpoint output contains a non-regular file")
+            raw = cls._read_c2c_output_file_once(cwd, relative)
+            reference = store.put_bytes(raw)
+            files.append({
+                "relative_path": path.relative_to(root).as_posix(),
+                "content_hash": reference["digest"],
+                "contract_ref": reference,
+            })
+        if not files:
+            raise IntegrityError("C2C checkpoint output tree is empty")
+        manifest = {
+            "schema_version": "auto_research_c2c_checkpoint_manifest_v1",
+            "root_locator": locator,
+            "files": files,
+        }
+        return store.put_json(manifest, schema_file="c2c_checkpoint_manifest_v1.schema.json")
 
     def _require_executor_capability(self, expected_phase: str) -> Any:
         context = self._active_phase_context
@@ -1966,18 +2220,22 @@ class ExperimentAgent:
         except TypedPhaseFailure as error:
             raise IntegrityError(str(error)) from error
 
-    def _frozen_phase_command(self, command_spec_id: str) -> str:
+    def _frozen_phase_command(self, command_spec_id: str) -> dict[str, Any]:
         context = self._active_phase_context
         if context is None:
             raise IntegrityError("frozen command lookup requires an authoritative phase context")
         plan = ContractStore(self.context.project_root).read_json(
             context.command_plan_hash,
-            schema_file="phase_command_plan_v1.schema.json",
+            schema_file="phase_command_plan_v2.schema.json",
         )
         matches = [item for item in plan["commands"] if item["command_spec_id"] == command_spec_id]
         if len(matches) != 1:
             raise IntegrityError(f"frozen command spec {command_spec_id!r} is unavailable")
-        return shlex.join(matches[0]["argv"])
+        return {
+            "argv": list(matches[0]["argv"]),
+            "environment": dict(matches[0]["environment"]),
+            "inherited_environment": list(matches[0]["inherited_environment"]),
+        }
 
     def _execute_phase(self, executor_type: type, authority: ResearchLedgerPhaseAuthority, callback: Any) -> dict[str, Any]:
         context = self._active_phase_context
@@ -2080,7 +2338,7 @@ class ExperimentAgent:
             raise IntegrityError("frozen adapter command requires the active Ledger journal")
         plan = ContractStore(self.context.project_root).read_json(
             context.command_plan_hash,
-            schema_file="phase_command_plan_v1.schema.json",
+            schema_file="phase_command_plan_v2.schema.json",
         )
         if len(plan["commands"]) != 1:
             raise IntegrityError("adapter wrapper requires exactly one frozen command spec")
@@ -3114,7 +3372,7 @@ class ExperimentAgent:
                 for step_idx, command in enumerate(run_spec["commands"]["preflight"]):
                     result = self._run_authoritative_step(
                         name=f"preflight_command_{step_idx}",
-                        command=command,
+                        command=self._frozen_phase_command(f"proxy-preflight_command_{step_idx}"),
                         working_dir=adapter.repo_root,
                         retry_policy={"max_attempts": 1},
                     )
@@ -3770,7 +4028,7 @@ class ExperimentAgent:
                 for step_idx, command in enumerate(run_spec["commands"]["preflight"]):
                     result = self._run_authoritative_step(
                         name=f"preflight_command_{step_idx}",
-                        command=command,
+                        command=self._frozen_phase_command(f"full-preflight_command_{step_idx}"),
                         working_dir=adapter.repo_root,
                         retry_policy={"max_attempts": 1},
                     )
@@ -4146,7 +4404,7 @@ class ExperimentAgent:
                         run_state["full_s3_decision"] = full_s3_decision
                     train_result = self._run_authoritative_step(
                         name="train",
-                        command=run_spec["commands"]["train"],
+                        command=self._frozen_phase_command("full-train"),
                         working_dir=adapter.repo_root,
                         retry_policy=retry_policy,
                     )
@@ -4195,7 +4453,7 @@ class ExperimentAgent:
                             recovery_gpu_ids = list(getattr(gpu_selection, "selected_ids", []) or [])
                             memory_safe_command = self._frozen_phase_command("full-train_recovery_memory_safe")
                             memory_safe = adapter.materialize_train_oom_recovery_config(run_spec, gpu_ids=recovery_gpu_ids)
-                            if memory_safe.get("status") != "materialized" or shlex.split(str(memory_safe.get("command") or "")) != shlex.split(memory_safe_command):
+                            if memory_safe.get("status") != "materialized" or memory_safe.get("command") != memory_safe_command:
                                 raise IntegrityError("memory-safe recovery no longer matches the frozen command plan")
                             action = {
                                 "action": "retry_train_memory_safe_recipe",
@@ -4203,7 +4461,7 @@ class ExperimentAgent:
                                 "reason": "detected CUDA OOM signature; retry with a memory-safe full S3 train recipe",
                                 "recovery_gpu_ids": recovery_gpu_ids,
                                 "memory_safe_train_config": next(
-                                    (item for item in shlex.split(memory_safe_command) if item.endswith("train_recipe_memory_safe.json")),
+                                    (item for item in memory_safe_command["argv"] if item.endswith("train_recipe_memory_safe.json")),
                                     "",
                                 ),
                                 "config_changes": memory_safe.get("config_changes") or {},
@@ -4236,7 +4494,7 @@ class ExperimentAgent:
                             dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
                             result = self._run_authoritative_step(
                                 name=f"eval_{dataset}",
-                                command=command,
+                                command=self._frozen_phase_command(f"full-eval_{dataset}"),
                                 working_dir=adapter.repo_root,
                                 retry_policy=retry_policy,
                             )
@@ -4245,7 +4503,8 @@ class ExperimentAgent:
                             run_state["attempts"].append(result)
                             if result["status"] != "ok":
                                 command_status = "partial"
-                    metrics = adapter.collect_candidate_metrics(run_spec["run_id"])
+                    authoritative_values = self._authoritative_c2c_measurements(include_proxy=True)
+                    metrics = self._c2c_metric_summary(authoritative_values.get("candidate") or {})
                     run_state["metrics"] = metrics
                     if metrics is not None and command_status not in {"failed", "blocked", "proxy_rejected", "proxy_repairable"}:
                         ablation = self._run_c2c_ablation_eval(
@@ -4557,6 +4816,49 @@ class ExperimentAgent:
         final_path = Path(run_spec["run_root"]) / "checkpoints" / "final"
         return final_path.exists() and any(final_path.iterdir()) if final_path.is_dir() else final_path.exists()
 
+    def _authoritative_c2c_measurements(
+        self,
+        *,
+        include_proxy: bool = False,
+    ) -> dict[str, dict[str, float]]:
+        context = self._active_phase_context
+        if context is None:
+            raise IntegrityError("C2C measurement decoding requires authoritative phase context")
+        state = ResearchEventLedger(self.context.project_root).state()
+        attempt = state["attempts"][context.attempt_id]
+        receipts: list[dict[str, Any]] = []
+        if include_proxy and context.phase == "full" and attempt.get("attempt_kind") == "proxy_full":
+            receipts.extend(
+                {
+                    **item,
+                    "raw_outputs": [
+                        output for output in item.get("raw_outputs") or [] if output.get("role") == "baseline"
+                    ],
+                }
+                for item in _current_authoritative_phase_command_receipts(
+                    self.context.project_root,
+                    attempt=attempt,
+                    phase="proxy",
+                )
+            )
+        receipts.extend(
+            _current_authoritative_phase_command_receipts(
+                self.context.project_root,
+                attempt=attempt,
+                phase=context.phase,
+            )
+        )
+        return _c2c_measurements_from_receipts(self.context.project_root, receipts)
+
+    @staticmethod
+    def _c2c_metric_summary(values: dict[str, float]) -> dict[str, Any] | None:
+        if not values:
+            return None
+        return {
+            "mean": round(sum(float(value) for value in values.values()) / len(values), 4),
+            "datasets": {key: float(value) for key, value in sorted(values.items())},
+        }
+
     def _run_c2c_proxy_screen(
         self,
         *,
@@ -4586,7 +4888,7 @@ class ExperimentAgent:
             for idx, command in enumerate(rendered_commands):
                 result = self._run_authoritative_step(
                     name=f"proxy_command_{idx}",
-                    command=command,
+                    command=self._frozen_phase_command(f"proxy-proxy_command_{idx}"),
                     working_dir=adapter.repo_root,
                     retry_policy={"max_attempts": 1, "timeout_seconds": self._c2c_proxy_command_timeout(proxy_cfg, idx, rendered_commands)},
                 )
@@ -4633,9 +4935,10 @@ class ExperimentAgent:
                     )
                     return proxy
 
-        metrics = adapter.collect_proxy_metrics(run_spec)
+        authoritative_values = self._authoritative_c2c_measurements()
+        metrics = self._c2c_metric_summary(authoritative_values.get("candidate") or {})
         eval_smoke = adapter.collect_proxy_eval_smoke(run_spec)
-        baseline_metrics = adapter.proxy_baseline_metrics(run_spec)
+        baseline_metrics = self._c2c_metric_summary(authoritative_values.get("baseline") or {})
         proxy["require_proxy_metrics"] = bool(proxy_cfg.get("require_proxy_metrics", False))
         proxy["attempts"] = attempts
         proxy["commands"] = rendered_commands
@@ -4696,7 +4999,7 @@ class ExperimentAgent:
             dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
             result = self._run_authoritative_step(
                 name=f"activation_smoke_eval_{dataset}",
-                command=command,
+                command=self._frozen_phase_command(f"proxy-activation_smoke_eval_{dataset}"),
                 working_dir=adapter.repo_root,
                 retry_policy={"max_attempts": 1, "timeout_seconds": timeout_seconds},
             )
@@ -4704,7 +5007,29 @@ class ExperimentAgent:
             eval_by_dataset[str(dataset)] = result
             if result.get("status") != "ok":
                 command_failed = True
-        collected = adapter.collect_proxy_activation_smoke(run_spec, activation_spec)
+        authoritative_values = self._authoritative_c2c_measurements()
+        enabled_metrics = self._c2c_metric_summary(authoritative_values.get("candidate") or {})
+        disabled_metrics = self._c2c_metric_summary(authoritative_values.get("activation_disabled") or {})
+        comparison = self._c2c_ablation_comparison(enabled_metrics, disabled_metrics)
+        mechanism_observed = bool(
+            comparison.get("enabled_minus_disabled_mean") is not None
+            and abs(float(comparison["enabled_minus_disabled_mean"])) > 0.0
+        )
+        collected = {
+            **activation_spec,
+            "status": "passed" if mechanism_observed and not command_failed else "failed",
+            "reason": (
+                "receipt-bound activation measurement differs from the enabled proxy result"
+                if mechanism_observed and not command_failed
+                else "receipt-bound activation measurement did not prove the frozen mechanism"
+            ),
+            "repair_hint": "repair activation wiring before full S3" if not mechanism_observed or command_failed else "",
+            "enabled_metrics": enabled_metrics,
+            "disabled_metrics": disabled_metrics,
+            "comparison": {**comparison, "mechanism_observed": mechanism_observed},
+            "output_smoke": adapter.collect_proxy_eval_smoke(run_spec),
+            "mechanism_trace": {"status": "observed" if mechanism_observed else "missing"},
+        }
         if command_failed:
             collected.update(
                 {
@@ -4748,7 +5073,7 @@ class ExperimentAgent:
             dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
             result = self._run_authoritative_step(
                 name=f"ablation_eval_{dataset}",
-                command=command,
+                command=self._frozen_phase_command(f"full-ablation_eval_{dataset}"),
                 working_dir=adapter.repo_root,
                 retry_policy=retry_policy,
             )
@@ -4756,12 +5081,14 @@ class ExperimentAgent:
             eval_by_dataset[dataset] = result
             if result.get("status") != "ok":
                 status = "partial"
-        metrics = adapter.collect_ablation_metrics(run_spec, ablation_spec)
+        authoritative_values = self._authoritative_c2c_measurements(include_proxy=True)
+        metrics = self._c2c_metric_summary(authoritative_values.get("ablation") or {})
         if metrics:
             write_json(Path(ablation_spec["metrics_path"]), metrics)
         else:
             status = "partial"
-        comparison = self._c2c_ablation_comparison(adapter.collect_candidate_metrics(run_spec["run_id"]), metrics)
+        enabled_metrics = self._c2c_metric_summary(authoritative_values.get("candidate") or {})
+        comparison = self._c2c_ablation_comparison(enabled_metrics, metrics)
         return self._jsonable({
             **ablation_spec,
             "status": status,
@@ -4904,7 +5231,7 @@ class ExperimentAgent:
             for step_idx, command in enumerate(baseline_spec["commands"]["preflight"]):
                 result = self._run_authoritative_step(
                     name=f"proxy_baseline_preflight_{step_idx}",
-                    command=command,
+                    command=self._frozen_phase_command(f"proxy-proxy_baseline_preflight_{step_idx}"),
                     working_dir=adapter.repo_root,
                     retry_policy={"max_attempts": 1, "timeout_seconds": self._c2c_proxy_command_timeout(proxy_cfg, -1, [])},
                 )
@@ -4919,7 +5246,7 @@ class ExperimentAgent:
                     )
             train_result = self._run_authoritative_step(
                 name="proxy_baseline_train",
-                command=baseline_spec["commands"]["train"],
+                command=self._frozen_phase_command("proxy-proxy_baseline_train"),
                 working_dir=adapter.repo_root,
                 retry_policy={**retry_policy, "timeout_seconds": self._c2c_proxy_command_timeout(proxy_cfg, 0, [baseline_spec["commands"]["train"]])},
             )
@@ -4937,7 +5264,7 @@ class ExperimentAgent:
                 dataset = eval_items[eval_idx][0] if eval_idx < len(eval_items) else f"dataset_{eval_idx}"
                 result = self._run_authoritative_step(
                     name=f"proxy_baseline_eval_{dataset}",
-                    command=command,
+                    command=self._frozen_phase_command(f"proxy-proxy_baseline_eval_{dataset}"),
                     working_dir=adapter.repo_root,
                     retry_policy={**retry_policy, "timeout_seconds": self._c2c_proxy_command_timeout(proxy_cfg, 1 + eval_idx, baseline_spec["commands"]["eval"])},
                 )
@@ -4950,7 +5277,8 @@ class ExperimentAgent:
                         reason=f"proxy baseline eval {dataset} failed",
                         failed_step=result,
                     )
-            metrics = adapter.collect_proxy_baseline_run_metrics(baseline_spec)
+            authoritative_values = self._authoritative_c2c_measurements()
+            metrics = self._c2c_metric_summary(authoritative_values.get("baseline") or {})
             if not metrics:
                 return self._c2c_proxy_baseline_failure(
                     adapter,
@@ -5097,7 +5425,7 @@ class ExperimentAgent:
         return base
 
     @staticmethod
-    def _c2c_proxy_commands(adapter: C2CAdapter, run_spec: dict[str, Any], proxy_cfg: dict[str, Any]) -> list[str]:
+    def _c2c_proxy_commands(adapter: C2CAdapter, run_spec: dict[str, Any], proxy_cfg: dict[str, Any]) -> list[dict[str, Any]]:
         commands = list(proxy_cfg.get("commands") or [])
         if not commands and proxy_cfg.get("mode") in {"command", "commands", "replay", "validation"}:
             proxy_commands = (run_spec.get("proxy_screen") or {}).get("commands") or {}
@@ -5112,14 +5440,16 @@ class ExperimentAgent:
             "proxy_train_config": str((run_spec.get("proxy_screen") or {}).get("train_config") or ""),
             "proxy_metrics": str((run_spec.get("proxy_screen") or {}).get("metrics_path") or ""),
         }
-        rendered: list[str] = []
+        rendered: list[dict[str, Any]] = []
         for command in commands:
             if not command:
                 continue
-            try:
-                rendered.append(str(command).format(**fields))
-            except KeyError:
-                rendered.append(str(command))
+            if not isinstance(command, dict) or not isinstance(command.get("argv"), list):
+                raise IntegrityError("C2C proxy commands must use typed argv/environment contracts")
+            rendered.append({
+                **deepcopy(command),
+                "argv": [str(value).format(**fields) for value in command["argv"]],
+            })
         return rendered
 
     @staticmethod
@@ -8140,7 +8470,7 @@ def _failure_evidence_from_result(
     if set(receipt) != required_receipt_fields:
         return None
     try:
-        receipt_payload = ContractStore(project_root).read_json(receipt["receipt_ref"], schema_file="phase_run_receipt_v3.schema.json")
+        receipt_payload = ContractStore(project_root).read_json(receipt["receipt_ref"], schema_file="phase_run_receipt_v4.schema.json")
         raw_bytes = ContractStore(project_root).read_bytes(receipt_payload["stdout_ref"])
     except (OSError, TypeError, ValueError):
         return None
@@ -8189,26 +8519,29 @@ def _failure_evidence_from_result(
             return None
         raw_bytes = encode_canonical_evidence(probe_payload)
         producer_run_id = probe_payload["producer_run_id"]
-    log_hash = hashlib.sha256(raw_bytes).hexdigest()
-    scoped_relative_path = content_addressed_evidence_path(
-        attempt_id=attempt["attempt_id"],
-        producer_run_id=producer_run_id,
-        evidence_kind=evidence_kind,
-        content_hash=log_hash,
-    )
-    try:
-        EvidenceStore(project_root).write_entry(
-            {
-                "relative_path": scoped_relative_path,
-                "producer_run_id": producer_run_id,
-                "kind": evidence_kind,
-                "content_hash": log_hash,
-            },
-            attempt,
-            raw_bytes,
+    if evidence_kind == "resource_probe":
+        log_hash = hashlib.sha256(raw_bytes).hexdigest()
+        scoped_relative_path = content_addressed_evidence_path(
+            attempt_id=attempt["attempt_id"],
+            producer_run_id=producer_run_id,
+            evidence_kind=evidence_kind,
+            content_hash=log_hash,
         )
-    except ValueError:
-        return None
+        try:
+            EvidenceStore(project_root).write_entry(
+                {
+                    "relative_path": scoped_relative_path,
+                    "producer_run_id": producer_run_id,
+                    "kind": evidence_kind,
+                    "content_hash": log_hash,
+                },
+                attempt,
+                raw_bytes,
+            )
+        except ValueError:
+            return None
+    else:
+        log_hash = receipt_payload["stderr_hash"]
     source_phase = "full" if (attempt.get("phases") or {}).get("full") == "RUNNING" else "proxy"
     if failure_class == "activation_failure":
         source_phase = "activation"
@@ -8233,7 +8566,9 @@ def _failure_evidence_from_result(
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
         "cross_references": {
-            "resource_probe_hash" if failure_class in {"resource_pause", "oom_retry"} else "command_result_evidence_hash": log_hash
+            "resource_probe_hash" if failure_class in {"resource_pause", "oom_retry"} else "phase_run_receipt_hash": (
+                log_hash if failure_class in {"resource_pause", "oom_retry"} else receipt["receipt_hash"]
+            )
         },
         "lifecycle_generation": attempt["lifecycle_generation"],
         "implementation_hash": attempt["implementation_hash"],
@@ -8403,7 +8738,6 @@ def _current_authoritative_phase_command_receipts(
     phase_execution = (current.get("phase_executions") or {}).get(phase)
     if not isinstance(phase_execution, dict):
         raise S3ValidationError("authoritative phase execution is missing during C2C evidence collection")
-    store = ContractStore(project_root)
     receipts: list[dict[str, Any]] = []
     for record in (state.get("phase_commands") or {}).values():
         command = record.get("command") if isinstance(record, dict) else None
@@ -8411,20 +8745,20 @@ def _current_authoritative_phase_command_receipts(
             continue
         if (
             command.get("attempt_id") != attempt["attempt_id"]
-            or command.get("lifecycle_generation") != attempt["lifecycle_generation"]
-            or command.get("implementation_hash") != attempt["implementation_hash"]
-            or command.get("attempt_input_hash") != attempt["attempt_input_hash"]
+            or command.get("lifecycle_generation") != phase_execution["lifecycle_generation"]
+            or command.get("implementation_hash") != phase_execution["implementation_hash"]
+            or command.get("attempt_input_hash") != phase_execution["attempt_input_hash"]
             or command.get("phase") != phase
             or command.get("phase_execution_id") != phase_execution["phase_execution_id"]
             or command.get("phase_start_event_id") != phase_execution["phase_start_event_id"]
             or command.get("producer_run_id") != phase_execution["producer_run_id"]
         ):
             continue
-        if command.get("command_spec_id") == f"{phase}-collect-evidence":
+        if command.get("command_spec_id") == f"{phase}-derive-evidence":
             continue
         if record.get("status") != "completed" or not isinstance(record.get("receipt_ref"), dict):
             raise S3ValidationError("C2C evidence collection found an incomplete current phase command")
-        receipt = store.read_json(record["receipt_ref"], schema_file="phase_run_receipt_v3.schema.json")
+        receipt = validate_phase_run_receipt(project_root, record, record["receipt_ref"])
         if receipt.get("command_id") != command.get("command_id") or receipt.get("command_hash") != command.get("command_hash"):
             raise S3ValidationError("C2C command receipt identity differs from the authorized command")
         receipts.append(
@@ -8440,10 +8774,70 @@ def _current_authoritative_phase_command_receipts(
                 "exit_code": int(receipt["exit_code"]),
                 "stdout_hash": receipt["stdout_hash"],
                 "stderr_hash": receipt["stderr_hash"],
+                "phase": receipt["phase"],
+                "phase_execution_id": receipt["phase_execution_id"],
+                "producer_run_id": receipt["producer_run_id"],
+                "raw_outputs": deepcopy(receipt.get("raw_outputs") or []),
             }
         )
     receipts.sort(key=lambda item: (item["ordinal"], item["command_spec_id"]))
     return receipts
+
+
+def _c2c_measurements_from_receipts(
+    project_root: Path,
+    receipts: list[dict[str, Any]],
+) -> dict[str, dict[str, float]]:
+    store = ContractStore(project_root)
+    values: dict[str, dict[str, float]] = {}
+    seen_outputs: set[tuple[str, str]] = set()
+    for receipt in receipts:
+        for output in receipt.get("raw_outputs") or []:
+            role = output.get("role")
+            dataset_id = output.get("dataset_id")
+            if role not in {"baseline", "candidate", "ablation", "activation_disabled", "matched_control", "coverage"}:
+                continue
+            if not isinstance(dataset_id, str) or not dataset_id:
+                raise S3ValidationError("C2C quantitative raw output lacks dataset identity")
+            identity = (str(role), dataset_id)
+            if identity in seen_outputs:
+                raise S3ValidationError(f"duplicate C2C raw measurement: {role}/{dataset_id}")
+            seen_outputs.add(identity)
+            reference = output.get("contract_ref")
+            if not isinstance(reference, dict):
+                raise S3ValidationError("C2C raw measurement lacks immutable ContractRef")
+            try:
+                raw = store.read_bytes(reference)
+                if hashlib.sha256(raw).hexdigest() != output.get("content_hash"):
+                    raise S3ValidationError("C2C raw measurement content hash mismatch")
+                payload = json.loads(raw.decode("utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                raise S3ValidationError(f"C2C raw measurement cannot be decoded: {error}") from error
+            if not isinstance(payload, dict):
+                raise S3ValidationError("C2C raw measurement must be a JSON object")
+            declared_dataset = payload.get("dataset")
+            if declared_dataset is not None and str(declared_dataset) != dataset_id:
+                raise S3ValidationError("C2C raw measurement dataset differs from the frozen locator")
+            value = _c2c_metric_value_from_raw_payload(payload)
+            values.setdefault(str(role), {})[dataset_id] = value
+    return values
+
+
+def _c2c_metric_value_from_raw_payload(payload: dict[str, Any]) -> float:
+    raw_value = next(
+        (
+            payload[key]
+            for key in ("metric_value", "accuracy_percent", "overall_accuracy", "accuracy", "mean")
+            if key in payload
+        ),
+        None,
+    )
+    if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)) or not math.isfinite(float(raw_value)):
+        raise S3ValidationError("C2C raw measurement lacks a finite numeric metric")
+    value = float(raw_value)
+    if "overall_accuracy" in payload or ("accuracy" in payload and 0.0 <= value <= 1.0):
+        value *= 100.0
+    return round(value, 10)
 
 
 def _c2c_strict_evidence_inventory(
@@ -8456,55 +8850,93 @@ def _c2c_strict_evidence_inventory(
     simulate: bool,
     authoritative_command_receipts: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, str]]:
-    if not isinstance(comparison_candidate, dict):
-        return []
+    if simulate:
+        if authoritative_command_receipts is not None:
+            raise S3ValidationError("synthetic C2C evidence cannot mix authoritative command receipts")
+        if not isinstance(comparison_candidate, dict):
+            raise S3ValidationError("synthetic C2C evidence requires an explicit synthetic comparison payload")
+    elif not authoritative_command_receipts:
+        raise S3ValidationError("C2C real evidence requires current authoritative command receipts")
     phase = "proxy" if attempt.get("state") == "PROXY_RUNNING" else "full" if attempt.get("state") == "FULL_RUNNING" else None
     if phase is None:
         raise S3ValidationError("C2C evidence collection requires an authoritatively running phase")
     phase_execution = (attempt.get("phase_executions") or {}).get(phase)
     if not isinstance(phase_execution, dict):
         raise S3ValidationError("C2C evidence collection requires PhaseExecutionManifest")
+    if not simulate:
+        expected_receipts = _current_authoritative_phase_command_receipts(
+            project_root,
+            attempt=attempt,
+            phase=phase,
+        )
+        if phase == "full" and attempt.get("attempt_kind") == "proxy_full":
+            expected_receipts = [
+                {
+                    **item,
+                    "raw_outputs": [
+                        output
+                        for output in item.get("raw_outputs") or []
+                        if output.get("role") == "baseline"
+                    ],
+                }
+                for item in _current_authoritative_phase_command_receipts(
+                    project_root,
+                    attempt=attempt,
+                    phase="proxy",
+                )
+            ] + expected_receipts
+        if canonical_hash(authoritative_command_receipts) != canonical_hash(expected_receipts):
+            raise S3ValidationError("C2C real evidence receipts differ from the current authoritative Ledger receipts")
+        authoritative_command_receipts = expected_receipts
     producer_run_id = phase_execution["producer_run_id"]
     seeds = next(item["seeds"] for item in trial_spec["phase_contracts"] if item["phase"] == phase)
     metric_id = trial_spec["primary_metric_id"]
     phase_contract = next(item for item in trial_spec["phase_contracts"] if item["phase"] == phase)
     dataset_ids = list(phase_contract["datasets"])
-    receipt_specs: set[str] = set()
     activation_receipt: dict[str, Any] | None = None
-    if authoritative_command_receipts is not None:
-        if not authoritative_command_receipts:
-            raise S3ValidationError("C2C real evidence requires current authoritative command receipts")
+    receipt_values: dict[str, dict[str, float]] | None = None
+    if not simulate:
+        assert authoritative_command_receipts is not None
         for receipt in authoritative_command_receipts:
             if receipt.get("exit_code") != 0:
                 raise S3ValidationError("C2C evidence cannot use a failed authoritative command receipt")
-            receipt_specs.add(str(receipt["command_spec_id"]))
         if phase == "proxy":
-            if not any("proxy_command" in spec and spec.endswith("1") for spec in receipt_specs):
-                raise S3ValidationError("C2C proxy evidence requires the current candidate proxy measurement receipt")
             activation_receipt = next(
-                (receipt for receipt in authoritative_command_receipts if "activation_smoke_eval" in str(receipt["command_spec_id"])),
+                (
+                    receipt
+                    for receipt in authoritative_command_receipts
+                    if any(output.get("role") == "activation_disabled" for output in receipt.get("raw_outputs") or [])
+                ),
                 None,
             )
             if activation_receipt is None:
                 raise S3ValidationError("C2C proxy evidence requires the current activation receipt")
-        else:
-            if not any(spec == "full-train" for spec in receipt_specs):
-                raise S3ValidationError("C2C full evidence requires the current full train receipt")
-            if not any(spec.startswith("full-eval_") for spec in receipt_specs):
-                raise S3ValidationError("C2C full evidence requires the current full evaluation receipt")
-    if phase == "proxy":
+        receipt_values = _c2c_measurements_from_receipts(project_root, authoritative_command_receipts)
+    if not simulate:
+        assert receipt_values is not None
+        candidate_datasets = receipt_values.get("candidate") or {}
+        baseline_datasets = receipt_values.get("baseline") or {}
+        ablation_datasets = receipt_values.get("ablation") or {}
+        matched_datasets = receipt_values.get("matched_control") or {}
+        coverage_datasets = receipt_values.get("coverage") or {}
+    elif phase == "proxy":
+        assert isinstance(comparison_candidate, dict)
         proxy_screen = comparison_candidate.get("proxy_screen") if isinstance(comparison_candidate.get("proxy_screen"), dict) else {}
         candidate_datasets = ((proxy_screen.get("metrics") or {}).get("datasets") or {})
         proxy_baseline = proxy_screen.get("baseline_metrics")
         if not isinstance(proxy_baseline, dict):
             proxy_baseline = proxy_screen.get("proxy_baseline")
         baseline_datasets = ((proxy_baseline or {}).get("datasets") or {}) if isinstance(proxy_baseline, dict) else {}
+        ablation_datasets = ((((comparison_candidate.get("ablation") or {}).get("metrics") or {}).get("datasets")) or {})
+        matched_datasets = ((comparison_candidate.get("matched_control_metrics") or {}).get("datasets") or {})
+        coverage_datasets = ((comparison_candidate.get("coverage_metrics") or {}).get("datasets") or {})
     else:
+        assert isinstance(comparison_candidate, dict)
         candidate_datasets = ((comparison_candidate.get("metrics") or {}).get("datasets") or {})
         baseline_datasets = baseline.get("datasets") if isinstance(baseline.get("datasets"), dict) else {}
-    ablation_datasets = ((((comparison_candidate.get("ablation") or {}).get("metrics") or {}).get("datasets")) or {})
-    matched_datasets = ((comparison_candidate.get("matched_control_metrics") or {}).get("datasets") or {})
-    coverage_datasets = ((comparison_candidate.get("coverage_metrics") or {}).get("datasets") or {})
+        ablation_datasets = ((((comparison_candidate.get("ablation") or {}).get("metrics") or {}).get("datasets")) or {})
+        matched_datasets = ((comparison_candidate.get("matched_control_metrics") or {}).get("datasets") or {})
+        coverage_datasets = ((comparison_candidate.get("coverage_metrics") or {}).get("datasets") or {})
 
     def quantitative(kind: str, values: dict[str, dict[str, float]]) -> dict[str, Any]:
         payload = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind=kind, phase=phase, fields={})
@@ -8539,9 +8971,27 @@ def _c2c_strict_evidence_inventory(
 
     payloads: dict[str, dict[str, Any]] = {}
     if phase == "proxy":
-        activation = comparison_candidate.get("activation_smoke")
-        if not isinstance(activation, dict):
-            activation = (comparison_candidate.get("proxy_screen") or {}).get("activation_smoke")
+        if not simulate:
+            assert receipt_values is not None
+            disabled = receipt_values.get("activation_disabled") or {}
+            activation_datasets_present = sorted(set(candidate_datasets) & set(disabled))
+            activation_passed = (
+                bool(activation_datasets_present)
+                and all(
+                    abs(float(candidate_datasets[item]) - float(disabled[item])) > 0.0
+                    for item in activation_datasets_present
+                )
+            )
+            activation = {
+                "status": "passed" if activation_passed else "failed",
+                "attempts": [{"status": "ok"}],
+                "probe_id": "c2c-receipt-bound-activation",
+            }
+        else:
+            assert isinstance(comparison_candidate, dict)
+            activation = comparison_candidate.get("activation_smoke")
+            if not isinstance(activation, dict):
+                activation = (comparison_candidate.get("proxy_screen") or {}).get("activation_smoke")
         if simulate and not isinstance(activation, dict):
             activation = {
                 "status": "passed",
@@ -8565,7 +9015,8 @@ def _c2c_strict_evidence_inventory(
         if not activation_surfaces:
             raise S3ValidationError("frozen proxy policy must preregister activation surfaces")
         activation_exit_code = int(activation_receipt["exit_code"]) if activation_receipt is not None else 0
-        payloads["activation_evidence"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="activation_evidence", phase="proxy", fields={"probe_id": str(activation.get("probe_id") or "c2c-forward-probe"), "status": "passed" if activation_exit_code == 0 else "failed", "command_status": "completed" if activation_exit_code == 0 else "failed", "exit_code": activation_exit_code, "implementation_surface_ids": activation_surfaces})
+        activation_status = "passed" if activation.get("status") == "passed" and activation_exit_code == 0 else "failed"
+        payloads["activation_evidence"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="activation_evidence", phase="proxy", fields={"probe_id": str(activation.get("probe_id") or "c2c-forward-probe"), "status": activation_status, "command_status": "completed" if activation_exit_code == 0 else "failed", "exit_code": activation_exit_code, "implementation_surface_ids": activation_surfaces})
         payloads["proxy_baseline_fingerprint"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_baseline_fingerprint", phase="proxy", fields={"baseline_hash": baseline_hash, "dataset_ids": dataset_ids, "seeds": seeds, "fingerprint_inputs": fingerprint_inputs})
         baseline_fingerprint_hash = hashlib.sha256(encode_canonical_evidence(payloads["proxy_baseline_fingerprint"])).hexdigest()
         payloads["proxy_cache_report"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="proxy_cache_report", phase="proxy", fields={"cross_references": {"proxy_baseline_fingerprint_hash": baseline_fingerprint_hash}, "cache_key": canonical_hash({"attempt": attempt["attempt_id"], "phase_execution": phase_execution["phase_execution_id"]}), "baseline_hash": baseline_hash, "cache_entry_hash": baseline_hash, "status": "created"})
@@ -8573,24 +9024,28 @@ def _c2c_strict_evidence_inventory(
         proxy_results_hash = hashlib.sha256(encode_canonical_evidence(payloads["proxy_results"])).hexdigest()
         proxy_references = {"activation_evidence_hash": activation_hash, "proxy_results_hash": proxy_results_hash}
         if attempt["profile"] == "bootstrap":
-            bootstrap = comparison_candidate.get("bootstrap")
-            if simulate and not isinstance(bootstrap, dict):
-                bootstrap = {"status": "proxy_reached"}
-            if authoritative_command_receipts is None and (not isinstance(bootstrap, dict) or bootstrap.get("status") != "proxy_reached"):
-                raise S3ValidationError("bootstrap completion requires the current proxy execution completion trace")
+            if simulate:
+                assert isinstance(comparison_candidate, dict)
+                bootstrap = comparison_candidate.get("bootstrap")
+                if not isinstance(bootstrap, dict):
+                    bootstrap = {"status": "proxy_reached"}
+                if bootstrap.get("status") != "proxy_reached":
+                    raise S3ValidationError("bootstrap completion requires the current synthetic proxy completion trace")
             payloads["bootstrap_completion"] = _identity_evidence_payload(attempt=attempt, producer_run_id=producer_run_id, evidence_kind="bootstrap_completion", phase="proxy", fields={"cross_references": proxy_references, "completion_status": "verified"})
         else:
-            readiness = comparison_candidate.get("full_s3_readiness")
+            readiness = (
+                {"status": "ready", "full_train_allowed": True}
+                if not simulate and activation_status == "passed"
+                else {"status": "blocked", "full_train_allowed": False}
+                if not simulate
+                else comparison_candidate.get("full_s3_readiness")
+            )
             if simulate and not isinstance(readiness, dict):
                 readiness = {"status": "ready", "full_train_allowed": True}
-            if authoritative_command_receipts is None and not isinstance(readiness, dict):
+            if not isinstance(readiness, dict):
                 raise S3ValidationError("full readiness must be derived from successful current proxy checks")
             readiness_ids = list((trial_spec.get("proxy_decision_policy") or {}).get("readiness_check_ids") or [])
-            ready = (
-                activation_exit_code == 0
-                if authoritative_command_receipts is not None
-                else readiness.get("full_train_allowed") is True and readiness.get("status") == "ready"
-            )
+            ready = readiness.get("full_train_allowed") is True and readiness.get("status") == "ready"
             payloads["full_s3_readiness"] = _identity_evidence_payload(
                 attempt=attempt,
                 producer_run_id=producer_run_id,
@@ -8675,7 +9130,7 @@ def _generic_external_evidence_inventory(
         contract_store.read_contract(
             sample_contract_ref,
             contract_kind="sample_manifest",
-            schema_file="sample_manifest_v3.schema.json",
+            schema_file="sample_manifest_v4.schema.json",
         )
         contract_store.read_contract(
             evaluator_contract_ref,

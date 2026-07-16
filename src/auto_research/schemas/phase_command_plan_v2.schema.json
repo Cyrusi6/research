@@ -4,53 +4,19 @@
   "additionalProperties": false,
   "required": [
     "schema_version",
-    "command_id",
-    "command_hash",
-    "command_spec_id",
-    "command_spec",
-    "command_plan_hash",
-    "command_plan_ref",
-    "attempt_id",
-    "lifecycle_generation",
+    "plan_id",
     "phase",
-    "phase_execution_id",
-    "phase_start_event_id",
-    "producer_run_id",
-    "implementation_hash",
-    "attempt_input_hash",
-    "authorization_hash",
-    "provenance_mode",
-    "idempotency_key"
+    "adapter_identity",
+    "variant_spec_hash",
+    "source_snapshot_hash",
+    "commands"
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_phase_command_v2"
+      "const": "auto_research_phase_command_plan_v2"
     },
-    "command_id": {
+    "plan_id": {
       "$ref": "#/$defs/safe_id"
-    },
-    "command_hash": {
-      "$ref": "#/$defs/hash"
-    },
-    "command_spec_id": {
-      "$ref": "#/$defs/safe_id"
-    },
-    "command_spec": {
-      "$ref": "#/$defs/command_spec"
-    },
-    "command_plan_hash": {
-      "$ref": "#/$defs/hash"
-    },
-    "command_plan_ref": {
-      "$ref": "#/$defs/blob"
-    },
-    "attempt_id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "lifecycle_generation": {
-      "type": "integer",
-      "minimum": 0
     },
     "phase": {
       "enum": [
@@ -58,34 +24,44 @@
         "full"
       ]
     },
-    "phase_execution_id": {
-      "$ref": "#/$defs/safe_id"
+    "adapter_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapter_id",
+        "adapter_version",
+        "provenance_mode"
+      ],
+      "properties": {
+        "adapter_id": {
+          "$ref": "#/$defs/safe_id"
+        },
+        "adapter_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "provenance_mode": {
+          "enum": [
+            "synthetic",
+            "local-external",
+            "production"
+          ]
+        }
+      }
     },
-    "phase_start_event_id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "producer_run_id": {
-      "$ref": "#/$defs/safe_id"
-    },
-    "implementation_hash": {
+    "variant_spec_hash": {
       "$ref": "#/$defs/hash"
     },
-    "attempt_input_hash": {
+    "source_snapshot_hash": {
       "$ref": "#/$defs/hash"
     },
-    "authorization_hash": {
-      "$ref": "#/$defs/hash"
-    },
-    "provenance_mode": {
-      "enum": [
-        "synthetic",
-        "local-external",
-        "production"
-      ]
-    },
-    "idempotency_key": {
-      "$ref": "#/$defs/hash"
+    "commands": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/command_spec"
+      }
     }
   },
   "$defs": {
@@ -96,36 +72,6 @@
     "safe_id": {
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"
-    },
-    "blob": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "schema_version",
-        "algorithm",
-        "digest",
-        "size_bytes",
-        "relative_path"
-      ],
-      "properties": {
-        "schema_version": {
-          "const": "auto_research_contract_blob_v1"
-        },
-        "algorithm": {
-          "const": "sha256"
-        },
-        "digest": {
-          "$ref": "#/$defs/hash"
-        },
-        "size_bytes": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "relative_path": {
-          "type": "string",
-          "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"
-        }
-      }
     },
     "output": {
       "type": "object",
@@ -148,7 +94,6 @@
             "proxy_cache_report",
             "full_s3_readiness",
             "bootstrap_completion",
-            "command_result_evidence",
             "resource_probe"
           ]
         },
@@ -170,6 +115,8 @@
         "ordinal",
         "dependencies",
         "argv",
+        "environment",
+        "inherited_environment",
         "cwd",
         "source_snapshot_hash",
         "expected_outputs",
@@ -331,6 +278,30 @@
                 }
               ]
             }
+          }
+        },
+        "environment": {
+          "type": "object",
+          "propertyNames": {
+            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,127}$"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "maxLength": 32768
+          }
+        },
+        "inherited_environment": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "HOME",
+              "PATH",
+              "TMPDIR",
+              "LANG",
+              "LC_ALL",
+              "TZ"
+            ]
           }
         }
       }

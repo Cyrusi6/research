@@ -20,6 +20,7 @@ import yaml
 
 from .code_intake import CodeIntakeResult, build_code_intake
 from .mineru import MinerUError, MinerUPdfClient
+from .phase_receipts import C2C_RAW_OUTPUT_SPECS_ENV
 from .shared_cache import shared_cache_root
 from .utils import deep_merge, ensure_dir, now_utc, read_json, read_yaml, sanitize_filename, sha256_file, write_json, write_yaml
 
@@ -2149,26 +2150,51 @@ class C2CAdapter:
 
     def _candidate_commands(self, train_config: Path, eval_configs: dict[str, Path], gpu_ids: list[int] | None = None) -> dict[str, Any]:
         python_cmd = self.env_python
-        env_prefix = self._offline_env_prefix(gpu_ids=gpu_ids)
-        preflight_env_prefix = self._offline_env_prefix(gpu_ids=[])
+        environment = self._offline_environment(gpu_ids=gpu_ids)
+        preflight_environment = self._offline_environment(gpu_ids=[])
         rel_train = train_config.relative_to(self.repo_root).as_posix()
         preflight = [
-            f"{preflight_env_prefix} {python_cmd} -m py_compile rosetta/model/aligner.py rosetta/model/projector.py rosetta/model/wrapper.py",
+            self._typed_command(
+                [python_cmd, "-m", "py_compile", "rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
+                preflight_environment,
+            ),
         ]
         test_path = self.repo_root / "test" / "test_aligner_span_overlap.py"
         if test_path.exists():
-            preflight.append(f"{preflight_env_prefix} {python_cmd} -m pytest --no-cov test/test_aligner_span_overlap.py")
+            preflight.append(self._typed_command(
+                [python_cmd, "-m", "pytest", "--no-cov", "test/test_aligner_span_overlap.py"],
+                preflight_environment,
+            ))
         train_launcher = self._train_launcher(num_processes=len(gpu_ids or []))
-        train = f"{env_prefix} {train_launcher} script/train/SFT_train.py --config {rel_train}"
+        train_payload = _read_json_fallback(train_config, default={}) or {}
+        train_output_dir = str((train_payload.get("output") or {}).get("output_dir") or "")
+        train_locator = self._safe_relative_output_locator(train_output_dir, suffix="final")
+        train = self._typed_command(
+            [*train_launcher, "script/train/SFT_train.py", "--config", rel_train],
+            environment,
+            raw_output_specs=[{
+                "output_id": f"checkpoint:{sanitize_filename(train_config.stem)}",
+                "kind": "c2c_checkpoint",
+                "schema_version": "auto_research_c2c_checkpoint_manifest_v1",
+                "locator": train_locator,
+                "locator_type": "tree",
+                "dataset_id": None,
+                "role": "checkpoint",
+                "required": True,
+            }],
+        )
         eval_commands = [
-            f"{env_prefix} {python_cmd} script/evaluation/unified_evaluator.py --config {path.relative_to(self.repo_root).as_posix()}"
+            self._typed_command(
+                [python_cmd, "script/evaluation/unified_evaluator.py", "--config", path.relative_to(self.repo_root).as_posix()],
+                environment,
+                raw_output_specs=[self._eval_raw_output_spec(path)],
+            )
             for path in eval_configs.values()
         ]
         return {"preflight": preflight, "train": train, "eval": eval_commands}
 
-    def _offline_env_prefix(self, gpu_ids: list[int] | None = None) -> str:
-        hf_home = str(Path.home() / ".cache" / "huggingface")
-        dataset_cache = str(Path(hf_home) / "datasets")
+    def _offline_environment(self, gpu_ids: list[int] | None = None) -> dict[str, str]:
+        hf_home, dataset_cache = self._huggingface_paths()
         repo_pythonpath = str(self.repo_root.resolve())
         visible_devices = ",".join(str(item) for item in gpu_ids) if gpu_ids is not None else None
         if visible_devices is None:
@@ -2178,23 +2204,109 @@ class C2CAdapter:
             configured_gpu_ids = _coerce_gpu_ids(configured_gpus)
             if configured_gpu_ids:
                 visible_devices = ",".join(str(item) for item in configured_gpu_ids)
-        cuda_prefix = f"CUDA_VISIBLE_DEVICES={visible_devices} " if visible_devices is not None else ""
-        return (
-            f"{cuda_prefix}"
-            "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_DATASETS_OFFLINE=1 "
-            "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True "
-            f"HF_HOME={hf_home} HF_DATASETS_CACHE={dataset_cache} "
-            f"PYTHONPATH={repo_pythonpath}:$PYTHONPATH "
-            "WANDB_DISABLED=true WANDB_MODE=disabled WANDB_START_METHOD=thread WANDB_REQUIRE_SERVICE=false"
-        )
+        inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+        environment = {
+            "HF_HUB_OFFLINE": "1",
+            "TRANSFORMERS_OFFLINE": "1",
+            "HF_DATASETS_OFFLINE": "1",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+            "HF_HOME": hf_home,
+            "HF_DATASETS_CACHE": dataset_cache,
+            "PYTHONPATH": os.pathsep.join(item for item in (repo_pythonpath, inherited_pythonpath) if item),
+            "WANDB_DISABLED": "true",
+            "WANDB_MODE": "disabled",
+            "WANDB_START_METHOD": "thread",
+            "WANDB_REQUIRE_SERVICE": "false",
+        }
+        if visible_devices is not None:
+            environment["CUDA_VISIBLE_DEVICES"] = visible_devices
+        return environment
 
-    def _train_launcher(self, num_processes: int | None = None) -> str:
+    def _huggingface_paths(self) -> tuple[str, str]:
+        hf_home = str(
+            self.c2c_config.get("hf_home")
+            or os.environ.get("HF_HOME")
+            or Path.home() / ".cache" / "huggingface"
+        )
+        dataset_cache = str(
+            self.c2c_config.get("hf_datasets_cache")
+            or os.environ.get("HF_DATASETS_CACHE")
+            or Path(hf_home) / "datasets"
+        )
+        return hf_home, dataset_cache
+
+    @staticmethod
+    def _typed_command(
+        argv: list[str],
+        environment: dict[str, str],
+        *,
+        raw_output_specs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        frozen_environment = dict(sorted(environment.items()))
+        if raw_output_specs:
+            frozen_environment[C2C_RAW_OUTPUT_SPECS_ENV] = json.dumps(
+                raw_output_specs,
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+        return {
+            "argv": list(argv),
+            "environment": frozen_environment,
+            "inherited_environment": ["HOME", "PATH", "TMPDIR"],
+        }
+
+    def _eval_raw_output_spec(self, eval_config_path: Path) -> dict[str, Any]:
+        payload = read_yaml(eval_config_path, default={}) or {}
+        dataset_id = str((payload.get("eval") or {}).get("dataset") or "")
+        if not dataset_id:
+            raise ValueError(f"C2C eval config lacks dataset identity: {eval_config_path}")
+        output_dir = str((payload.get("output") or {}).get("output_dir") or "")
+        locator = self._safe_relative_output_locator(
+            output_dir,
+            suffix=f"Rosetta_{dataset_id}_generate_summary.json",
+        )
+        lowered = output_dir.replace("\\", "/")
+        if "proxy_baseline" in lowered:
+            role = "baseline"
+            kind = "c2c_measurement"
+        elif "activation_smoke_disabled" in lowered:
+            role = "activation_disabled"
+            kind = "c2c_activation_measurement"
+        elif "ablation_disabled" in lowered:
+            role = "ablation"
+            kind = "c2c_ablation_measurement"
+        else:
+            role = "candidate"
+            kind = "c2c_measurement"
+        return {
+            "output_id": f"measurement:{sanitize_filename(role)}:{sanitize_filename(dataset_id)}",
+            "kind": kind,
+            "schema_version": "auto_research_c2c_measurement_raw_v1",
+            "locator": locator,
+            "locator_type": "file",
+            "dataset_id": dataset_id,
+            "role": role,
+            "required": True,
+        }
+
+    @staticmethod
+    def _safe_relative_output_locator(output_dir: str, *, suffix: str) -> str:
+        base = Path(output_dir)
+        if not output_dir or base.is_absolute() or ".." in base.parts:
+            raise ValueError("C2C command output locator must be a safe repository-relative path")
+        locator = (base / suffix).as_posix()
+        if locator.startswith("/") or "/../" in f"/{locator}/":
+            raise ValueError("C2C command output locator escapes the execution repository")
+        return locator
+
+    def _train_launcher(self, num_processes: int | None = None) -> list[str]:
         small_loop = self.c2c_config.get("small_loop", {})
         python_cmd = self.env_python
         num_train_processes = int(num_processes or small_loop.get("num_train_processes") or 1)
         if num_train_processes <= 1:
-            return python_cmd
-        return f"{python_cmd} -m torch.distributed.run --nproc_per_node={num_train_processes}"
+            return [python_cmd]
+        return [python_cmd, "-m", "torch.distributed.run", f"--nproc_per_node={num_train_processes}"]
 
     @staticmethod
     def _frozen_hashes(train_config: Path, eval_configs: dict[str, Path]) -> dict[str, str]:
@@ -2276,7 +2388,8 @@ class C2CAdapter:
         return action
 
     def _check_dataset_cache(self) -> dict[str, Any]:
-        cache_root = Path(os.environ.get("HF_DATASETS_CACHE") or Path.home() / ".cache" / "huggingface" / "datasets")
+        _, dataset_cache = self._huggingface_paths()
+        cache_root = Path(dataset_cache)
         aliases = {
             "mmlu-redux": ["mmlu", "mmlu-redux", "edinburgh-dawg"],
             "ai2-arc": ["ai2", "arc"],

@@ -384,6 +384,26 @@ def _validate_readiness(policy: Mapping[str, Any], payload: Mapping[str, Any]) -
         raise ValueError("full S3 readiness did not pass canonical checks")
 
 
+def derive_readiness_from_receipts(
+    *,
+    required_check_ids: Sequence[str],
+    raw_checks: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Derive readiness solely from frozen check identities and raw command facts."""
+
+    required = list(required_check_ids)
+    if len(required) != len(set(required)) or set(raw_checks) != set(required):
+        raise ValueError("readiness raw checks do not exactly match the frozen check set")
+    checks = []
+    for check_id in required:
+        raw = raw_checks[check_id]
+        status = str(raw.get("status") or "").upper()
+        exit_code = raw.get("exit_code")
+        passed = status == "PASS" and exit_code == 0 and raw.get("ready", True) is not False
+        checks.append({"check_id": check_id, "status": "PASS" if passed else "BLOCKED"})
+    return {"ready": all(item["status"] == "PASS" for item in checks), "checks": checks}
+
+
 def _validate_bootstrap(payload: Mapping[str, Any]) -> None:
     if payload.get("completion_status") != "verified":
         raise ValueError("bootstrap completion is not verified")

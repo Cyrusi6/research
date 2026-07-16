@@ -32,7 +32,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_phase_run_receipt_v3"
+      "const": "auto_research_phase_run_receipt_v4"
     },
     "command_id": {
       "$ref": "#/$defs/safe_id"
@@ -192,6 +192,51 @@
           "lifecycle_generation": {
             "type": "integer",
             "minimum": 0
+          }
+        }
+      }
+    },
+    "raw_outputs": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "output_id",
+          "kind",
+          "schema_version",
+          "content_hash",
+          "contract_ref",
+          "producer_run_id",
+          "phase",
+          "lifecycle_generation",
+          "command_spec_id",
+          "locator",
+          "locator_type",
+          "dataset_id",
+          "role"
+        ],
+        "properties": {
+          "output_id": {"$ref": "#/$defs/safe_id"},
+          "kind": {"type": "string", "pattern": "^[a-z][a-z0-9_]{2,127}$"},
+          "schema_version": {"type": "string", "pattern": "^auto_research_[a-z0-9_]+_v[0-9]+$"},
+          "content_hash": {"$ref": "#/$defs/hash"},
+          "contract_ref": {"$ref": "#/$defs/blob_ref"},
+          "producer_run_id": {"$ref": "#/$defs/safe_id"},
+          "phase": {"enum": ["proxy", "full"]},
+          "lifecycle_generation": {"type": "integer", "minimum": 0},
+          "command_spec_id": {"$ref": "#/$defs/safe_id"},
+          "locator": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096,
+            "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$)).+$"
+          },
+          "locator_type": {"enum": ["file", "tree"]},
+          "dataset_id": {"type": ["string", "null"], "minLength": 1, "maxLength": 256},
+          "role": {
+            "type": ["string", "null"],
+            "enum": [null, "baseline", "candidate", "ablation", "activation_disabled", "checkpoint"]
           }
         }
       }

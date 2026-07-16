@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from auto_research.agents.experiment import (
     ExperimentAgent,
     _c2c_strict_evidence_inventory,
@@ -17,9 +19,9 @@ from auto_research.phase_execution import (
     ResearchLedgerPhaseAuthority,
 )
 from auto_research.research_state import ResearchEventLedger
+from auto_research.s3_validation import S3ValidationError
 from support.authoritative_evidence import (
     record_completed_evidence_command,
-    validate_authoritative_completion,
 )
 from test_m114_authoritative_phase_transactions import _c2c_inputs
 
@@ -41,35 +43,20 @@ def _proxy_comparison(*, baseline_value: float, proxy_value: float, full_value: 
     }
 
 
-def test_proxy_inventory_uses_proxy_command_metrics_not_full_aggregate(tmp_path: Path) -> None:
+def test_real_proxy_inventory_rejects_mutable_proxy_and_full_aggregates_without_receipts(tmp_path: Path) -> None:
     attempt, trial_spec, _, baseline = _c2c_inputs(tmp_path)
-    ledger = ResearchEventLedger(tmp_path)
     comparison = _proxy_comparison(baseline_value=10.0, proxy_value=11.0, full_value=99.0)
 
-    inventory = _c2c_strict_evidence_inventory(
-        project_root=tmp_path,
-        attempt=attempt,
-        trial_spec=trial_spec,
-        comparison_candidate=comparison,
-        baseline=baseline,
-        simulate=False,
-    )
-    completion = _stage_evidence_inventory(
-        project_root=tmp_path,
-        attempt=attempt,
-        trial_spec=trial_spec,
-        inventory=inventory,
-    )
-    record_completed_evidence_command(tmp_path, ledger, attempt, completion)
-    rows = validate_authoritative_completion(
-        tmp_path,
-        ledger,
-        attempt,
-        completion,
-    ).observations
-
-    assert {(row["role"], row["metric_value"]) for row in rows} == {("baseline", 10.0), ("candidate", 11.0)}
-    assert all(row["metric_value"] != 99.0 for row in rows)
+    with pytest.raises(S3ValidationError, match="authoritative command receipts"):
+        _c2c_strict_evidence_inventory(
+            project_root=tmp_path,
+            attempt=attempt,
+            trial_spec=trial_spec,
+            comparison_candidate=comparison,
+            baseline=baseline,
+            simulate=False,
+        )
+    assert not (tmp_path / "experiment" / "staging").exists()
 
 
 def test_full_callbacks_observe_committed_proxy_and_full_phase_started(tmp_path: Path, monkeypatch) -> None:
@@ -82,7 +69,7 @@ def test_full_callbacks_observe_committed_proxy_and_full_phase_started(tmp_path:
         trial_spec=trial_spec,
         comparison_candidate=comparison,
         baseline=baseline,
-        simulate=False,
+        simulate=True,
     )
     completion = _stage_evidence_inventory(
         project_root=tmp_path,

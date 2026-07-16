@@ -10,7 +10,7 @@ import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from ..utils import now_utc
 
@@ -130,10 +130,21 @@ class ExperimentRunner:
         self,
         *,
         name: str,
-        command: str,
+        argv: Sequence[str],
         working_dir: Path,
+        environment: Mapping[str, str] | None = None,
+        inherited_environment: Sequence[str] = ("HOME", "PATH", "TMPDIR"),
         retry_policy: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        frozen_argv = [str(item) for item in argv]
+        if not frozen_argv or any(not item or "\x00" in item for item in frozen_argv):
+            raise ValueError("run_step requires a non-empty typed argv")
+        allowed_environment = {
+            str(key): os.environ[str(key)]
+            for key in inherited_environment
+            if str(key) in os.environ
+        }
+        allowed_environment.update({str(key): str(value) for key, value in dict(environment or {}).items()})
         retry_policy = retry_policy or {}
         max_attempts = max(1, int(retry_policy.get("max_attempts", 1) or 1))
         retryable_exit_codes = {
@@ -149,9 +160,10 @@ class ExperimentRunner:
             timed_out = False
             try:
                 process = subprocess.Popen(
-                    command,
+                    frozen_argv,
                     cwd=working_dir,
-                    shell=True,
+                    shell=False,
+                    env=allowed_environment,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     text=True,
@@ -171,7 +183,9 @@ class ExperimentRunner:
             entry = {
                 "step": name,
                 "attempt": attempt,
-                "command": command,
+                "argv": list(frozen_argv),
+                "environment": dict(sorted((environment or {}).items())),
+                "inherited_environment": sorted(str(item) for item in inherited_environment),
                 "returncode": returncode,
                 "stdout": _output_excerpt(stdout),
                 "stderr": _output_excerpt(stderr),
@@ -193,14 +207,14 @@ class ExperimentRunner:
                 time.sleep(backoff_seconds)
         return {"step": name, "status": status, "attempts": attempts, "returncode": attempts[-1]["returncode"]}
 
-    def run_plan_commands(self, commands: list[str], working_dir: Path, log_path: Path) -> dict[str, Any]:
+    def run_plan_commands(self, commands: list[Sequence[str]], working_dir: Path, log_path: Path) -> dict[str, Any]:
         outputs = []
         for command in commands:
-            step_result = self.run_step(name=f"command_{len(outputs)}", command=command, working_dir=working_dir)
+            step_result = self.run_step(name=f"command_{len(outputs)}", argv=command, working_dir=working_dir)
             last = step_result["attempts"][-1]
             outputs.append(
                 {
-                    "command": command,
+                    "argv": list(command),
                     "returncode": last["returncode"],
                     "stdout": last["stdout"][-2000:],
                     "stderr": last["stderr"][-2000:],

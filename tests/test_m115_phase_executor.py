@@ -115,7 +115,7 @@ def test_executor_rechecks_exact_sqlite_authorization_before_and_after_runner(tm
 def test_executor_kind_must_match_authorized_adapter(tmp_path: Path) -> None:
     context = _context(tmp_path)
     plan = {
-        "schema_version": "auto_research_phase_command_plan_v1",
+        "schema_version": "auto_research_phase_command_plan_v2",
         "plan_id": "c2c-phase-adapter:proxy:commands",
         "phase": "proxy",
         "adapter_identity": {"adapter_id": "c2c-phase-adapter", "adapter_version": "1", "provenance_mode": "production"},
@@ -127,6 +127,8 @@ def test_executor_kind_must_match_authorized_adapter(tmp_path: Path) -> None:
             "ordinal": 0,
             "dependencies": [],
             "argv": ["true"],
+            "environment": {},
+            "inherited_environment": ["HOME", "PATH", "TMPDIR"],
             "cwd": str(tmp_path),
             "source_snapshot_hash": context.implementation_hash,
             "expected_outputs": [{"kind": "proxy_results", "schema_version": "auto_research_proxy_results_v1", "required": True}],
@@ -136,7 +138,7 @@ def test_executor_kind_must_match_authorized_adapter(tmp_path: Path) -> None:
             "condition": {"kind": "always", "predicate_hash": None},
         }],
     }
-    plan_hash = ContractStore(tmp_path).put_json(plan, schema_file="phase_command_plan_v1.schema.json")["digest"]
+    plan_hash = ContractStore(tmp_path).put_json(plan, schema_file="phase_command_plan_v2.schema.json")["digest"]
     authorization = replace(_authorization(), command_plan_hash=plan_hash)
     context = replace(context, command_plan_hash=plan_hash, authorization_hash=authorization.authorization_hash)
     calls: list[str] = []
@@ -292,7 +294,11 @@ def test_experiment_side_effect_without_ledger_context_is_fail_closed(tmp_path: 
 
     agent.runner = Runner()
     with pytest.raises(IntegrityError, match="authoritative phase context"):
-        agent._run_authoritative_step(name="full-train", command="true", cwd=tmp_path)
+        agent._run_authoritative_step(
+            name="full-train",
+            command={"argv": ["true"], "cwd": str(tmp_path)},
+            cwd=tmp_path,
+        )
     assert calls == []
 
 

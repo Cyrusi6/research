@@ -57,7 +57,7 @@ def test_plan_contract_refs_are_immutable_and_reservation_rebuilds(tmp_path: Pat
     assert "artifact_path" not in trial_spec["sample_manifest"]
     assert "artifact_path" not in trial_spec["execution_contract"]["evaluator_provenance"]
     store = ContractStore(tmp_path)
-    assert store.read_contract(sample_ref, contract_kind="sample_manifest", schema_file="sample_manifest_v3.schema.json") == trial_spec["sample_manifest"]
+    assert store.read_contract(sample_ref, contract_kind="sample_manifest", schema_file="sample_manifest_v4.schema.json") == trial_spec["sample_manifest"]
     assert store.read_contract(evaluator_ref, contract_kind="evaluator_manifest", schema_file="evaluator_manifest_v2.schema.json") == trial_spec["execution_contract"]["evaluator_provenance"]
 
     attempt = _reserve(ledger, direction, variant, trial_spec)
@@ -119,7 +119,7 @@ def test_trial_spec_contract_ref_cannot_point_to_different_valid_manifest(tmp_pa
     modified_ref = ContractStore(tmp_path).put_contract(
         modified,
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v3.schema.json",
+        schema_file="sample_manifest_v4.schema.json",
     )
     trial_spec["sample_manifest_ref"] = modified_ref
     before = ledger.state()

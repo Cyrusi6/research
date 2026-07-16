@@ -20,7 +20,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_evidence_manifest_v4"
+      "const": "auto_research_evidence_manifest_v5"
     },
     "attempt_id": {
       "type": "string",
@@ -93,7 +93,9 @@
           "receipt_ref",
           "receipt_hash",
           "output_ref",
-          "completed_event_id"
+          "completed_event_id",
+          "derivation_ref",
+          "derivation_hash"
         ],
         "properties": {
           "evidence_id": {
@@ -227,42 +229,11 @@
             "type": "string",
             "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
           },
-          "derivation": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "type": "object",
-                "additionalProperties": false,
-                "required": [
-                  "decoder_id",
-                  "decoder_version",
-                  "decoder_hash",
-                  "source_output_hashes"
-                ],
-                "properties": {
-                  "decoder_id": {
-                    "$ref": "#/$defs/safe_id"
-                  },
-                  "decoder_version": {
-                    "type": "string",
-                    "minLength": 1
-                  },
-                  "decoder_hash": {
-                    "$ref": "#/$defs/hash"
-                  },
-                  "source_output_hashes": {
-                    "type": "array",
-                    "minItems": 1,
-                    "uniqueItems": true,
-                    "items": {
-                      "$ref": "#/$defs/hash"
-                    }
-                  }
-                }
-              }
-            ]
+          "derivation_ref": {
+            "$ref": "#/$defs/blob"
+          },
+          "derivation_hash": {
+            "$ref": "#/$defs/hash"
           }
         }
       }

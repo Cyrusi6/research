@@ -121,6 +121,27 @@ def test_stage_contract_switches_c2c_s3_outputs_for_bootstrap(tmp_path: Path) ->
 
     s3 = StageContractManager(paths.root).stage_started("S3_experiment", iteration=1, config=config)
 
-    assert "experiment/results/bootstrap_proxy_completion.json" in s3["required_outputs"]
+    assert "meta/research_events.sqlite3" in s3["required_outputs"]
+    assert "meta/research_state.json" in s3["required_outputs"]
+    assert "meta/route_outcome.json" in s3["required_outputs"]
+    assert "experiment/results/trial_result.json" in s3["required_outputs"]
+    assert "experiment/results/bootstrap_proxy_completion.json" in s3["optional_outputs"]
+    assert "experiment/results/bootstrap_proxy_completion.json" not in s3["required_outputs"]
     assert "experiment/results/c2c_full_s3_worthiness.json" not in s3["required_outputs"]
     assert "experiment/results/c2c_full_s3_decision.json" not in s3["required_outputs"]
+
+
+def test_stage_contract_uses_authoritative_trial_projection_for_writing(tmp_path: Path) -> None:
+    config = {"project": {"workspace_root": str(tmp_path)}, "review": {"max_iterations": 1}}
+    paths = init_workspace(config, "topic", project_id="proj_s4_authority", simulate=True)
+
+    s4 = StageContractManager(paths.root).stage_started("S4_writing", iteration=1, config=config)
+
+    assert set(s4["required_inputs"]) == {
+        "literature/survey.md",
+        "meta/research_state.json",
+        "experiment/results/trial_result.json",
+    }
+    assert "experiment/results/main_results.json" in s4["optional_inputs"]
+    assert "experiment/results/ablation_results.json" in s4["optional_inputs"]
+    assert "experiment/results/hypothesis_verification.md" in s4["optional_inputs"]

@@ -63,7 +63,7 @@ def _real_plan(project_root: Path) -> dict:
     plan["execution"] = {
         "mode": "real",
         "collector": "external_manifest",
-        "commands": ["true"],
+        "commands": [{"argv": ["true"]}],
         "workdir": str(project_root),
         "phase_manifest_path": "runner/phase_manifest.json",
         "evaluator_id": "fixture-evaluator",
@@ -217,7 +217,7 @@ def test_real_generic_trial_spec_uses_readable_content_addressed_contracts(tmp_p
     sample_manifest = store.read_contract(
         trial_spec["sample_manifest_ref"],
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v3.schema.json",
+        schema_file="sample_manifest_v4.schema.json",
     )
     evaluator_manifest = store.read_contract(
         trial_spec["execution_contract"]["evaluator_manifest_ref"],
@@ -228,7 +228,7 @@ def test_real_generic_trial_spec_uses_readable_content_addressed_contracts(tmp_p
     assert sample_manifest["provenance_mode"] == "real"
     assert evaluator_manifest["provenance_mode"] == "real"
     assert store.read_bytes(evaluator_manifest["source_blobs"][0]) == (tmp_path / "evaluator.py").read_bytes()
-    assert all((tmp_path / ref["relative_path"]).is_file() for ref in sample_manifest["datasets"][0]["source_blobs"])
+    assert all((tmp_path / ref["relative_path"]).is_file() for ref in sample_manifest["datasets"][0]["raw_sample_refs"])
 
 
 def test_only_explicit_inventory_is_staged_even_when_legacy_fixed_path_exists(tmp_path: Path) -> None:

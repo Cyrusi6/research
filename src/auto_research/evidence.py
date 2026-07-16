@@ -16,7 +16,7 @@ from typing import Any, Mapping
 from jsonschema import Draft202012Validator
 
 EXECUTION_OBSERVATION_SCHEMA_VERSION = "auto_research_execution_observation_v4"
-EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v4"
+EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v5"
 COMPLETION_EVIDENCE_SCHEMA_VERSION = "auto_research_completion_evidence_v3"
 QUANTITATIVE_EVIDENCE_SCHEMA_VERSIONS = {
     "main_results": "auto_research_main_results_v3",
@@ -35,7 +35,7 @@ EVIDENCE_SCHEMA_VERSIONS = {
 }
 
 TRANSACTION_EVIDENCE_SCHEMA_VERSIONS = {
-    "failure_evidence": "auto_research_failure_evidence_v5",
+    "failure_evidence": "auto_research_failure_evidence_v6",
     "resource_probe": "auto_research_resource_probe_evidence_v4",
     "resume_evidence": "auto_research_resume_evidence_v5",
 }
@@ -187,7 +187,7 @@ def decode_evidence_inventory(
     that were content-addressed; this function never reopens an artifact path.
     """
 
-    _validate_schema(manifest, "evidence_manifest_v4.schema.json")
+    _validate_schema(manifest, "evidence_manifest_v5.schema.json")
     _validate_manifest_identity(attempt, trial_spec, manifest)
     entries = manifest["entries"]
     entry_ids = [entry["evidence_id"] for entry in entries]

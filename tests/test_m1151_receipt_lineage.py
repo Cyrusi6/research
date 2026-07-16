@@ -24,7 +24,7 @@ def _passing_proxy_completion(project_root: Path) -> tuple[ResearchEventLedger, 
         trial_spec=trial_spec,
         comparison_candidate=comparison,
         baseline=baseline,
-        simulate=False,
+        simulate=True,
     )
     completion = stage_authoritative_completion(
         project_root,
@@ -66,7 +66,7 @@ def test_proxy_evidence_without_completed_command_receipt_lineage_is_zero_write_
         baseline_attempt,
         baseline_completion,
     )
-    assert validated.manifest["schema_version"] == "auto_research_evidence_manifest_v4"
+    assert validated.manifest["schema_version"] == "auto_research_evidence_manifest_v5"
     assert len(validated.lineage) == len(baseline_completion["entries"])
     assert all(item.receipt_hash and item.completed_event_id for item in validated.lineage.values())
 

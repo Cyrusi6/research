@@ -22,21 +22,21 @@ from .phase_command_plan import phase_command_plan_for_phase, validate_phase_com
 
 DIRECTION_SCHEMA_VERSION = "auto_research_direction_v3"
 VARIANT_SCHEMA_VERSION = "auto_research_variant_v4"
-EVENT_SCHEMA_VERSION = "auto_research_event_v7"
-ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v7"
-RESEARCH_STATE_SCHEMA_VERSION = "auto_research_state_v7"
-TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v6"
+EVENT_SCHEMA_VERSION = "auto_research_event_v8"
+ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v8"
+RESEARCH_STATE_SCHEMA_VERSION = "auto_research_state_v8"
+TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v7"
 TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v5"
 ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v4"
 CONSTRAINT_RESULT_SCHEMA_VERSION = "auto_research_constraint_result_v2"
 DIRECTION_AGGREGATE_SCHEMA_VERSION = "auto_research_direction_outcome_aggregate_v1"
 PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION = "auto_research_phase_execution_manifest_v3"
-PHASE_COMMAND_SCHEMA_VERSION = "auto_research_phase_command_v2"
-PHASE_RUN_RECEIPT_SCHEMA_VERSION = "auto_research_phase_run_receipt_v3"
-AUTHORITATIVE_EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v4"
-SAMPLE_MANIFEST_SCHEMA_VERSION = "auto_research_sample_manifest_v3"
+PHASE_COMMAND_SCHEMA_VERSION = "auto_research_phase_command_v3"
+PHASE_RUN_RECEIPT_SCHEMA_VERSION = "auto_research_phase_run_receipt_v4"
+AUTHORITATIVE_EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v5"
+SAMPLE_MANIFEST_SCHEMA_VERSION = "auto_research_sample_manifest_v4"
 COMPLETION_EVIDENCE_SCHEMA_VERSION = "auto_research_completion_evidence_v3"
-FAILURE_EVIDENCE_SCHEMA_VERSION = "auto_research_failure_evidence_v5"
+FAILURE_EVIDENCE_SCHEMA_VERSION = "auto_research_failure_evidence_v6"
 RESUME_EVIDENCE_SCHEMA_VERSION = "auto_research_resume_evidence_v5"
 RESOURCE_PROBE_SCHEMA_VERSION = "auto_research_resource_probe_evidence_v4"
 
@@ -216,7 +216,7 @@ def validate_variant_identity(direction: dict[str, Any], spec: dict[str, Any], *
 
 
 def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
-    validate_contract(trial_spec, "trial_spec_v6.schema.json")
+    validate_contract(trial_spec, "trial_spec_v7.schema.json")
     datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
     manifest_datasets = {item["dataset_id"] for item in trial_spec["sample_manifest"]["datasets"]}
     if datasets != manifest_datasets:
@@ -232,6 +232,8 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
             raise ValueError("sample_count must equal ordered sample identity count")
         if len(set(provenance["ordered_sample_ids"])) != len(provenance["ordered_sample_ids"]):
             raise ValueError("ordered sample identities must be unique")
+        if [item["digest"] for item in provenance["raw_sample_refs"]] != provenance["ordered_sample_ids"]:
+            raise ValueError("ordered sample identities must be recomputed from raw sample refs")
         if dataset["sample_hash"] != provenance["content_digest"]:
             raise ValueError("sample content provenance hash mismatch")
     if trial_spec["sample_manifest_ref"]["contract_kind"] != "sample_manifest":
@@ -357,7 +359,7 @@ def validate_execution_observation(observation: dict[str, Any]) -> None:
 
 
 def validate_evidence_manifest(manifest: dict[str, Any], *, trial_spec: dict[str, Any]) -> None:
-    validate_contract(manifest, "evidence_manifest_v4.schema.json")
+    validate_contract(manifest, "evidence_manifest_v5.schema.json")
     expected_hash = trial_spec_hash(trial_spec)
     if manifest["trial_spec_hash"] != expected_hash:
         raise ValueError("evidence manifest TrialSpec hash mismatch")

@@ -16,7 +16,7 @@ from jsonschema import Draft202012Validator
 
 CONTRACT_BLOB_SCHEMA_VERSION = "auto_research_contract_blob_v1"
 CONTRACT_REF_SCHEMA_VERSION = "auto_research_contract_ref_v1"
-SAMPLE_MANIFEST_SCHEMA_VERSION = "auto_research_sample_manifest_v3"
+SAMPLE_MANIFEST_SCHEMA_VERSION = "auto_research_sample_manifest_v4"
 EVALUATOR_MANIFEST_SCHEMA_VERSION = "auto_research_evaluator_manifest_v2"
 CONTRACT_STORE_ROOT = PurePosixPath("meta/contracts/sha256")
 
@@ -53,9 +53,9 @@ def _schema_validator(schema_file: str) -> Draft202012Validator:
 
 
 def validate_sample_manifest(payload: Mapping[str, Any], *, store: ContractStore | None = None) -> None:
-    validate_schema(payload, "sample_manifest_v3.schema.json")
+    validate_schema(payload, "sample_manifest_v4.schema.json")
     if store is not None:
-        store._validate_known_contract(payload, "sample_manifest_v3.schema.json")
+        store._validate_known_contract(payload, "sample_manifest_v4.schema.json")
 
 
 def validate_evaluator_manifest(payload: Mapping[str, Any], *, store: ContractStore | None = None) -> None:
@@ -245,7 +245,7 @@ class ContractStore:
         return digest.hexdigest()
 
     def _validate_known_contract(self, payload: Mapping[str, Any], schema_file: str) -> None:
-        if schema_file == "sample_manifest_v3.schema.json":
+        if schema_file == "sample_manifest_v4.schema.json":
             dataset_ids: set[str] = set()
             for dataset in payload["datasets"]:
                 if dataset["dataset_id"] in dataset_ids:
@@ -255,7 +255,9 @@ class ContractStore:
                     raise ValueError("sample_count does not match ordered_sample_ids")
                 if len(set(dataset["ordered_sample_ids"])) != len(dataset["ordered_sample_ids"]):
                     raise ValueError("sample manifest contains duplicate ordered sample identity")
-                actual = self.digest_referenced_bytes(dataset["source_blobs"])
+                if [item["digest"] for item in dataset["raw_sample_refs"]] != dataset["ordered_sample_ids"]:
+                    raise ValueError("ordered sample identities do not match raw sample refs")
+                actual = self.digest_referenced_bytes(dataset["raw_sample_refs"])
                 if actual != dataset["content_digest"]:
                     raise ValueError("sample content_digest does not prove source blob bytes")
         elif schema_file == "evaluator_manifest_v2.schema.json":
@@ -268,7 +270,7 @@ class ContractStore:
                 raise ValueError("evaluator dependency_digest does not prove dependency blob bytes")
             if config_digest != payload["config_digest"]:
                 raise ValueError("evaluator config_digest does not prove config blob bytes")
-        elif schema_file == "phase_run_receipt_v3.schema.json":
+        elif schema_file == "phase_run_receipt_v4.schema.json":
             for output in payload["outputs"]:
                 reference = output["contract_ref"]
                 self.verify(reference)

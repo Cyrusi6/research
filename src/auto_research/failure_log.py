@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 from typing import Any
 
+from .research_state import ResearchEventLedger
 from .utils import now_utc
 
 C2C_FAILED_DECISIONS = {None, "not_viable", "failed_no_metrics", "partial", "blocked", "patch_rejected", "proxy_rejected", "proxy_repairable"}
@@ -306,8 +307,11 @@ def load_c2c_feedback_bundle(project_root: Path, *, view: str = "all") -> dict[s
         project_root / "plan" / "performance_feedback.json",
         project_root / "experiment" / "results" / "proxy_calibration.json",
         project_root / "experiment" / "results" / "failure_feedback.json",
-        project_root / "experiment" / "results" / "main_results.json",
     ]
+    ledger_path = project_root / "meta" / "research_events.sqlite3"
+    if ledger_path.exists():
+        sources.append(_relative_path(project_root, ledger_path))
+        entries.extend(_authoritative_feedback_entries(ResearchEventLedger(project_root).state()))
     feedback_dir = project_root / "literature" / "feedback"
     if feedback_dir.exists():
         feedback_sources.extend(sorted(feedback_dir.glob("failed_ideas_round_*.json")))
@@ -338,6 +342,129 @@ def load_c2c_feedback_bundle(project_root: Path, *, view: str = "all") -> dict[s
             entries.extend(shared_entries)
 
     return build_c2c_feedback_bundle(entries, project_id=project_root.name, traces=traces, sources=sources, view=view)
+
+
+def _authoritative_feedback_entries(state: dict[str, Any]) -> list[dict[str, Any]]:
+    attempts = state.get("attempts") if isinstance(state.get("attempts"), dict) else {}
+    entries: list[dict[str, Any]] = []
+    for attempt_id, trial in sorted((state.get("trial_results") or {}).items()):
+        if not isinstance(trial, dict) or trial.get("outcome_classification") != "rejected":
+            continue
+        attempt = attempts.get(attempt_id) if isinstance(attempts, dict) else {}
+        entries.append(_trial_feedback_entry(attempt if isinstance(attempt, dict) else {}, trial))
+    for attempt_id, outcome in sorted((state.get("proxy_outcomes") or {}).items()):
+        if not isinstance(outcome, dict) or outcome.get("decision") != "PROPOSE_NEXT_VARIANT":
+            continue
+        attempt = attempts.get(attempt_id) if isinstance(attempts, dict) else {}
+        entries.append(_proxy_feedback_entry(attempt if isinstance(attempt, dict) else {}, outcome))
+    seen_failure_events: set[str] = set()
+    for operation in (state.get("operation_events") or {}).values():
+        if not isinstance(operation, dict):
+            continue
+        event_id = str(operation.get("event_id") or "")
+        if event_id in seen_failure_events:
+            continue
+        payload = operation.get("payload") if isinstance(operation.get("payload"), dict) else {}
+        evidence = payload.get("failure_evidence") if isinstance(payload.get("failure_evidence"), dict) else {}
+        if not evidence or evidence.get("failure_class") in {"resource_pause", "oom_retry"}:
+            continue
+        attempt = attempts.get(evidence.get("attempt_id")) if isinstance(attempts, dict) else {}
+        entries.append(_failure_feedback_entry(attempt if isinstance(attempt, dict) else {}, evidence, event_id))
+        seen_failure_events.add(event_id)
+    return entries
+
+
+def _trial_feedback_entry(attempt: dict[str, Any], trial: dict[str, Any]) -> dict[str, Any]:
+    summary = trial.get("primary_metric_summary") if isinstance(trial.get("primary_metric_summary"), dict) else {}
+    metric_id = str(summary.get("metric_id") or "primary_metric")
+    observations = [
+        item
+        for item in trial.get("observations") or []
+        if isinstance(item, dict) and item.get("metric_id") == metric_id and item.get("role") in {"baseline", "candidate"}
+    ]
+    role_datasets: dict[str, dict[str, list[float]]] = {"baseline": {}, "candidate": {}}
+    for observation in observations:
+        role = str(observation["role"])
+        dataset = str(observation.get("dataset_id") or "")
+        if dataset:
+            role_datasets[role].setdefault(dataset, []).append(float(observation["metric_value"]))
+    baseline_datasets = {key: sum(values) / len(values) for key, values in role_datasets["baseline"].items() if values}
+    candidate_datasets = {key: sum(values) / len(values) for key, values in role_datasets["candidate"].items() if values}
+    improvements = summary.get("paired_improvements") if isinstance(summary.get("paired_improvements"), dict) else {}
+    dataset_regressions: dict[str, float] = {}
+    for pair_id, value in improvements.items():
+        dataset = str(pair_id).rsplit(":", 1)[0]
+        regression = max(0.0, -float(value))
+        if regression:
+            dataset_regressions[dataset] = max(dataset_regressions.get(dataset, 0.0), regression)
+    return {
+        "kind": "authoritative_trial_feedback",
+        "source": "research_event_ledger",
+        "attempt_id": trial.get("attempt_id"),
+        "idea_id": trial.get("variant_id") or attempt.get("variant_id"),
+        "title": trial.get("variant_id") or attempt.get("variant_id"),
+        "decision": "not_viable",
+        "failure_mode": "method_rejected",
+        "reason": "verified TrialResult failed one or more preregistered acceptance constraints",
+        "metrics": {
+            "mean": summary.get("candidate_mean"),
+            "datasets": candidate_datasets,
+        },
+        "baseline_metrics": {
+            "mean": summary.get("baseline_mean"),
+            "datasets": baseline_datasets,
+        },
+        "dataset_regressions": dataset_regressions,
+        "acceptance": {
+            "passed": False,
+            "delta": summary.get("delta"),
+            "all_hard_constraints_passed": trial.get("all_hard_constraints_passed"),
+            "constraint_results": trial.get("constraint_results") or [],
+        },
+    }
+
+
+def _proxy_feedback_entry(attempt: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
+    deltas = {str(key): float(value) for key, value in (outcome.get("dataset_deltas") or {}).items()}
+    regressions = {key: max(0.0, -value) for key, value in deltas.items() if value < 0}
+    return {
+        "kind": "authoritative_proxy_feedback",
+        "source": "research_event_ledger",
+        "attempt_id": outcome.get("attempt_id"),
+        "idea_id": attempt.get("variant_id"),
+        "title": attempt.get("variant_id"),
+        "decision": "proxy_rejected",
+        "failure_mode": "proxy_rejected",
+        "reason": ", ".join(str(item) for item in outcome.get("reason_codes") or []),
+        "proxy_screen": {
+            "status": "rejected",
+            "proxy_delta_vs_baseline": outcome.get("observed_delta"),
+            "proxy_dataset_deltas": deltas,
+            "proxy_dataset_regressions": regressions,
+            "proxy_worst_dataset_regression": outcome.get("worst_dataset_regression"),
+        },
+        "dataset_regressions": regressions,
+        "proxy_outcome_hash": outcome.get("evidence_set_hash"),
+    }
+
+
+def _failure_feedback_entry(attempt: dict[str, Any], evidence: dict[str, Any], event_id: str) -> dict[str, Any]:
+    failure_class = str(evidence.get("failure_class") or "integrity_failure")
+    return {
+        "kind": "authoritative_attempt_failure_feedback",
+        "source": "research_event_ledger",
+        "source_event_id": event_id,
+        "attempt_id": evidence.get("attempt_id"),
+        "idea_id": attempt.get("variant_id"),
+        "title": attempt.get("variant_id"),
+        "decision": "proxy_repairable" if failure_class in {"implementation_failure", "activation_failure"} else "blocked",
+        "failure_mode": failure_class,
+        "reason": evidence.get("reason") or failure_class,
+        "failure_class": failure_class,
+        "source_phase": evidence.get("source_phase"),
+        "evidence_id": evidence.get("evidence_id"),
+        "receipt_hash": evidence.get("receipt_hash"),
+    }
 
 
 def is_retryable_c2c_candidate(candidate: dict[str, Any] | None) -> bool:

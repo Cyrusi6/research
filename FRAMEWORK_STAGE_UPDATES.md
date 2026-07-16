@@ -3034,3 +3034,66 @@ Native Unified S1 Producer/Core has not started. Real external Codex S1 smoke an
 ### Breaking Schema Removal
 
 The current runtime accepts only Event/AttemptRecord/ResearchState v7, TrialSpec v6, PhaseExecutionManifest v3, PhaseCommand v2, PhaseRunReceipt v3, EvidenceManifest v4, SampleManifest v3, CompletionEvidence v3, FailureEvidence/ResumeEvidence v5, and ResourceProbe v4. Replaced v6/v5/v4/v3 authority schemas and readers are deleted rather than dual-read or migrated. Older workspaces must restart from S1.
+
+## 2026-07-16 M1.1.5.2 Raw Execution Provenance and Recovery Closure
+
+M1.1.5.2 supersedes the v7/v6 production-authority checkpoint without redesigning the established SQLite phase state machine. It closes the remaining gap between an authorized physical command and the scientific evidence that can affect TrialResult, budget, RouteOutcome, or Direction aggregate. Native Unified S1 is outside this stage.
+
+### Current Breaking Contracts
+
+- Event v8, AttemptRecord v8, and ResearchState v8 are the only state/event authority. TrialSpec v7 freezes the scientific, execution, resource, and command contracts used after reservation.
+- PhaseExecutionManifest v3 remains current. PhaseCommandPlan v2 freezes exact typed invocation data; PhaseCommand v3 binds the selected plan entry; PhaseRunReceipt v4 records immutable logs plus physical raw outputs.
+- EvidenceManifest v5 consumes only normalized evidence linked through EvidenceDerivationManifest v1. SampleManifest v4 proves selected real sample bytes. FailureEvidence v6 is receipt-derived; CoreResourceProbeReceipt v2 is produced only by the constrained resource authority. C2CCheckpointManifest v1 records content-addressed checkpoint outputs.
+- CompletionEvidence v3, ResumeEvidence v5, ResourceProbe v4, TrialResult v5, and RouteOutcome v4 did not require shape changes. Replaced Event/Attempt/State v7, TrialSpec v6, PhaseCommandPlan v1, PhaseCommand v2, PhaseRunReceipt v3, EvidenceManifest v4, SampleManifest v3, FailureEvidence v5, and their runtime readers are removed with no dual read, fallback, or automatic migration.
+
+### Typed Physical Command Execution
+
+- A command plan freezes `argv[]`, `cwd`, environment overrides, the inherited-environment allowlist, source snapshot, ordinal/dependencies, deterministic condition, exact expected raw outputs, and retry/resource/resume policy.
+- The runner executes `subprocess.Popen(argv, shell=False, env=...)`. Shell display strings are diagnostic only; no argv-to-shell-string round trip can change the frozen invocation.
+- C2C, Generic external, bootstrap, and synthetic paths continue through their explicit PhaseExecutor. Every physical side effect rereads the current SQLite phase authorization and exact command-plan membership before execution.
+
+### Raw Receipt and Derivation Chain
+
+```text
+PhaseCommandStarted
+-> typed local/external subprocess
+-> immutable stdout/stderr and physical raw output ContractRefs
+-> PhaseRunReceipt v4
+-> PhaseCommandCompleted
+-> EvidenceDerivationManifest v1
+-> normalized evidence ContractRefs
+-> EvidenceManifest v5
+-> proxy classifier or TrialResult finalization
+```
+
+- Each raw output carries command, Attempt, generation, phase execution, producer, sample, evaluator, and scientific role identity. Missing expected output, altered bytes, stale generation, cross-Attempt receipt, or unregistered evidence fails before authoritative scientific commit.
+- The derivation manifest binds source command IDs, receipt and raw-output hashes, decoder identity/source hash, frozen sample/evaluator/protocol hashes, and normalized output hashes. Reducer, rebuild, and Gate validate the same immutable lineage.
+- Mutable comparison candidates, run-state summaries, fixed result directories, caller-authored observations, and caller-authored activation/readiness conclusions are not scientific fact sources.
+- Real SampleManifest v4 derives ordered sample IDs and aggregate digests from the actual selected sample bytes. Synthetic sample provenance remains explicitly separate and cannot satisfy real execution contracts.
+
+### Resource Authority
+
+- Failure routing derives command status, exit code, and log identity from the committed current-phase receipt. A caller-supplied command-result object cannot independently authorize repair or failure classification.
+- Resource pause uses a constrained Core measurement or authorized probe result bound to the current Attempt/resource contract. `insufficient` capacity atomically records `PAUSE_RESOURCE`, preserves a recoverable reservation, and consumes no method outcome.
+- Resume requires a new authoritative `available` measurement for the same resource and pause event. Hand-authored CAS blobs, cross-Attempt probes, or mismatched resource identity cannot resume an Attempt.
+- CPU-only or PATH-without-`nvidia-smi` execution therefore produces a recoverable `RESOURCE_PAUSED` Attempt rather than quarantine, an exception, or permanent `PROXY_RUNNING`.
+
+### Seven-Point Crash Matrix
+
+| Crash boundary | Deterministic recovery |
+|---|---|
+| Started committed, trustworthy receipt absent | Record an explicit unknown/integrity control outcome; do not silently repeat the side effect |
+| Durable receipt and raw outputs exist, Completed absent | Verify the frozen locator and submit Completed without rerunning |
+| Completed committed, proxy/full evidence absent | Rebuild inventory and derivation from receipt raw outputs |
+| ProxyEvidenceCommitted, FullPhaseStarted absent | Reuse the committed `RUN_FULL` route and start full exactly once |
+| FullPhaseStarted, first full command not started | Resume the frozen full DAG without rerunning proxy |
+| Full commands completed, AttemptFinalized absent | Reuse immutable receipts/derivations and finalize once |
+| AttemptFinalized committed, caller did not receive route | Return the historical TrialResult, RouteOutcome, aggregate, and budget without duplicate-method validation or new events |
+
+The canonical black-box cases are `tests/test_m1152_production_recovery_e2e.py::test_crash_after_started_before_receipt_blocks_without_rerun`, `::test_crash_after_durable_receipt_before_completed_reconciles_once`, `::test_crash_after_completed_before_evidence_commit_reuses_receipt`, `::test_crash_after_proxy_commit_before_full_start_reuses_proxy`, `::test_crash_after_full_started_before_first_command_runs_full_once`, `::test_crash_after_full_commands_before_finalization_reuses_all_receipts`, and `::test_crash_after_finalization_before_route_delivery_returns_history`.
+
+### Acceptance Boundary
+
+- The normal, proxy-cleared, empty-HOME/empty-HF-cache/PATH-without-Codex, and CPU-only/PATH-without-`nvidia-smi` complete suites each report `705 passed, 2 skipped, 0 failed`. No skip or xfail was added; the two skips remain the existing optional torch/transformers checks.
+- Non-simulated production-component tests run real local subprocesses with frozen argv/env/cwd and verify Receipt/CAS, derivation, Ledger/rebuild, Gate, proxy/full ordering, bootstrap isolation, five-variant budget `5/0/5`, and sixth-attempt rejection. They validate production component wiring, not actual GPU research or scientific success.
+- Synthetic Generic/C2C tests remain deterministic state/evidence/budget checks only. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training have not started.

@@ -5,6 +5,7 @@ import subprocess
 import sys
 import time
 import zipfile
+from copy import deepcopy
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,7 +22,11 @@ import auto_research.orchestrator as orchestrator_module
 from auto_research.adapters.runner import ExperimentRunner
 from auto_research.agents.debate import MultiAgentReasoningService
 from auto_research.agents.experiment import ExperimentAgent
-from auto_research.agents.experiment import _c2c_strict_evidence_inventory, _stage_evidence_inventory
+from auto_research.agents.experiment import (
+    _c2c_strict_evidence_inventory,
+    _current_authoritative_phase_command_receipts,
+    _stage_evidence_inventory,
+)
 from auto_research.agents.intake import IntakeAgent, _c2c_evidence_brief, _c2c_static_bundle_validity
 from auto_research.agents.plan import PlanAgent, _trial_spec_from_plan
 from auto_research.agents.base import AgentContext
@@ -55,13 +60,16 @@ from auto_research.utils import sha256_file, write_json, write_yaml
 from auto_research.workspace import init_workspace
 from auto_research.cli import _run_c2c_command, _smoke_c2c_command
 from auto_research.command_journal import CommandExecutionResult, LedgerCommandJournal
+from auto_research.contract_store import ContractStore
 from auto_research.phase_execution import (
     C2CFullPhaseExecutor,
     C2CProxyPhaseExecutor,
     PhaseArtifactInventory,
     ResearchLedgerPhaseAuthority,
 )
+from auto_research.phase_receipts import C2C_RAW_OUTPUT_SPECS_ENV
 from auto_research.research_state import IntegrityError, ResearchEventLedger
+from auto_research.s3_validation import S3ValidationError
 from support.authoritative_evidence import build_trial_spec_v5, record_completed_evidence_command, start_attempt_phase
 from test_m113_ledger_closure import _direction as _state_direction
 from test_m113_ledger_closure import _trial_spec_legacy as _state_trial_spec_legacy
@@ -153,6 +161,31 @@ def _authorize_c2c_phase(
         ledger.select_direction(direction)
         ledger.plan_variant(variant)
         trial_spec = _state_trial_spec_legacy()
+        configured_datasets = list(
+            ((agent.context.config.get("c2c", {}).get("small_loop", {}) or {}).get("eval_datasets") or [])
+            or (agent.context.config.get("c2c", {}).get("datasets") or [])
+            or ["fake"]
+        )
+        trial_spec["sample_manifest"]["datasets"] = [
+            {
+                "dataset_id": dataset_id,
+                "source_revision": "c2c-fixture-v1",
+                "split": "test",
+                "sample_count": 1,
+                "ordered_sample_ids": [canonical_hash({"dataset": dataset_id, "sample": 0})],
+                "content_hash": canonical_hash({"dataset": dataset_id, "content": 0}),
+            }
+            for dataset_id in configured_datasets
+        ]
+        trial_spec["datasets"] = [
+            {
+                "dataset_id": dataset_id,
+                "split": "test",
+                "sample_count": 1,
+                "sample_hash": canonical_hash({"dataset": dataset_id, "content": 0}),
+            }
+            for dataset_id in configured_datasets
+        ]
         trial_spec["protocol"]["required_phases"] = ["proxy"] if profile == "bootstrap" else ["proxy", "full"]
         trial_spec["protocol"]["terminal_phases"] = ["proxy"] if profile == "bootstrap" else ["full"]
         trial_spec["protocol"]["proxy_terminal_allowed"] = profile == "bootstrap"
@@ -183,11 +216,13 @@ def _authorize_c2c_phase(
         attempt = start_attempt_phase(ledger, attempt, "proxy")
         trial_spec = attempt["frozen_trial_spec"]
         proxy_policy = trial_spec["proxy_decision_policy"]
+        fixture_values = {dataset_id: 1.0 for dataset_id in configured_datasets}
+        fixture_baseline = {dataset_id: 0.0 for dataset_id in configured_datasets}
         comparison = {
-            "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
+            "metrics": {"mean": 1.0, "datasets": fixture_values},
             "proxy_screen": {
-                "metrics": {"mean": 1.0, "datasets": {"fake": 1.0}},
-                "baseline_metrics": {"mean": 0.0, "datasets": {"fake": 0.0}},
+                "metrics": {"mean": 1.0, "datasets": fixture_values},
+                "baseline_metrics": {"mean": 0.0, "datasets": fixture_baseline},
             },
             "activation_smoke": {
                 "status": "passed",
@@ -212,20 +247,26 @@ def _authorize_c2c_phase(
                 ],
             },
             "bootstrap": {"status": "proxy_reached"},
-            "ablation": {"metrics": {"datasets": {"fake": 0.5}}},
-            "matched_control_metrics": {"datasets": {"fake": 0.8}},
-            "coverage_metrics": {"datasets": {"fake": 1.0}},
+            "ablation": {"metrics": {"datasets": {dataset_id: 0.5 for dataset_id in configured_datasets}}},
+            "matched_control_metrics": {"datasets": {dataset_id: 0.8 for dataset_id in configured_datasets}},
+            "coverage_metrics": {"datasets": {dataset_id: 1.0 for dataset_id in configured_datasets}},
         }
-        baseline = {"mean": 0.0, "datasets": {"fake": 0.0}}
+        baseline = {"mean": 0.0, "datasets": fixture_baseline}
     assert attempt is not None and trial_spec is not None and comparison is not None and baseline is not None
     if phase == "full":
+        _record_proxy_prerequisite_receipts(agent, ledger, attempt, trial_spec)
         inventory = _c2c_strict_evidence_inventory(
             project_root=project_root,
             attempt=attempt,
             trial_spec=trial_spec,
-            comparison_candidate=comparison,
-            baseline=baseline,
+            comparison_candidate=None,
+            baseline={},
             simulate=False,
+            authoritative_command_receipts=_current_authoritative_phase_command_receipts(
+                project_root,
+                attempt=attempt,
+                phase="proxy",
+            ),
         )
         completion = _stage_evidence_inventory(
             project_root=project_root,
@@ -233,7 +274,6 @@ def _authorize_c2c_phase(
             trial_spec=trial_spec,
             inventory=inventory,
         )
-        _record_proxy_prerequisite_receipts(project_root, ledger, attempt, trial_spec)
         record_completed_evidence_command(project_root, ledger, attempt, completion)
         attempt, route = ledger.commit_proxy_evidence(completion)
         assert route["next_action"] == "RUN_FULL"
@@ -249,11 +289,14 @@ def _authorize_c2c_phase(
 
 
 def _record_proxy_prerequisite_receipts(
-    project_root: Path,
+    agent: ExperimentAgent,
     ledger: ResearchEventLedger,
     attempt: dict,
     trial_spec: dict,
+    *,
+    metric_values: dict[str, float] | None = None,
 ) -> None:
+    project_root = agent.context.project_root
     proxy_context = ResearchLedgerPhaseAuthority(ledger).context_for_attempt(
         project_root,
         attempt["attempt_id"],
@@ -269,6 +312,11 @@ def _record_proxy_prerequisite_receipts(
     for command_spec in proxy_plan["commands"][:-1]:
         if command_spec["command_spec_id"] in completed_specs:
             continue
+        raw_outputs = _materialize_c2c_fixture_raw_outputs(
+            agent,
+            command_spec,
+            metric_values=metric_values,
+        )
         journal.run_once(
             proxy_context,
             command_id=f"fixture-prerequisite-{command_spec['command_spec_id']}",
@@ -276,17 +324,68 @@ def _record_proxy_prerequisite_receipts(
             argv=tuple(command_spec["argv"]),
             cwd=command_spec["cwd"],
             source_snapshot_hash=command_spec["source_snapshot_hash"],
-            expected_outputs=(),
+            expected_outputs=tuple(item["kind"] for item in command_spec["expected_outputs"]),
+            environment=command_spec["environment"],
+            inherited_environment=tuple(command_spec["inherited_environment"]),
+            retry_policy=command_spec["retry_policy"],
+            resource_policy=command_spec["resource_policy"],
+            resume_policy=command_spec["resume_policy"],
             runner=lambda: CommandExecutionResult(
                 exit_code=0,
                 stdout_hash=hashlib.sha256(b"fixture-proxy-prerequisite").hexdigest(),
                 stderr_hash=hashlib.sha256(b"").hexdigest(),
                 outputs=(),
+                raw_outputs=tuple(raw_outputs),
                 stdout="fixture-proxy-prerequisite",
                 stderr="",
                 external_job_id="fixture-proxy-prerequisite",
             ),
         )
+
+
+def _materialize_c2c_fixture_raw_outputs(
+    agent: ExperimentAgent,
+    command_spec: dict,
+    *,
+    metric_values: dict[str, float] | None = None,
+) -> list[dict]:
+    encoded = (command_spec.get("environment") or {}).get(C2C_RAW_OUTPUT_SPECS_ENV)
+    if encoded is None:
+        return []
+    specs = json.loads(encoded)
+    assert isinstance(specs, list)
+    cwd = Path(command_spec["cwd"])
+    values = {
+        "baseline": 0.50,
+        "candidate": 0.51,
+        "activation_disabled": 0.49,
+        "ablation": 0.50,
+        "matched_control": 0.50,
+        "coverage": 0.50,
+    }
+    values.update(metric_values or {})
+    for spec in specs:
+        target = cwd / spec["locator"]
+        if spec["locator_type"] == "tree":
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "fixture.bin").write_bytes(b"fixture-checkpoint")
+            continue
+        assert spec["locator_type"] == "file"
+        dataset = str(spec["dataset_id"])
+        role = str(spec["role"])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            json.dumps(
+                {
+                    "model": "Rosetta",
+                    "dataset": dataset,
+                    "answer_method": "generate",
+                    "overall_accuracy": values[role],
+                }
+            ),
+            encoding="utf-8",
+        )
+    return agent._capture_c2c_raw_outputs(command_spec=command_spec, cwd=cwd)
 
 
 def _run_authorized_c2c_candidate(agent: ExperimentAgent, *, phase: str, **kwargs):
@@ -311,28 +410,35 @@ def _run_authorized_c2c_candidate(agent: ExperimentAgent, *, phase: str, **kwarg
             else agent._run_single_c2c_full_candidate
         )
         result_holder["result"] = method(**kwargs)
-        artifacts = []
-        for kind in context.expected_evidence_kinds:
-            relative = Path("experiment") / "attempts" / context.attempt_id / "executor-tests" / context.phase_execution_id / f"{kind}.json"
-            path = agent.context.project_root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"kind": kind, "phase_execution_id": context.phase_execution_id}), encoding="utf-8")
-            artifacts.append(
-                {
-                    "kind": kind,
-                    "source_path": relative.as_posix(),
-                    "content_hash": sha256_file(path),
-                    "receipt_hash": canonical_hash(
-                        {"attempt_id": context.attempt_id, "phase_execution_id": context.phase_execution_id, "kind": kind}
-                    ),
-                    "producer_run_id": context.producer_run_id,
-                }
-            )
-        return PhaseArtifactInventory(context=context, artifacts=artifacts)
+        return _c2c_fixture_phase_inventory(agent, context)
 
     executor_type = C2CProxyPhaseExecutor if phase == "proxy" else C2CFullPhaseExecutor
     executor_type(authority, execute).execute(context)
     return result_holder["result"]
+
+
+def _c2c_fixture_phase_inventory(
+    agent: ExperimentAgent,
+    context,
+) -> PhaseArtifactInventory:
+    artifacts = []
+    for kind in context.expected_evidence_kinds:
+        relative = Path("experiment") / "attempts" / context.attempt_id / "executor-tests" / context.phase_execution_id / f"{kind}.json"
+        path = agent.context.project_root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"kind": kind, "phase_execution_id": context.phase_execution_id}), encoding="utf-8")
+        artifacts.append(
+            {
+                "kind": kind,
+                "source_path": relative.as_posix(),
+                "content_hash": sha256_file(path),
+                "receipt_hash": canonical_hash(
+                    {"attempt_id": context.attempt_id, "phase_execution_id": context.phase_execution_id, "kind": kind}
+                ),
+                "producer_run_id": context.producer_run_id,
+            }
+        )
+    return PhaseArtifactInventory(context=context, artifacts=artifacts)
 
 
 def _run_c2c_proxy_then_full(agent: ExperimentAgent, **kwargs):
@@ -423,6 +529,182 @@ def _fake_c2c_repo(tmp_path: Path) -> Path:
     (root / "wandb/offline-run/skip.txt").write_text("skip", encoding="utf-8")
     (root / "local/checkpoints/demo/model.pth").write_text("skip", encoding="utf-8")
     return root
+
+
+def _c2c_fixture_command(
+    *,
+    argv: list[str] | tuple[str, ...],
+    working_dir: Path | str,
+    environment: dict[str, str] | None,
+    inherited_environment: list[str] | tuple[str, ...] | None,
+    retry_policy: dict | None,
+) -> dict:
+    assert not isinstance(argv, str)
+    frozen_argv = [str(item) for item in argv]
+    repo = Path(working_dir)
+    assert repo.is_absolute(), repo
+    frozen_environment = {str(key): str(value) for key, value in dict(environment or {}).items()}
+    frozen_inherited_environment = tuple(str(item) for item in (inherited_environment or ()))
+    assert frozen_inherited_environment == ("HOME", "PATH", "TMPDIR")
+    encoded_raw_outputs = frozen_environment.get(C2C_RAW_OUTPUT_SPECS_ENV)
+    raw_output_specs = json.loads(encoded_raw_outputs) if encoded_raw_outputs is not None else []
+    assert isinstance(raw_output_specs, list)
+    assert all(isinstance(item, dict) for item in raw_output_specs)
+    script = next(
+        (
+            item
+            for item in frozen_argv
+            if item.endswith("script/train/SFT_train.py") or item.endswith("script/evaluation/unified_evaluator.py")
+        ),
+        None,
+    )
+    if script is None:
+        assert raw_output_specs == []
+        return {
+            "kind": "preflight",
+            "argv": frozen_argv,
+            "repo": repo,
+            "environment": frozen_environment,
+            "inherited_environment": frozen_inherited_environment,
+            "retry_policy": dict(retry_policy or {}),
+            "raw_output_specs": raw_output_specs,
+        }
+    assert "--config" in frozen_argv, frozen_argv
+    config_path = repo / frozen_argv[frozen_argv.index("--config") + 1]
+    assert config_path.is_file(), config_path
+    if script.endswith("script/train/SFT_train.py"):
+        payload = json.loads(config_path.read_text(encoding="utf-8"))
+        output_dir = repo / payload["output"]["output_dir"]
+        output_text = output_dir.as_posix()
+        if "proxy_baseline" in output_text:
+            kind = "proxy_baseline_train"
+        elif "/proxy/" in output_text:
+            kind = "proxy_train"
+        elif "memory_safe" in config_path.name:
+            kind = "train_recovery_memory_safe"
+        elif "reduced_concurrency" in config_path.name:
+            kind = "train_recovery_reduced_concurrency"
+        else:
+            kind = "train"
+        assert len(raw_output_specs) == 1
+        raw_output_spec = raw_output_specs[0]
+        assert raw_output_spec["locator_type"] == "tree"
+        assert raw_output_spec["role"] == "checkpoint"
+        assert repo / raw_output_spec["locator"] == output_dir / "final"
+        return {
+            "kind": kind,
+            "argv": frozen_argv,
+            "repo": repo,
+            "environment": frozen_environment,
+            "inherited_environment": frozen_inherited_environment,
+            "retry_policy": dict(retry_policy or {}),
+            "raw_output_specs": raw_output_specs,
+            "config_path": config_path,
+            "config": payload,
+            "output_dir": output_dir,
+            "raw_output_path": repo / raw_output_spec["locator"],
+        }
+    payload = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    output_dir = repo / payload["output"]["output_dir"]
+    dataset = str(payload["eval"]["dataset"])
+    output_text = output_dir.as_posix()
+    if "proxy_baseline" in output_text:
+        kind = "proxy_baseline_eval"
+    elif "activation_smoke_disabled" in output_text:
+        kind = "activation_eval"
+    elif "ablation_disabled" in output_text:
+        kind = "ablation_eval"
+    elif "/proxy/" in output_text:
+        kind = "proxy_eval"
+    else:
+        kind = "eval"
+    assert len(raw_output_specs) == 1
+    raw_output_spec = raw_output_specs[0]
+    assert raw_output_spec["locator_type"] == "file"
+    assert raw_output_spec["dataset_id"] == dataset
+    assert repo / raw_output_spec["locator"] == output_dir / f"Rosetta_{dataset}_generate_summary.json"
+    return {
+        "kind": kind,
+        "argv": frozen_argv,
+        "repo": repo,
+        "environment": frozen_environment,
+        "inherited_environment": frozen_inherited_environment,
+        "retry_policy": dict(retry_policy or {}),
+        "raw_output_specs": raw_output_specs,
+        "config_path": config_path,
+        "config": payload,
+        "output_dir": output_dir,
+        "dataset": dataset,
+        "raw_output_path": repo / raw_output_spec["locator"],
+    }
+
+
+def _write_c2c_fixture_checkpoint(command: dict) -> None:
+    final = Path(command["raw_output_path"])
+    final.mkdir(parents=True, exist_ok=True)
+    (final / "marker.txt").write_text("ok", encoding="utf-8")
+
+
+def _write_c2c_fixture_eval(command: dict, accuracy: float, predictions: list[str] | None = None) -> None:
+    output_dir = Path(command["output_dir"])
+    dataset = str(command["dataset"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+    Path(command["raw_output_path"]).write_text(
+        json.dumps(
+            {
+                "model": "Rosetta",
+                "dataset": dataset,
+                "answer_method": "generate",
+                "overall_accuracy": accuracy,
+            }
+        ),
+        encoding="utf-8",
+    )
+    if predictions is not None:
+        (output_dir / "prediction_outputs.jsonl").write_text(
+            "\n".join(json.dumps({"prediction": label, "answer": "A"}) for label in predictions) + "\n",
+            encoding="utf-8",
+        )
+
+
+def _c2c_fixture_step_label(command: dict) -> str:
+    kind = command["kind"]
+    dataset = command.get("dataset")
+    labels = {
+        "proxy_train": "proxy_command_0",
+        "proxy_eval": "proxy_command_1",
+        "proxy_baseline_train": "proxy_baseline_train",
+        "train_recovery_reduced_concurrency": "train_recovery_reduced_concurrency",
+        "train_recovery_memory_safe": "train_recovery_memory_safe",
+        "train": "train",
+        "preflight": "preflight",
+    }
+    if kind == "proxy_baseline_eval":
+        return f"proxy_baseline_eval_{dataset}"
+    if kind == "activation_eval":
+        return f"activation_smoke_eval_{dataset}"
+    if kind == "ablation_eval":
+        return f"ablation_eval_{dataset}"
+    if kind == "eval":
+        return f"eval_{dataset}"
+    return labels[kind]
+
+
+def _attempt_scoped_evidence_file(project_root: Path, attempt: dict, phase: str, kind: str) -> Path:
+    execution = attempt["phase_executions"][phase]
+    evidence_dir = (
+        project_root
+        / "experiment"
+        / "attempts"
+        / attempt["attempt_id"]
+        / execution["producer_run_id"]
+        / kind
+    )
+    artifacts = sorted(evidence_dir.glob("*.json"))
+    assert len(artifacts) == 1, artifacts
+    artifact = artifacts[0]
+    assert artifact.stem == sha256_file(artifact)
+    return artifact
 
 
 def _fake_git_c2c_repo(tmp_path: Path) -> Path:
@@ -4103,7 +4385,7 @@ def test_code_patch_agent_includes_previous_patch_failure_in_retry_contract(tmp_
     assert previous["failed_checks"]
 
 
-def test_code_patch_agent_includes_proxy_effect_repair_contract(tmp_path: Path) -> None:
+def test_code_patch_agent_ignores_mutable_main_results_feedback(tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _code_patch_test_config(tmp_path / "workspace", repo)
     paths = init_workspace(config, "topic", project_id="proj_proxy_effect_repair_feedback", simulate=False)
@@ -4167,17 +4449,85 @@ def test_code_patch_agent_includes_proxy_effect_repair_contract(tmp_path: Path) 
     assert manifest["status"] == "ok"
     contract = captured["implementation_contract"]
     assert isinstance(contract, dict)
-    proxy_effect = contract["proxy_effect_repair_contract"]
-    assert isinstance(proxy_effect, dict)
-    assert proxy_effect["mode"] == "effect_first_proxy_repair"
-    assert proxy_effect["dragging_datasets"][0]["dataset"] == "mmlu-redux"
+    assert contract["previous_patch_failure"] == {}
+    assert contract["previous_failure"] == {}
+    assert contract["proxy_effect_repair_contract"] == {}
     requirements = contract["s2_5_requirements"]
-    assert any("effect-first cheap-proxy repair" in requirement for requirement in requirements)
-    assert any("mmlu-redux" in requirement for requirement in requirements)
-    assert any("paperization-only" in requirement for requirement in requirements)
-    assert any("Activation smoke failed" in requirement and "disable_mechanism" in requirement for requirement in requirements)
-    assert any("prediction_comparison" in requirement for requirement in requirements)
-    assert any("activation_smoke_disabled/eval_mmlu-redux.yaml" in requirement for requirement in requirements)
+    assert not any("effect-first cheap-proxy repair" in requirement for requirement in requirements)
+    assert not any("Activation smoke failed" in requirement for requirement in requirements)
+
+
+def test_code_patch_loads_latest_authoritative_attempt_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import auto_research.code_patch as code_patch_module
+
+    project_root = tmp_path / "proj_authoritative_patch_failure"
+    ledger_path = project_root / "meta" / "research_events.sqlite3"
+    ledger_path.parent.mkdir(parents=True)
+    ledger_path.write_bytes(b"ledger-placeholder")
+    attempt = {
+        "attempt_id": "attempt-authoritative",
+        "variant_id": "repair-variant",
+        "variant_semantic_hash": "a" * 64,
+        "variant_spec_hash": "b" * 64,
+    }
+
+    class StubLedger:
+        def __init__(self, root: Path):
+            assert root == project_root
+
+        def state(self) -> dict:
+            return {
+                "attempts": {attempt["attempt_id"]: attempt},
+                "operation_events": {
+                    "old": {
+                        "event_id": "event:failure:old",
+                        "payload": {
+                            "failure_evidence": {
+                                "attempt_id": attempt["attempt_id"],
+                                "failure_class": "activation_failure",
+                                "reason": "old activation failure",
+                                "lifecycle_generation": 0,
+                                "observed_at": "2026-07-15T00:00:00Z",
+                                "implementation_hash": "c" * 64,
+                                "attempt_input_hash": "d" * 64,
+                                "source_state": "PROXY_RUNNING",
+                                "source_phase": "activation",
+                                "evidence_id": "failure-old",
+                                "receipt_hash": "e" * 64,
+                                "command_id": "activation-old",
+                            }
+                        },
+                    },
+                    "new": {
+                        "event_id": "event:failure:new",
+                        "payload": {
+                            "failure_evidence": {
+                                "attempt_id": attempt["attempt_id"],
+                                "failure_class": "implementation_failure",
+                                "reason": "latest immutable receipt failure",
+                                "lifecycle_generation": 1,
+                                "observed_at": "2026-07-15T00:01:00Z",
+                                "implementation_hash": "f" * 64,
+                                "attempt_input_hash": "1" * 64,
+                                "source_state": "FULL_RUNNING",
+                                "source_phase": "full",
+                                "evidence_id": "failure-new",
+                                "receipt_hash": "2" * 64,
+                                "command_id": "train-new",
+                            }
+                        },
+                    },
+                },
+            }
+
+    monkeypatch.setattr(code_patch_module, "ResearchEventLedger", StubLedger)
+
+    failures = code_patch_module._load_authoritative_attempt_failures(project_root)
+
+    assert failures["repair-variant"]["reason"] == "latest immutable receipt failure"
+    assert failures["repair-variant"]["lifecycle_generation"] == 1
+    assert failures["repair-variant"]["receipt_hash"] == "2" * 64
+    assert failures["repair-variant"]["variant_spec_hash"] == "b" * 64
 
 
 def test_code_patch_agent_marks_codex_429_as_retryable(tmp_path: Path) -> None:
@@ -6102,16 +6452,16 @@ def test_c2c_materialized_train_configs_disable_wandb_without_service_token(tmp_
         assert payload["training"]["per_device_train_batch_size"] == 1
         assert payload["training"]["gradient_accumulation_steps"] == 1
 
-    combined_commands = "\n".join(
-        [
-            run_spec["commands"]["train"],
-            run_spec["proxy_screen"]["commands"]["train"],
-            baseline_spec["commands"]["train"],
-        ]
-    )
-    assert "WANDB_DISABLED=true" in combined_commands
-    assert "WANDB_SERVICE=" not in combined_commands
-    assert "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True" in combined_commands
+    commands = [
+        run_spec["commands"]["train"],
+        run_spec["proxy_screen"]["commands"]["train"],
+        baseline_spec["commands"]["train"],
+    ]
+    for command in commands:
+        assert command["environment"]["WANDB_DISABLED"] == "true"
+        assert command["environment"]["WANDB_MODE"] == "disabled"
+        assert "WANDB_SERVICE" not in command["environment"]
+        assert command["environment"]["PYTORCH_CUDA_ALLOC_CONF"] == "expandable_segments:True"
 
 
 def test_c2c_materializes_proxy_activation_smoke_ablation_config(tmp_path: Path) -> None:
@@ -6282,12 +6632,12 @@ def test_c2c_proxy_gpu_policy_defaults_to_single_clean_gpu(monkeypatch, tmp_path
 
     assert full_selection.selected_ids == [1, 2]
     assert proxy_selection.selected_ids == [1]
-    assert "CUDA_VISIBLE_DEVICES=1,2" in run_spec["commands"]["train"]
-    assert "CUDA_VISIBLE_DEVICES=1 " in run_spec["proxy_screen"]["commands"]["train"]
-    assert "torch.distributed.run" not in run_spec["proxy_screen"]["commands"]["train"]
-    assert all("CUDA_VISIBLE_DEVICES=1,2" not in command for command in run_spec["commands"]["preflight"])
-    assert all("CUDA_VISIBLE_DEVICES=1 " not in command for command in run_spec["commands"]["preflight"])
-    assert any("--no-cov" in command for command in run_spec["commands"]["preflight"])
+    assert run_spec["commands"]["train"]["environment"]["CUDA_VISIBLE_DEVICES"] == "1,2"
+    assert run_spec["proxy_screen"]["commands"]["train"]["environment"]["CUDA_VISIBLE_DEVICES"] == "1"
+    assert "torch.distributed.run" not in run_spec["proxy_screen"]["commands"]["train"]["argv"]
+    assert all(command["environment"].get("CUDA_VISIBLE_DEVICES") != "1,2" for command in run_spec["commands"]["preflight"])
+    assert all(command["environment"].get("CUDA_VISIBLE_DEVICES") != "1" for command in run_spec["commands"]["preflight"])
+    assert any("--no-cov" in command["argv"] for command in run_spec["commands"]["preflight"])
 
 
 def test_c2c_full_train_resource_policy_sets_batch_grad_and_lr(monkeypatch, tmp_path: Path) -> None:
@@ -6414,15 +6764,13 @@ def test_c2c_materialization_localizes_runtime_model_literals(tmp_path: Path) ->
 
 def test_experiment_runner_preserves_command_output_head_and_tail(tmp_path: Path) -> None:
     runner = ExperimentRunner({})
-    command = (
-        "python - <<'PY'\n"
-        "import sys\n"
-        "sys.stderr.write('TRACEBACK_START\\n' + 'x' * 15000 + '\\nROOT_CAUSE\\n')\n"
-        "raise SystemExit(1)\n"
-        "PY"
-    )
+    argv = [
+        sys.executable,
+        "-c",
+        "import sys; sys.stderr.write('TRACEBACK_START\\n' + 'x' * 15000 + '\\nROOT_CAUSE\\n'); raise SystemExit(1)",
+    ]
 
-    result = runner.run_step(name="fail", command=command, working_dir=tmp_path)
+    result = runner.run_step(name="fail", argv=argv, working_dir=tmp_path)
     stderr = result["attempts"][0]["stderr"]
 
     assert result["status"] == "failed"
@@ -6433,15 +6781,9 @@ def test_experiment_runner_preserves_command_output_head_and_tail(tmp_path: Path
 
 def test_experiment_runner_times_out_process_group(tmp_path: Path) -> None:
     runner = ExperimentRunner({})
-    command = (
-        "python - <<'PY'\n"
-        "import time\n"
-        "print('started', flush=True)\n"
-        "time.sleep(5)\n"
-        "PY"
-    )
+    argv = [sys.executable, "-c", "import time; print('started', flush=True); time.sleep(5)"]
 
-    result = runner.run_step(name="slow", command=command, working_dir=tmp_path, retry_policy={"timeout_seconds": 1})
+    result = runner.run_step(name="slow", argv=argv, working_dir=tmp_path, retry_policy={"timeout_seconds": 1})
     attempt = result["attempts"][0]
 
     assert result["status"] == "failed"
@@ -7364,7 +7706,12 @@ def test_c2c_failed_train_checkpoint_does_not_bypass_authoritative_receipt(monke
             "eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
             "train_samples": 1,
             "gpu_ids": [0],
-            "proxy_screen": {"enabled": False},
+            "proxy_screen": {
+                "enabled": True,
+                "train_samples": 1,
+                "eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
+                "min_delta_to_pass": 0.1,
+            },
         },
         "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
         "allowed_prefixes": ["recipe/", "local/auto_research_runs/"],
@@ -7374,23 +7721,20 @@ def test_c2c_failed_train_checkpoint_does_not_bypass_authoritative_receipt(monke
     agent = ExperimentAgent(context)
     seen_steps: list[str] = []
 
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        seen_steps.append(name)
-        run_repo = Path(working_dir)
-        if name == "train":
-            run_id = "idea"
-            final = run_repo / "local" / "auto_research_runs" / run_id / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
+        )
+        seen_steps.append(_c2c_fixture_step_label(command))
+        if command["kind"] == "train":
+            _write_c2c_fixture_checkpoint(command)
             return {"step": name, "status": "failed", "attempts": [{"stdout": "", "stderr": "train crashed", "returncode": 1}], "returncode": 1}
-        if name.startswith("eval_"):
-            dataset = name.replace("eval_", "")
-            out = run_repo / "local" / "auto_research_runs" / "idea" / "results" / dataset
-            out.mkdir(parents=True, exist_ok=True)
-            (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": 0.51}),
-                encoding="utf-8",
-            )
+        if command["kind"] == "eval":
+            _write_c2c_fixture_eval(command, 0.51)
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
@@ -7414,7 +7758,7 @@ def test_c2c_failed_train_checkpoint_does_not_bypass_authoritative_receipt(monke
             proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
         )
     assert "train" in seen_steps
-    assert not any(name.startswith("eval_") for name in seen_steps)
+    assert "eval" not in seen_steps
 
 
 def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: Path) -> None:
@@ -7459,7 +7803,12 @@ def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: 
                 "per_device_train_batch_size": 1,
                 "preserve_effective_batch": True,
             },
-            "proxy_screen": {"enabled": False},
+            "proxy_screen": {
+                "enabled": True,
+                "train_samples": 1,
+                "eval_datasets": ["mmlu-redux"],
+                "min_delta_to_pass": 0.1,
+            },
         },
         "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
         "allowed_prefixes": ["recipe/", "local/auto_research_runs/"],
@@ -7469,31 +7818,28 @@ def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: 
     agent = ExperimentAgent(context)
     seen_steps: list[str] = []
 
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del retry_policy
-        run_repo = Path(working_dir)
-        seen_steps.append(name)
-        if name in {"train", "train_recovery_reduced_concurrency"}:
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
+        )
+        seen_steps.append(command["kind"])
+        if command["kind"] in {"train", "train_recovery_reduced_concurrency"}:
             return {
                 "step": name,
                 "status": "failed",
                 "attempts": [{"stdout": "", "stderr": "torch.OutOfMemoryError: CUDA out of memory", "returncode": 1}],
                 "returncode": 1,
             }
-        if name == "train_recovery_memory_safe":
-            assert "train_recipe_memory_safe.json" in command
-            run_id = "idea"
-            final = run_repo / "local" / "auto_research_runs" / run_id / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
+        if command["kind"] == "train_recovery_memory_safe":
+            assert command["config_path"].name == "train_recipe_memory_safe.json"
+            _write_c2c_fixture_checkpoint(command)
             return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
-        if name == "eval_mmlu-redux":
-            out = run_repo / "local" / "auto_research_runs" / "idea" / "results" / "mmlu-redux"
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.51}),
-                encoding="utf-8",
-            )
+        if command["kind"] == "eval":
+            _write_c2c_fixture_eval(command, 0.51)
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
@@ -7519,7 +7865,7 @@ def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: 
     memory_safe_payload = json.loads(memory_safe_config.read_text(encoding="utf-8"))
     state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
 
-    assert seen_steps.index("train_recovery_memory_safe") < seen_steps.index("eval_mmlu-redux")
+    assert seen_steps.index("train_recovery_memory_safe") < seen_steps.index("eval")
     assert result["command_status"] == "ok"
     assert result["metrics"]["mean"] == 51.0
     assert memory_safe_payload["training"]["per_device_train_batch_size"] == 1
@@ -7763,19 +8109,35 @@ def test_s3_blocks_outputs_written_to_original_snapshot(monkeypatch, tmp_path: P
             "eval_datasets": ["mmlu-redux"],
             "train_samples": 1,
             "gpu_ids": [0],
-            "proxy_screen": {"enabled": False},
+            "proxy_screen": {
+                "enabled": True,
+                "train_samples": 1,
+                "eval_datasets": ["mmlu-redux"],
+                "min_delta_to_pass": 0.1,
+            },
         },
     }
     paths = init_workspace(config, "topic", project_id="proj_s3_pollution", simulate=False)
     context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
     agent = ExperimentAgent(context)
 
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, working_dir, retry_policy
-        if name == "train":
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
+        )
+        if command["kind"] == "train":
+            _write_c2c_fixture_checkpoint(command)
             final = repo / "local" / "auto_research_runs" / "polluter" / "checkpoints" / "final"
             final.mkdir(parents=True, exist_ok=True)
             (final / "marker.txt").write_text("polluted", encoding="utf-8")
+        elif command["kind"] == "eval":
+            _write_c2c_fixture_eval(command, 0.51)
+        elif command["kind"] == "ablation_eval":
+            _write_c2c_fixture_eval(command, 0.50)
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
@@ -7842,54 +8204,27 @@ def test_s3_runs_ablation_switch_disabled_eval(monkeypatch, tmp_path: Path) -> N
     agent = ExperimentAgent(context)
     seen_steps: list[str] = []
 
-    def write_summary(root: Path, dataset: str, accuracy: float) -> None:
-        out = root / dataset
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
-            json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": accuracy}),
-            encoding="utf-8",
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
         )
-
-    def write_predictions(root: Path, dataset: str, labels: list[str]) -> None:
-        out = root / dataset
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "prediction_outputs.jsonl").write_text(
-            "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in labels) + "\n",
-            encoding="utf-8",
-        )
-
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, retry_policy
-        seen_steps.append(name)
-        run_root = Path(working_dir) / "local" / "auto_research_runs" / "mechanism"
-        if name == "proxy_baseline_train":
-            final = Path(working_dir) / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_baseline_eval_mmlu-redux":
-            write_summary(Path(working_dir) / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50)
-        elif name == "proxy_command_0":
-            final = run_root / "proxy" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_command_1":
-            root = run_root / "proxy" / "results"
-            write_summary(root, "mmlu-redux", 0.505)
-            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
-        elif name == "activation_smoke_eval_mmlu-redux":
-            root = run_root / "proxy" / "activation_smoke_disabled" / "results"
-            write_summary(root, "mmlu-redux", 0.49)
-            write_predictions(root, "mmlu-redux", ["B", "B", "C", "D"])
-        elif name == "train":
-            final = run_root / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name.startswith("eval_"):
-            dataset = name.replace("eval_", "")
-            write_summary(run_root / "results", dataset, 0.55)
-        elif name.startswith("ablation_eval_"):
-            dataset = name.replace("ablation_eval_", "")
-            write_summary(run_root / "ablation_disabled" / "results", dataset, 0.50)
+        seen_steps.append(_c2c_fixture_step_label(command))
+        if command["kind"] in {"proxy_baseline_train", "proxy_train", "train"}:
+            _write_c2c_fixture_checkpoint(command)
+        elif command["kind"] == "proxy_baseline_eval":
+            _write_c2c_fixture_eval(command, 0.50)
+        elif command["kind"] == "proxy_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command["kind"] == "activation_eval":
+            _write_c2c_fixture_eval(command, 0.49, ["B", "B", "C", "D"])
+        elif command["kind"] == "eval":
+            _write_c2c_fixture_eval(command, 0.55)
+        elif command["kind"] == "ablation_eval":
+            _write_c2c_fixture_eval(command, 0.50)
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
@@ -8129,9 +8464,16 @@ def test_c2c_static_proxy_rejects_evaluator_patch_before_training(monkeypatch, t
     agent = ExperimentAgent(context)
     seen_steps = []
 
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        seen_steps.append(name)
-        if name == "train" or name.startswith("eval_"):
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
+        )
+        seen_steps.append(command["kind"])
+        if command["kind"] in {"train", "eval"}:
             raise AssertionError("proxy rejected candidate must not reach full train/eval")
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
@@ -8316,13 +8658,40 @@ def test_s3_replays_authoritative_proxy_receipt_without_rerun(tmp_path: Path) ->
         profile="standard",
     )
     comparison["proxy_screen"]["metrics"] = {"mean": -1.0, "datasets": {"fake": -1.0}}
+    _record_proxy_prerequisite_receipts(
+        agent,
+        ledger,
+        attempt,
+        trial_spec,
+        metric_values={"baseline": 0.50, "candidate": 0.0, "activation_disabled": 0.01},
+    )
+    authoritative_receipts = _current_authoritative_phase_command_receipts(
+        paths.root,
+        attempt=attempt,
+        phase="proxy",
+    )
+    forged_receipts = deepcopy(authoritative_receipts)
+    forged_receipts[0]["stdout_hash"] = "0" * 64
+    before_forgery = ledger.state()["last_sequence"]
+    with pytest.raises(S3ValidationError, match="authoritative Ledger receipts"):
+        _c2c_strict_evidence_inventory(
+            project_root=paths.root,
+            attempt=attempt,
+            trial_spec=trial_spec,
+            comparison_candidate=None,
+            baseline={},
+            simulate=False,
+            authoritative_command_receipts=forged_receipts,
+        )
+    assert ledger.state()["last_sequence"] == before_forgery
     inventory = _c2c_strict_evidence_inventory(
         project_root=paths.root,
         attempt=attempt,
         trial_spec=trial_spec,
-        comparison_candidate=comparison,
-        baseline=baseline,
+        comparison_candidate=None,
+        baseline={},
         simulate=False,
+        authoritative_command_receipts=authoritative_receipts,
     )
     completion = _stage_evidence_inventory(
         project_root=paths.root,
@@ -8330,7 +8699,6 @@ def test_s3_replays_authoritative_proxy_receipt_without_rerun(tmp_path: Path) ->
         trial_spec=trial_spec,
         inventory=inventory,
     )
-    _record_proxy_prerequisite_receipts(paths.root, ledger, attempt, trial_spec)
     first_receipt = record_completed_evidence_command(paths.root, ledger, attempt, completion)
     completed = ledger.state()
 
@@ -8349,6 +8717,11 @@ def test_s3_replays_authoritative_proxy_receipt_without_rerun(tmp_path: Path) ->
         cwd=command_spec["cwd"],
         source_snapshot_hash=command_spec["source_snapshot_hash"],
         expected_outputs=tuple(item["kind"] for item in command_spec["expected_outputs"]),
+        environment=command_spec["environment"],
+        inherited_environment=tuple(command_spec["inherited_environment"]),
+        retry_policy=command_spec["retry_policy"],
+        resource_policy=command_spec["resource_policy"],
+        resume_policy=command_spec["resume_policy"],
         runner=forbidden_rerun,
     )
     replayed = restarted.state()
@@ -8739,6 +9112,21 @@ def test_c2c_proxy_command_failure_classifies_distributed_child_failure() -> Non
 
 def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch, tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
+    monkeypatch.setattr(
+        ExperimentRunner,
+        "_gpu_snapshot",
+        staticmethod(
+            lambda: [
+                {
+                    "index": 0,
+                    "memory_total_mb": 24564,
+                    "memory_free_mb": 24000,
+                    "memory_used_mb": 564,
+                    "utilization_gpu": 0,
+                }
+            ]
+        ),
+    )
     config = _base_config(tmp_path / "workspace", simulate=False)
     config["c2c"] = {
         "enabled": True,
@@ -8771,57 +9159,33 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
     agent = ExperimentAgent(context)
     seen_steps = []
 
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        run_repo = Path(working_dir)
-        seen_steps.append(name)
-        if name == "proxy_baseline_train":
-            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        if name == "proxy_baseline_eval_mmlu-redux":
-            out = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results" / "mmlu-redux"
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.5}),
-                encoding="utf-8",
-            )
-        if name == "proxy_command_1":
-            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "proxy" / "results" / "mmlu-redux"
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.505}),
-                encoding="utf-8",
-            )
-            (out / "prediction_outputs.jsonl").write_text(
-                "\n".join(
-                    json.dumps({"prediction": f"Answer: {label}", "answer": label})
-                    for label in ["A", "B", "C", "D"]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-        if name == "activation_smoke_eval_mmlu-redux":
-            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "proxy" / "activation_smoke_disabled" / "results" / "mmlu-redux"
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.49}),
-                encoding="utf-8",
-            )
-        if name == "train":
-            final = run_repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        if name == "eval_mmlu-redux":
-            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_replay" / "results" / "mmlu-redux"
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.51}),
-                encoding="utf-8",
-            )
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
+        )
+        command_kind = command["kind"]
+        seen_steps.append(_c2c_fixture_step_label(command))
+        if command_kind in {"proxy_baseline_train", "proxy_train", "train"}:
+            _write_c2c_fixture_checkpoint(command)
+        elif command_kind == "proxy_baseline_eval":
+            _write_c2c_fixture_eval(command, 0.50)
+        elif command_kind == "proxy_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command_kind == "activation_eval":
+            _write_c2c_fixture_eval(command, 0.49)
+        elif command_kind == "eval":
+            _write_c2c_fixture_eval(command, 0.51)
+        elif command_kind == "ablation_eval":
+            _write_c2c_fixture_eval(command, 0.50)
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     gpu_selection = agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1})
+    proxy_gpu_selection = agent._select_c2c_proxy_gpus(agent._c2c_proxy_gpu_policy(execution={}))
     result, _full_result = _run_c2c_proxy_then_full(agent,
         adapter=C2CAdapter(paths.root, config),
         candidate={
@@ -8838,15 +9202,55 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
         min_delta=0.1,
         max_regression=2.0,
         gpu_selection=gpu_selection,
-        proxy_gpu_selection=gpu_selection,
+        proxy_gpu_selection=proxy_gpu_selection,
     )
 
     proxy = result["proxy_screen"]
-    baseline_cache = paths.root / "experiment" / "results" / "c2c_proxy_baseline.json"
-    assert baseline_cache.exists()
-    assert seen_steps.index("proxy_baseline_train") < seen_steps.index("proxy_command_0")
-    assert seen_steps.index("activation_smoke_eval_mmlu-redux") < seen_steps.index("train")
-    assert seen_steps.index("proxy_command_1") < seen_steps.index("train")
+    state = ResearchEventLedger(paths.root).state()
+    attempt = next(iter(state["attempts"].values()))
+    baseline_artifact = _attempt_scoped_evidence_file(
+        paths.root,
+        attempt,
+        "proxy",
+        "proxy_baseline_fingerprint",
+    )
+    baseline_payload = json.loads(baseline_artifact.read_text(encoding="utf-8"))
+    assert baseline_payload["attempt_id"] == attempt["attempt_id"]
+    assert baseline_payload["phase_execution_id"] == attempt["phase_executions"]["proxy"]["phase_execution_id"]
+    assert baseline_payload["producer_run_id"] == attempt["phase_executions"]["proxy"]["producer_run_id"]
+    baseline_commands = [
+        item
+        for item in state["phase_commands"].values()
+        if item["command"]["command_spec_id"]
+        in {"proxy-proxy_baseline_train", "proxy-proxy_baseline_eval_mmlu-redux"}
+    ]
+    assert [item["status"] for item in baseline_commands] == ["completed", "completed"]
+    assert all(item["receipt_ref"]["digest"] == sha256_file(paths.root / item["receipt_ref"]["relative_path"]) for item in baseline_commands)
+    baseline_receipts = {
+        item["command"]["command_spec_id"]: ContractStore(paths.root).read_json(
+            item["receipt_ref"],
+            schema_file="phase_run_receipt_v4.schema.json",
+        )
+        for item in baseline_commands
+    }
+    train_raw = baseline_receipts["proxy-proxy_baseline_train"]["raw_outputs"]
+    eval_raw = baseline_receipts["proxy-proxy_baseline_eval_mmlu-redux"]["raw_outputs"]
+    assert [(item["role"], item["locator_type"]) for item in train_raw] == [("checkpoint", "tree")]
+    assert [(item["role"], item["dataset_id"], item["locator_type"]) for item in eval_raw] == [
+        ("baseline", "mmlu-redux", "file")
+    ]
+    raw_baseline_payload = json.loads(ContractStore(paths.root).read_bytes(eval_raw[0]["contract_ref"]))
+    assert raw_baseline_payload["overall_accuracy"] == 0.50
+    assert eval_raw[0]["content_hash"] == eval_raw[0]["contract_ref"]["digest"]
+    command_sequences = {
+        item["command"]["command_spec_id"]: item["started_sequence"]
+        for item in state["phase_commands"].values()
+    }
+    assert command_sequences["proxy-proxy_baseline_train"] < command_sequences["proxy-proxy_baseline_eval_mmlu-redux"]
+    assert command_sequences["proxy-proxy_baseline_eval_mmlu-redux"] < command_sequences["proxy-proxy_command_0"]
+    assert command_sequences["proxy-proxy_command_0"] < command_sequences["proxy-proxy_command_1"]
+    assert command_sequences["proxy-proxy_command_1"] < command_sequences["proxy-activation_smoke_eval_mmlu-redux"]
+    assert command_sequences["proxy-activation_smoke_eval_mmlu-redux"] < command_sequences["full-train"]
     assert proxy["status"] == "passed"
     assert proxy["proxy_delta_vs_baseline"] == 0.5
     assert proxy["full_baseline_mean"] == 50.0
@@ -8855,7 +9259,6 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
     assert proxy["proxy_delta_vs_comparison_baseline"] == 0.5
     assert proxy["proxy_delta_vs_proxy_baseline"] == 0.5
     assert proxy["artifact_paths"]["proxy_metrics"].endswith("proxy_metrics.json")
-    assert proxy["artifact_paths"]["proxy_baseline_metrics"].endswith("c2c_proxy_baseline.json")
     assert proxy["proxy_decision_mode"] == "paired_baseline"
     assert proxy["eval_smoke"]["status"] == "ok"
     assert proxy["eval_smoke"]["answer_parse_rate"] == 1.0
@@ -8911,15 +9314,19 @@ def test_c2c_proxy_baseline_eval_timeout_blocks_without_configured_fallback(monk
     agent = ExperimentAgent(context)
     seen_steps = []
 
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, retry_policy
-        run_repo = Path(working_dir)
-        seen_steps.append(name)
-        if name == "proxy_baseline_train":
-            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        if name == "proxy_baseline_eval_mmlu-redux":
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
+        )
+        command_kind = command["kind"]
+        seen_steps.append(_c2c_fixture_step_label(command))
+        if command_kind == "proxy_baseline_train":
+            _write_c2c_fixture_checkpoint(command)
+        elif command_kind == "proxy_baseline_eval":
             return {
                 "step": name,
                 "status": "failed",
@@ -8934,61 +9341,92 @@ def test_c2c_proxy_baseline_eval_timeout_blocks_without_configured_fallback(monk
                     }
                 ],
             }
-        if name == "proxy_command_0":
-            final = run_repo / "local" / "auto_research_runs" / "idea_proxy_timeout" / "proxy" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        if name == "proxy_command_1":
-            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_timeout" / "proxy" / "results" / "mmlu-redux"
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.505}),
-                encoding="utf-8",
-            )
-            (out / "prediction_outputs.jsonl").write_text(
-                "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in ["A", "B", "C", "D"]) + "\n",
-                encoding="utf-8",
-            )
-        if name == "train":
-            final = run_repo / "local" / "auto_research_runs" / "idea_proxy_timeout" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        if name == "eval_mmlu-redux":
-            out = run_repo / "local" / "auto_research_runs" / "idea_proxy_timeout" / "results" / "mmlu-redux"
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.51}),
-                encoding="utf-8",
-            )
+        elif command_kind in {"proxy_train", "train"}:
+            _write_c2c_fixture_checkpoint(command)
+        elif command_kind == "proxy_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command_kind == "eval":
+            _write_c2c_fixture_eval(command, 0.51)
+        elif command_kind == "ablation_eval":
+            _write_c2c_fixture_eval(command, 0.50)
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
     gpu_selection = agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1})
-    result, _full_result = _run_c2c_proxy_then_full(agent,
-        adapter=C2CAdapter(paths.root, config),
-        candidate={
-            "id": "idea_proxy_timeout",
-            "title": "Idea Proxy Timeout",
-            "experiment_contract": {
-                "config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}},
-            },
+    proxy_gpu_selection = agent._select_c2c_proxy_gpus(agent._c2c_proxy_gpu_policy(execution={}))
+    candidate = {
+        "id": "idea_proxy_timeout",
+        "title": "Idea Proxy Timeout",
+        "experiment_contract": {
+            "config_overrides": {"train": {"model": {"soft_alignment_top_k": 2}}},
         },
-        index=0,
-        simulate=False,
-        baseline_mean=50.0,
-        min_delta=0.1,
-        max_regression=2.0,
-        gpu_selection=gpu_selection,
-        proxy_gpu_selection=gpu_selection,
+    }
+    ledger, _, _, _, _ = _authorize_c2c_phase(
+        agent,
+        phase="proxy",
+        candidate=candidate,
     )
+    phase_context = agent._active_phase_context
+    assert phase_context is not None
+    frozen_plan = ContractStore(paths.root).read_json(
+        phase_context.command_plan_hash,
+        schema_file="phase_command_plan_v2.schema.json",
+    )
+    frozen_repo = Path(frozen_plan["commands"][0]["cwd"])
+    runtime_config = {
+        **config,
+        "c2c": {**config["c2c"], "snapshot_path": str(frozen_repo)},
+    }
+    adapter = C2CAdapter(paths.root, runtime_config)
+    run_spec = adapter.materialize_candidate_configs(
+        candidate,
+        gpu_selection,
+        proxy_gpu_selection=proxy_gpu_selection,
+    )
+    result_holder = {}
 
-    proxy = result["proxy_screen"]
+    def execute_baseline(executor_context):
+        for index, command in enumerate(run_spec["commands"]["preflight"]):
+            agent._run_authoritative_step(
+                name=f"preflight_command_{index}",
+                command=command,
+                working_dir=adapter.repo_root,
+                retry_policy={"max_attempts": 1},
+            )
+        result_holder["baseline"] = agent._ensure_c2c_proxy_baseline(
+            adapter,
+            run_spec,
+            proxy_gpu_selection,
+            {"max_attempts": 1},
+        )
+        return _c2c_fixture_phase_inventory(agent, executor_context)
+
+    C2CProxyPhaseExecutor(
+        ResearchLedgerPhaseAuthority(ledger),
+        execute_baseline,
+    ).execute(phase_context)
+    baseline = result_holder["baseline"]
 
     assert "proxy_baseline_eval_mmlu-redux" in seen_steps
     assert "proxy_command_0" not in seen_steps
-    baseline_event = next(item for item in result["command_logs"] if item["event"] == "proxy_baseline")
-    assert baseline_event["status"] == "blocked"
-    assert proxy["status"] != "passed"
+    state = ResearchEventLedger(paths.root).state()
+    baseline_record = next(
+        item
+        for item in state["phase_commands"].values()
+        if item["command"]["command_spec_id"] == "proxy-proxy_baseline_eval_mmlu-redux"
+    )
+    receipt = ContractStore(paths.root).read_json(
+        baseline_record["receipt_ref"],
+        schema_file="phase_run_receipt_v4.schema.json",
+    )
+    assert baseline_record["status"] == "completed"
+    assert receipt["exit_code"] == 124
+    assert receipt["raw_outputs"] == []
+    assert ContractStore(paths.root).read_bytes(receipt["stderr_ref"]).decode("utf-8") == "Command timed out after 1200s"
+    assert baseline_record["command"]["command_spec"]["environment"]["CUDA_VISIBLE_DEVICES"] == ""
+    assert proxy_gpu_selection.selected_ids == []
+    assert baseline["status"] == "blocked"
+    assert baseline["command_failure"]["category"] == "proxy_timeout"
 
 
 def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkeypatch, tmp_path: Path) -> None:
@@ -9025,45 +9463,25 @@ def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkey
     agent = ExperimentAgent(context)
     seen_steps: list[str] = []
 
-    def write_summary(root: Path, dataset: str, accuracy: float) -> None:
-        out = root / dataset
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
-            json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": accuracy}),
-            encoding="utf-8",
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
         )
-
-    def write_predictions(root: Path, dataset: str, labels: list[str]) -> None:
-        out = root / dataset
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "prediction_outputs.jsonl").write_text(
-            "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in labels) + "\n",
-            encoding="utf-8",
-        )
-
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, retry_policy
-        run_repo = Path(working_dir)
-        seen_steps.append(name)
-        if name == "proxy_baseline_train":
-            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_baseline_eval_mmlu-redux":
-            write_summary(run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50)
-        elif name == "proxy_command_0":
-            final = run_repo / "local" / "auto_research_runs" / "no_effect" / "proxy" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_command_1":
-            root = run_repo / "local" / "auto_research_runs" / "no_effect" / "proxy" / "results"
-            write_summary(root, "mmlu-redux", 0.505)
-            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
-        elif name == "activation_smoke_eval_mmlu-redux":
-            root = run_repo / "local" / "auto_research_runs" / "no_effect" / "proxy" / "activation_smoke_disabled" / "results"
-            write_summary(root, "mmlu-redux", 0.505)
-            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
-        elif name == "train" or name.startswith("eval_"):
+        command_kind = command["kind"]
+        seen_steps.append(_c2c_fixture_step_label(command))
+        if command_kind in {"proxy_baseline_train", "proxy_train"}:
+            _write_c2c_fixture_checkpoint(command)
+        elif command_kind == "proxy_baseline_eval":
+            _write_c2c_fixture_eval(command, 0.50)
+        elif command_kind == "proxy_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command_kind == "activation_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command_kind in {"train", "eval"}:
             raise AssertionError("activation smoke no-effect must not reach full train/eval")
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
@@ -9088,17 +9506,31 @@ def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkey
         proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
     )
 
-    state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    run_state = json.loads(Path(result["run_state_path"]).read_text(encoding="utf-8"))
+    ledger_state = ResearchEventLedger(paths.root).state()
+    measurement_receipts = {
+        item["command"]["command_spec_id"]: ContractStore(paths.root).read_json(
+            item["receipt_ref"],
+            schema_file="phase_run_receipt_v4.schema.json",
+        )
+        for item in ledger_state["phase_commands"].values()
+        if item["command"]["command_spec_id"]
+        in {"proxy-proxy_command_1", "proxy-activation_smoke_eval_mmlu-redux"}
+    }
+    candidate_raw = measurement_receipts["proxy-proxy_command_1"]["raw_outputs"][0]
+    disabled_raw = measurement_receipts["proxy-activation_smoke_eval_mmlu-redux"]["raw_outputs"][0]
     assert "activation_smoke_eval_mmlu-redux" in seen_steps
     assert "train" not in seen_steps
     assert result["decision"] == "proxy_repairable"
     assert result["command_status"] == "proxy_repairable"
     assert result["activation_smoke"]["status"] == "failed"
     assert result["activation_smoke"]["comparison"]["enabled_minus_disabled_mean"] == 0.0
-    assert result["activation_smoke"]["comparison"]["prediction_comparison"]["prediction_diff_rate"] == 0.0
+    assert (candidate_raw["role"], disabled_raw["role"]) == ("candidate", "activation_disabled")
+    assert json.loads(ContractStore(paths.root).read_bytes(candidate_raw["contract_ref"]))["overall_accuracy"] == 0.505
+    assert json.loads(ContractStore(paths.root).read_bytes(disabled_raw["contract_ref"]))["overall_accuracy"] == 0.505
     assert result["proxy_screen"]["status"] == "repairable_proxy_risk"
     assert result["failure_attribution"]["primary_failure"] == "proxy_activation_smoke_no_effect"
-    assert state["train"] is None
+    assert run_state["train"] is None
 
 
 def test_c2c_full_s3_readiness_blocks_train_when_not_ready(monkeypatch, tmp_path: Path) -> None:
@@ -9156,29 +9588,25 @@ def test_c2c_full_s3_readiness_blocks_train_when_not_ready(monkeypatch, tmp_path
             encoding="utf-8",
         )
 
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, retry_policy
-        run_repo = Path(working_dir)
-        seen_steps.append(name)
-        if name == "proxy_baseline_train":
-            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_baseline_eval_mmlu-redux":
-            write_summary(run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50)
-        elif name == "proxy_command_0":
-            final = run_repo / "local" / "auto_research_runs" / "readiness_not_ready" / "proxy" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_command_1":
-            root = run_repo / "local" / "auto_research_runs" / "readiness_not_ready" / "proxy" / "results"
-            write_summary(root, "mmlu-redux", 0.505)
-            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
-        elif name == "activation_smoke_eval_mmlu-redux":
-            root = run_repo / "local" / "auto_research_runs" / "readiness_not_ready" / "proxy" / "activation_smoke_disabled" / "results"
-            write_summary(root, "mmlu-redux", 0.505)
-            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
-        elif name == "train" or name.startswith("eval_") or name.startswith("ablation_eval_"):
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
+        )
+        command_kind = command["kind"]
+        seen_steps.append(_c2c_fixture_step_label(command))
+        if command_kind in {"proxy_baseline_train", "proxy_train"}:
+            _write_c2c_fixture_checkpoint(command)
+        elif command_kind == "proxy_baseline_eval":
+            _write_c2c_fixture_eval(command, 0.50)
+        elif command_kind == "proxy_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command_kind == "activation_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command_kind in {"train", "eval", "ablation_eval"}:
             raise AssertionError("full_s3_readiness not_ready must not reach full train/eval/ablation")
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
@@ -9220,7 +9648,7 @@ def test_c2c_full_s3_readiness_blocks_train_when_not_ready(monkeypatch, tmp_path
     assert any(action["action"] == "block_full_train_until_readiness" for action in state["recovery_actions"])
 
 
-def test_c2c_proxy_activation_smoke_allows_metric_neutral_when_wiring_trace_passed(monkeypatch, tmp_path: Path) -> None:
+def test_c2c_proxy_activation_wiring_trace_does_not_override_metric_neutral_receipts(monkeypatch, tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
     config["c2c"] = {
@@ -9273,56 +9701,31 @@ def test_c2c_proxy_activation_smoke_allows_metric_neutral_when_wiring_trace_pass
     agent = ExperimentAgent(context)
     seen_steps: list[str] = []
 
-    def write_summary(root: Path, dataset: str, accuracy: float) -> None:
-        out = root / dataset
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
-            json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": accuracy}),
-            encoding="utf-8",
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
         )
-
-    def write_predictions(root: Path, dataset: str, labels: list[str]) -> None:
-        out = root / dataset
-        out.mkdir(parents=True, exist_ok=True)
-        (out / "prediction_outputs.jsonl").write_text(
-            "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in labels) + "\n",
-            encoding="utf-8",
-        )
-
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, retry_policy
-        run_repo = Path(working_dir)
-        seen_steps.append(name)
-        if name == "proxy_baseline_train":
-            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_baseline_eval_mmlu-redux":
-            write_summary(run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50)
-        elif name == "proxy_command_0":
-            final = run_repo / "local" / "auto_research_runs" / "wired_neutral" / "proxy" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_command_1":
-            root = run_repo / "local" / "auto_research_runs" / "wired_neutral" / "proxy" / "results"
-            write_summary(root, "mmlu-redux", 0.505)
-            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
-        elif name == "activation_smoke_eval_mmlu-redux":
-            root = run_repo / "local" / "auto_research_runs" / "wired_neutral" / "proxy" / "activation_smoke_disabled" / "results"
-            write_summary(root, "mmlu-redux", 0.505)
-            write_predictions(root, "mmlu-redux", ["A", "B", "C", "D"])
-        elif name == "train":
-            final = run_repo / "local" / "auto_research_runs" / "wired_neutral" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "eval_mmlu-redux":
-            write_summary(run_repo / "local" / "auto_research_runs" / "wired_neutral" / "results", "mmlu-redux", 0.51)
-        elif name == "ablation_eval_mmlu-redux":
-            write_summary(run_repo / "local" / "auto_research_runs" / "wired_neutral" / "ablation_disabled" / "results", "mmlu-redux", 0.50)
+        command_kind = command["kind"]
+        seen_steps.append(_c2c_fixture_step_label(command))
+        if command_kind in {"proxy_baseline_train", "proxy_train"}:
+            _write_c2c_fixture_checkpoint(command)
+        elif command_kind == "proxy_baseline_eval":
+            _write_c2c_fixture_eval(command, 0.50)
+        elif command_kind == "proxy_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command_kind == "activation_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command_kind in {"train", "eval", "ablation_eval"}:
+            raise AssertionError("metric-neutral activation receipts must block full S3")
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result, _full_result = _run_c2c_proxy_then_full(agent,
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "wired_neutral",
@@ -9343,15 +9746,28 @@ def test_c2c_proxy_activation_smoke_allows_metric_neutral_when_wiring_trace_pass
     )
 
     comparison = result["activation_smoke"]["comparison"]
-    assert result["activation_smoke"]["status"] == "passed"
+    ledger_state = ResearchEventLedger(paths.root).state()
+    activation_record = next(
+        item
+        for item in ledger_state["phase_commands"].values()
+        if item["command"]["command_spec_id"] == "proxy-activation_smoke_eval_mmlu-redux"
+    )
+    activation_receipt = ContractStore(paths.root).read_json(
+        activation_record["receipt_ref"],
+        schema_file="phase_run_receipt_v4.schema.json",
+    )
+    activation_raw = activation_receipt["raw_outputs"][0]
+    assert result["activation_smoke"]["status"] == "failed"
     assert comparison["mechanism_observed"] is False
-    assert comparison["mechanism_wired_metric_neutral"] is True
-    assert result["activation_smoke"]["mechanism_trace"]["status"] == "wired"
-    assert "train" in seen_steps
-    assert _full_result["command_status"] == "ok"
+    assert result["activation_smoke"]["mechanism_trace"]["status"] == "missing"
+    assert activation_raw["role"] == "activation_disabled"
+    assert json.loads(ContractStore(paths.root).read_bytes(activation_raw["contract_ref"]))["overall_accuracy"] == 0.505
+    assert validation_path.exists()
+    assert "train" not in seen_steps
+    assert result["command_status"] == "proxy_repairable"
 
 
-def test_c2c_proxy_activation_smoke_passes_metric_neutral_prediction_change(monkeypatch, tmp_path: Path) -> None:
+def test_c2c_proxy_activation_prediction_sidecar_does_not_override_metric_neutral_receipts(monkeypatch, tmp_path: Path) -> None:
     repo = _fake_c2c_repo(tmp_path)
     config = _base_config(tmp_path / "workspace", simulate=False)
     config["c2c"] = {
@@ -9390,51 +9806,31 @@ def test_c2c_proxy_activation_smoke_passes_metric_neutral_prediction_change(monk
     agent = ExperimentAgent(context)
     seen_steps: list[str] = []
 
-    def write_summary_and_predictions(root: Path, dataset: str, accuracy: float, labels: list[str]) -> None:
-        out = root / dataset
-        out.mkdir(parents=True, exist_ok=True)
-        (out / f"Rosetta_{dataset}_generate_summary.json").write_text(
-            json.dumps({"model": "Rosetta", "dataset": dataset, "answer_method": "generate", "overall_accuracy": accuracy}),
-            encoding="utf-8",
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
         )
-        (out / "prediction_outputs.jsonl").write_text(
-            "\n".join(json.dumps({"prediction": f"Answer: {label}", "answer": label}) for label in labels) + "\n",
-            encoding="utf-8",
-        )
-
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        del command, retry_policy
-        run_repo = Path(working_dir)
-        seen_steps.append(name)
-        if name == "proxy_baseline_train":
-            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_baseline_eval_mmlu-redux":
-            write_summary_and_predictions(run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results", "mmlu-redux", 0.50, ["A", "B", "C", "D"])
-        elif name == "proxy_command_0":
-            final = run_repo / "local" / "auto_research_runs" / "prediction_change" / "proxy" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "proxy_command_1":
-            write_summary_and_predictions(run_repo / "local" / "auto_research_runs" / "prediction_change" / "proxy" / "results", "mmlu-redux", 0.505, ["A", "B", "C", "D"])
-        elif name == "activation_smoke_eval_mmlu-redux":
-            write_summary_and_predictions(
-                run_repo / "local" / "auto_research_runs" / "prediction_change" / "proxy" / "activation_smoke_disabled" / "results",
-                "mmlu-redux",
-                0.505,
-                ["A", "A", "C", "D"],
-            )
-        elif name == "train":
-            final = run_repo / "local" / "auto_research_runs" / "prediction_change" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        elif name == "eval_mmlu-redux":
-            write_summary_and_predictions(run_repo / "local" / "auto_research_runs" / "prediction_change" / "results", "mmlu-redux", 0.51, ["A", "B", "C", "D"])
+        command_kind = command["kind"]
+        seen_steps.append(_c2c_fixture_step_label(command))
+        if command_kind in {"proxy_baseline_train", "proxy_train"}:
+            _write_c2c_fixture_checkpoint(command)
+        elif command_kind == "proxy_baseline_eval":
+            _write_c2c_fixture_eval(command, 0.50, ["A", "B", "C", "D"])
+        elif command_kind == "proxy_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "B", "C", "D"])
+        elif command_kind == "activation_eval":
+            _write_c2c_fixture_eval(command, 0.505, ["A", "A", "C", "D"])
+        elif command_kind in {"train", "eval", "ablation_eval"}:
+            raise AssertionError("prediction sidecars cannot authorize metric-neutral activation")
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
     monkeypatch.setattr(agent.runner, "run_step", fake_run_step)
-    result, _full_result = _run_c2c_proxy_then_full(agent,
+    _authorize_c2c_phase(agent, phase="proxy")
+    result = _run_authorized_c2c_candidate(agent, phase="proxy",
         adapter=C2CAdapter(paths.root, config),
         candidate={
             "id": "prediction_change",
@@ -9454,13 +9850,32 @@ def test_c2c_proxy_activation_smoke_passes_metric_neutral_prediction_change(monk
     )
 
     comparison = result["activation_smoke"]["comparison"]
-    assert seen_steps.index("activation_smoke_eval_mmlu-redux") < seen_steps.index("train")
-    assert result["activation_smoke"]["status"] == "passed"
+    ledger_state = ResearchEventLedger(paths.root).state()
+    activation_record = next(
+        item
+        for item in ledger_state["phase_commands"].values()
+        if item["command"]["command_spec_id"] == "proxy-activation_smoke_eval_mmlu-redux"
+    )
+    activation_receipt = ContractStore(paths.root).read_json(
+        activation_record["receipt_ref"],
+        schema_file="phase_run_receipt_v4.schema.json",
+    )
+    activation_raw = activation_receipt["raw_outputs"][0]
+    execution_repo = Path(result["execution_repo"]["repo_root"])
+    prediction_sidecar = (
+        execution_repo
+        / "local/auto_research_runs/prediction_change/proxy/activation_smoke_disabled/results/mmlu-redux/prediction_outputs.jsonl"
+    )
+    assert "activation_smoke_eval_mmlu-redux" in seen_steps
+    assert "train" not in seen_steps
+    assert result["activation_smoke"]["status"] == "failed"
     assert comparison["enabled_minus_disabled_mean"] == 0.0
-    assert comparison["prediction_comparison"]["prediction_diff_rate"] == 0.25
-    assert comparison["prediction_comparison"]["answer_diff_rate"] == 0.25
-    assert comparison["mechanism_observed"] is True
-    assert _full_result["command_status"] == "ok"
+    assert comparison["mechanism_observed"] is False
+    assert activation_raw["locator"].endswith("Rosetta_mmlu-redux_generate_summary.json")
+    assert json.loads(ContractStore(paths.root).read_bytes(activation_raw["contract_ref"]))["overall_accuracy"] == 0.505
+    assert prediction_sidecar.exists()
+    assert all(item["locator"] != prediction_sidecar.relative_to(execution_repo).as_posix() for item in activation_receipt["raw_outputs"])
+    assert result["command_status"] == "proxy_repairable"
 
 
 def test_c2c_eval_smoke_detects_all_zero_empty_outputs(tmp_path: Path) -> None:
@@ -9519,31 +9934,22 @@ def test_c2c_proxy_all_zero_records_eval_smoke_failure(monkeypatch, tmp_path: Pa
     context = AgentContext(paths.root, config, ArtifactManager(paths.root), ModelClient(config, project_root=paths.root))
     agent = ExperimentAgent(context)
 
-    def fake_run_step(*, name, command, working_dir, retry_policy=None):
-        run_repo = Path(working_dir)
-        if name == "proxy_baseline_train":
-            final = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "checkpoints" / "final"
-            final.mkdir(parents=True, exist_ok=True)
-            (final / "marker.txt").write_text("ok", encoding="utf-8")
-        if name == "proxy_baseline_eval_mmlu-redux":
-            out = run_repo / "local" / "auto_research_runs" / "proxy_baseline" / "results" / "mmlu-redux"
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.5}),
-                encoding="utf-8",
-            )
-        if name == "proxy_command_1":
-            out = run_repo / "local" / "auto_research_runs" / "all_zero_proxy" / "proxy" / "results" / "mmlu-redux"
-            out.mkdir(parents=True, exist_ok=True)
-            (out / "Rosetta_mmlu-redux_generate_summary.json").write_text(
-                json.dumps({"model": "Rosetta", "dataset": "mmlu-redux", "answer_method": "generate", "overall_accuracy": 0.0}),
-                encoding="utf-8",
-            )
-            (out / "prediction_outputs.jsonl").write_text(
-                "\n".join(json.dumps({"prediction": "", "answer": "A"}) for _ in range(4)) + "\n",
-                encoding="utf-8",
-            )
-        if name == "train" or name.startswith("eval_"):
+    def fake_run_step(*, name, argv, working_dir, environment=None, inherited_environment=None, retry_policy=None):
+        command = _c2c_fixture_command(
+            argv=argv,
+            working_dir=working_dir,
+            environment=environment,
+            inherited_environment=inherited_environment,
+            retry_policy=retry_policy,
+        )
+        command_kind = command["kind"]
+        if command_kind in {"proxy_baseline_train", "proxy_train"}:
+            _write_c2c_fixture_checkpoint(command)
+        elif command_kind == "proxy_baseline_eval":
+            _write_c2c_fixture_eval(command, 0.50)
+        elif command_kind == "proxy_eval":
+            _write_c2c_fixture_eval(command, 0.0, ["", "", "", ""])
+        elif command_kind in {"train", "eval", "ablation_eval"}:
             raise AssertionError("hard proxy reject must not reach full train/eval")
         return {"step": name, "status": "ok", "attempts": [{"stdout": "", "stderr": "", "returncode": 0}], "returncode": 0}
 
@@ -9566,6 +9972,17 @@ def test_c2c_proxy_all_zero_records_eval_smoke_failure(monkeypatch, tmp_path: Pa
     )
 
     proxy = result["proxy_screen"]
+    ledger_state = ResearchEventLedger(paths.root).state()
+    proxy_eval_record = next(
+        item
+        for item in ledger_state["phase_commands"].values()
+        if item["command"]["command_spec_id"] == "proxy-proxy_command_1"
+    )
+    proxy_eval_receipt = ContractStore(paths.root).read_json(
+        proxy_eval_record["receipt_ref"],
+        schema_file="phase_run_receipt_v4.schema.json",
+    )
+    proxy_raw = proxy_eval_receipt["raw_outputs"][0]
     assert result["decision"] == "proxy_rejected"
     assert proxy["status"] == "rejected"
     assert proxy["metrics"]["mean"] == 0.0
@@ -9574,6 +9991,8 @@ def test_c2c_proxy_all_zero_records_eval_smoke_failure(monkeypatch, tmp_path: Pa
     assert proxy["proxy_eval_health_failure"]["status"] == "suspected_output_or_parser_failure"
     assert result["failure_attribution"]["primary_failure"] == "proxy_eval_output_health_failure"
     assert result["failure_attribution"]["proxy_eval_health_failure"]["red_flags"]
+    assert proxy_raw["role"] == "candidate"
+    assert json.loads(ContractStore(paths.root).read_bytes(proxy_raw["contract_ref"]))["overall_accuracy"] == 0.0
 
 
 def test_c2c_failure_attribution_records_dataset_sample_and_patch_risk() -> None:

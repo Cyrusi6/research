@@ -7,7 +7,7 @@ import os
 import re
 import stat
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Protocol, Sequence
@@ -15,6 +15,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from .contract_store import ContractStore, canonical_contract_bytes, contract_digest
 from .domain_contracts import PHASE_COMMAND_SCHEMA_VERSION, PHASE_RUN_RECEIPT_SCHEMA_VERSION
 from .phase_command_plan import validate_phase_command_plan
+from .phase_receipts import validate_phase_run_receipt
 from .phase_execution import (
     AuthoritativePhaseContext,
     PhaseArtifactInventory,
@@ -22,8 +23,8 @@ from .phase_execution import (
     PhaseAuthority,
 )
 
-PHASE_COMMAND_SCHEMA_FILE = "phase_command_v2.schema.json"
-PHASE_RUN_RECEIPT_SCHEMA_FILE = "phase_run_receipt_v3.schema.json"
+PHASE_COMMAND_SCHEMA_FILE = "phase_command_v3.schema.json"
+PHASE_RUN_RECEIPT_SCHEMA_FILE = "phase_run_receipt_v4.schema.json"
 COMMAND_RECEIPT_LOCATOR_SCHEMA_VERSION = "auto_research_command_receipt_locator_v1"
 _COMMAND_LOCATOR_ROOT = Path("meta") / "command_receipts"
 _SAFE_COMMAND_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
@@ -46,6 +47,7 @@ class CommandExecutionResult:
     stdout_hash: str
     stderr_hash: str
     outputs: tuple[Mapping[str, Any], ...]
+    raw_outputs: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
     external_job_id: str | None = None
     stdout: str | None = None
     stderr: str | None = None
@@ -107,6 +109,8 @@ class LedgerCommandJournal:
         cwd: str,
         source_snapshot_hash: str,
         expected_outputs: Sequence[str],
+        environment: Mapping[str, str] | None = None,
+        inherited_environment: Sequence[str] | None = None,
         runner: Callable[[], CommandExecutionResult],
         retry_policy: Mapping[str, Any] | None = None,
         resource_policy: Mapping[str, Any] | None = None,
@@ -123,6 +127,8 @@ class LedgerCommandJournal:
             cwd=cwd,
             source_snapshot_hash=source_snapshot_hash,
             expected_outputs=expected_outputs,
+            environment=environment,
+            inherited_environment=inherited_environment,
             retry_policy=retry_policy,
             resource_policy=resource_policy,
             resume_policy=resume_policy,
@@ -233,6 +239,8 @@ class LedgerCommandJournal:
         cwd: str,
         source_snapshot_hash: str,
         expected_outputs: Sequence[str],
+        environment: Mapping[str, str] | None = None,
+        inherited_environment: Sequence[str] | None = None,
         retry_policy: Mapping[str, Any] | None = None,
         resource_policy: Mapping[str, Any] | None = None,
         resume_policy: Mapping[str, Any] | None = None,
@@ -245,7 +253,7 @@ class LedgerCommandJournal:
         try:
             frozen_plan = store.read_json(
                 context.command_plan_hash,
-                schema_file="phase_command_plan_v1.schema.json",
+                schema_file="phase_command_plan_v2.schema.json",
             )
             validate_phase_command_plan(
                 frozen_plan,
@@ -263,6 +271,8 @@ class LedgerCommandJournal:
             if (command_spec_id is None or item["command_spec_id"] == command_spec_id)
             and item["argv"] == list(argv)
             and item["cwd"] == cwd
+            and item["environment"] == dict(environment or {})
+            and item["inherited_environment"] == sorted(inherited_environment or ["HOME", "PATH", "TMPDIR"])
             and (
                 not requested_output_kinds
                 or sorted(output["kind"] for output in item["expected_outputs"]) == requested_output_kinds
@@ -385,6 +395,7 @@ class LedgerCommandJournal:
             "stderr_ref": stderr_ref,
             "external_job_id": result.external_job_id,
             "outputs": LedgerCommandJournal._receipt_outputs(command, result),
+            "raw_outputs": LedgerCommandJournal._receipt_raw_outputs(command, result),
         }
 
     def _validate_receipt_ref(
@@ -393,54 +404,11 @@ class LedgerCommandJournal:
         record: Mapping[str, Any],
         receipt_ref: Mapping[str, Any],
     ) -> dict[str, Any]:
+        del command
         try:
-            receipt = ContractStore(self.project_root).read_json(
-                receipt_ref,
-                schema_file=PHASE_RUN_RECEIPT_SCHEMA_FILE,
-            )
+            return validate_phase_run_receipt(self.project_root, record, receipt_ref)
         except (OSError, TypeError, ValueError) as error:
             raise CommandJournalError(f"durable command receipt is invalid: {error}") from error
-        expected = {
-            "command_id": command["command_id"],
-            "command_hash": command["command_hash"],
-            "command_spec_id": command["command_spec_id"],
-            "command_plan_hash": command["command_plan_hash"],
-            "attempt_id": command["attempt_id"],
-            "lifecycle_generation": command["lifecycle_generation"],
-            "phase": command["phase"],
-            "phase_execution_id": command["phase_execution_id"],
-            "phase_start_event_id": command["phase_start_event_id"],
-            "producer_run_id": command["producer_run_id"],
-            "implementation_hash": command["implementation_hash"],
-            "attempt_input_hash": command["attempt_input_hash"],
-            "provenance_mode": command["provenance_mode"],
-        }
-        for field_name, value in expected.items():
-            if receipt.get(field_name) != value:
-                raise CommandJournalError(f"durable command receipt {field_name} mismatch")
-        started_event_id = record.get("started_event_id") or record.get("event_id")
-        started_event_hash = record.get("started_event_hash") or record.get("event_hash")
-        if receipt.get("started_event_id") != started_event_id or receipt.get("started_event_hash") != started_event_hash:
-            raise CommandJournalError("durable command receipt does not bind the authoritative start event")
-        expected_outputs = tuple(command["command_spec"]["expected_outputs"])
-        if receipt["exit_code"] != 0 and not receipt["outputs"]:
-            return receipt
-        if len(receipt["outputs"]) != len(expected_outputs):
-            raise CommandJournalError("durable command receipt output count differs from frozen command intent")
-        for expected_output, output in zip(expected_outputs, receipt["outputs"], strict=True):
-            if output["kind"] != expected_output["kind"] or output["schema_version"] != expected_output["schema_version"]:
-                raise CommandJournalError("durable command receipt output differs from frozen command spec")
-            if output["producer_run_id"] != command["producer_run_id"]:
-                raise CommandJournalError("durable command receipt output producer mismatch")
-            if output["phase"] != command["phase"] or output["lifecycle_generation"] != command["lifecycle_generation"]:
-                raise CommandJournalError("durable command receipt output execution identity mismatch")
-            if output["content_hash"] != output["contract_ref"]["digest"]:
-                raise CommandJournalError("durable command receipt output hash mismatch")
-            try:
-                ContractStore(self.project_root).verify(output["contract_ref"])
-            except (OSError, TypeError, ValueError) as error:
-                raise CommandJournalError(f"durable command receipt output is invalid: {error}") from error
-        return receipt
 
     @staticmethod
     def _receipt_outputs(
@@ -475,6 +443,42 @@ class LedgerCommandJournal:
             })
         return normalized
 
+    @staticmethod
+    def _receipt_raw_outputs(
+        command: Mapping[str, Any],
+        result: CommandExecutionResult,
+    ) -> list[dict[str, Any]]:
+        if result.exit_code != 0:
+            if result.raw_outputs:
+                raise CommandJournalError("failed command cannot publish scientific raw outputs")
+            return []
+        normalized: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for supplied in result.raw_outputs:
+            output_id = str(supplied.get("output_id") or "")
+            if not output_id or output_id in seen:
+                raise CommandJournalError("command raw output_id must be unique and non-empty")
+            seen.add(output_id)
+            reference = supplied.get("contract_ref")
+            if not isinstance(reference, Mapping):
+                raise CommandJournalError("command raw output requires an immutable ContractRef")
+            normalized.append({
+                "output_id": output_id,
+                "kind": str(supplied.get("kind") or ""),
+                "schema_version": str(supplied.get("schema_version") or ""),
+                "content_hash": str(reference.get("digest") or ""),
+                "contract_ref": dict(reference),
+                "producer_run_id": command["producer_run_id"],
+                "phase": command["phase"],
+                "lifecycle_generation": command["lifecycle_generation"],
+                "command_spec_id": command["command_spec_id"],
+                "locator": str(supplied.get("locator") or ""),
+                "locator_type": str(supplied.get("locator_type") or ""),
+                "dataset_id": supplied.get("dataset_id"),
+                "role": supplied.get("role"),
+            })
+        return normalized
+
     def _execution_result_from_receipt(self, receipt: Mapping[str, Any]) -> CommandExecutionResult:
         store = ContractStore(self.project_root)
         stdout_raw = store.read_bytes(receipt["stdout_ref"])
@@ -486,6 +490,7 @@ class LedgerCommandJournal:
             stdout_hash=str(receipt["stdout_hash"]),
             stderr_hash=str(receipt["stderr_hash"]),
             outputs=tuple(dict(item) for item in receipt["outputs"]),
+            raw_outputs=tuple(dict(item) for item in receipt.get("raw_outputs") or []),
             external_job_id=str(receipt["external_job_id"]) if receipt.get("external_job_id") else None,
             stdout=stdout_raw.decode("utf-8"),
             stderr=stderr_raw.decode("utf-8"),

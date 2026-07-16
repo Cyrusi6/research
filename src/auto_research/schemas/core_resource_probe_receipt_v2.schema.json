@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "operation",
+    "attempt_id",
+    "direction_semantic_hash",
+    "direction_spec_hash",
+    "variant_semantic_hash",
+    "variant_spec_hash",
+    "trial_spec_hash",
+    "protocol_hash",
+    "sample_manifest_hash",
+    "evaluator_hash",
+    "lifecycle_generation",
+    "implementation_hash",
+    "attempt_input_hash",
+    "phase",
+    "phase_execution_id",
+    "phase_start_event_id",
+    "authority_event_id",
+    "producer_run_id",
+    "resource_type",
+    "resource_id",
+    "required_capacity",
+    "observed_capacity",
+    "unit",
+    "probe_status",
+    "observed_at",
+    "provider_id"
+  ],
+  "properties": {
+    "schema_version": {"const": "auto_research_core_resource_probe_receipt_v2"},
+    "operation": {"enum": ["pause", "resume"]},
+    "attempt_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"},
+    "direction_semantic_hash": {"$ref": "#/$defs/hash"},
+    "direction_spec_hash": {"$ref": "#/$defs/hash"},
+    "variant_semantic_hash": {"$ref": "#/$defs/hash"},
+    "variant_spec_hash": {"$ref": "#/$defs/hash"},
+    "trial_spec_hash": {"$ref": "#/$defs/hash"},
+    "protocol_hash": {"$ref": "#/$defs/hash"},
+    "sample_manifest_hash": {"$ref": "#/$defs/hash"},
+    "evaluator_hash": {"$ref": "#/$defs/hash"},
+    "lifecycle_generation": {"type": "integer", "minimum": 0},
+    "implementation_hash": {"$ref": "#/$defs/hash"},
+    "attempt_input_hash": {"$ref": "#/$defs/hash"},
+    "phase": {"enum": ["proxy", "full", "resume"]},
+    "phase_execution_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "phase_start_event_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"},
+    "authority_event_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"},
+    "producer_run_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "resource_type": {"enum": ["gpu_memory", "system_memory", "disk", "network", "quota"]},
+    "resource_id": {"type": "string", "minLength": 1},
+    "required_capacity": {"type": "number", "exclusiveMinimum": 0},
+    "observed_capacity": {"type": "number", "minimum": 0},
+    "unit": {"enum": ["bytes", "count", "bytes_per_second"]},
+    "probe_status": {"enum": ["insufficient", "available"]},
+    "observed_at": {"type": "string", "format": "date-time"},
+    "provider_id": {"enum": ["core-os-resource-provider-v1", "constrained-test-resource-provider-v1"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"operation": {"const": "pause"}}},
+      "then": {
+        "properties": {
+          "phase": {"enum": ["proxy", "full"]},
+          "probe_status": {"const": "insufficient"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"operation": {"const": "resume"}}},
+      "then": {
+        "properties": {
+          "phase": {"const": "resume"},
+          "probe_status": {"const": "available"}
+        }
+      }
+    }
+  ],
+  "$defs": {"hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"}}
+}

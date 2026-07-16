@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 import shutil
 import subprocess
 from collections.abc import Iterator
@@ -149,26 +150,16 @@ def _best_python(candidates: list[str]) -> str | None:
 
 def _python_has_laps_dependencies(python_bin: str) -> bool:
     try:
-        if " " in python_bin:
-            result = subprocess.run(
-                f"{python_bin} -c \"import torch, transformers, tensorboard_logger; print('ok')\"",
-                shell=True,
-                executable="/bin/bash",
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-        else:
-            result = subprocess.run(
-                [
-                    python_bin,
-                    "-c",
-                    "import torch, transformers, tensorboard_logger; print('ok')",
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+        argv = shlex.split(python_bin)
+        if not argv:
+            return False
+        result = subprocess.run(
+            [*argv, "-c", "import torch, transformers, tensorboard_logger; print('ok')"],
+            shell=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
     except Exception:
         return False
     return result.returncode == 0

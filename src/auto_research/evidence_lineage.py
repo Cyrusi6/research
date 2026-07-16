@@ -16,7 +16,7 @@ from typing import Any, Mapping, Sequence
 from .contract_store import ContractStore, canonical_contract_bytes, contract_digest, validate_schema
 from .evidence import EvidenceStore, decode_evidence_inventory
 
-_RECEIPT_SCHEMA_FILE = "phase_run_receipt_v3.schema.json"
+_RECEIPT_SCHEMA_FILE = "phase_run_receipt_v4.schema.json"
 _LINEAGE_FIELDS = {
     "command_id",
     "command_hash",
@@ -26,6 +26,8 @@ _LINEAGE_FIELDS = {
     "output_ref",
     "completed_event_id",
     "derivation",
+    "derivation_ref",
+    "derivation_hash",
 }
 
 
@@ -78,7 +80,7 @@ def manifest_from_completion_evidence(
     if not isinstance(entries, list) or not entries:
         raise ValueError("CompletionEvidence entries are required")
     return {
-        "schema_version": "auto_research_evidence_manifest_v4",
+        "schema_version": "auto_research_evidence_manifest_v5",
         "attempt_id": attempt["attempt_id"],
         "direction_semantic_hash": attempt["direction_semantic_hash"],
         "direction_spec_hash": attempt["direction_spec_hash"],
@@ -172,6 +174,15 @@ def validate_receipt_bound_evidence(
             "output_ref": output_ref,
             "completed_event_id": output["completed_event_id"],
         }
+        derivation = _store_direct_derivation_manifest(
+            project_root=project_root,
+            attempt=attempt,
+            phase=phase,
+            entry=entry,
+            output=output,
+        )
+        derived["derivation_ref"] = derivation
+        derived["derivation_hash"] = derivation["digest"]
         supplied_lineage = {key: entry[key] for key in _LINEAGE_FIELDS if key in entry}
         if supplied_lineage:
             expected_lineage = dict(derived)
@@ -197,9 +208,9 @@ def validate_receipt_bound_evidence(
         )
 
     canonical_manifest = {key: deepcopy(value) for key, value in manifest.items() if key != "entries"}
-    canonical_manifest["schema_version"] = "auto_research_evidence_manifest_v4"
+    canonical_manifest["schema_version"] = "auto_research_evidence_manifest_v5"
     canonical_manifest["entries"] = canonical_entries
-    validate_schema(canonical_manifest, "evidence_manifest_v4.schema.json")
+    validate_schema(canonical_manifest, "evidence_manifest_v5.schema.json")
     observations, decoded = decode_evidence_inventory(
         attempt=attempt,
         trial_spec=trial_spec,
@@ -214,6 +225,53 @@ def validate_receipt_bound_evidence(
         evidence_bytes=dict(evidence_bytes),
         lineage=lineage,
     )
+
+
+def _store_direct_derivation_manifest(
+    *,
+    project_root: Path,
+    attempt: Mapping[str, Any],
+    phase: str,
+    entry: Mapping[str, Any],
+    output: Mapping[str, Any],
+) -> dict[str, Any]:
+    store = ContractStore(project_root)
+    decoder_raw = Path(__file__).read_bytes()
+    decoder_ref = store.put_bytes(decoder_raw)
+    manifest = {
+        "schema_version": "auto_research_evidence_derivation_manifest_v1",
+        "derivation_id": f"derive:{entry['kind']}:{entry['content_hash'][:24]}",
+        "attempt_id": attempt["attempt_id"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "phase": phase,
+        "phase_execution_id": entry["phase_execution_id"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "protocol_hash": attempt["protocol_hash"],
+        "sample_manifest_hash": attempt["sample_manifest_hash"],
+        "evaluator_hash": attempt["evaluator_hash"],
+        "source_commands": [{
+            "command_id": output["command_id"],
+            "command_hash": output["command_hash"],
+            "receipt_ref": deepcopy(output["receipt_ref"]),
+            "receipt_hash": output["receipt_hash"],
+            "output_ref": deepcopy(output["output_ref"]),
+            "output_hash": output["output_ref"]["digest"],
+        }],
+        "decoder": {
+            "decoder_id": "direct-canonical-evidence-decoder",
+            "decoder_version": "1",
+            "source_ref": decoder_ref,
+            "source_hash": decoder_ref["digest"],
+        },
+        "normalized_outputs": [{
+            "kind": entry["kind"],
+            "contract_ref": deepcopy(output["output_ref"]),
+            "content_hash": entry["content_hash"],
+        }],
+    }
+    return store.put_json(manifest, schema_file="evidence_derivation_manifest_v1.schema.json")
 
 
 def _expected_phase_kinds(trial_spec: Mapping[str, Any], phase: str) -> set[str]:

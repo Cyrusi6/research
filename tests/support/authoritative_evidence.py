@@ -37,7 +37,7 @@ def _record_failed_phase_command(
     running_phase = next(phase for phase in ("proxy", "full") if attempt["phases"].get(phase) == "RUNNING")
     ledger = ResearchEventLedger(project_root)
     context = ResearchLedgerPhaseAuthority(ledger).context_for_attempt(project_root, attempt["attempt_id"], running_phase)
-    plan = ContractStore(project_root).read_json(context.command_plan_hash, schema_file="phase_command_plan_v1.schema.json")
+    plan = ContractStore(project_root).read_json(context.command_plan_hash, schema_file="phase_command_plan_v2.schema.json")
     used = {
         record["command"]["command_spec_id"]
         for record in ledger.state()["phase_commands"].values()
@@ -73,7 +73,7 @@ def _record_failed_phase_command(
     }
 
 
-def build_trial_spec_v5(
+def build_trial_spec_v7(
     spec: dict,
     *,
     project_root: Path | None = None,
@@ -92,16 +92,13 @@ def build_trial_spec_v5(
     dataset_specs = []
     for index, dataset in enumerate(legacy_manifest["datasets"]):
         dataset_id = dataset["dataset_id"]
-        ordered_sample_ids = list(dataset["ordered_sample_ids"])
-        source_payload = {
-            "dataset_id": dataset_id,
-            "source_revision": dataset["source_revision"],
-            "split": dataset["split"],
-            "ordered_sample_ids": ordered_sample_ids,
-            "fixture_index": index,
-        }
-        source_blob = store.put_bytes(canonical_contract_bytes(source_payload))
-        content_digest = store.digest_referenced_bytes([source_blob])
+        declared_sample_ids = list(dataset["ordered_sample_ids"])
+        raw_sample_refs = [
+            store.put_bytes(canonical_contract_bytes({"fixture_sample": sample_id, "ordinal": ordinal}))
+            for ordinal, sample_id in enumerate(declared_sample_ids)
+        ]
+        ordered_sample_ids = [item["digest"] for item in raw_sample_refs]
+        content_digest = store.digest_referenced_bytes(raw_sample_refs)
         sample_datasets.append(
             {
                 "dataset_id": dataset_id,
@@ -109,8 +106,10 @@ def build_trial_spec_v5(
                 "split": dataset["split"],
                 "sample_count": len(ordered_sample_ids),
                 "ordered_sample_ids": ordered_sample_ids,
-                "source_blobs": [source_blob],
+                "raw_sample_refs": raw_sample_refs,
                 "content_digest": content_digest,
+                "record_format": "jsonl-record-bytes-v1",
+                "canonicalization_contract": "preserve-selected-record-bytes-v1",
             }
         )
         dataset_specs.append(
@@ -125,7 +124,7 @@ def build_trial_spec_v5(
     if len(manifest_id) < 8:
         manifest_id = f"fixture-{manifest_id}"
     sample_manifest = {
-        "schema_version": "auto_research_sample_manifest_v3",
+        "schema_version": "auto_research_sample_manifest_v4",
         "manifest_id": manifest_id,
         "provenance_mode": legacy_manifest.get("provenance_mode", "synthetic"),
         "datasets": sample_datasets,
@@ -134,7 +133,7 @@ def build_trial_spec_v5(
     result["sample_manifest_ref"] = store.put_contract(
         sample_manifest,
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v3.schema.json",
+        schema_file="sample_manifest_v4.schema.json",
     )
     result["datasets"] = dataset_specs
 
@@ -286,6 +285,9 @@ def build_trial_spec_v5(
         result["proxy_decision_policy"] = None
     validate_trial_spec(result)
     return result
+
+
+build_trial_spec_v5 = build_trial_spec_v7
 
 
 def refresh_phase_command_plans(spec: dict, *, project_root: Path | None = None) -> dict:
@@ -560,7 +562,7 @@ def build_bootstrap_completion(
     return stage_authoritative_completion(project_root, attempt, trial_spec, inventory)
 
 
-def build_failure_evidence_v4(
+def build_failure_evidence_v6(
     project_root: Path,
     attempt: dict,
     *,
@@ -568,7 +570,7 @@ def build_failure_evidence_v4(
     suffix: str,
     exit_code: int = 1,
 ) -> dict:
-    """Stage canonical non-resource failure and command-receipt evidence."""
+    """Stage canonical non-resource failure bound to a committed PhaseRunReceipt."""
 
     if failure_class not in {
         "implementation_failure",
@@ -576,7 +578,7 @@ def build_failure_evidence_v4(
         "integrity_failure",
         "safety_failure",
     }:
-        raise ValueError("build_failure_evidence_v4 only supports non-resource failures")
+        raise ValueError("build_failure_evidence_v6 only supports non-resource failures")
     running_phase = next(
         (phase for phase in ("proxy", "full") if attempt["phases"].get(phase) == "RUNNING"),
         None,
@@ -606,40 +608,13 @@ def build_failure_evidence_v4(
         "phase_execution_id": phase_execution["phase_execution_id"],
         "phase_start_event_id": phase_execution["phase_start_event_id"],
     }
-    receipt = {
-        "schema_version": "auto_research_command_result_evidence_v1",
-        "evidence_kind": "command_result_evidence",
-        "evidence_id": f"command-result-{attempt['lifecycle_generation']}-{suffix}",
-        **identity,
-        "command_id": f"failure-command-{attempt['lifecycle_generation']}-{suffix}",
-        "command": ["python", "failure_fixture.py", "--phase", source_phase],
-        "working_directory": "runner",
-        "started_at": "2026-07-14T00:00:00Z",
-        "finished_at": "2026-07-14T00:00:01Z",
-        "command_status": "failed",
-        "exit_code": exit_code,
-        "stdout_hash": "a" * 64,
-        "stderr_hash": "b" * 64,
-    }
-    receipt_raw = encode_canonical_evidence(receipt)
-    receipt_hash = hashlib.sha256(receipt_raw).hexdigest()
-    receipt_path = (
-        project_root
-        / "experiment"
-        / "attempts"
-        / attempt["attempt_id"]
-        / producer_run_id
-        / "command_result_evidence"
-        / f"{receipt_hash}.json"
-    )
-    receipt_path.parent.mkdir(parents=True, exist_ok=True)
-    receipt_path.write_bytes(receipt_raw)
+    stderr_text = "b" * 64
     command_binding = _record_failed_phase_command(
         project_root,
         attempt,
         suffix=suffix,
         exit_code=exit_code,
-        stderr="b" * 64,
+        stderr=stderr_text,
     )
 
     command_status = "integrity_blocked" if failure_class in {"integrity_failure", "safety_failure"} else "failed"
@@ -648,7 +623,7 @@ def build_failure_evidence_v4(
         "evidence_kind": "failure_evidence",
         "evidence_id": f"failure-evidence-{attempt['lifecycle_generation']}-{suffix}",
         **identity,
-        "cross_references": {"command_result_evidence_hash": receipt_hash},
+        "cross_references": {"phase_run_receipt_hash": command_binding["receipt_hash"]},
         "source_state": attempt["state"],
         "source_phase": source_phase,
         "failure_class": failure_class,
@@ -656,7 +631,7 @@ def build_failure_evidence_v4(
         "exit_code": exit_code,
         "reason": f"verified {failure_class}",
         "observed_at": "2026-07-14T00:00:01Z",
-        "log_hash": receipt["stderr_hash"],
+        "log_hash": hashlib.sha256(stderr_text.encode()).hexdigest(),
         **command_binding,
     }
     evidence_raw = encode_canonical_evidence(evidence)
@@ -673,6 +648,9 @@ def build_failure_evidence_v4(
     evidence_path.parent.mkdir(parents=True, exist_ok=True)
     evidence_path.write_bytes(evidence_raw)
     return evidence
+
+
+build_failure_evidence_v4 = build_failure_evidence_v6
 
 
 def build_resource_failure_evidence_v4(

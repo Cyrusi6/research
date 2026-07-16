@@ -216,42 +216,31 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
             }
         ],
         "required_outputs": [
+            "meta/research_events.sqlite3",
+            "meta/research_state.json",
+            "meta/route_outcome.json",
             "experiment/results/trial_result.json",
-            "experiment/results/main_results.json",
-            "experiment/results/ablation_results.json",
-            "experiment/results/hypothesis_verification.md",
             "experiment/gate_report.json",
         ],
         "optional_outputs": [
+            "experiment/results/main_results.json",
+            "experiment/results/ablation_results.json",
+            "experiment/results/hypothesis_verification.md",
             "experiment/results/posthoc_review.json",
             "experiment/results/failure_feedback.json",
             "experiment/results/c2c_small_loop_results.json",
+            "experiment/results/s3_candidate_selection.json",
+            "experiment/results/c2c_proxy_baseline_fingerprint.json",
+            "experiment/results/c2c_proxy_cache_report.json",
+            "experiment/results/c2c_effective_proxy_policy.json",
+            "experiment/results/c2c_proxy_decision_report.json",
+            "experiment/results/c2c_proxy_calibration_policy.json",
+            "experiment/results/c2c_full_s3_worthiness.json",
+            "experiment/results/c2c_full_s3_decision.json",
+            "experiment/results/bootstrap_proxy_completion.json",
             "experiment/code_snapshots",
         ],
-        "conditional_outputs": [
-            {
-                "when": "execution.collector == c2c_small_loop",
-                "paths": [
-                    "experiment/results/s3_candidate_selection.json",
-                    "experiment/results/c2c_proxy_baseline_fingerprint.json",
-                    "experiment/results/c2c_proxy_cache_report.json",
-                    "experiment/results/c2c_effective_proxy_policy.json",
-                    "experiment/results/c2c_proxy_decision_report.json",
-                    "experiment/results/c2c_proxy_calibration_policy.json",
-                ],
-            },
-            {
-                "when": "execution.c2c_profile == standard",
-                "paths": [
-                    "experiment/results/c2c_full_s3_worthiness.json",
-                    "experiment/results/c2c_full_s3_decision.json",
-                ],
-            },
-            {
-                "when": "execution.c2c_profile == bootstrap",
-                "paths": ["experiment/results/bootstrap_proxy_completion.json"],
-            },
-        ],
+        "conditional_outputs": [],
         "required_config": ["experiment"],
         "conditional_config": [{"when": "project.mode == c2c", "keys": ["c2c", "llm.execution_provider"]}],
         "gate_validator": "s3_experiment_gate_v1",
@@ -259,11 +248,15 @@ DEFAULT_STAGE_CONTRACTS: dict[str, dict[str, Any]] = {
     "S4_writing": {
         "required_inputs": [
             "literature/survey.md",
+            "meta/research_state.json",
+            "experiment/results/trial_result.json",
+        ],
+        "optional_inputs": [
+            "meta/direction_outcome_aggregate.json",
             "experiment/results/main_results.json",
             "experiment/results/ablation_results.json",
             "experiment/results/hypothesis_verification.md",
         ],
-        "optional_inputs": [],
         "conditional_inputs": [],
         "required_outputs": [
             "paper/main.tex",

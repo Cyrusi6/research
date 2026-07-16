@@ -16,12 +16,8 @@ from auto_research.phase_execution import (
 )
 from auto_research.research_state import IntegrityError
 from auto_research.utils import read_json
-from test_c2c import _fake_c2c_repo
-from test_m115_final_e2e import (
-    _c2c_context,
-    _generic_project,
-    _install_local_c2c_runner,
-)
+from support.local_c2c_execution import build_c2c_context, create_local_c2c_repo, install_fake_gpu
+from test_m115_final_e2e import _generic_project
 
 
 @pytest.fixture(autouse=True)
@@ -100,23 +96,22 @@ def test_c2c_standard_run_uses_proxy_then_full_executors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = _fake_c2c_repo(tmp_path)
+    install_fake_gpu(tmp_path, monkeypatch)
+    repo = create_local_c2c_repo(tmp_path / "fixture-c2c", proxy_accuracy=0.51)
     root = tmp_path / "c2c"
     root.mkdir()
-    context = _c2c_context(root, repo, profile="standard")
+    context = build_c2c_context(root, repo, profile="standard")
     calls: list[tuple[str, str]] = []
     _install_executor_spy(monkeypatch, "C2CProxyPhaseExecutor", C2CProxyPhaseExecutor, calls)
     _install_executor_spy(monkeypatch, "C2CFullPhaseExecutor", C2CFullPhaseExecutor, calls)
     agent = ExperimentAgent(context)
-    runner_trace: list[dict] = []
-    _install_local_c2c_runner(agent, proxy_accuracy=0.51, trace=runner_trace)
 
-    agent.run()
+    result = agent.run()
 
     assert calls == [
         ("C2CProxyPhaseExecutor", "proxy"),
         ("C2CFullPhaseExecutor", "full"),
-    ]
+    ], result
     trial_spec = read_json(root / "plan/trial_spec.json", default={}) or {}
     for phase_contract in trial_spec["phase_contracts"]:
         commands = phase_contract["command_plan"]["commands"]
@@ -135,38 +130,33 @@ def test_c2c_standard_run_uses_proxy_then_full_executors(
         recovery_commands = [command for command in commands if "train_recovery" in command["command_spec_id"]]
         assert all(command["condition"]["kind"] != "always" for command in recovery_commands)
         assert all("full-train" in command["dependencies"] for command in recovery_commands)
-    command_names = [item["name"] for item in runner_trace]
-    assert "collect-evidence" not in command_names
-    assert command_names.index("proxy_command_1") < command_names.index("train")
     command_events = [
         (event["sequence"], event["payload"]["command"]["command_spec_id"])
         for event in experiment_module.ResearchEventLedger(root).events()
         if event["event_type"] == "PhaseCommandStarted"
     ]
     command_sequences = {command_spec_id: sequence for sequence, command_spec_id in command_events}
-    assert command_sequences["proxy-collect-evidence"] < command_sequences["full-train"]
+    assert command_sequences["proxy-derive-evidence"] < command_sequences["full-train"]
 
 
 def test_c2c_proxy_reject_never_invokes_full_executor_or_commands(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    repo = _fake_c2c_repo(tmp_path)
+    install_fake_gpu(tmp_path, monkeypatch)
+    repo = create_local_c2c_repo(tmp_path / "fixture-c2c-reject", proxy_accuracy=0.49)
     root = tmp_path / "c2c-reject"
     root.mkdir()
-    context = _c2c_context(root, repo, profile="standard")
+    context = build_c2c_context(root, repo, profile="standard")
     calls: list[tuple[str, str]] = []
     _install_executor_spy(monkeypatch, "C2CProxyPhaseExecutor", C2CProxyPhaseExecutor, calls)
     _install_executor_spy(monkeypatch, "C2CFullPhaseExecutor", C2CFullPhaseExecutor, calls)
     agent = ExperimentAgent(context)
-    runner_trace: list[dict] = []
-    _install_local_c2c_runner(agent, proxy_accuracy=0.49, trace=runner_trace)
 
     result = agent.run()
 
     assert calls == [("C2CProxyPhaseExecutor", "proxy")]
-    assert result["route_outcome"]["next_action"] == "PROPOSE_NEXT_VARIANT"
-    assert not any(item["name"] in {"train", "eval_mmlu-redux", "ablation_eval_mmlu-redux"} for item in runner_trace)
+    assert result.get("route_outcome", {}).get("next_action") == "PROPOSE_NEXT_VARIANT", result
     assert "FullPhaseStarted" not in [
         event["event_type"] for event in experiment_module.ResearchEventLedger(root).events()
     ]
@@ -213,7 +203,11 @@ def test_direct_authoritative_step_cannot_bypass_phase_executor_before_runner(tm
     agent._active_command_journal = Journal()
 
     with pytest.raises(IntegrityError, match="PhaseExecutor|executor authorization|executor capability"):
-        agent._run_authoritative_step(name="direct-bypass", command="true", cwd=tmp_path)
+        agent._run_authoritative_step(
+            name="direct-bypass",
+            command={"argv": ["true"], "cwd": str(tmp_path)},
+            cwd=tmp_path,
+        )
 
     assert runner_calls == []
 

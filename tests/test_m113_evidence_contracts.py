@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from pathlib import Path
 
 import pytest
 
@@ -93,8 +94,8 @@ def _trial_spec(
     seeds: tuple[int, ...] = (7,),
     project_root: Path | None = None,
 ) -> dict:
-    from support.authoritative_evidence import build_trial_spec_v5
-    return build_trial_spec_v5(
+    from support.authoritative_evidence import build_trial_spec_v7
+    return build_trial_spec_v7(
         _trial_spec_legacy(objective=objective, datasets=datasets, seeds=seeds),
         project_root=project_root,
     )
@@ -129,7 +130,7 @@ def _main_inventory(spec: dict, values: dict[tuple[str, int], tuple[float, float
     digest = evidence_content_hash(payload)
     path = content_addressed_evidence_path(attempt_id=attempt["attempt_id"], producer_run_id=producer_run_id, evidence_kind="main_results", content_hash=digest)
     blob = lambda value: {"schema_version": "auto_research_contract_blob_v1", "algorithm": "sha256", "digest": value, "size_bytes": 1, "relative_path": f"meta/contracts/sha256/{value[:2]}/{value}.json"}
-    entry = {"evidence_id": evidence_id, "kind": "main_results", "relative_path": path, "content_hash": digest, "schema_version": payload["schema_version"], "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], **common, "cross_references": {}, "command_id": "command-main-attempt-1", "command_hash": "a" * 64, "command_plan_hash": "b" * 64, "receipt_ref": blob("c" * 64), "receipt_hash": "c" * 64, "output_ref": blob(digest), "completed_event_id": "event:command:completed:main"}
+    entry = {"evidence_id": evidence_id, "kind": "main_results", "relative_path": path, "content_hash": digest, "schema_version": payload["schema_version"], "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], **common, "cross_references": {}, "command_id": "command-main-attempt-1", "command_hash": "a" * 64, "command_plan_hash": "b" * 64, "receipt_ref": blob("c" * 64), "receipt_hash": "c" * 64, "output_ref": blob(digest), "completed_event_id": "event:command:completed:main", "derivation_ref": blob("d" * 64), "derivation_hash": "d" * 64}
     manifest = {"schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION, "attempt_id": attempt["attempt_id"], "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "lifecycle_generation": 0, "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"], "entries": [entry]}
     return manifest, {evidence_id: raw}
 
@@ -288,7 +289,7 @@ def test_nonquantitative_evidence_schema_baseline_then_version_and_extra_propert
 
 def test_transaction_evidence_is_not_completion_manifest_evidence() -> None:
     assert TRANSACTION_EVIDENCE_SCHEMA_VERSIONS == {
-        "failure_evidence": "auto_research_failure_evidence_v5",
+        "failure_evidence": "auto_research_failure_evidence_v6",
         "resource_probe": "auto_research_resource_probe_evidence_v4",
         "resume_evidence": "auto_research_resume_evidence_v5",
     }
@@ -313,7 +314,38 @@ def test_completion_manifest_rejects_noncompletion_evidence_kinds(kind: str) -> 
     forged = deepcopy(manifest)
     forged["entries"][0]["kind"] = kind
     with pytest.raises(ValueError):
-        validate_contract(forged, "evidence_manifest_v4.schema.json")
+        validate_contract(forged, "evidence_manifest_v5.schema.json")
+
+
+def test_evidence_manifest_v5_rejects_replaced_inline_derivation() -> None:
+    spec = _trial_spec()
+    manifest, _ = _main_inventory(spec, {("d1", 7): (0.0, 1.0)})
+    forged = deepcopy(manifest)
+    forged["entries"][0]["derivation"] = {
+        "decoder_id": "legacy-decoder",
+        "decoder_version": "1",
+        "decoder_hash": "e" * 64,
+        "source_output_hashes": ["f" * 64],
+    }
+    with pytest.raises(ValueError):
+        validate_contract(forged, "evidence_manifest_v5.schema.json")
+
+
+def test_replaced_authoritative_schema_files_are_absent() -> None:
+    schema_root = Path(__file__).parents[1] / "src" / "auto_research" / "schemas"
+    replaced = {
+        "trial_spec_v6.schema.json",
+        "phase_command_plan_v1.schema.json",
+        "phase_command_v2.schema.json",
+        "phase_run_receipt_v3.schema.json",
+        "evidence_manifest_v4.schema.json",
+        "sample_manifest_v3.schema.json",
+        "failure_evidence_v5.schema.json",
+        "event_v7.schema.json",
+        "attempt_record_v7.schema.json",
+        "research_state_v7.schema.json",
+    }
+    assert not any((schema_root / name).exists() for name in replaced)
 
 
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])

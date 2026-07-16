@@ -101,17 +101,19 @@ def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dic
     return attempt, trial_spec, comparison, baseline
 
 
-def test_c2c_real_adapter_must_not_return_empty_inventory(tmp_path: Path) -> None:
+def test_c2c_real_inventory_rejects_mutable_results_without_authoritative_receipts(tmp_path: Path) -> None:
     attempt, trial_spec, comparison, baseline = _c2c_inputs(tmp_path)
-    inventory = _c2c_strict_evidence_inventory(
-        project_root=tmp_path,
-        attempt=attempt,
-        trial_spec=trial_spec,
-        comparison_candidate=comparison,
-        baseline=baseline,
-        simulate=False,
-    )
-    assert inventory
+    before = list((tmp_path / "experiment").rglob("*.json"))
+    with pytest.raises(S3ValidationError, match="authoritative command receipts"):
+        _c2c_strict_evidence_inventory(
+            project_root=tmp_path,
+            attempt=attempt,
+            trial_spec=trial_spec,
+            comparison_candidate=comparison,
+            baseline=baseline,
+            simulate=False,
+        )
+    assert list((tmp_path / "experiment").rglob("*.json")) == before
 
 
 def test_c2c_bootstrap_inventory_is_proxy_only_and_contains_completion(tmp_path: Path) -> None:
@@ -228,7 +230,7 @@ def test_resume_rejects_probe_with_other_attempt_identity(tmp_path: Path) -> Non
     new_path.write_bytes(raw)
     evidence["cross_references"]["resource_probe_hash"] = new_hash
     _scoped_artifact(tmp_path, paused, producer, "resume_evidence", evidence)
-    with pytest.raises(IntegrityError, match="identity|attempt"):
+    with pytest.raises(IntegrityError, match="identity|attempt|authority|completed authoritative command"):
         ledger.resume_attempt(evidence)
 
 
@@ -371,7 +373,7 @@ def test_generic_non_simulate_external_manifest_commits_strict_trial(tmp_path: P
         "acceptance_criteria": {"minimum_mean_delta": 0.1, "maximum_dataset_regression": 0.0},
         "ablation_matrix": [],
         "execution": {
-            "mode": "real", "collector": "external_manifest", "commands": [f"{sys.executable} producer.py"],
+            "mode": "real", "collector": "external_manifest", "commands": [{"argv": [sys.executable, "producer.py"]}],
             "workdir": str(project_root), "phase_manifest_path": "runner/phase_manifest.json",
             "evaluator_id": "fixture-evaluator", "evaluator_source_paths": ["evaluator.py"],
             "dependency_payloads": [{"name": "python", "version": f"{sys.version_info.major}.{sys.version_info.minor}"}],
@@ -383,7 +385,7 @@ def test_generic_non_simulate_external_manifest_commits_strict_trial(tmp_path: P
     sample_manifest = contract_store.read_contract(
         trial_spec["sample_manifest_ref"],
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v3.schema.json",
+        schema_file="sample_manifest_v4.schema.json",
     )
     evaluator_manifest = contract_store.read_contract(
         trial_spec["execution_contract"]["evaluator_manifest_ref"],
@@ -480,16 +482,19 @@ def test_real_evaluator_manifest_tamper_rejects_reservation_without_write(tmp_pa
     direction, variant = _authoritative_direction_and_variant()
     evaluator_source = tmp_path / "evaluator.py"
     evaluator_source.write_text("def evaluate(value):\n    return value\n", encoding="utf-8")
+    samples = tmp_path / "samples"
+    samples.mkdir()
+    (samples / "dataset-a.jsonl").write_text('{"id":"sample-a","text":"fixture"}\n', encoding="utf-8")
     plan = {
         "hypotheses": [{"id": "H1", "statement": "candidate improves accuracy"}],
         "baselines": [{"name": "baseline"}],
-        "datasets": [{"name": "dataset-a", "split": "validation", "sample_count": 1, "source_revision": "fixture-v1", "ordered_sample_ids": ["1" * 64]}],
+        "datasets": [{"name": "dataset-a", "split": "validation", "sample_count": 1, "source_revision": "fixture-v1", "sample_source_path": "samples/dataset-a.jsonl"}],
         "metrics": [{"name": "accuracy", "primary": True, "higher_is_better": True}],
         "statistical_testing": {"seeds": [7], "aggregation": "mean", "require_complete_seed_coverage": True},
         "acceptance_criteria": {"minimum_mean_delta": 0.1, "maximum_dataset_regression": 0.0},
         "ablation_matrix": [],
         "execution": {
-            "mode": "real", "collector": "external_manifest", "commands": ["true"], "workdir": str(tmp_path),
+            "mode": "real", "collector": "external_manifest", "commands": [{"argv": ["true"]}], "workdir": str(tmp_path),
             "phase_manifest_path": "runner/phase_manifest.json", "evaluator_id": "fixture-evaluator",
             "evaluator_source_paths": ["evaluator.py"], "dependency_payloads": [{"lock": "fixture-v1"}],
         },
@@ -519,7 +524,7 @@ def test_proxy_evidence_transaction_gates_full_without_budget_consumption(tmp_pa
     ledger = ResearchEventLedger(tmp_path)
     inventory = _c2c_strict_evidence_inventory(
         project_root=tmp_path, attempt=attempt, trial_spec=trial_spec,
-        comparison_candidate=comparison, baseline=baseline, simulate=False,
+        comparison_candidate=comparison, baseline=baseline, simulate=True,
     )
     completion = _stage_evidence_inventory(project_root=tmp_path, attempt=attempt, trial_spec=trial_spec, inventory=inventory)
     record_completed_evidence_command(tmp_path, ledger, attempt, completion)
@@ -538,7 +543,7 @@ def test_proxy_reject_prevents_full_start_and_releases_reservation(tmp_path: Pat
     ledger = ResearchEventLedger(tmp_path)
     inventory = _c2c_strict_evidence_inventory(
         project_root=tmp_path, attempt=attempt, trial_spec=trial_spec,
-        comparison_candidate=comparison, baseline=baseline, simulate=False,
+        comparison_candidate=comparison, baseline=baseline, simulate=True,
     )
     completion = _stage_evidence_inventory(project_root=tmp_path, attempt=attempt, trial_spec=trial_spec, inventory=inventory)
     record_completed_evidence_command(tmp_path, ledger, attempt, completion)
@@ -554,7 +559,7 @@ def test_proxy_reject_prevents_full_start_and_releases_reservation(tmp_path: Pat
 def test_rebuild_rejects_forged_proxy_outcome_derivatives(tmp_path: Path) -> None:
     attempt, trial_spec, comparison, baseline = _c2c_inputs(tmp_path)
     ledger = ResearchEventLedger(tmp_path)
-    inventory = _c2c_strict_evidence_inventory(project_root=tmp_path, attempt=attempt, trial_spec=trial_spec, comparison_candidate=comparison, baseline=baseline, simulate=False)
+    inventory = _c2c_strict_evidence_inventory(project_root=tmp_path, attempt=attempt, trial_spec=trial_spec, comparison_candidate=comparison, baseline=baseline, simulate=True)
     completion = _stage_evidence_inventory(project_root=tmp_path, attempt=attempt, trial_spec=trial_spec, inventory=inventory)
     record_completed_evidence_command(tmp_path, ledger, attempt, completion)
     ledger.commit_proxy_evidence(completion)

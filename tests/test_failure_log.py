@@ -1,6 +1,7 @@
 import json
 from pathlib import Path
 
+import auto_research.failure_log as failure_log_module
 from auto_research.failure_log import FailureLogManager, build_c2c_feedback_bundle, load_c2c_feedback_bundle
 from auto_research.method_memory import append_shared_c2c_method_failure, collect_used_shared_memory_refs, load_shared_method_memory, shared_method_memory_for_prompt
 
@@ -250,6 +251,64 @@ def test_c2c_feedback_loader_filters_retryable_resource_pause_noise(tmp_path: Pa
     assert "gpu_wait_candidate" not in json.dumps(method_bundle, ensure_ascii=False)
     assert "gpu_wait_candidate" not in json.dumps(implementation_bundle, ensure_ascii=False)
     assert "no_metrics" not in implementation_bundle["summary"]["failure_modes"]
+
+
+def test_c2c_feedback_loader_uses_ledger_and_ignores_mutable_main_results(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    project_root = tmp_path / "proj"
+    ledger_path = project_root / "meta" / "research_events.sqlite3"
+    ledger_path.parent.mkdir(parents=True)
+    ledger_path.write_bytes(b"authoritative-ledger-placeholder")
+    results_dir = project_root / "experiment" / "results"
+    results_dir.mkdir(parents=True)
+    (results_dir / "main_results.json").write_text(
+        json.dumps(
+            {
+                "candidate_results": [
+                    {
+                        "id": "mutable-forgery",
+                        "decision": "proxy_rejected",
+                        "proxy_screen": {"proxy_dataset_deltas": {"mmlu-redux": -99.0}},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class StubLedger:
+        def __init__(self, root: Path):
+            assert root == project_root
+
+        def state(self) -> dict:
+            return {
+                "attempts": {"attempt-ledger": {"variant_id": "ledger-variant"}},
+                "trial_results": {},
+                "proxy_outcomes": {
+                    "attempt-ledger": {
+                        "attempt_id": "attempt-ledger",
+                        "decision": "PROPOSE_NEXT_VARIANT",
+                        "observed_delta": -0.4,
+                        "dataset_deltas": {"mmlu-redux": -1.5, "openbookqa": 0.7},
+                        "worst_dataset_regression": 1.5,
+                        "reason_codes": ["proxy_contract_constraints_fail"],
+                        "evidence_set_hash": "a" * 64,
+                    }
+                },
+                "operation_events": {},
+            }
+
+    monkeypatch.setattr(failure_log_module, "ResearchEventLedger", StubLedger)
+
+    bundle = load_c2c_feedback_bundle(project_root, view="method")
+
+    assert bundle["summary"]["failed_idea_ids"] == ["ledger-variant"]
+    assert bundle["summary"]["dataset_regressions"]["mmlu-redux"] == 1.5
+    assert "mutable-forgery" not in json.dumps(bundle, ensure_ascii=False)
+    assert "meta/research_events.sqlite3" in bundle["sources"]
+    assert "experiment/results/main_results.json" not in bundle["sources"]
 
 
 def test_shared_method_memory_records_only_method_failures(tmp_path: Path) -> None:

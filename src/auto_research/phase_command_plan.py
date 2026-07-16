@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import shlex
 import stat
 from copy import deepcopy
 from pathlib import Path, PurePosixPath
@@ -11,7 +10,7 @@ from typing import Any, Iterable, Mapping, Sequence
 from .contract_store import ContractStore
 
 
-PHASE_COMMAND_PLAN_SCHEMA_VERSION = "auto_research_phase_command_plan_v1"
+PHASE_COMMAND_PLAN_SCHEMA_VERSION = "auto_research_phase_command_plan_v2"
 
 _PHASES = {"proxy", "full"}
 _PROVENANCE_MODES = {"synthetic", "local-external", "production"}
@@ -89,7 +88,7 @@ def store_phase_command_plan(project_root: Path, plan: Mapping[str, Any]) -> tup
     validate_phase_command_plan(plan)
     reference = ContractStore(project_root).put_json(
         dict(plan),
-        schema_file="phase_command_plan_v1.schema.json",
+        schema_file="phase_command_plan_v2.schema.json",
     )
     return reference, str(reference["digest"])
 
@@ -103,7 +102,7 @@ def validate_phase_command_plan(
 
     from .contract_store import validate_schema
 
-    validate_schema(plan, "phase_command_plan_v1.schema.json")
+    validate_schema(plan, "phase_command_plan_v2.schema.json")
     commands = list(plan["commands"])
     command_ids = [item["command_spec_id"] for item in commands]
     if len(command_ids) != len(set(command_ids)):
@@ -151,12 +150,13 @@ def _normalize_command(
     source_snapshot_hash: str,
 ) -> dict[str, Any]:
     if isinstance(raw, str):
-        argv = ["/bin/sh", "-c", raw] if _requires_shell(raw) else shlex.split(raw)
-        payload: dict[str, Any] = {}
+        raise ValueError("PhaseCommandPlan commands must use typed argv, not shell strings")
     elif isinstance(raw, Mapping):
         payload = deepcopy(dict(raw))
         raw_argv = payload.pop("argv", None)
-        argv = shlex.split(raw_argv) if isinstance(raw_argv, str) else list(raw_argv or [])
+        if isinstance(raw_argv, str):
+            raise ValueError("PhaseCommandPlan argv must be a string array")
+        argv = list(raw_argv or [])
     else:
         argv = list(raw) if isinstance(raw, Sequence) else []
         payload = {}
@@ -169,6 +169,14 @@ def _normalize_command(
         "ordinal": ordinal,
         "dependencies": list(payload.pop("dependencies")) if "dependencies" in payload else None,
         "argv": argv,
+        "environment": {
+            str(key): str(value)
+            for key, value in dict(payload.pop("environment", {})).items()
+        },
+        "inherited_environment": sorted(
+            str(value)
+            for value in payload.pop("inherited_environment", ["HOME", "PATH", "TMPDIR"])
+        ),
         "cwd": str(payload.pop("cwd", default_cwd)),
         "source_snapshot_hash": str(payload.pop("source_snapshot_hash", source_snapshot_hash)),
         "expected_outputs": payload.pop("expected_outputs", None),
@@ -222,10 +230,6 @@ def _validate_cwd(value: str) -> None:
             break
         if stat.S_ISLNK(mode):
             raise ValueError("PhaseCommandPlan cwd cannot contain symlink components")
-
-
-def _requires_shell(value: str) -> bool:
-    return any(token in value for token in ("&&", "||", ">", "<", "|", ";", "$("))
 
 
 __all__ = [

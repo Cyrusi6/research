@@ -178,14 +178,14 @@ The M1.1.4 canonical behavior mappings remain valid. Fixtures now create TrialSp
 | Mismatched probe or pause evidence resumes Attempt | `tests/test_m115_failure_validation.py::test_resume_rejects_resource_identity_phase_and_producer_attacks`; `tests/test_m114_authoritative_phase_transactions.py::test_resume_rejects_probe_with_other_attempt_identity` | Resume binds the original pause, resource, Attempt, phase, and producer |
 | Reducer trusts rehashed Failure/Resume event payload | `tests/test_m115_failure_resume_reducer.py::test_rebuild_rejects_rehashed_failure_semantic_mutation`; `tests/test_m115_failure_resume_reducer.py::test_rebuild_rejects_failure_and_resume_raw_byte_drift` | Rebuild rereads immutable bytes and repeats semantic validation |
 | Full resource resume loses proxy authorization or reruns proxy | `tests/test_m115_failure_resume_reducer.py::test_full_resource_resume_retains_proxy_authorization_and_restarts_only_full` | New generation resumes from proxy-completed/full-pending |
-| Full starts after proxy science rejection | `tests/test_m114_authoritative_phase_transactions.py::test_proxy_reject_prevents_full_start_and_releases_reservation`; `tests/test_m115_final_e2e.py::test_c2c_non_simulated_physical_proxy_barrier` | Reject routes next variant, releases slot, consumes zero, invokes full zero times |
-| Bootstrap uses full artifacts or standard budget/history | `tests/test_m115_final_e2e.py::test_c2c_non_simulated_bootstrap_is_proxy_only_and_budget_isolated`; `tests/test_s3_proxy_gate.py::test_s3_bootstrap_gate_is_repeatable_read_only_and_budget_isolated` | Bootstrap is proxy terminal and standard-budget isolated |
+| Full starts after proxy science rejection | `tests/test_m114_authoritative_phase_transactions.py::test_proxy_reject_prevents_full_start_and_releases_reservation`; `tests/test_m1152_c2c_production_e2e.py::test_c2c_real_proxy_reject_never_runs_full`; `tests/test_m1152_production_recovery_e2e.py::test_c2c_non_simulated_single_attempt_obeys_proxy_barrier` | Reject routes next variant, releases slot, consumes zero, invokes full zero times |
+| Bootstrap uses full artifacts or standard budget/history | `tests/test_m1152_c2c_production_e2e.py::test_c2c_real_bootstrap_is_proxy_only_and_budget_isolated`; `tests/test_m1152_production_recovery_e2e.py::test_c2c_non_simulated_bootstrap_is_proxy_only_and_budget_isolated`; `tests/test_s3_proxy_gate.py::test_s3_bootstrap_gate_is_repeatable_read_only_and_budget_isolated` | Bootstrap is proxy terminal and standard-budget isolated |
 | Global TrialSpec projection controls historical replay | `tests/test_m114_authoritative_phase_transactions.py::test_exact_replay_uses_attempt_scoped_trial_spec_not_global_projection` | Replay uses Attempt-scoped frozen TrialSpec and historical operation result |
 | Caller event ID is ignored | `tests/test_m114_authoritative_phase_transactions.py::test_complete_attempt_honors_explicit_event_id` | Same ID/same intent replays; same ID/different intent conflicts |
 | Extra but valid evidence accepted before Gate failure | `tests/test_m114_authoritative_phase_transactions.py::test_unregistered_optional_evidence_is_rejected_before_commit`; `tests/test_s3_proxy_gate.py::test_bootstrap_completion_rejects_noncompletion_authoritative_kind` | Exact evidence set is enforced before any authoritative write |
 | Rehashed producer-derived proxy/result fields survive rebuild | `tests/test_m114_authoritative_phase_transactions.py::test_rebuild_rejects_forged_proxy_outcome_derivatives`; `tests/test_m114_authoritative_phase_transactions.py::test_reducer_rejects_forged_finalization_derivatives` | Reducer recomputes proxy and TrialResult derivatives from immutable evidence |
 | Generic external command bypasses ContractStore/authority | `tests/test_m114_authoritative_phase_transactions.py::test_generic_non_simulate_external_manifest_commits_strict_trial`; `tests/test_m115_final_e2e.py::test_generic_full_only_uses_authority_journal_and_gate` | Generic production-component path uses manifest v2, journal, immutable evidence, Ledger, and Gate |
-| Sixth standard execution reaches command/artifact creation | `tests/test_m115_final_e2e.py::test_generic_non_simulated_five_variants_and_sixth_precommand_rejection`; `tests/test_m115_final_e2e.py::test_c2c_non_simulated_five_variants_have_physical_proxy_full_order` | Five unique outcomes consume exactly five slots; sixth is rejected before command |
+| Sixth standard execution reaches command/artifact creation | `tests/test_m115_final_e2e.py::test_generic_non_simulated_five_variants_and_sixth_precommand_rejection`; `tests/test_m1152_production_recovery_e2e.py::test_c2c_non_simulated_five_variants_and_sixth_precommand_rejection` | Five unique outcomes consume exactly five slots; sixth is rejected before resource plan, command, or artifact creation |
 
 ### Deleted contract migration
 
@@ -193,13 +193,13 @@ The runtime intentionally rejects and does not migrate Event v5, AttemptRecord v
 
 ### Scope labels
 
-- `tests/test_m115_final_e2e.py` local subprocess cases are **non-simulated production-component** checks: they exercise ExperimentAgent, phase executor, Ledger command events, ContractStore, EvidenceStore, reducer/rebuild, and Gate without GPU requirements. They are not claims of scientific success.
+- The Generic cases retained in `tests/test_m115_final_e2e.py` and the C2C cases in `tests/test_m1152_c2c_production_e2e.py` / `tests/test_m1152_production_recovery_e2e.py` are **non-simulated production-component** checks: they exercise real local subprocesses, ExperimentAgent, phase executor, command receipts, ContractStore, EvidenceStore, derivation, reducer/rebuild, and Gate without claiming GPU scientific success.
 - Existing Generic/C2C five-variant simulation tests remain **synthetic** and prove deterministic state/budget/evidence behavior only.
 - Native Unified S1 Producer/Core and real external Codex S1 smoke are not migrated or claimed by M1.1.5-Final.
 
 ### Historical pre-v7 hermetic checkpoint
 
-- `tests/test_m115_final_e2e.py` now provisions its own temporary C2C dataset cache. The non-simulated tests no longer pass only because `/root/.cache`, the invoking user's HF cache, or another host cache happens to exist.
+- The M1.1.5.2 C2C production-component fixtures provision their own content-addressed sample bytes, fake local C2C repository, and constrained resource probe. They do not depend on `/root/.cache`, the invoking user's HF cache, an installed Codex binary, or host GPU availability.
 - `tests/test_resources.py::test_scan_reusable_runs_skips_directories_that_disappear_during_walk` replaces the racy project-wide `Path.rglob()` behavior with a filesystem-race-tolerant scan.
 - `tests/test_resources.py::test_scan_reusable_runs_ignores_project_temp_directory` ensures concurrent pytest `.tmp` trees are not interpreted as reusable scientific runs.
 - The pre-v7 checkpoint recorded green normal, proxy-cleared, and empty-HOME/no-Codex suites. Those historical counts do not validate M1.1.5.1 and are intentionally not repeated as current results.
@@ -225,3 +225,49 @@ Final acceptance commands and exact counts are recorded in the delivery report. 
 The current runtime versions are Event/AttemptRecord/ResearchState v7, TrialSpec v6, PhaseExecutionManifest v3, PhaseCommand v2, PhaseRunReceipt v3, EvidenceManifest v4, SampleManifest v3, CompletionEvidence v3, FailureEvidence/ResumeEvidence v5, and ResourceProbe v4. Replaced v6/v5/v4/v3 readers and schemas are removed; they are not dual-read or migrated.
 
 Final M1.1.5.1 verification reports `669 passed, 2 skipped, 0 failed` in the normal, proxy-cleared, and empty-HOME/empty-HF-cache/PATH-without-Codex full suites. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training remain outside this migration. Local subprocess and synthetic fixtures are engineering validation only.
+
+## M1.1.5.2 Raw Execution Provenance and Recovery Migration
+
+M1.1.5.2 replaces the remaining process-local, mutable-result, and caller-authored execution assumptions with typed physical commands, immutable raw command outputs, deterministic derivation, and receipt-derived resource/failure authority. Event/AttemptRecord/ResearchState v8 and TrialSpec v7 are breaking authority contracts. PhaseExecutionManifest v3 remains current; PhaseCommandPlan v2, PhaseCommand v3, PhaseRunReceipt v4, EvidenceManifest v5, EvidenceDerivationManifest v1, SampleManifest v4, and FailureEvidence v6 define the changed execution/provenance shapes. CompletionEvidence v3, ResumeEvidence v5, ResourceProbe v4, TrialResult v5, and RouteOutcome v4 retain their current shapes. Replaced readers/schemas are deleted without dual read, fallback, or automatic migration.
+
+### Deleted C2C test-name mapping
+
+| Deleted test from `tests/test_m115_final_e2e.py` | Canonical replacement |
+|---|---|
+| `test_c2c_non_simulated_physical_proxy_barrier` | Reject: `tests/test_m1152_c2c_production_e2e.py::test_c2c_real_proxy_reject_never_runs_full`; pass: `tests/test_m1152_c2c_production_e2e.py::test_c2c_real_proxy_pass_commits_before_full_and_finalizes`; full Agent/restart path: `tests/test_m1152_production_recovery_e2e.py::test_c2c_non_simulated_single_attempt_obeys_proxy_barrier` |
+| `test_c2c_non_simulated_bootstrap_is_proxy_only_and_budget_isolated` | `tests/test_m1152_c2c_production_e2e.py::test_c2c_real_bootstrap_is_proxy_only_and_budget_isolated`; `tests/test_m1152_production_recovery_e2e.py::test_c2c_non_simulated_bootstrap_is_proxy_only_and_budget_isolated` |
+| `test_c2c_non_simulated_five_variants_have_physical_proxy_full_order` | `tests/test_m1152_production_recovery_e2e.py::test_c2c_non_simulated_five_variants_and_sixth_precommand_rejection` |
+
+### M1.1.5.2 attack and recovery mapping
+
+| Removed or attacked behavior | Canonical regression | Preserved authority |
+|---|---|---|
+| Shell-string execution or frozen environment prefix is re-parsed | `tests/test_m1152_raw_execution_closure.py::test_runner_executes_frozen_argv_and_environment_without_shell_roundtrip` | Exact typed argv/env/cwd executes with `shell=False` |
+| Physical raw measurements are replaced by mutable result dictionaries or virtual collection | `tests/test_m1152_c2c_raw_provenance.py::test_c2c_command_plan_uses_core_derivation_not_virtual_collect`; `tests/test_m1152_c2c_raw_provenance.py::test_non_simulated_c2c_phase_commits_core_derivation_receipt` | PhaseRunReceipt v4 raw outputs feed EvidenceDerivationManifest v1 and normalized evidence |
+| Real sample identity is declared from metadata instead of selected bytes | `tests/test_m1152_raw_execution_closure.py::test_real_sample_manifest_recomputes_ordered_ids_from_raw_sample_bytes` | SampleManifest v4 recomputes ordered IDs and digests from immutable sample bytes |
+| Activation exit zero overrides a blocked readiness check | `tests/test_m1152_c2c_raw_provenance.py::test_receipt_authorized_readiness_block_is_not_overridden_by_activation_exit_zero`; `tests/test_m1152_raw_execution_closure.py::test_readiness_blocked_cannot_be_overridden_by_zero_exit_activation` | Proxy readiness is derived from each frozen raw check receipt |
+| Failure log hash differs from the command receipt stderr | `tests/test_m1152_raw_execution_closure.py::test_failure_log_hash_must_equal_authoritative_phase_receipt_stderr` | FailureEvidence v6 derives logs and exit status from the committed receipt |
+| Caller fabricates an available Core resource receipt to resume | `tests/test_m1152_raw_execution_closure.py::test_manual_core_resource_receipt_cannot_authorize_resume` | Resume requires a constrained authoritative measurement bound to the pause and resource identity |
+| CPU/no-`nvidia-smi` execution quarantines or strands a running Attempt | `tests/test_m1152_raw_execution_closure.py::test_c2c_no_gpu_must_return_pause_route_not_quarantine` | Resource authority atomically emits `PAUSE_RESOURCE` and a recoverable `RESOURCE_PAUSED` Attempt |
+| Receipt command, plan, log ref, or output identity drifts | `tests/test_m1152_raw_execution_closure.py::test_phase_receipt_validator_rejects_command_identity_and_log_ref_drift` | Journal, Ledger, reducer/rebuild, failure validation, and Gate share the receipt validator |
+| Started without a trustworthy receipt crashes process-local replay | `tests/test_m1152_raw_execution_closure.py::test_started_without_receipt_restart_returns_authoritative_integrity_route` | Restart returns an explicit fail-closed control route without rerunning or leaving permanent RUNNING state |
+| Finalization commits but route delivery crashes | `tests/test_m1152_raw_execution_closure.py::test_finalized_attempt_restart_returns_historical_result_without_duplicate_variant` | A new Agent returns the historical result/route without duplicate-method validation |
+
+### Seven crash boundaries
+
+| Boundary | Canonical production-component test |
+|---|---|
+| Started, before trustworthy receipt | `tests/test_m1152_production_recovery_e2e.py::test_crash_after_started_before_receipt_blocks_without_rerun` |
+| Durable receipt, before Completed | `tests/test_m1152_production_recovery_e2e.py::test_crash_after_durable_receipt_before_completed_reconciles_once` |
+| Completed, before evidence commit | `tests/test_m1152_production_recovery_e2e.py::test_crash_after_completed_before_evidence_commit_reuses_receipt` |
+| ProxyEvidenceCommitted, before FullPhaseStarted | `tests/test_m1152_production_recovery_e2e.py::test_crash_after_proxy_commit_before_full_start_reuses_proxy` |
+| FullPhaseStarted, before first full command | `tests/test_m1152_production_recovery_e2e.py::test_crash_after_full_started_before_first_command_runs_full_once` |
+| Full commands completed, before AttemptFinalized | `tests/test_m1152_production_recovery_e2e.py::test_crash_after_full_commands_before_finalization_reuses_all_receipts` |
+| AttemptFinalized, before RouteOutcome delivery | `tests/test_m1152_production_recovery_e2e.py::test_crash_after_finalization_before_route_delivery_returns_history` |
+
+### Acceptance and scope
+
+- The normal, proxy-cleared, empty-HOME/empty-HF-cache/PATH-without-Codex, and CPU-only/PATH-without-`nvidia-smi` complete suites each report `705 passed, 2 skipped, 0 failed`. The two skips remain the existing optional torch/transformers dynamic checks; no new skip or xfail was introduced.
+- Non-simulated production-component tests use real local subprocesses and frozen argv/env/cwd, then pass physical raw bytes through Receipt/CAS, deterministic derivation, Ledger/rebuild, and Gate. These fixtures prove production-component authority and exactly-once wiring, not real GPU scientific training or scientific success.
+- Synthetic Generic/C2C five-variant tests prove deterministic semantic identity, evidence, budget, and sixth-attempt rejection only.
+- Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training remain unstarted and are not claimed by this migration.

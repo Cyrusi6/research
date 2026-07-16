@@ -12,6 +12,8 @@ import threading
 import time
 import uuid
 import fcntl
+import shutil
+import subprocess
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
@@ -46,6 +48,7 @@ from .proxy_classifier import (
     validate_proxy_evaluation_binding,
 )
 from .phase_execution import AuthoritativePhaseContext, PhaseAuthorization
+from .phase_receipts import validate_phase_run_receipt
 from .phase_command_plan import validate_phase_command_plan
 from .failure_validation import (
     canonical_evidence_bytes,
@@ -102,6 +105,10 @@ FAILURE_ROUTES = {
 
 class IntegrityError(RuntimeError):
     """Raised when authoritative history or a requested transition is inconsistent."""
+
+
+class _NoDomainEvent(RuntimeError):
+    pass
 
 
 class BreakingSchemaError(IntegrityError):
@@ -406,7 +413,7 @@ class ResearchEventLedger:
                 trial_spec=frozen_trial_spec,
                 timestamp=timestamp,
             )
-            validate_contract(attempt, "attempt_record_v7.schema.json")
+            validate_contract(attempt, "attempt_record_v8.schema.json")
             existing = state["attempts"].get(attempt_id)
             if existing is not None:
                 immutable_keys = [
@@ -573,7 +580,7 @@ class ResearchEventLedger:
         return authorization
 
     def start_phase_command(self, command: dict[str, Any]) -> dict[str, Any]:
-        validate_contract(command, "phase_command_v2.schema.json")
+        validate_contract(command, "phase_command_v3.schema.json")
         request_fingerprint = canonical_hash({"operation": "start_phase_command", "command": command})
 
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
@@ -666,7 +673,9 @@ class ResearchEventLedger:
         return deepcopy(state["attempts"][attempt_id])
 
     def disposition_failure(self, failure_evidence: dict[str, Any], *, event_id: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
-        validate_contract(failure_evidence, "failure_evidence_v5.schema.json")
+        validate_contract(failure_evidence, "failure_evidence_v6.schema.json")
+        if str(failure_evidence.get("command_id") or "").startswith("core-resource-probe-"):
+            raise IntegrityError("caller-authored Core resource receipts are forbidden")
         request_fingerprint = canonical_hash({"operation": "disposition_failure", "evidence": failure_evidence})
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
             attempt = _attempt(state, failure_evidence["attempt_id"])
@@ -681,8 +690,123 @@ class ResearchEventLedger:
         attempt_id = failure_evidence["attempt_id"]
         return deepcopy(event_state["attempts"][attempt_id]), deepcopy(event_state["last_route_outcome"])
 
+    def pause_if_resources_unavailable(
+        self,
+        attempt_id: str,
+        *,
+        measurement_provider: Callable[[str, str, str], float] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        """Measure frozen phase resources inside the transaction and pause atomically."""
+
+        result: tuple[dict[str, Any], dict[str, Any]] | None = None
+
+        def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
+            nonlocal result
+            attempt = _attempt(state, attempt_id)
+            phase = "proxy" if attempt["state"] == "PROXY_RUNNING" else "full" if attempt["state"] == "FULL_RUNNING" else None
+            if phase is None:
+                raise IntegrityError("resource measurement requires an authoritative running phase")
+            execution = attempt["phase_executions"][phase]
+            plan = ContractStore(self.project_root).read_json(execution["command_plan_hash"], schema_file="phase_command_plan_v2.schema.json")
+            gpu_policies = [item["resource_policy"] for item in plan["commands"] if item["resource_policy"]["resource_class"] == "gpu_memory"]
+            if not gpu_policies:
+                result = None
+                raise _NoDomainEvent()
+            required = max(float(item["minimum_capacity"]) for item in gpu_policies)
+            unit = gpu_policies[0]["unit"]
+            provider = measurement_provider or _measure_os_resource
+            observed = float(provider("gpu_memory", "gpu:any", unit))
+            if observed >= required:
+                result = None
+                raise _NoDomainEvent()
+            producer_run_id = execution["producer_run_id"]
+            observed_at = now_utc()
+            receipt = {
+                "schema_version": "auto_research_core_resource_probe_receipt_v2",
+                "operation": "pause",
+                "attempt_id": attempt_id,
+                **{
+                    key: attempt[key]
+                    for key in (
+                        "direction_semantic_hash",
+                        "direction_spec_hash",
+                        "variant_semantic_hash",
+                        "variant_spec_hash",
+                        "trial_spec_hash",
+                        "protocol_hash",
+                        "sample_manifest_hash",
+                        "evaluator_hash",
+                    )
+                },
+                "lifecycle_generation": attempt["lifecycle_generation"],
+                "implementation_hash": attempt["implementation_hash"],
+                "attempt_input_hash": attempt["attempt_input_hash"],
+                "phase": phase,
+                "phase_execution_id": execution["phase_execution_id"],
+                "phase_start_event_id": execution["phase_start_event_id"],
+                "authority_event_id": execution["phase_start_event_id"],
+                "producer_run_id": producer_run_id,
+                "resource_type": "gpu_memory",
+                "resource_id": "gpu:any",
+                "required_capacity": required,
+                "observed_capacity": observed,
+                "unit": unit,
+                "probe_status": "insufficient",
+                "observed_at": observed_at,
+                "provider_id": "constrained-test-resource-provider-v1" if measurement_provider else "core-os-resource-provider-v1",
+            }
+            receipt_ref = ContractStore(self.project_root).put_json(receipt, schema_file="core_resource_probe_receipt_v2.schema.json")
+            command_id = f"core-resource-probe-{attempt_id[:12]}-g{attempt['lifecycle_generation']}"
+            command_hash = canonical_hash({"command_id": command_id, "receipt": receipt_ref["digest"]})
+            command_plan_hash = canonical_hash({"operation": "phase-resource-probe", "trial_spec_hash": attempt["trial_spec_hash"], "phase": phase, "required": required, "unit": unit})
+            probe = {
+                "schema_version": "auto_research_resource_probe_evidence_v4",
+                "evidence_kind": "resource_probe",
+                "evidence_id": f"resource-probe-{attempt_id[:12]}-g{attempt['lifecycle_generation']}",
+                **{key: attempt[key] for key in ["attempt_id", "direction_semantic_hash", "direction_spec_hash", "variant_semantic_hash", "variant_spec_hash", "trial_spec_hash", "protocol_hash", "sample_manifest_hash", "evaluator_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash"]},
+                "producer_run_id": producer_run_id,
+                "phase": phase,
+                "phase_execution_id": execution["phase_execution_id"],
+                "phase_start_event_id": execution["phase_start_event_id"],
+                "resource_type": "gpu_memory", "resource_id": "gpu:any", "required_capacity": required,
+                "observed_capacity": observed, "unit": unit, "probe_status": "insufficient", "observed_at": observed_at,
+                "command_id": command_id, "command_hash": command_hash, "command_plan_hash": command_plan_hash,
+                "receipt_ref": receipt_ref, "receipt_hash": receipt_ref["digest"],
+            }
+            validate_contract(probe, "resource_probe_v4.schema.json")
+            probe_hash = _write_operation_evidence(self.project_root, attempt, producer_run_id, "resource_probe", probe)
+            failure = {
+                "schema_version": FAILURE_EVIDENCE_SCHEMA_VERSION,
+                "evidence_kind": "failure_evidence",
+                "evidence_id": f"failure-resource-{attempt_id[:12]}-g{attempt['lifecycle_generation']}",
+                **{key: attempt[key] for key in ["attempt_id", "direction_semantic_hash", "direction_spec_hash", "variant_semantic_hash", "variant_spec_hash", "trial_spec_hash", "protocol_hash", "sample_manifest_hash", "evaluator_hash", "lifecycle_generation", "implementation_hash", "attempt_input_hash"]},
+                "producer_run_id": producer_run_id,
+                "cross_references": {"resource_probe_hash": probe_hash},
+                "source_state": attempt["state"], "source_phase": phase, "phase": phase,
+                "phase_execution_id": execution["phase_execution_id"], "phase_start_event_id": execution["phase_start_event_id"],
+                "failure_class": "resource_pause", "command_status": "resource_paused", "exit_code": 75,
+                "reason": "frozen phase resource requirement is unavailable", "observed_at": observed_at,
+                "log_hash": probe_hash,
+                "command_id": command_id, "command_hash": command_hash, "command_plan_hash": command_plan_hash,
+                "receipt_ref": receipt_ref, "receipt_hash": receipt_ref["digest"],
+            }
+            validate_contract(failure, "failure_evidence_v6.schema.json")
+            _write_operation_evidence(self.project_root, attempt, producer_run_id, "failure_evidence", failure)
+            payload = {"failure_evidence": failure}
+            return "AttemptDispositioned", payload, _operation_event_id("attempt-disposition", attempt, payload)
+
+        try:
+            _, state, _ = self._domain_transact(build)
+        except _NoDomainEvent:
+            return None
+        attempt = deepcopy(state["attempts"][attempt_id])
+        result = (attempt, deepcopy(state["last_route_outcome"]))
+        return result
+
     def resume_attempt(self, resume_evidence: dict[str, Any], *, event_id: str | None = None) -> dict[str, Any]:
         validate_contract(resume_evidence, "resume_evidence_v5.schema.json")
+        if str(resume_evidence.get("command_id") or "").startswith("core-resource-"):
+            raise IntegrityError("core resource resume evidence can only be created by resume_resource_attempt")
         request_fingerprint = canonical_hash({"operation": "resume_attempt", "evidence": resume_evidence})
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
             attempt = _attempt(state, resume_evidence["attempt_id"])
@@ -694,6 +818,159 @@ class ResearchEventLedger:
             return "AttemptResumed", payload, event_id or _operation_event_id("attempt-resumed", attempt, payload)
         _, state, _ = self._domain_transact(build, explicit_event_id=event_id, request_fingerprint=request_fingerprint if event_id else None)
         return deepcopy(state["attempts"][resume_evidence["attempt_id"]])
+
+    def resume_resource_attempt(
+        self,
+        attempt_id: str,
+        *,
+        measurement_provider: Callable[[str, str, str], float] | None = None,
+    ) -> dict[str, Any]:
+        def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
+            attempt = _attempt(state, attempt_id)
+            if attempt["state"] != "RESOURCE_PAUSED":
+                raise IntegrityError("resource resume requires RESOURCE_PAUSED")
+            pause_operation = _latest_pause_operation(state, attempt)
+            if pause_operation is None:
+                raise IntegrityError("resource resume requires a committed resource pause event")
+            pause_event_id, pause_evidence = pause_operation
+            pause_probe_raw = _read_canonical_operation_evidence(
+                self.project_root,
+                attempt,
+                pause_evidence["producer_run_id"],
+                "resource_probe",
+                pause_evidence["cross_references"]["resource_probe_hash"],
+            )
+            pause_probe = json.loads(pause_probe_raw.decode("utf-8"))
+            resource_type = pause_probe["resource_type"]
+            resource_id = pause_probe["resource_id"]
+            required = float(pause_probe["required_capacity"])
+            unit = pause_probe["unit"]
+            provider = measurement_provider or _measure_os_resource
+            observed = float(provider(resource_type, resource_id, unit))
+            if observed < required:
+                raise IntegrityError("resource remains insufficient for resume")
+            producer_run_id = f"resume-{attempt_id[:12]}-g{attempt['lifecycle_generation']}"
+            phase_execution_id = f"resume-{attempt_id[:12]}-g{attempt['lifecycle_generation']}"
+            observed_at = now_utc()
+            receipt = {
+                "schema_version": "auto_research_core_resource_probe_receipt_v2",
+                "operation": "resume",
+                "attempt_id": attempt_id,
+                **{
+                    key: attempt[key]
+                    for key in (
+                        "direction_semantic_hash",
+                        "direction_spec_hash",
+                        "variant_semantic_hash",
+                        "variant_spec_hash",
+                        "trial_spec_hash",
+                        "protocol_hash",
+                        "sample_manifest_hash",
+                        "evaluator_hash",
+                    )
+                },
+                "lifecycle_generation": attempt["lifecycle_generation"],
+                "implementation_hash": attempt["implementation_hash"],
+                "attempt_input_hash": attempt["attempt_input_hash"],
+                "phase": "resume",
+                "phase_execution_id": phase_execution_id,
+                "phase_start_event_id": pause_event_id,
+                "authority_event_id": pause_event_id,
+                "producer_run_id": producer_run_id,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "required_capacity": required,
+                "observed_capacity": observed,
+                "unit": unit,
+                "probe_status": "available",
+                "observed_at": observed_at,
+                "provider_id": "constrained-test-resource-provider-v1" if measurement_provider else "core-os-resource-provider-v1",
+            }
+            receipt_ref = ContractStore(self.project_root).put_json(
+                receipt, schema_file="core_resource_probe_receipt_v2.schema.json"
+            )
+            command_id = f"core-resource-resume-{attempt_id[:12]}-g{attempt['lifecycle_generation']}"
+            command_hash = canonical_hash({"command_id": command_id, "receipt": receipt_ref["digest"]})
+            command_plan_hash = canonical_hash({
+                "operation": "resume-resource-probe",
+                "trial_spec_hash": attempt["trial_spec_hash"],
+                "paused_phase": attempt.get("paused_phase"),
+            })
+            identity = {
+                key: attempt[key]
+                for key in [
+                    "attempt_id", "direction_semantic_hash", "direction_spec_hash",
+                    "variant_semantic_hash", "variant_spec_hash", "trial_spec_hash",
+                    "protocol_hash", "sample_manifest_hash", "evaluator_hash",
+                    "lifecycle_generation", "implementation_hash", "attempt_input_hash",
+                ]
+            }
+            probe = {
+                "schema_version": "auto_research_resource_probe_evidence_v4",
+                "evidence_kind": "resource_probe",
+                "evidence_id": f"resource-resume-{attempt_id[:12]}-g{attempt['lifecycle_generation']}",
+                **identity,
+                "producer_run_id": producer_run_id,
+                "phase": "resume",
+                "phase_execution_id": phase_execution_id,
+                "phase_start_event_id": pause_event_id,
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "required_capacity": required,
+                "observed_capacity": observed,
+                "unit": unit,
+                "probe_status": "available",
+                "observed_at": observed_at,
+                "command_id": command_id,
+                "command_hash": command_hash,
+                "command_plan_hash": command_plan_hash,
+                "receipt_ref": receipt_ref,
+                "receipt_hash": receipt_ref["digest"],
+            }
+            validate_contract(probe, "resource_probe_v4.schema.json")
+            probe_hash = _write_operation_evidence(
+                self.project_root, attempt, producer_run_id, "resource_probe", probe
+            )
+            resume_evidence = {
+                "schema_version": RESUME_EVIDENCE_SCHEMA_VERSION,
+                "evidence_kind": "resume_evidence",
+                "evidence_id": f"resume-{attempt_id[:12]}-g{attempt['lifecycle_generation']}",
+                **identity,
+                "producer_run_id": producer_run_id,
+                "cross_references": {"resource_probe_hash": probe_hash},
+                "phase": "resume",
+                "phase_execution_id": phase_execution_id,
+                "phase_start_event_id": pause_event_id,
+                "pause_event_id": pause_event_id,
+                "pause_evidence_hash": evidence_bytes_hash(canonical_evidence_bytes(pause_evidence)),
+                "pause_phase": pause_evidence["phase"],
+                "pause_phase_execution_id": pause_evidence["phase_execution_id"],
+                "pause_producer_run_id": pause_evidence["producer_run_id"],
+                "resource_type": resource_type,
+                "resource_id": resource_id,
+                "required_capacity": required,
+                "observed_capacity": observed,
+                "unit": unit,
+                "probe_status": "available",
+                "observed_at": observed_at,
+                "command_id": command_id,
+                "command_hash": command_hash,
+                "command_plan_hash": command_plan_hash,
+                "receipt_ref": receipt_ref,
+                "receipt_hash": receipt_ref["digest"],
+            }
+            validate_contract(resume_evidence, "resume_evidence_v5.schema.json")
+            _write_operation_evidence(
+                self.project_root, attempt, producer_run_id, "resume_evidence", resume_evidence
+            )
+            _validate_resume_evidence(
+                self.project_root, state, attempt, resume_evidence, allow_core_resource=True
+            )
+            payload = {"resume_evidence": resume_evidence}
+            return "AttemptResumed", payload, _operation_event_id("attempt-resumed", attempt, payload)
+
+        _, state, _ = self._domain_transact(build)
+        return deepcopy(state["attempts"][attempt_id])
 
     def complete_attempt(self, completion_evidence: dict[str, Any], *, event_id: str | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
         _validate_completion_request_shape(completion_evidence)
@@ -954,7 +1231,7 @@ def _validate_trial_contracts(project_root: Path, trial_spec: dict[str, Any]) ->
         sample_manifest = store.read_contract(
             trial_spec["sample_manifest_ref"],
             contract_kind="sample_manifest",
-            schema_file="sample_manifest_v3.schema.json",
+            schema_file="sample_manifest_v4.schema.json",
         )
         evaluator_manifest = store.read_contract(
             trial_spec["execution_contract"]["evaluator_manifest_ref"],
@@ -1092,7 +1369,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         next_state["current_variant_spec_hash"] = variant["variant_spec_hash"]
     elif event_type == "AttemptReserved":
         attempt = payload["attempt"]
-        validate_contract(attempt, "attempt_record_v7.schema.json")
+        validate_contract(attempt, "attempt_record_v8.schema.json")
         project_root = next_state.get("project_root")
         if not project_root:
             raise IntegrityError("AttemptReserved rebuild requires authoritative project_root")
@@ -1197,7 +1474,7 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         attempt["updated_at"] = event["created_at"]
     elif event_type == "PhaseCommandStarted":
         command = payload["command"]
-        validate_contract(command, "phase_command_v2.schema.json")
+        validate_contract(command, "phase_command_v3.schema.json")
         if command["command_id"] in next_state["phase_commands"]:
             raise IntegrityError("duplicate PhaseCommandStarted command_id")
         _validate_phase_command_authorization(next_state, command)
@@ -1254,6 +1531,34 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
             unknown_reason=payload["reason"],
             updated_at=event["created_at"],
         )
+        attempt = _attempt(next_state, record["command"]["attempt_id"])
+        if attempt["state"] in TERMINAL_ATTEMPT_STATES:
+            raise IntegrityError("unknown command outcome cannot modify a terminal Attempt")
+        phase = record["command"]["phase"]
+        attempt["state"] = "INTEGRITY_BLOCKED"
+        attempt["failure_class"] = "integrity_failure"
+        attempt["terminal_outcome"] = "integrity_blocked"
+        attempt["method_evaluable"] = False
+        attempt["phases"][phase] = "FAILED"
+        attempt["updated_at"] = event["created_at"]
+        if attempt["reserved_slot"]:
+            budget = next_state["directions"][attempt["direction_semantic_hash"]]["budget"]
+            budget["reserved"] -= 1
+            attempt["reserved_slot"] = False
+        route = build_route_outcome(
+            next_state,
+            "BLOCK_INTEGRITY",
+            ["phase_command_unknown_outcome"],
+            attempt,
+            source_event_id=event["event_id"],
+            source_sequence=event["sequence"],
+        )
+        next_state["last_route_outcome"] = route
+        next_state["operation_events"][_command_unknown_replay_key(record["command"])] = {
+            "event_id": event["event_id"],
+            "payload": deepcopy(payload),
+            "route_outcome": deepcopy(route),
+        }
     elif event_type == "ProxyEvidenceCommitted":
         proxy_outcome = payload["proxy_outcome"]
         validate_contract(proxy_outcome, "proxy_outcome_v3.schema.json")
@@ -1358,12 +1663,18 @@ def reduce_event(state: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]
         attempt["updated_at"] = event["created_at"]
     elif event_type == "AttemptDispositioned":
         evidence = payload["failure_evidence"]
-        validate_contract(evidence, "failure_evidence_v5.schema.json")
+        validate_contract(evidence, "failure_evidence_v6.schema.json")
         attempt = _attempt(next_state, evidence["attempt_id"])
         project_root = next_state.get("project_root")
         if not project_root:
             raise IntegrityError("failure reduction requires project root")
-        _validate_failure_evidence(Path(project_root), next_state, attempt, evidence)
+        _validate_failure_evidence(
+            Path(project_root),
+            next_state,
+            attempt,
+            evidence,
+            allow_core_resource=str(evidence.get("command_id") or "").startswith("core-resource-probe-"),
+        )
         action, target_state = _failure_route(evidence["failure_class"])
         _apply_failure_disposition(next_state, attempt, target_state, evidence, event["created_at"])
         route = build_route_outcome(next_state, action, [evidence["failure_class"]], attempt, source_event_id=event["event_id"], source_sequence=event["sequence"])
@@ -1582,7 +1893,7 @@ def _validate_event(event: dict[str, Any]) -> None:
     if event.get("schema_version") != EVENT_SCHEMA_VERSION:
         raise BreakingSchemaError("invalid or unsupported Event v3 schema")
     try:
-        validate_contract(event, "event_v7.schema.json")
+        validate_contract(event, "event_v8.schema.json")
     except ValueError as exc:
         raise IntegrityError(f"invalid Event v3 schema: {exc}") from exc
     _validate_event_request(event["event_type"], event["payload"], event["event_id"])
@@ -1759,7 +2070,7 @@ def _validate_phase_command_authorization(state: dict[str, Any], command: dict[s
         raise IntegrityError("PhaseCommand command_plan_hash differs from frozen phase contract")
     try:
         store = ContractStore(Path(state["project_root"]))
-        frozen_plan = store.read_json(command["command_plan_ref"], schema_file="phase_command_plan_v1.schema.json")
+        frozen_plan = store.read_json(command["command_plan_ref"], schema_file="phase_command_plan_v2.schema.json")
         validate_phase_command_plan(frozen_plan, expected_evidence_kinds=phase_contract["evidence_kinds"])
         plan_blob = store.verify(command["command_plan_ref"])
     except (KeyError, OSError, TypeError, ValueError) as exc:
@@ -1820,7 +2131,7 @@ def _validate_phase_command_authorization(state: dict[str, Any], command: dict[s
         ) else "full-train"
         if not receipt_is_oom(completed_receipt(predecessor)):
             raise IntegrityError("memory-safe recovery requires an authoritative predecessor OOM receipt")
-    if spec_id.startswith(("full-eval_", "full-ablation_eval_", "full-collect-evidence")):
+    if spec_id.startswith(("full-eval_", "full-ablation_eval_", "full-derive-evidence")):
         training_receipts = [
             completed_receipt(item["command_spec_id"])
             for item in frozen_plan["commands"]
@@ -1854,45 +2165,9 @@ def _validate_phase_command_authorization(state: dict[str, Any], command: dict[s
 
 def _validate_phase_run_receipt(project_root: Path, record: dict[str, Any], receipt_ref: dict[str, Any]) -> dict[str, Any]:
     try:
-        receipt = ContractStore(project_root).read_json(receipt_ref, schema_file="phase_run_receipt_v3.schema.json")
+        return validate_phase_run_receipt(project_root, record, receipt_ref)
     except (KeyError, TypeError, ValueError, OSError) as exc:
         raise IntegrityError(f"PhaseRunReceipt rejected: {exc}") from exc
-    command = record["command"]
-    expected = {
-        "command_id": command["command_id"],
-        "command_hash": command["command_hash"],
-        "started_event_id": record["started_event_id"],
-        "started_event_hash": record["started_event_hash"],
-        "attempt_id": command["attempt_id"],
-        "lifecycle_generation": command["lifecycle_generation"],
-        "phase": command["phase"],
-        "phase_execution_id": command["phase_execution_id"],
-        "phase_start_event_id": command["phase_start_event_id"],
-        "producer_run_id": command["producer_run_id"],
-        "implementation_hash": command["implementation_hash"],
-        "attempt_input_hash": command["attempt_input_hash"],
-        "provenance_mode": command["provenance_mode"],
-        "started_at": record["created_at"],
-    }
-    for key, value in expected.items():
-        if receipt.get(key) != value:
-            raise IntegrityError(f"PhaseRunReceipt {key} mismatch")
-    store = ContractStore(project_root)
-    expected_outputs = command["command_spec"]["expected_outputs"]
-    if receipt["exit_code"] != 0 and not receipt["outputs"]:
-        return receipt
-    if len(receipt["outputs"]) != len(expected_outputs):
-        raise IntegrityError("PhaseRunReceipt output count differs from frozen command plan")
-    for expected_output, output in zip(expected_outputs, receipt["outputs"], strict=True):
-        if output["kind"] != expected_output["kind"] or output["schema_version"] != expected_output["schema_version"]:
-            raise IntegrityError("PhaseRunReceipt output differs from frozen command plan")
-        try:
-            blob = store.verify(output["contract_ref"])
-        except (TypeError, ValueError, OSError) as exc:
-            raise IntegrityError(f"PhaseRunReceipt output rejected: {exc}") from exc
-        if blob["digest"] != output["content_hash"]:
-            raise IntegrityError("PhaseRunReceipt output content hash mismatch")
-    return receipt
 
 
 def _phase_command(state: dict[str, Any], command_id: str) -> dict[str, Any]:
@@ -1905,6 +2180,15 @@ def _phase_command(state: dict[str, Any], command_id: str) -> dict[str, Any]:
 def _validate_command_replay(record: dict[str, Any], command: dict[str, Any]) -> None:
     if canonical_json(record["command"]) != canonical_json(command):
         raise IntegrityError("phase command replay identity conflict")
+
+
+def _command_unknown_replay_key(command: dict[str, Any]) -> str:
+    return "phase-command-unknown:" + canonical_hash({
+        "command_id": command["command_id"],
+        "command_hash": command["command_hash"],
+        "attempt_id": command["attempt_id"],
+        "lifecycle_generation": command["lifecycle_generation"],
+    })
 
 
 def _phase_command_operation_result(record: dict[str, Any], event: dict[str, Any]) -> dict[str, Any]:
@@ -1961,7 +2245,7 @@ def _validate_state_invariants(state: dict[str, Any]) -> None:
         if candidate_phases != {trial["completeness"]}:
             raise IntegrityError("TrialResult observations disagree with completeness")
     for attempt in state["attempts"].values():
-        validate_contract(attempt, "attempt_record_v7.schema.json")
+        validate_contract(attempt, "attempt_record_v8.schema.json")
         _validate_frozen_trial_spec(attempt)
         expected_consumes, expected_reserved_at_reservation = _profile_budget_mapping(attempt["profile"], attempt["attempt_kind"])
         if attempt["consumes_direction_budget"] != expected_consumes:
@@ -2229,6 +2513,8 @@ def _validate_failure_evidence(
     state: dict[str, Any],
     attempt: dict[str, Any],
     evidence: dict[str, Any],
+    *,
+    allow_core_resource: bool = False,
 ) -> None:
     _validate_failure_identity(attempt, evidence)
     execution_phase = evidence["source_phase"] if evidence["source_phase"] in {"proxy", "full"} else (
@@ -2244,7 +2530,13 @@ def _validate_failure_evidence(
         if evidence["producer_run_id"] != execution["producer_run_id"]:
             raise IntegrityError("FailureEvidence producer_run_id mismatch")
     _failure_route(evidence["failure_class"])
-    _validate_operation_command_binding(project_root, state, attempt, evidence, allow_core_probe=False)
+    authoritative_receipt = _validate_operation_command_binding(
+        project_root,
+        state,
+        attempt,
+        evidence,
+        allow_core_probe=allow_core_resource and evidence["failure_class"] in {"resource_pause", "oom_retry"},
+    )
     _validate_trial_spec_projection(project_root, attempt)
     failure_raw = _read_canonical_operation_evidence(
         project_root,
@@ -2265,14 +2557,16 @@ def _validate_failure_evidence(
             )
             validate_failure_evidence_bytes(expected_identity, failure_raw, resource_probe_raw=probe_raw)
         else:
-            receipt_raw = _read_canonical_operation_evidence(
-                project_root,
-                attempt,
-                evidence["producer_run_id"],
-                "command_result_evidence",
-                evidence["cross_references"]["command_result_evidence_hash"],
+            if authoritative_receipt is None or int(authoritative_receipt["exit_code"]) == 0:
+                raise IntegrityError("non-resource failure requires a failed authoritative PhaseRunReceipt")
+            if evidence["log_hash"] != authoritative_receipt["stderr_hash"]:
+                raise IntegrityError("FailureEvidence log_hash differs from authoritative receipt stderr_hash")
+            receipt_raw = canonical_contract_bytes(authoritative_receipt)
+            validate_failure_evidence_bytes(
+                expected_identity,
+                failure_raw,
+                phase_run_receipt_raw=receipt_raw,
             )
-            validate_failure_evidence_bytes(expected_identity, failure_raw, command_result_raw=receipt_raw)
     except (TypeError, ValueError, KeyError) as exc:
         raise IntegrityError(f"FailureEvidence raw-byte validation failed: {exc}") from exc
 
@@ -2296,37 +2590,64 @@ def _validate_operation_command_binding(
     evidence: dict[str, Any],
     *,
     allow_core_probe: bool,
-) -> None:
+) -> dict[str, Any] | None:
     receipt_ref = evidence.get("receipt_ref")
     if not isinstance(receipt_ref, dict) or evidence.get("receipt_hash") != receipt_ref.get("digest"):
         raise IntegrityError("operation evidence receipt binding is malformed")
     if allow_core_probe:
         try:
-            raw = ContractStore(project_root).read_bytes(receipt_ref)
-            receipt = json.loads(raw.decode("utf-8"))
-        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            receipt = ContractStore(project_root).read_json(
+                receipt_ref,
+                schema_file="core_resource_probe_receipt_v2.schema.json",
+            )
+        except (TypeError, ValueError, UnicodeDecodeError, json.JSONDecodeError, OSError) as exc:
             raise IntegrityError(f"core resource probe receipt rejected: {exc}") from exc
         expected_fields = {
-            "schema_version": "auto_research_core_resource_probe_receipt_v1",
+            "schema_version": "auto_research_core_resource_probe_receipt_v2",
             "attempt_id": attempt["attempt_id"],
+            "direction_semantic_hash": attempt["direction_semantic_hash"],
+            "direction_spec_hash": attempt["direction_spec_hash"],
+            "variant_semantic_hash": attempt["variant_semantic_hash"],
+            "variant_spec_hash": attempt["variant_spec_hash"],
+            "trial_spec_hash": attempt["trial_spec_hash"],
+            "protocol_hash": attempt["protocol_hash"],
+            "sample_manifest_hash": attempt["sample_manifest_hash"],
+            "evaluator_hash": attempt["evaluator_hash"],
             "lifecycle_generation": attempt["lifecycle_generation"],
             "implementation_hash": attempt["implementation_hash"],
             "attempt_input_hash": attempt["attempt_input_hash"],
+            "phase": evidence["phase"],
+            "phase_execution_id": evidence["phase_execution_id"],
+            "phase_start_event_id": evidence["phase_start_event_id"],
+            "authority_event_id": evidence["phase_start_event_id"],
+            "producer_run_id": evidence["producer_run_id"],
         }
         if any(receipt.get(key) != value for key, value in expected_fields.items()):
             raise IntegrityError("core resource probe receipt identity mismatch")
         for key in ("resource_type", "resource_id", "required_capacity", "observed_capacity", "unit", "probe_status", "observed_at"):
-            if receipt.get(key) != evidence.get(key):
+            if key in evidence and receipt.get(key) != evidence.get(key):
                 raise IntegrityError(f"core resource probe receipt {key} mismatch")
         expected_command_hash = canonical_hash({"command_id": evidence["command_id"], "receipt": receipt_ref["digest"]})
+        operation = "resume-resource-probe" if evidence.get("phase") == "resume" else "phase-resource-probe"
+        expected_operation = "resume" if operation == "resume-resource-probe" else "pause"
+        if receipt["operation"] != expected_operation:
+            raise IntegrityError("core resource probe operation mismatch")
         expected_plan_hash = canonical_hash({
-            "operation": "resume-resource-probe",
+            "operation": operation,
             "trial_spec_hash": attempt["trial_spec_hash"],
-            "paused_phase": attempt.get("paused_phase"),
+            **(
+                {"paused_phase": attempt.get("paused_phase")}
+                if operation == "resume-resource-probe"
+                else {
+                    "phase": receipt.get("phase"),
+                    "required": receipt.get("required_capacity"),
+                    "unit": receipt.get("unit"),
+                }
+            ),
         })
         if evidence["command_hash"] != expected_command_hash or evidence["command_plan_hash"] != expected_plan_hash:
             raise IntegrityError("core resource probe command identity mismatch")
-        return
+        return deepcopy(receipt)
     record = state.get("phase_commands", {}).get(evidence.get("command_id"))
     if not isinstance(record, dict) or record.get("status") != "completed":
         raise IntegrityError("operation evidence requires a completed authoritative command")
@@ -2350,9 +2671,17 @@ def _validate_operation_command_binding(
         raise IntegrityError("operation evidence receipt identity mismatch")
     if int(receipt["exit_code"]) != int(evidence.get("exit_code", receipt["exit_code"])):
         raise IntegrityError("operation evidence exit_code differs from receipt")
+    return receipt
 
 
-def _validate_resume_evidence(project_root: Path, state: dict[str, Any], attempt: dict[str, Any], evidence: dict[str, Any]) -> None:
+def _validate_resume_evidence(
+    project_root: Path,
+    state: dict[str, Any],
+    attempt: dict[str, Any],
+    evidence: dict[str, Any],
+    *,
+    allow_core_resource: bool | None = None,
+) -> None:
     _validate_resume_identity(attempt, evidence)
     if attempt["state"] != "RESOURCE_PAUSED":
         raise IntegrityError("resume requires RESOURCE_PAUSED")
@@ -2362,7 +2691,11 @@ def _validate_resume_evidence(project_root: Path, state: dict[str, Any], attempt
     pause_event_id, pause_evidence = pause_operation
     if evidence["pause_event_id"] != pause_event_id or evidence["pause_evidence_hash"] != evidence_bytes_hash(canonical_evidence_bytes(pause_evidence)):
         raise IntegrityError("resume does not bind the committed pause event")
-    _validate_operation_command_binding(project_root, state, attempt, evidence, allow_core_probe=True)
+    if allow_core_resource is None:
+        allow_core_resource = str(evidence.get("command_id") or "").startswith("core-resource-resume-")
+    _validate_operation_command_binding(
+        project_root, state, attempt, evidence, allow_core_probe=allow_core_resource
+    )
     _validate_trial_spec_projection(project_root, attempt)
     resume_raw = _read_canonical_operation_evidence(
         project_root,
@@ -2431,7 +2764,7 @@ def _read_canonical_operation_evidence(
         raise IntegrityError(f"{kind} producer_run_id is unsafe")
     if not re.fullmatch(r"[a-f0-9]{64}", digest):
         raise IntegrityError(f"{kind} content hash is invalid")
-    if kind not in {"failure_evidence", "command_result_evidence", "resource_probe", "resume_evidence"}:
+    if kind not in {"failure_evidence", "resource_probe", "resume_evidence"}:
         raise IntegrityError(f"unsupported operation evidence kind: {kind}")
     relative_path = (
         f"experiment/attempts/{attempt['attempt_id']}/{producer_run_id}/{kind}/{digest}.json"
@@ -2725,3 +3058,57 @@ def _decode_phase_completion(
 
 def canonical_json(value: Any) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+
+
+def _measure_os_resource(resource_type: str, resource_id: str, unit: str) -> float:
+    del resource_id
+    if resource_type == "gpu_memory":
+        executable = shutil.which("nvidia-smi")
+        if executable is None:
+            return 0.0
+        result = subprocess.run(
+            [executable, "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            return 0.0
+        values = []
+        for line in result.stdout.splitlines():
+            try:
+                values.append(float(line.strip()) * 1024 * 1024)
+            except ValueError:
+                continue
+        return max(values, default=0.0)
+    if resource_type == "system_memory" and unit == "bytes":
+        try:
+            return float(os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"))
+        except (ValueError, OSError):
+            return 0.0
+    if resource_type == "disk" and unit == "bytes":
+        return float(shutil.disk_usage(".").free)
+    return 0.0
+
+
+def _write_operation_evidence(
+    project_root: Path,
+    attempt: dict[str, Any],
+    producer_run_id: str,
+    kind: str,
+    payload: dict[str, Any],
+) -> str:
+    raw = canonical_evidence_bytes(payload)
+    digest = evidence_bytes_hash(raw)
+    relative_path = content_addressed_evidence_path(
+        attempt_id=attempt["attempt_id"],
+        producer_run_id=producer_run_id,
+        evidence_kind=kind,
+        content_hash=digest,
+    )
+    EvidenceStore(project_root).write_entry(
+        {"relative_path": relative_path, "producer_run_id": producer_run_id, "kind": kind, "content_hash": digest},
+        attempt,
+        raw,
+    )
+    return digest

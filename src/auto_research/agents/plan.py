@@ -2056,7 +2056,7 @@ class PlanAgent:
             memory,
             artifact_type="c2c_s2_planner_memory",
             summary="Compact memory for direction-conditioned S2 planning",
-            source_paths=["plan/performance_feedback.json", "experiment/results/failure_feedback.json", "experiment/results/main_results.json"],
+            source_paths=["meta/research_events.sqlite3", "plan/performance_feedback.json", "experiment/results/failure_feedback.json"],
         )
         return {"artifact": record, "entry_count": len(entries), "memory": memory}
 
@@ -3284,7 +3284,9 @@ def _c2c_s2_available_artifacts() -> dict[str, str]:
         "planner_memory": "plan/s2_planner_memory.json",
         "performance_feedback": "plan/performance_feedback.json",
         "direction_scorecard": "plan/direction_scorecard.json",
-        "failure_feedback": "experiment/results/failure_feedback.json",
+        "research_ledger": "meta/research_events.sqlite3",
+        "research_state_projection": "meta/research_state.json",
+        "latest_trial_result_projection": "experiment/results/trial_result.json",
         "iteration_trace": "meta/iteration_trace.jsonl",
         "candidate_ideas": "plan/s2_planner/candidate_pool.json",
         "patch_manifest": "plan/code_patches/patch_manifest.json",
@@ -3664,21 +3666,35 @@ def _store_trial_contracts(
     sample_datasets: list[dict[str, Any]] = []
     for source_value, dataset in zip(raw_datasets, datasets):
         source = source_value if isinstance(source_value, dict) else {}
-        sample_ids = source.get("ordered_sample_ids") or [
-            canonical_hash(
-                {
-                    "dataset_id": dataset["dataset_id"],
-                    "split": dataset["split"],
-                    "ordinal": ordinal,
-                    "mode": provenance_mode,
-                }
-            )
-            for ordinal in range(dataset["sample_count"])
-        ]
-        if len(sample_ids) != dataset["sample_count"]:
-            raise ValueError(f"TrialSpec dataset {dataset['dataset_id']} sample IDs must match sample_count")
-        if any(not isinstance(item, str) or re.fullmatch(r"[a-f0-9]{64}", item) is None for item in sample_ids):
-            raise ValueError(f"TrialSpec dataset {dataset['dataset_id']} requires content-addressed ordered_sample_ids")
+        declared_sample_ids = source.get("ordered_sample_ids")
+        sample_payloads: list[bytes] = []
+        if provenance_mode == "real":
+            configured_path = source.get("sample_path") or source.get("source_path")
+            sample_path = Path(configured_path) if configured_path else project_root / "samples" / f"{dataset['dataset_id']}.jsonl"
+            if not sample_path.is_absolute():
+                sample_path = project_root / sample_path
+            try:
+                raw_lines = [line for line in sample_path.read_bytes().splitlines(keepends=True) if line.strip()]
+            except OSError as exc:
+                raise ValueError(f"real TrialSpec dataset {dataset['dataset_id']} requires readable selected sample bytes") from exc
+            for ordinal, line in enumerate(raw_lines):
+                try:
+                    payload = json.loads(line.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"sample {dataset['dataset_id']}:{ordinal} is not canonicalizable JSON") from exc
+                del payload
+                sample_payloads.append(line)
+        else:
+            synthetic_ids = list(declared_sample_ids or [])
+            if not synthetic_ids:
+                synthetic_ids = [canonical_hash({"dataset_id": dataset["dataset_id"], "split": dataset["split"], "ordinal": ordinal, "mode": "synthetic"}) for ordinal in range(dataset["sample_count"])]
+            sample_payloads = [canonical_contract_bytes({"synthetic_sample_id": sample_id}) for sample_id in synthetic_ids]
+        if len(sample_payloads) != dataset["sample_count"]:
+            raise ValueError(f"TrialSpec dataset {dataset['dataset_id']} selected sample bytes must match sample_count")
+        sample_refs = [store.put_bytes(raw) for raw in sample_payloads]
+        sample_ids = [reference["digest"] for reference in sample_refs]
+        if declared_sample_ids is not None and list(declared_sample_ids) != sample_ids:
+            raise ValueError(f"TrialSpec dataset {dataset['dataset_id']} ordered_sample_ids do not match selected sample bytes")
         source_revision = str(
             source.get("source_revision")
             or ("synthetic-v1" if provenance_mode == "synthetic" else "")
@@ -3690,20 +3706,21 @@ def _store_trial_contracts(
             "source_revision": source_revision,
             "split": dataset["split"],
             "ordered_sample_ids": sample_ids,
+            "record_format": "jsonl-record-bytes-v1",
+            "canonicalization_contract": "preserve-selected-record-bytes-v1",
         }
-        source_blob = store.put_bytes(canonical_contract_bytes(sample_source))
-        content_digest = store.digest_referenced_bytes([source_blob])
+        content_digest = store.digest_referenced_bytes(sample_refs)
         dataset["sample_hash"] = content_digest
         sample_datasets.append(
             {
                 **sample_source,
                 "sample_count": dataset["sample_count"],
-                "source_blobs": [source_blob],
+                "raw_sample_refs": sample_refs,
                 "content_digest": content_digest,
             }
         )
     sample_manifest = {
-        "schema_version": "auto_research_sample_manifest_v3",
+        "schema_version": "auto_research_sample_manifest_v4",
         "manifest_id": f"{variant.get('variant_id')}:sample-manifest",
         "provenance_mode": provenance_mode,
         "datasets": sample_datasets,
@@ -3711,7 +3728,7 @@ def _store_trial_contracts(
     sample_ref = store.put_contract(
         sample_manifest,
         contract_kind="sample_manifest",
-        schema_file="sample_manifest_v3.schema.json",
+        schema_file="sample_manifest_v4.schema.json",
     )
 
     source_blobs: list[dict[str, Any]] = []

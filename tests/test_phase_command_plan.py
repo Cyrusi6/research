@@ -73,7 +73,7 @@ def test_phase_command_plan_rejects_dag_and_identity_attacks(tmp_path, mutate, m
         validate_phase_command_plan(attacked, expected_evidence_kinds=["main_results"])
 
 
-def test_trial_spec_v6_embeds_nonempty_frozen_synthetic_plan(tmp_path) -> None:
+def test_trial_spec_v7_embeds_nonempty_frozen_synthetic_plan(tmp_path) -> None:
     variant = {
         "variant_id": "variant-command-plan",
         "variant_spec_hash": canonical_hash({"variant": "command-plan"}),
@@ -101,7 +101,7 @@ def test_trial_spec_v6_embeds_nonempty_frozen_synthetic_plan(tmp_path) -> None:
     trial_spec = _trial_spec_from_plan(plan, variant, project_root=tmp_path)
     validate_trial_spec(trial_spec)
     command_plan = phase_command_plan_for_phase(trial_spec, "full")
-    assert trial_spec["schema_version"] == "auto_research_trial_spec_v6"
+    assert trial_spec["schema_version"] == "auto_research_trial_spec_v7"
     assert command_plan["commands"][0]["argv"] == ["auto-research-adapter", "synthetic", "full"]
     assert trial_spec["phase_contracts"][0]["command_plan_hash"] == canonical_hash(command_plan)
 
@@ -122,6 +122,27 @@ def test_generic_real_phase_requires_explicit_command(tmp_path) -> None:
             source_snapshot_hash=canonical_hash({"source": "snapshot"}),
             command_values=[],
             expected_evidence=_outputs(),
+            default_cwd=str(tmp_path),
+        )
+
+
+def test_phase_command_plan_rejects_removed_command_result_evidence(tmp_path) -> None:
+    with pytest.raises(ValueError):
+        build_phase_command_plan(
+            phase="full",
+            adapter_id="generic-external-adapter",
+            adapter_version="1",
+            provenance_mode="local-external",
+            variant_spec_hash=canonical_hash({"variant": "one"}),
+            source_snapshot_hash=canonical_hash({"source": "snapshot"}),
+            command_values=[["python", "producer.py"]],
+            expected_evidence=[
+                {
+                    "kind": "command_result_evidence",
+                    "schema_version": "auto_research_command_result_evidence_v1",
+                    "required": True,
+                }
+            ],
             default_cwd=str(tmp_path),
         )
 

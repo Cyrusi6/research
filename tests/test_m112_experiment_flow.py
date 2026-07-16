@@ -114,10 +114,10 @@ class _ResumeLedger:
         }
         return [{"event_id": f"event:pause:{self.attempt['lifecycle_generation']}", "event_type": "AttemptDispositioned", "payload": {"failure_evidence": pause_evidence}}]
 
-    def resume_attempt(self, evidence: dict) -> dict:
-        self.calls.append(("resume", deepcopy(evidence)))
+    def resume_resource_attempt(self, attempt_id: str, *, measurement_provider=None) -> dict:
+        self.calls.append(("resume", attempt_id))
         self.attempt["state"] = "READY"
-        self.attempt["lifecycle_generation"] = evidence["lifecycle_generation"] + 1
+        self.attempt["lifecycle_generation"] += 1
         return deepcopy(self.attempt)
 
     def start_proxy_phase(self, attempt_id: str, *, phase_execution_id: str, producer_run_id: str) -> dict:
@@ -160,24 +160,17 @@ def _resume_attempt(generation: int, *, state: str = "RESOURCE_PAUSED") -> dict:
 def test_resource_resume_precedes_execution_transition(tmp_path: Path, generation: int) -> None:
     attempt = _resume_attempt(generation)
     ledger = _ResumeLedger(attempt)
+    agent = ExperimentAgent.__new__(ExperimentAgent)
+    agent._resource_measurement_provider = lambda resource_type, resource_id, unit: 2
 
-    resumed = ExperimentAgent._prepare_attempt_execution(
+    resumed = agent._prepare_attempt_execution(
         ledger,
         attempt,
-        resource_probe={
-            "resource_type": "quota",
-            "resource_id": "test-quota",
-            "required_capacity": 1,
-            "observed_capacity": 2,
-            "unit": "count",
-            "probe_status": "available",
-            "observed_at": "2026-07-14T00:00:00Z",
-        },
         project_root=tmp_path,
     )
 
     assert [call[0] for call in ledger.calls] == ["resume", "start_proxy"]
-    assert ledger.calls[0][1]["lifecycle_generation"] == generation
+    assert ledger.calls[0][1] == attempt["attempt_id"]
     assert ledger.calls[1][0] == "start_proxy"
     assert resumed["state"] == "PROXY_RUNNING"
 
@@ -186,8 +179,10 @@ def test_ready_attempt_does_not_emit_resume(tmp_path: Path) -> None:
     attempt = _resume_attempt(3, state="READY")
     attempt["phases"]["proxy"] = "COMPLETED"
     ledger = _ResumeLedger(attempt)
+    agent = ExperimentAgent.__new__(ExperimentAgent)
+    agent._resource_measurement_provider = lambda resource_type, resource_id, unit: 2
 
-    ExperimentAgent._prepare_attempt_execution(ledger, attempt, resource_probe=None, project_root=tmp_path)
+    agent._prepare_attempt_execution(ledger, attempt, project_root=tmp_path)
 
     attempt["state"] = "PROXY_COMPLETED"
     assert [call[0] for call in ledger.calls] == ["start_full"]
@@ -273,7 +268,10 @@ def test_real_experiment_agent_three_resource_resumes_then_single_commit(monkeyp
     config = {"experiment": {"simulate": True, "random_seeds": [7]}, "orchestration": {"profile": "standard"}, "llm": {"use_real_api": False}}
     artifacts = ArtifactManager(project_root)
     context = AgentContext(project_root, config, artifacts, ModelClient(config, project_root=project_root))
-    agent = ExperimentAgent(context)
+    agent = ExperimentAgent(
+        context,
+        resource_measurement_provider=lambda resource_type, resource_id, unit: 1,
+    )
     monkeypatch.setattr(
         agent.runner,
         "env_report",

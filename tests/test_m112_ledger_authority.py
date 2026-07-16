@@ -16,7 +16,6 @@ from auto_research.research_state import (
 from test_authoritative_state_machine import _trial_spec
 from test_m113_ledger_closure import (
     _failure_evidence as _canonical_failure_evidence,
-    _resume_evidence as _canonical_resume_evidence,
 )
 from support.authoritative_evidence import start_attempt_phase
 
@@ -72,10 +71,6 @@ def _failure(root: Path, attempt: dict, index: int, *, failure_class: str = "res
     )
 
 
-def _resume(root: Path, ledger: ResearchEventLedger, attempt: dict, index: int) -> dict:
-    return _canonical_resume_evidence(root, ledger, attempt, resource_type="system_memory")
-
-
 @pytest.mark.parametrize("forged", ["IMPLEMENTATION_REPAIR", "RESOURCE_PAUSED", "INTEGRITY_BLOCKED", "ABANDONED", "METHOD_COMPLETED"])
 def test_public_transition_cannot_forge_authoritative_states(tmp_path: Path, forged: str) -> None:
     ledger, attempt = _reserved(tmp_path)
@@ -92,7 +87,10 @@ def test_three_resource_pause_resume_cycles_preserve_attempt_and_reservation(tmp
         paused, route = ledger.disposition_failure(_failure(tmp_path, attempt, index))
         assert paused["state"] == "RESOURCE_PAUSED" and paused["phases"]["full"] == "RUNNING"
         assert route["next_action"] == "PAUSE_RESOURCE" and route["source"]["sequence"] == ledger.events()[-1]["sequence"]
-        attempt = ledger.resume_attempt(_resume(tmp_path, ledger, paused, index))
+        attempt = ledger.resume_resource_attempt(
+            paused["attempt_id"],
+            measurement_provider=lambda resource_type, resource_id, unit: 20.0,
+        )
         assert attempt["state"] == "READY" and attempt["phases"]["full"] == "PENDING"
     state = ledger.state()
     assert attempt["attempt_id"] in state["attempts"]
@@ -110,7 +108,10 @@ def test_explicit_disposition_event_id_late_replay_returns_historical_result(tmp
     assert historical_query["attempt"] == historical_attempt
     assert historical_query["route_outcome"] == historical_route
     assert historical_query["state_sequence"] == historical_route["source"]["sequence"]
-    resumed = ledger.resume_attempt(_resume(tmp_path, ledger, historical_attempt, 1))
+    resumed = ledger.resume_resource_attempt(
+        historical_attempt["attempt_id"],
+        measurement_provider=lambda resource_type, resource_id, unit: 20.0,
+    )
     start_attempt_phase(ledger, resumed, "full")
     before = len(ledger.events())
     replay_attempt, replay_route = ledger.disposition_failure(evidence, event_id="pause-explicit-1")

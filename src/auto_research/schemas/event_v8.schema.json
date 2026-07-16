@@ -14,7 +14,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_event_v7"
+      "const": "auto_research_event_v8"
     },
     "event_id": {
       "type": "string",
@@ -531,7 +531,7 @@
           "type": "object"
         },
         "evidence_manifest": {
-          "$ref": "evidence_manifest_v4.schema.json"
+          "$ref": "evidence_manifest_v5.schema.json"
         },
         "request_fingerprint": {
           "$ref": "#/$defs/request"
@@ -546,7 +546,7 @@
       ],
       "properties": {
         "command": {
-          "$ref": "phase_command_v2.schema.json"
+          "$ref": "phase_command_v3.schema.json"
         },
         "request_fingerprint": {
           "$ref": "#/$defs/request"

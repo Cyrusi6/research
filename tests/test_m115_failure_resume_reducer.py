@@ -84,7 +84,7 @@ def _full_running_proxy_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, di
         trial_spec=trial_spec,
         comparison_candidate=comparison,
         baseline=baseline,
-        simulate=False,
+        simulate=True,
     )
     inventory = [
         item for item in inventory
@@ -148,11 +148,25 @@ def _resume(tmp_path: Path, attempt: dict, pause_event: dict, pause_failure: dic
         "phase_start_event_id": "event:resume:resource:0001",
     }
     core_receipt = {
-        "schema_version": "auto_research_core_resource_probe_receipt_v1",
+        "schema_version": "auto_research_core_resource_probe_receipt_v2",
+        "operation": "resume",
         "attempt_id": attempt["attempt_id"],
+        "direction_semantic_hash": attempt["direction_semantic_hash"],
+        "direction_spec_hash": attempt["direction_spec_hash"],
+        "variant_semantic_hash": attempt["variant_semantic_hash"],
+        "variant_spec_hash": attempt["variant_spec_hash"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "protocol_hash": attempt["protocol_hash"],
+        "sample_manifest_hash": attempt["sample_manifest_hash"],
+        "evaluator_hash": attempt["evaluator_hash"],
         "lifecycle_generation": attempt["lifecycle_generation"],
         "implementation_hash": attempt["implementation_hash"],
         "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": "resume",
+        "phase_execution_id": identity["phase_execution_id"],
+        "phase_start_event_id": pause_event["event_id"],
+        "authority_event_id": pause_event["event_id"],
+        "producer_run_id": producer_run_id,
         "resource_type": "gpu_memory",
         "resource_id": "gpu:0",
         "required_capacity": 10.0,
@@ -160,8 +174,12 @@ def _resume(tmp_path: Path, attempt: dict, pause_event: dict, pause_failure: dic
         "unit": "bytes",
         "probe_status": "available",
         "observed_at": "2026-07-15T01:01:00Z",
+        "provider_id": "constrained-test-resource-provider-v1",
     }
-    receipt_ref = ContractStore(tmp_path).put_bytes(canonical_evidence_bytes(core_receipt))
+    receipt_ref = ContractStore(tmp_path).put_json(
+        core_receipt,
+        schema_file="core_resource_probe_receipt_v2.schema.json",
+    )
     command_id = f"core-resource-probe-{attempt['attempt_id'][:12]}-g{attempt['lifecycle_generation']}"
     command_binding = {
         "command_id": command_id,
@@ -248,7 +266,10 @@ def test_full_resource_resume_retains_proxy_authorization_and_restarts_only_full
     assert paused["phases"] == {"proxy": "COMPLETED", "full": "RUNNING"}
 
     pause_event = next(event for event in reversed(ledger.events()) if event["event_type"] == "AttemptDispositioned")
-    resumed = ledger.resume_attempt(_resume(tmp_path, paused, pause_event, failure, failure_hash))
+    resumed = ledger.resume_resource_attempt(
+        paused["attempt_id"],
+        measurement_provider=lambda resource_type, resource_id, unit: 20.0,
+    )
 
     assert resumed["lifecycle_generation"] == running["lifecycle_generation"] + 1
     assert resumed["state"] == "PROXY_COMPLETED"
@@ -261,6 +282,58 @@ def test_full_resource_resume_retains_proxy_authorization_and_restarts_only_full
     )
     assert restarted["state"] == "FULL_RUNNING"
     assert restarted["phases"] == {"proxy": "COMPLETED", "full": "RUNNING"}
+
+
+def test_three_full_resource_pause_resume_cycles_preserve_attempt_and_proxy_authority(tmp_path: Path) -> None:
+    ledger, running = _full_running_proxy_attempt(tmp_path)
+    attempt_id = running["attempt_id"]
+    variant_identity = (
+        running["variant_semantic_hash"],
+        running["variant_spec_hash"],
+    )
+    committed_proxy = deepcopy(running["committed_proxy_outcome"])
+
+    current = running
+    for cycle in range(1, 4):
+        failure = build_resource_failure_evidence_v4(
+            tmp_path,
+            current,
+            failure_class="resource_pause",
+            suffix=f"full-cycle-{cycle:04d}",
+            resource_type="gpu_memory",
+            resource_id="gpu:0",
+            required_capacity=10.0,
+            observed_capacity=4.0,
+            unit="bytes",
+            exit_code=137,
+        )
+        paused, route = ledger.disposition_failure(failure)
+        assert route["next_action"] == "PAUSE_RESOURCE"
+        assert paused["state"] == "RESOURCE_PAUSED"
+        assert paused["reserved_slot"] is True
+
+        resumed = ledger.resume_resource_attempt(
+            attempt_id,
+            measurement_provider=lambda resource_type, resource_id, unit: 20.0,
+        )
+        assert resumed["attempt_id"] == attempt_id
+        assert (resumed["variant_semantic_hash"], resumed["variant_spec_hash"]) == variant_identity
+        assert resumed["lifecycle_generation"] == cycle
+        assert resumed["state"] == "PROXY_COMPLETED"
+        assert resumed["phases"] == {"proxy": "COMPLETED", "full": "PENDING"}
+        assert resumed["committed_proxy_outcome"] == committed_proxy
+        assert resumed["reserved_slot"] is True
+
+        current = ledger.start_full_phase(
+            attempt_id,
+            phase_execution_id=f"phase-full-cycle-{cycle:04d}",
+            producer_run_id=f"producer-full-cycle-{cycle:04d}",
+        )
+        assert current["state"] == "FULL_RUNNING"
+
+    budget = ledger.state()["directions"][running["direction_semantic_hash"]]["budget"]
+    assert budget == {"target": 5, "reserved": 1, "consumed": 0}
+    assert len([event for event in ledger.events() if event["event_type"] == "AttemptResumed"]) == 3
 
 
 def test_rebuild_rejects_rehashed_failure_semantic_mutation(tmp_path: Path) -> None:
@@ -289,8 +362,12 @@ def test_rebuild_rejects_failure_and_resume_raw_byte_drift(tmp_path: Path) -> No
     failure, _, failure_hash = _resource_pause(tmp_path, running)
     paused, _ = ledger.disposition_failure(failure)
     pause_event = next(event for event in reversed(ledger.events()) if event["event_type"] == "AttemptDispositioned")
-    resume = _resume(tmp_path, paused, pause_event, failure, failure_hash)
-    ledger.resume_attempt(resume)
+    ledger.resume_resource_attempt(
+        paused["attempt_id"],
+        measurement_provider=lambda resource_type, resource_id, unit: 20.0,
+    )
+    resume_event = next(event for event in reversed(ledger.events()) if event["event_type"] == "AttemptResumed")
+    resume = resume_event["payload"]["resume_evidence"]
 
     resume_hash = evidence_bytes_hash(canonical_evidence_bytes(resume))
     resume_path = tmp_path / "experiment" / "attempts" / paused["attempt_id"] / resume["producer_run_id"] / "resume_evidence" / f"{resume_hash}.json"
