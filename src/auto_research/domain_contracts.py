@@ -14,26 +14,26 @@ from jsonschema import Draft202012Validator
 from referencing import Registry, Resource
 
 from .evidence import (
-    EVIDENCE_MANIFEST_SCHEMA_VERSION,
     EXECUTION_OBSERVATION_SCHEMA_VERSION,
     decode_evidence_inventory,
 )
 from .phase_command_plan import phase_command_plan_for_phase, validate_phase_command_plan
+from .derivation_contracts import validate_evidence_derivation_plan, validate_readiness_check_plan
 
 DIRECTION_SCHEMA_VERSION = "auto_research_direction_v3"
 VARIANT_SCHEMA_VERSION = "auto_research_variant_v4"
-EVENT_SCHEMA_VERSION = "auto_research_event_v8"
-ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v8"
-RESEARCH_STATE_SCHEMA_VERSION = "auto_research_state_v8"
-TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v7"
-TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v5"
+EVENT_SCHEMA_VERSION = "auto_research_event_v9"
+ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v9"
+RESEARCH_STATE_SCHEMA_VERSION = "auto_research_state_v9"
+TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v8"
+TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v6"
 ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v4"
 CONSTRAINT_RESULT_SCHEMA_VERSION = "auto_research_constraint_result_v2"
 DIRECTION_AGGREGATE_SCHEMA_VERSION = "auto_research_direction_outcome_aggregate_v1"
 PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION = "auto_research_phase_execution_manifest_v3"
-PHASE_COMMAND_SCHEMA_VERSION = "auto_research_phase_command_v3"
-PHASE_RUN_RECEIPT_SCHEMA_VERSION = "auto_research_phase_run_receipt_v4"
-AUTHORITATIVE_EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v5"
+PHASE_COMMAND_SCHEMA_VERSION = "auto_research_phase_command_v4"
+PHASE_RUN_RECEIPT_SCHEMA_VERSION = "auto_research_phase_run_receipt_v5"
+AUTHORITATIVE_EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v6"
 SAMPLE_MANIFEST_SCHEMA_VERSION = "auto_research_sample_manifest_v4"
 COMPLETION_EVIDENCE_SCHEMA_VERSION = "auto_research_completion_evidence_v3"
 FAILURE_EVIDENCE_SCHEMA_VERSION = "auto_research_failure_evidence_v6"
@@ -134,6 +134,15 @@ def acceptance_contract_hash(trial_spec: dict[str, Any]) -> str:
             "acceptance_constraints": trial_spec.get("acceptance_constraints"),
             "required_roles": trial_spec.get("required_roles"),
             "evidence_requirements": trial_spec.get("evidence_requirements"),
+            "proxy_decision_policy": trial_spec.get("proxy_decision_policy"),
+            "phase_authority": [
+                {
+                    "phase": item.get("phase"),
+                    "derivation_plan_hash": item.get("derivation_plan_hash"),
+                    "readiness_check_plan_hash": item.get("readiness_check_plan_hash"),
+                }
+                for item in trial_spec.get("phase_contracts") or []
+            ],
         }
     )
 
@@ -216,7 +225,7 @@ def validate_variant_identity(direction: dict[str, Any], spec: dict[str, Any], *
 
 
 def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
-    validate_contract(trial_spec, "trial_spec_v7.schema.json")
+    validate_contract(trial_spec, "trial_spec_v8.schema.json")
     datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
     manifest_datasets = {item["dataset_id"] for item in trial_spec["sample_manifest"]["datasets"]}
     if datasets != manifest_datasets:
@@ -290,16 +299,32 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
         if reference["digest"] != contract["command_plan_hash"]:
             raise ValueError(f"{phase} phase command plan content reference mismatch")
         validate_phase_command_plan(plan, expected_evidence_kinds=contract["evidence_kinds"])
+        derivation_plan = contract["derivation_plan"]
+        validate_evidence_derivation_plan(derivation_plan)
+        if contract["derivation_plan_ref"]["digest"] != contract["derivation_plan_hash"]:
+            raise ValueError(f"{phase} derivation plan content reference mismatch")
+        if plan["derivation_plan_hash"] != contract["derivation_plan_hash"]:
+            raise ValueError(f"{phase} command and TrialSpec derivation plans disagree")
+        readiness_plan = contract["readiness_check_plan"]
+        if readiness_plan is None:
+            if contract["readiness_check_plan_ref"] is not None or contract["readiness_check_plan_hash"] is not None:
+                raise ValueError(f"{phase} readiness plan identity is incomplete")
+        else:
+            validate_readiness_check_plan(readiness_plan)
+            if contract["readiness_check_plan_ref"]["digest"] != contract["readiness_check_plan_hash"]:
+                raise ValueError(f"{phase} readiness plan content reference mismatch")
+            if plan["readiness_check_plan_hash"] != contract["readiness_check_plan_hash"]:
+                raise ValueError(f"{phase} command and TrialSpec readiness plans disagree")
     expected_versions = {
         "main_results": "auto_research_main_results_v3",
         "proxy_results": "auto_research_proxy_results_v1",
         "ablation_results": "auto_research_ablation_results_v3",
         "coverage_results": "auto_research_coverage_results_v3",
         "matched_control_results": "auto_research_matched_control_results_v3",
-        "activation_evidence": "auto_research_activation_evidence_v3",
+        "activation_evidence": "auto_research_activation_evidence_v4",
         "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v3",
         "proxy_cache_report": "auto_research_proxy_cache_report_v3",
-        "full_s3_readiness": "auto_research_full_s3_readiness_v3",
+        "full_s3_readiness": "auto_research_full_s3_readiness_v4",
         "bootstrap_completion": "auto_research_bootstrap_completion_v3",
     }
     for requirement in trial_spec["evidence_requirements"]:
@@ -347,6 +372,10 @@ def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
         for key, value in expected.items():
             if proxy_policy[key] != value:
                 raise ValueError(f"ProxyDecisionPolicy {key} disagrees with proxy phase contract")
+        if proxy_policy["readiness_check_plan_hash"] != proxy_phase["readiness_check_plan_hash"]:
+            raise ValueError("ProxyDecisionPolicy readiness plan hash disagrees with proxy phase contract")
+        if proxy_policy["readiness_check_plan_ref"] != proxy_phase["readiness_check_plan_ref"]:
+            raise ValueError("ProxyDecisionPolicy readiness plan reference disagrees with proxy phase contract")
     elif proxy_policy is not None:
         raise ValueError("full-only TrialSpec cannot carry ProxyDecisionPolicy")
 
@@ -359,7 +388,7 @@ def validate_execution_observation(observation: dict[str, Any]) -> None:
 
 
 def validate_evidence_manifest(manifest: dict[str, Any], *, trial_spec: dict[str, Any]) -> None:
-    validate_contract(manifest, "evidence_manifest_v5.schema.json")
+    validate_contract(manifest, "evidence_manifest_v6.schema.json")
     expected_hash = trial_spec_hash(trial_spec)
     if manifest["trial_spec_hash"] != expected_hash:
         raise ValueError("evidence manifest TrialSpec hash mismatch")
@@ -377,7 +406,7 @@ def validate_trial_evidence(
     attempt: dict[str, Any] | None = None,
     trial_spec: dict[str, Any] | None = None,
 ) -> None:
-    validate_contract(result, "trial_result_v5.schema.json")
+    validate_contract(result, "trial_result_v6.schema.json")
     observations = result["observations"]
     for observation in observations:
         validate_execution_observation(observation)
@@ -510,8 +539,7 @@ def validate_trial_result(
 
 
 def validate_contract(payload: Any, schema_name: str) -> None:
-    schema, registry = _compiled_schema(schema_name)
-    errors = sorted(Draft202012Validator(schema, registry=registry).iter_errors(payload), key=lambda error: list(error.absolute_path))
+    errors = sorted(_compiled_validator(schema_name).iter_errors(payload), key=lambda error: list(error.absolute_path))
     if errors:
         messages = []
         for error in errors[:20]:
@@ -529,6 +557,12 @@ def _compiled_schema(schema_name: str) -> tuple[dict[str, Any], Registry]:
         resource = Resource.from_contents(json.loads(path.read_text(encoding="utf-8")))
         registry = registry.with_resource(path.name, resource)
     return schema, registry
+
+
+@lru_cache(maxsize=None)
+def _compiled_validator(schema_name: str) -> Draft202012Validator:
+    schema, registry = _compiled_schema(schema_name)
+    return Draft202012Validator(schema, registry=registry)
 
 
 def contract_errors(payload: Any, schema_name: str) -> list[str]:

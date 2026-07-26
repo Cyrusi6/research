@@ -39,14 +39,14 @@ from test_m113_ledger_closure import (
     _receipt_backed_completion,
     _scoped_artifact,
     _trial_spec,
-    _trial_spec_legacy,
+    _trial_spec_facts,
     _valid_completion,
     _variant,
 )
 
 
 def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dict, dict, dict]:
-    from support.authoritative_evidence import start_attempt_phase, build_trial_spec_v5
+    from support.authoritative_evidence import start_attempt_phase, build_trial_spec_v8
     ledger = ResearchEventLedger(tmp_path)
     direction = _direction()
     variant = _variant(direction)
@@ -55,7 +55,7 @@ def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dic
     variant_path.write_text(json.dumps(variant, ensure_ascii=False, sort_keys=True), encoding="utf-8")
     ledger.select_direction(direction)
     ledger.plan_variant(variant)
-    trial_spec = _trial_spec_legacy()
+    trial_spec = _trial_spec_facts()
     trial_spec["protocol"]["required_phases"] = ["proxy"] if profile == "bootstrap" else ["proxy", "full"]
     trial_spec["protocol"]["terminal_phases"] = ["proxy"] if profile == "bootstrap" else ["full"]
     trial_spec["protocol"]["proxy_terminal_allowed"] = profile == "bootstrap"
@@ -65,17 +65,15 @@ def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dic
     )
     trial_spec["evidence_requirements"] = [
         {"requirement_id": "proxy-results", "kind": "proxy_results", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_results_v1"},
-        {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_activation_evidence_v3"},
+        {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_activation_evidence_v4"},
         {"requirement_id": "proxy-baseline", "kind": "proxy_baseline_fingerprint", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_baseline_fingerprint_v3"},
         {"requirement_id": "proxy-cache", "kind": "proxy_cache_report", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_cache_report_v3"},
-        {"requirement_id": "proxy-policy", "kind": "effective_proxy_policy", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_effective_proxy_policy_v3"},
-        {"requirement_id": "proxy-calibration", "kind": "proxy_calibration_policy", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_calibration_policy_v3"},
-        {"requirement_id": "bootstrap" if profile == "bootstrap" else "readiness", "kind": "bootstrap_completion" if profile == "bootstrap" else "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_bootstrap_completion_v3" if profile == "bootstrap" else "auto_research_full_s3_readiness_v3"},
+        {"requirement_id": "bootstrap" if profile == "bootstrap" else "readiness", "kind": "bootstrap_completion" if profile == "bootstrap" else "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_bootstrap_completion_v3" if profile == "bootstrap" else "auto_research_full_s3_readiness_v4"},
     ]
     if profile == "standard":
         trial_spec["evidence_requirements"].append({"requirement_id": "main", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_main_results_v3"})
     trial_spec["required_artifacts"] = [item["kind"] for item in trial_spec["evidence_requirements"]]
-    trial_spec = build_trial_spec_v5(
+    trial_spec = build_trial_spec_v8(
         trial_spec,
         project_root=tmp_path,
         adapter_id="auto-research-c2c",
@@ -99,6 +97,41 @@ def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dic
     }
     baseline = {"mean": 0.0, "datasets": {"fake": 0.0}}
     return attempt, trial_spec, comparison, baseline
+
+
+def _generic_external_command(argv: list[str], cwd: Path) -> dict:
+    raw_outputs = [
+        {
+            "output_id": "raw-main-results",
+            "kind": "main_results",
+            "schema_version": "auto_research_main_results_v3",
+            "locator": "runner/main.json",
+            "locator_type": "file",
+            "dataset_id": None,
+            "role": None,
+            "required": True,
+            "normalized_kinds": ["main_results"],
+        },
+        {
+            "output_id": "raw-activation-evidence",
+            "kind": "activation_evidence",
+            "schema_version": "auto_research_activation_evidence_v4",
+            "locator": "runner/activation.json",
+            "locator_type": "file",
+            "dataset_id": None,
+            "role": None,
+            "required": True,
+            "normalized_kinds": ["activation_evidence"],
+        },
+    ]
+    return {
+        "argv": argv,
+        "cwd": str(cwd),
+        "environment": {
+            "AUTO_RESEARCH_C2C_RAW_OUTPUT_SPECS": json.dumps(raw_outputs, sort_keys=True, separators=(",", ":")),
+        },
+        "physical_raw_outputs": raw_outputs,
+    }
 
 
 def test_c2c_real_inventory_rejects_mutable_results_without_authoritative_receipts(tmp_path: Path) -> None:
@@ -285,7 +318,7 @@ def test_unregistered_optional_evidence_is_rejected_before_commit(tmp_path: Path
     producer_run_id = attempt["phase_executions"]["full"]["producer_run_id"]
     evidence_id = "evidence:unregistered-activation"
     payload = {
-        "schema_version": "auto_research_activation_evidence_v2",
+        "schema_version": "auto_research_activation_evidence_v4",
         "evidence_kind": "activation_evidence",
         "evidence_id": evidence_id,
         "attempt_id": attempt["attempt_id"],
@@ -306,10 +339,20 @@ def test_unregistered_optional_evidence_is_rejected_before_commit(tmp_path: Path
         "phase_start_event_id": attempt["phase_executions"]["full"]["phase_start_event_id"],
         "cross_references": {},
         "probe_id": "unregistered-probe",
-        "status": "passed",
+        "status": "activated",
         "command_status": "completed",
         "exit_code": 0,
-        "implementation_surface_ids": ["src/model.py"],
+        "expected_surface_ids": ["src/model.py"],
+        "observed_surface_ids": ["src/model.py"],
+        "activation_delta_threshold": 0.0,
+        "surface_measurements": [{
+            "surface_id": "src/model.py",
+            "enabled_value": 1.0,
+            "disabled_value": 0.0,
+            "delta": 1.0,
+            "threshold": 0.0,
+            "status": "ACTIVATED",
+        }],
     }
     raw = encode_canonical_evidence(payload)
     digest = hashlib.sha256(raw).hexdigest()
@@ -325,7 +368,7 @@ def test_unregistered_optional_evidence_is_rejected_before_commit(tmp_path: Path
         "kind": "activation_evidence",
         "relative_path": relative_path,
         "content_hash": digest,
-        "schema_version": "auto_research_activation_evidence_v2",
+        "schema_version": "auto_research_activation_evidence_v4",
         "attempt_id": attempt["attempt_id"],
         "producer_run_id": producer_run_id,
         "direction_semantic_hash": attempt["direction_semantic_hash"],
@@ -373,7 +416,7 @@ def test_generic_non_simulate_external_manifest_commits_strict_trial(tmp_path: P
         "acceptance_criteria": {"minimum_mean_delta": 0.1, "maximum_dataset_regression": 0.0},
         "ablation_matrix": [],
         "execution": {
-            "mode": "real", "collector": "external_manifest", "commands": [{"argv": [sys.executable, "producer.py"]}],
+            "mode": "real", "collector": "external_manifest", "commands": [_generic_external_command([sys.executable, "producer.py"], project_root)],
             "workdir": str(project_root), "phase_manifest_path": "runner/phase_manifest.json",
             "evaluator_id": "fixture-evaluator", "evaluator_source_paths": ["evaluator.py"],
             "dependency_payloads": [{"name": "python", "version": f"{sys.version_info.major}.{sys.version_info.minor}"}],
@@ -418,7 +461,7 @@ identity={'attempt_id':attempt['attempt_id'],'producer_run_id':producer,'directi
 rows=[]
 for role,value in [('baseline',0.5),('candidate',0.8)]: rows.append({'phase':'full','role':role,'dataset_id':'dataset-a','metric_id':'accuracy','seed':7,'metric_value':value,'command_status':'completed','attempt_id':attempt['attempt_id'],'variant_semantic_hash':attempt['variant_semantic_hash'],'variant_spec_hash':attempt['variant_spec_hash'],'trial_spec_hash':attempt['trial_spec_hash'],'sample_manifest_hash':attempt['sample_manifest_hash'],'evaluator_hash':attempt['evaluator_hash'],'producer_run_id':producer,**{k:v for k,v in common.items() if k!='phase'}})
 main={'schema_version':'auto_research_main_results_v3','evidence_kind':'main_results','evidence_id':'evidence-main-real',**identity,'rows':rows}
-activation={'schema_version':'auto_research_activation_evidence_v3','evidence_kind':'activation_evidence','evidence_id':'evidence-activation-real',**identity,'probe_id':'forward-probe-real','status':'passed','command_status':'completed','exit_code':0,'implementation_surface_ids':['src/router.py']}
+activation={'schema_version':'auto_research_activation_evidence_v4','evidence_kind':'activation_evidence','evidence_id':'evidence-activation-real',**identity,'probe_id':'forward-probe-real','status':'activated','command_status':'completed','exit_code':0,'expected_surface_ids':['src/router.py'],'observed_surface_ids':['src/router.py'],'activation_delta_threshold':0.0,'surface_measurements':[{'surface_id':'src/router.py','enabled_value':1.0,'disabled_value':0.0,'delta':1.0,'threshold':0.0,'status':'ACTIVATED'}]}
 (root/'runner').mkdir(); (root/'runner/main.json').write_text(json.dumps(main,sort_keys=True,separators=(',',':'))); (root/'runner/activation.json').write_text(json.dumps(activation,sort_keys=True,separators=(',',':')))
 manifest={**phase,'sample_contract_ref':attempt['frozen_trial_spec']['sample_manifest_ref'],'evaluator_contract_ref':attempt['frozen_trial_spec']['execution_contract']['evaluator_manifest_ref'],'artifacts':[{'kind':'main_results','source_path':'runner/main.json','producer_run_id':producer},{'kind':'activation_evidence','source_path':'runner/activation.json','producer_run_id':producer}]}
 (root/'runner/phase_manifest.json').write_text(json.dumps(manifest,sort_keys=True,separators=(',',':')))
@@ -494,7 +537,7 @@ def test_real_evaluator_manifest_tamper_rejects_reservation_without_write(tmp_pa
         "acceptance_criteria": {"minimum_mean_delta": 0.1, "maximum_dataset_regression": 0.0},
         "ablation_matrix": [],
         "execution": {
-            "mode": "real", "collector": "external_manifest", "commands": [{"argv": ["true"]}], "workdir": str(tmp_path),
+            "mode": "real", "collector": "external_manifest", "commands": [_generic_external_command(["true"], tmp_path)], "workdir": str(tmp_path),
             "phase_manifest_path": "runner/phase_manifest.json", "evaluator_id": "fixture-evaluator",
             "evaluator_source_paths": ["evaluator.py"], "dependency_payloads": [{"lock": "fixture-v1"}],
         },

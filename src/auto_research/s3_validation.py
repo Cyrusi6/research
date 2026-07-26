@@ -21,7 +21,7 @@ from .domain_contracts import (
 )
 from .evidence import EvidenceStore, decode_receipt_bound_evidence_inventory
 from .evidence_lineage import validate_receipt_bound_evidence
-from .proxy_classifier import classify_proxy_outcome
+from .proxy_classifier import classify_receipt_bound_proxy_outcome
 from .utils import read_json
 
 
@@ -180,6 +180,12 @@ def validate_committed_s3(
             attempt=attempt,
             proxy_event_payload=proxy_event_payload,
         )
+        _validate_proxy_route_and_state(
+            errors,
+            attempt=attempt,
+            route_outcome=route_outcome,
+            proxy_event_payload=proxy_event_payload,
+        )
     errors.extend(contract_errors(route_outcome, "route_outcome_v4.schema.json"))
     source = route_outcome.get("source") if isinstance(route_outcome.get("source"), dict) else {}
     if source.get("attempt_id") != attempt.get("attempt_id") or not source.get("event_id"):
@@ -276,16 +282,79 @@ def _validate_committed_proxy_evidence(
         binding = phase_execution.get("proxy_evaluation_binding")
         if not isinstance(binding, dict):
             raise ValueError("proxy phase lacks frozen evaluation binding")
-        expected = classify_proxy_outcome(
+        expected = classify_receipt_bound_proxy_outcome(
             frozen_policy=_frozen_trial_spec(attempt)["proxy_decision_policy"],
+            readiness_check_plan=_proxy_readiness_check_plan(attempt),
             evaluation_binding=binding,
-            decoded_evidence=bound.decoded_evidence,
+            receipt_bound_evidence=bound,
             evidence_manifest_hash=canonical_hash(bound.manifest),
         )
         if canonical_json(expected) != canonical_json(supplied_outcome):
             raise ValueError("ProxyOutcome differs from receipt-derived classifier result")
     except (KeyError, OSError, TypeError, ValueError) as exc:
         errors.append(f"committed proxy evidence audit failed: {exc}")
+
+
+def _proxy_readiness_check_plan(attempt: dict[str, Any]) -> dict[str, Any]:
+    matches = [
+        item
+        for item in _frozen_trial_spec(attempt).get("phase_contracts", [])
+        if item.get("phase") == "proxy"
+    ]
+    if len(matches) != 1 or not isinstance(matches[0].get("readiness_check_plan"), dict):
+        raise ValueError("proxy phase lacks frozen ReadinessCheckPlan")
+    return matches[0]["readiness_check_plan"]
+
+
+def _validate_proxy_route_and_state(
+    errors: list[str],
+    *,
+    attempt: dict[str, Any],
+    route_outcome: dict[str, Any],
+    proxy_event_payload: dict[str, Any] | None,
+) -> None:
+    outcome = (proxy_event_payload or {}).get("proxy_outcome")
+    committed = attempt.get("committed_proxy_outcome")
+    if not isinstance(outcome, dict) or not isinstance(committed, dict):
+        return
+    decision = outcome.get("decision")
+    expected = {
+        "RUN_FULL": (
+            {
+                "PROXY_COMPLETED",
+                "FULL_RUNNING",
+                "RESOURCE_PAUSED",
+                "IMPLEMENTATION_REPAIR",
+                "INTEGRITY_BLOCKED",
+                "ABANDONED",
+                "METHOD_COMPLETED",
+            },
+            "COMPLETED",
+            None,
+        ),
+        "REPAIR_IMPLEMENTATION": ({"IMPLEMENTATION_REPAIR"}, "FAILED", True),
+        "PROPOSE_NEXT_VARIANT": ({"ABANDONED"}, "COMPLETED", False),
+    }.get(decision)
+    if expected is None:
+        errors.append(f"unsupported committed ProxyOutcome decision: {decision}")
+        return
+    expected_states, expected_phase, expected_reserved = expected
+    if attempt.get("state") not in expected_states:
+        errors.append("Attempt state differs from committed ProxyOutcome decision")
+    if (attempt.get("phases") or {}).get("proxy") != expected_phase:
+        errors.append("Attempt proxy phase differs from committed ProxyOutcome decision")
+    if (
+        expected_reserved is not None
+        and attempt.get("profile") == "standard"
+        and attempt.get("reserved_slot") is not expected_reserved
+    ):
+        errors.append("Attempt reservation differs from committed ProxyOutcome decision")
+    source = route_outcome.get("source") or {}
+    if source.get("event_id") == committed.get("event_id"):
+        if route_outcome.get("next_action") != decision:
+            errors.append("RouteOutcome action differs from committed ProxyOutcome decision")
+        if route_outcome.get("reason_codes") != outcome.get("reason_codes"):
+            errors.append("RouteOutcome reasons differ from committed ProxyOutcome")
 
 
 def _validate_attempt_hashes(errors: list[str], attempt: dict[str, Any], frozen: dict[str, Any]) -> None:

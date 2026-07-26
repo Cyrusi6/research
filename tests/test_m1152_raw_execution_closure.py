@@ -13,6 +13,8 @@ from auto_research.adapters.runner import ExperimentRunner
 from auto_research.agents.experiment import ExperimentAgent
 from auto_research.command_journal import LedgerCommandJournal
 from auto_research.contract_store import ContractStore
+from auto_research.derivation_contracts import build_readiness_check_plan, freeze_decoder_descriptor
+from auto_research.derivation_validation import ReceiptBoundSources
 from auto_research.domain_contracts import validate_trial_spec
 from auto_research.failure_validation import canonical_evidence_bytes, evidence_bytes_hash
 from auto_research.research_state import IntegrityError, ResearchEventLedger
@@ -151,7 +153,7 @@ def test_phase_receipt_validator_rejects_command_identity_and_log_ref_drift(tmp_
     ExperimentAgent(context).run()
     ledger = ResearchEventLedger(root)
     command_id, record = next(iter(ledger.state()["phase_commands"].items()))
-    receipt = ContractStore(root).read_json(record["receipt_ref"], schema_file="phase_run_receipt_v4.schema.json")
+    receipt = ContractStore(root).read_json(record["receipt_ref"], schema_file="phase_run_receipt_v5.schema.json")
     baseline_events = ledger.events()
     for field, value in (
         ("command_spec_id", "forged-command-spec"),
@@ -161,7 +163,7 @@ def test_phase_receipt_validator_rejects_command_identity_and_log_ref_drift(tmp_
     ):
         attacked = deepcopy(receipt)
         attacked[field] = value
-        ref = ContractStore(root).put_json(attacked, schema_file="phase_run_receipt_v4.schema.json")
+        ref = ContractStore(root).put_json(attacked, schema_file="phase_run_receipt_v5.schema.json")
         with pytest.raises(IntegrityError, match="PhaseRunReceipt|receipt|command"):
             ledger.complete_phase_command(command_id, ref)
         assert ledger.events() == baseline_events
@@ -189,12 +191,66 @@ def test_c2c_no_gpu_must_return_pause_route_not_quarantine(tmp_path: Path, monke
 def test_readiness_blocked_cannot_be_overridden_by_zero_exit_activation(tmp_path: Path) -> None:
     validator = getattr(__import__("auto_research.proxy_classifier", fromlist=["derive_readiness_from_receipts"]), "derive_readiness_from_receipts", None)
     assert callable(validator), "production readiness must be derived from raw command receipts"
-    outcome = validator(
-        required_check_ids=("activation", "full-ready"),
-        raw_checks={
-            "activation": {"status": "PASS", "exit_code": 0},
-            "full-ready": {"status": "BLOCKED", "ready": False, "exit_code": 0},
-        },
+    decoder = freeze_decoder_descriptor(
+        tmp_path,
+        decoder_id="canonical-identity",
+        decoder_version="1",
+        semantic_contract={"readiness": "receipt-bound-raw-measurement-v1"},
     )
+    binding = {
+        "source_ordinal": 0,
+        "source_phase": "proxy",
+        "command_spec_id": "proxy-readiness-command",
+        "output_id": "raw-readiness-output",
+        "output_kind": "c2c_activation_measurement",
+        "output_schema_version": "auto_research_c2c_raw_measurement_v1",
+    }
+    plan = build_readiness_check_plan(
+        plan_id="proxy-readiness-authority",
+        phase="proxy",
+        checks=[{
+            "ordinal": 0,
+            "check_id": "full-ready-check",
+            "check_kind": "raw_measurement",
+            "source_bindings": [binding],
+            "predicate": {"field_path": "ready", "comparator": "eq", "threshold": True},
+            "required_coverage": {"mode": "exact", "expected_surface_ids": []},
+            "decoder_descriptor": decoder,
+            "blocked_classification": "IMPLEMENTATION_BLOCKED",
+            "blocked_route": "REPAIR_IMPLEMENTATION",
+        }],
+    )
+    raw_ref = ContractStore(tmp_path).put_bytes(b'{"ready":false}')
+    key = ("proxy", "proxy-readiness-command", "raw-readiness-output")
+    lineage = {
+        "source_phase": "proxy",
+        "command_spec_id": "proxy-readiness-command",
+        "output_id": "raw-readiness-output",
+        "output_kind": "c2c_activation_measurement",
+        "command_status": "completed",
+        "exit_code": 0,
+        "receipt_hash": raw_ref["digest"],
+        "receipt_ref": raw_ref,
+        "output_ref": raw_ref,
+        "completed_event_id": "event:readiness:completed",
+    }
+    passing_sources = ReceiptBoundSources(
+        raw_facts={key: {"ready": True}},
+        raw_fact_lineage={key: lineage},
+        surface_checks=(),
+        physical_inputs=(),
+    )
+    passing = validator(readiness_check_plan=plan, receipt_bound_sources=passing_sources)
+    assert passing["ready"] is True
+    assert passing["classification"] == "PASS"
+
+    blocked_sources = ReceiptBoundSources(
+        raw_facts={key: {"ready": False}},
+        raw_fact_lineage={key: lineage},
+        surface_checks=(),
+        physical_inputs=(),
+    )
+    outcome = validator(readiness_check_plan=plan, receipt_bound_sources=blocked_sources)
     assert outcome["ready"] is False
-    assert outcome["checks"][1]["status"] != "PASS"
+    assert outcome["classification"] == "BLOCKED"
+    assert outcome["checks"][0]["status"] == "BLOCKED"

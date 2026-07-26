@@ -153,10 +153,22 @@ def _activation(attempt: dict) -> dict:
         "phase_execution_id": execution["phase_execution_id"],
         "phase_start_event_id": execution["phase_start_event_id"],
         "probe_id": "fixture-forward-probe",
-        "status": "passed",
+        "status": "activated",
         "command_status": "completed",
         "exit_code": 0,
-        "implementation_surface_ids": ["src/router.py"],
+        "expected_surface_ids": ["src/router.py"],
+        "observed_surface_ids": ["src/router.py"],
+        "activation_delta_threshold": 0.01,
+        "surface_measurements": [
+            {
+                "surface_id": "src/router.py",
+                "enabled_value": 1.0,
+                "disabled_value": 0.0,
+                "delta": 1.0,
+                "threshold": 0.01,
+                "status": "ACTIVATED",
+            }
+        ],
     }
 
 

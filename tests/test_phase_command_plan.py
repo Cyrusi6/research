@@ -24,6 +24,36 @@ def _outputs() -> list[dict]:
     ]
 
 
+def _coverage() -> dict:
+    return {
+        "mode": "exact_cartesian",
+        "datasets": ["fixture-dataset"],
+        "seeds": [7],
+        "metrics": ["score"],
+        "roles": ["baseline", "candidate"],
+    }
+
+
+def _producer_command(tmp_path, argv: list[str]) -> dict:
+    return {
+        "argv": argv,
+        "cwd": str(tmp_path),
+        "physical_raw_outputs": [
+            {
+                "output_id": "raw-main-results",
+                "kind": "raw_main_results",
+                "schema_version": "auto_research_main_results_v3",
+                "locator": "runner/main-results.json",
+                "locator_type": "file",
+                "dataset_id": None,
+                "role": None,
+                "required": True,
+                "normalized_kinds": ["main_results"],
+            }
+        ],
+    }
+
+
 def test_phase_command_plan_is_content_addressed_and_ordered(tmp_path) -> None:
     source_hash = canonical_hash({"source": "snapshot"})
     plan = build_phase_command_plan(
@@ -34,16 +64,20 @@ def test_phase_command_plan_is_content_addressed_and_ordered(tmp_path) -> None:
         variant_spec_hash=canonical_hash({"variant": "one"}),
         source_snapshot_hash=source_hash,
         command_values=[
-            ["python", "prepare.py"],
-            ["python", "producer.py"],
+            {"argv": ["python", "prepare.py"], "cwd": str(tmp_path)},
+            _producer_command(tmp_path, ["python", "producer.py"]),
         ],
         expected_evidence=_outputs(),
         default_cwd=str(tmp_path),
+        project_root=tmp_path,
+        coverage_contract=_coverage(),
     )
     reference, digest = store_phase_command_plan(tmp_path, plan)
     assert reference["digest"] == digest == canonical_hash(plan)
     assert plan["commands"][1]["dependencies"] == [plan["commands"][0]["command_spec_id"]]
-    assert plan["commands"][1]["expected_outputs"] == _outputs()
+    assert plan["commands"][1]["physical_raw_outputs"][0]["normalized_kinds"] == ["main_results"]
+    assert plan["commands"][2]["dependencies"] == [plan["commands"][1]["command_spec_id"]]
+    assert [item["kind"] for item in plan["commands"][2]["expected_outputs"]] == ["main_results"]
 
 
 @pytest.mark.parametrize(
@@ -63,9 +97,14 @@ def test_phase_command_plan_rejects_dag_and_identity_attacks(tmp_path, mutate, m
         provenance_mode="local-external",
         variant_spec_hash=canonical_hash({"variant": "one"}),
         source_snapshot_hash=canonical_hash({"source": "snapshot"}),
-        command_values=[["python", "prepare.py"], ["python", "producer.py"]],
+        command_values=[
+            {"argv": ["python", "prepare.py"], "cwd": str(tmp_path)},
+            _producer_command(tmp_path, ["python", "producer.py"]),
+        ],
         expected_evidence=_outputs(),
         default_cwd=str(tmp_path),
+        project_root=tmp_path,
+        coverage_contract=_coverage(),
     )
     attacked = deepcopy(plan)
     mutate(attacked)
@@ -73,7 +112,7 @@ def test_phase_command_plan_rejects_dag_and_identity_attacks(tmp_path, mutate, m
         validate_phase_command_plan(attacked, expected_evidence_kinds=["main_results"])
 
 
-def test_trial_spec_v7_embeds_nonempty_frozen_synthetic_plan(tmp_path) -> None:
+def test_trial_spec_v8_embeds_nonempty_frozen_synthetic_plan(tmp_path) -> None:
     variant = {
         "variant_id": "variant-command-plan",
         "variant_spec_hash": canonical_hash({"variant": "command-plan"}),
@@ -101,7 +140,7 @@ def test_trial_spec_v7_embeds_nonempty_frozen_synthetic_plan(tmp_path) -> None:
     trial_spec = _trial_spec_from_plan(plan, variant, project_root=tmp_path)
     validate_trial_spec(trial_spec)
     command_plan = phase_command_plan_for_phase(trial_spec, "full")
-    assert trial_spec["schema_version"] == "auto_research_trial_spec_v7"
+    assert trial_spec["schema_version"] == "auto_research_trial_spec_v8"
     assert command_plan["commands"][0]["argv"] == ["auto-research-adapter", "synthetic", "full"]
     assert trial_spec["phase_contracts"][0]["command_plan_hash"] == canonical_hash(command_plan)
 
@@ -123,6 +162,8 @@ def test_generic_real_phase_requires_explicit_command(tmp_path) -> None:
             command_values=[],
             expected_evidence=_outputs(),
             default_cwd=str(tmp_path),
+            project_root=tmp_path,
+            coverage_contract=_coverage(),
         )
 
 
@@ -144,6 +185,8 @@ def test_phase_command_plan_rejects_removed_command_result_evidence(tmp_path) ->
                 }
             ],
             default_cwd=str(tmp_path),
+            project_root=tmp_path,
+            coverage_contract=_coverage(),
         )
 
 
@@ -160,9 +203,11 @@ def test_generic_command_plan_freezes_exact_argv_cwd_and_source(tmp_path) -> Non
         provenance_mode="local-external",
         variant_spec_hash=canonical_hash({"variant": "one"}),
         source_snapshot_hash=source_hash,
-        command_values=[command],
+        command_values=[_producer_command(tmp_path / "worktree", command["argv"])],
         expected_evidence=_outputs(),
         default_cwd=str(tmp_path),
+        project_root=tmp_path,
+        coverage_contract=_coverage(),
     )
 
     frozen = plan["commands"][0]
@@ -184,7 +229,9 @@ def test_phase_command_plan_rejects_symlinked_cwd_component(tmp_path) -> None:
             provenance_mode="local-external",
             variant_spec_hash=canonical_hash({"variant": "one"}),
             source_snapshot_hash=canonical_hash({"source": "snapshot"}),
-            command_values=[{"argv": ["python", "producer.py"], "cwd": str(linked)}],
+            command_values=[{**_producer_command(linked, ["python", "producer.py"]), "cwd": str(linked)}],
             expected_evidence=_outputs(),
             default_cwd=str(tmp_path),
+            project_root=tmp_path,
+            coverage_contract=_coverage(),
         )

@@ -120,8 +120,8 @@ def test_crash_after_durable_receipt_before_completed_reconciles_once(
 
     assert result["route_outcome"]["next_action"] == "PROPOSE_NEXT_VARIANT"
     assert len(generic_invocations(root)) == 1
-    assert _event_count(root, "PhaseCommandStarted") == 1
-    assert _event_count(root, "PhaseCommandCompleted") == 1
+    assert _event_count(root, "PhaseCommandStarted") == 2
+    assert _event_count(root, "PhaseCommandCompleted") == 2
     assert _event_count(root, "AttemptFinalized") == 1
     assert direction_budget(root) == {"target": 5, "reserved": 0, "consumed": 1}
     assert_trial_lineage(root)

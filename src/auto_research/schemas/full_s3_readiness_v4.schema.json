@@ -17,11 +17,11 @@
     "sample_manifest_hash",
     "evaluator_hash",
     "cross_references",
-    "probe_id",
-    "status",
-    "command_status",
-    "exit_code",
-    "implementation_surface_ids",
+    "readiness_check_plan_ref",
+    "readiness_check_plan_hash",
+    "ready",
+    "classification",
+    "checks",
     "lifecycle_generation",
     "implementation_hash",
     "attempt_input_hash",
@@ -31,10 +31,10 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_activation_evidence_v3"
+      "const": "auto_research_full_s3_readiness_v4"
     },
     "evidence_kind": {
-      "const": "activation_evidence"
+      "const": "full_s3_readiness"
     },
     "evidence_id": {
       "type": "string",
@@ -82,34 +82,49 @@
     },
     "cross_references": {
       "type": "object",
-      "additionalProperties": false
+      "required": [
+        "activation_evidence_hash",
+        "proxy_results_hash"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "activation_evidence_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "proxy_results_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
     },
-    "probe_id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "status": {
-      "enum": [
-        "passed",
-        "failed"
-      ]
-    },
-    "command_status": {
-      "enum": [
-        "completed",
-        "failed"
-      ]
-    },
-    "exit_code": {
-      "type": "integer"
-    },
-    "implementation_surface_ids": {
+    "readiness_check_plan_ref": {"$ref": "#/$defs/blob"},
+    "readiness_check_plan_hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "ready": {"type": "boolean"},
+    "classification": {"enum": ["PASS", "BLOCKED"]},
+    "checks": {
       "type": "array",
       "minItems": 1,
-      "uniqueItems": true,
       "items": {
-        "type": "string",
-        "minLength": 1
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "check_id",
+          "status",
+          "measurement",
+          "comparator",
+          "threshold"
+        ],
+        "properties": {
+          "check_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "status": {"enum": ["PASS", "BLOCKED"]},
+          "measurement": {"type": ["number", "boolean", "string", "array"]},
+          "comparator": {"enum": ["eq", "gt", "gte", "lt", "lte", "delta_gte", "exact_set"]},
+          "threshold": {"type": ["number", "boolean", "string", "array"]}
+        }
       }
     },
     "lifecycle_generation": {
@@ -142,46 +157,8 @@
       "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
     }
   },
-  "allOf": [
-    {
-      "if": {
-        "properties": {
-          "status": {
-            "const": "passed"
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "command_status": {
-            "const": "completed"
-          },
-          "exit_code": {
-            "const": 0
-          }
-        }
-      }
-    },
-    {
-      "if": {
-        "properties": {
-          "status": {
-            "const": "failed"
-          }
-        }
-      },
-      "then": {
-        "properties": {
-          "command_status": {
-            "const": "failed"
-          },
-          "exit_code": {
-            "not": {
-              "const": 0
-            }
-          }
-        }
-      }
-    }
-  ]
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "blob": {"type": "object", "additionalProperties": false, "required": ["schema_version", "algorithm", "digest", "size_bytes", "relative_path"], "properties": {"schema_version": {"const": "auto_research_contract_blob_v1"}, "algorithm": {"const": "sha256"}, "digest": {"$ref": "#/$defs/hash"}, "size_bytes": {"type": "integer", "minimum": 1}, "relative_path": {"type": "string", "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"}}}
+  }
 }

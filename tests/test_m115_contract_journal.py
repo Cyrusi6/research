@@ -173,7 +173,21 @@ def _command_context(
 ) -> tuple[AuthoritativePhaseContext, PhaseAuthorization]:
     (tmp_path / "work").mkdir(exist_ok=True)
     source_snapshot_hash = "f" * 64
-    command_values = commands or ({"command_spec_id": "full-command-train", "argv": ["python", "train.py"]},)
+    command_values = [dict(value) for value in (
+        commands or ({"command_spec_id": "full-command-train", "argv": ["python", "train.py"]},)
+    )]
+    if not any(value.get("physical_raw_outputs") for value in command_values):
+        command_values[0]["physical_raw_outputs"] = [{
+            "output_id": "raw-main-results",
+            "kind": "raw_main_results",
+            "schema_version": "auto_research_main_results_v3",
+            "locator": "raw/main-results.json",
+            "locator_type": "file",
+            "dataset_id": None,
+            "role": None,
+            "required": True,
+            "normalized_kinds": ["main_results"],
+        }]
     plan = build_phase_command_plan(
         phase="full",
         adapter_id="adapter-command-1",
@@ -184,6 +198,14 @@ def _command_context(
         command_values=command_values,
         expected_evidence=[{"kind": "main_results", "schema_version": "auto_research_main_results_v3"}],
         default_cwd="work",
+        project_root=tmp_path,
+        coverage_contract={
+            "mode": "exact_cartesian",
+            "datasets": ["dataset-a"],
+            "seeds": [0],
+            "metrics": ["accuracy"],
+            "roles": ["candidate"],
+        },
     )
     _, command_plan_hash = store_phase_command_plan(tmp_path, plan)
     authorization = PhaseAuthorization(
@@ -215,7 +237,17 @@ def _command_result(tmp_path: Path) -> CommandExecutionResult:
         exit_code=0,
         stdout_hash=hashlib.sha256(stdout.encode()).hexdigest(),
         stderr_hash=hashlib.sha256(stderr.encode()).hexdigest(),
-        outputs=(output,),
+        outputs=(),
+        raw_outputs=({
+            "output_id": "raw-main-results",
+            "kind": "raw_main_results",
+            "schema_version": "auto_research_main_results_v3",
+            "contract_ref": output,
+            "locator": "raw/main-results.json",
+            "locator_type": "file",
+            "dataset_id": None,
+            "role": None,
+        },),
         external_job_id="job-1",
         stdout=stdout,
         stderr=stderr,
@@ -234,14 +266,14 @@ def test_ledger_journal_executes_completed_command_exactly_once(tmp_path: Path) 
 
     kwargs = dict(
         command_id="command-full-0001", argv=("python", "train.py"), cwd="work",
-        source_snapshot_hash="f" * 64, expected_outputs=("main_results",), runner=runner,
+        source_snapshot_hash="f" * 64, expected_outputs=(), runner=runner,
     )
     first = journal.run_once(context, **kwargs)
     second = journal.run_once(context, **kwargs)
     assert first["status"] == second["status"] == "completed"
     assert calls == ["run"]
     assert ledger.authorization_calls == 3
-    receipt = ContractStore(tmp_path).read_json(first["receipt"], schema_file="phase_run_receipt_v4.schema.json")
+    receipt = ContractStore(tmp_path).read_json(first["receipt"], schema_file="phase_run_receipt_v5.schema.json")
     assert receipt["phase_start_event_id"] == context.phase_start_event_id
     assert receipt["producer_run_id"] == context.producer_run_id
 
@@ -252,13 +284,13 @@ def test_started_without_receipt_becomes_unknown_and_never_reruns(tmp_path: Path
     journal = LedgerCommandJournal(tmp_path, ledger)
     command = journal._command_payload(
         context, authorization, command_id="command-full-0002", argv=("python", "train.py"), cwd="work",
-        source_snapshot_hash="f" * 64, expected_outputs=("main_results",),
+        source_snapshot_hash="f" * 64, expected_outputs=(),
     )
     ledger.start_phase_command(command)
     calls: list[str] = []
     result = journal.run_once(
         context, command_id="command-full-0002", argv=("python", "train.py"), cwd="work",
-        source_snapshot_hash="f" * 64, expected_outputs=("main_results",),
+        source_snapshot_hash="f" * 64, expected_outputs=(),
         runner=lambda: calls.append("run") or _command_result(tmp_path),
     )
     assert result["status"] == "unknown"
@@ -273,7 +305,7 @@ def test_receipt_after_side_effect_before_db_can_be_reconciled_without_rerun(tmp
     calls: list[str] = []
     kwargs = dict(
         command_id="command-full-0003", argv=("python", "train.py"), cwd="work",
-        source_snapshot_hash="f" * 64, expected_outputs=("main_results",),
+        source_snapshot_hash="f" * 64, expected_outputs=(),
         runner=lambda: calls.append("run") or _command_result(tmp_path),
     )
     with pytest.raises(RuntimeError, match="DB crash"):
@@ -291,7 +323,17 @@ def test_command_id_reuse_with_different_intent_is_integrity_conflict(tmp_path: 
             {
                 "command_spec_id": "full-command-true",
                 "argv": ["true"],
-                "expected_outputs": [{"kind": "main_results", "schema_version": "auto_research_main_results_v3", "required": True}],
+                "physical_raw_outputs": [{
+                    "output_id": "raw-main-results",
+                    "kind": "raw_main_results",
+                    "schema_version": "auto_research_main_results_v3",
+                    "locator": "raw/main-results.json",
+                    "locator_type": "file",
+                    "dataset_id": None,
+                    "role": None,
+                    "required": True,
+                    "normalized_kinds": ["main_results"],
+                }],
             },
             {
                 "command_spec_id": "full-command-false",
@@ -304,7 +346,7 @@ def test_command_id_reuse_with_different_intent_is_integrity_conflict(tmp_path: 
     journal = LedgerCommandJournal(tmp_path, ledger)
     journal.run_once(
         context, command_id="command-full-0004", argv=("true",), cwd="work",
-        source_snapshot_hash="f" * 64, expected_outputs=("main_results",), runner=lambda: _command_result(tmp_path),
+        source_snapshot_hash="f" * 64, expected_outputs=(), runner=lambda: _command_result(tmp_path),
     )
     with pytest.raises(CommandJournalError, match="conflicts"):
         journal.run_once(
@@ -329,7 +371,7 @@ def test_ledger_journal_requires_exact_frozen_source_and_policies(tmp_path: Path
         "command_spec_id": "full-command-policy",
         "argv": ("python", "train.py"),
         "cwd": "work",
-        "expected_outputs": ("main_results",),
+        "expected_outputs": (),
         "runner": lambda: _command_result(tmp_path),
     }
     with pytest.raises(CommandJournalError, match="source snapshot"):
@@ -361,7 +403,7 @@ def test_ledger_journal_rejects_symlinked_cwd_before_start(tmp_path: Path) -> No
             argv=("python", "train.py"),
             cwd="linked-work",
             source_snapshot_hash="f" * 64,
-            expected_outputs=("main_results",),
+            expected_outputs=(),
             runner=lambda: _command_result(tmp_path),
         )
     assert ledger.commands == {}

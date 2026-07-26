@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import sys
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from auto_research.agents.base import AgentContext
 from auto_research.agents.experiment import ExperimentAgent
 from auto_research.agents.plan import _trial_spec_from_plan
 from auto_research.artifacts import ArtifactManager
+from auto_research.contract_store import ContractStore
 from auto_research.domain_contracts import build_variant_spec
 from auto_research.llm import ModelClient
 from auto_research.research_state import ResearchEventLedger
@@ -97,16 +99,71 @@ from pathlib import Path
 root=Path('.')
 attempt=next(json.loads(path.read_text()) for path in (root/'meta/attempts').glob('*.json') if json.loads(path.read_text())['state']=='FULL_RUNNING')
 phase=attempt['phase_executions']['full']; producer=phase['producer_run_id']
+marker=root/'runner/invocations.jsonl'; marker.parent.mkdir(parents=True,exist_ok=True)
+with marker.open('a',encoding='utf-8') as stream: stream.write(json.dumps({'attempt_id':attempt['attempt_id'],'phase':'full','producer_run_id':producer},sort_keys=True)+'\n')
 common={'lifecycle_generation':attempt['lifecycle_generation'],'implementation_hash':attempt['implementation_hash'],'attempt_input_hash':attempt['attempt_input_hash'],'phase':'full','phase_execution_id':phase['phase_execution_id'],'phase_start_event_id':phase['phase_start_event_id']}
 identity={'attempt_id':attempt['attempt_id'],'producer_run_id':producer,'direction_semantic_hash':attempt['direction_semantic_hash'],'direction_spec_hash':attempt['direction_spec_hash'],'variant_semantic_hash':attempt['variant_semantic_hash'],'variant_spec_hash':attempt['variant_spec_hash'],'trial_spec_hash':attempt['trial_spec_hash'],'protocol_hash':attempt['protocol_hash'],'sample_manifest_hash':attempt['sample_manifest_hash'],'evaluator_hash':attempt['evaluator_hash'],'cross_references':{},**common}
 rows=[]
 for role,value in [('baseline',0.5),('candidate',0.8)]: rows.append({'phase':'full','role':role,'dataset_id':'dataset-a','metric_id':'accuracy','seed':7,'metric_value':value,'command_status':'completed','attempt_id':attempt['attempt_id'],'variant_semantic_hash':attempt['variant_semantic_hash'],'variant_spec_hash':attempt['variant_spec_hash'],'trial_spec_hash':attempt['trial_spec_hash'],'sample_manifest_hash':attempt['sample_manifest_hash'],'evaluator_hash':attempt['evaluator_hash'],'producer_run_id':producer,**{k:v for k,v in common.items() if k!='phase'}})
 main={'schema_version':'auto_research_main_results_v3','evidence_kind':'main_results','evidence_id':'evidence-main-real',**identity,'rows':rows}
-activation={'schema_version':'auto_research_activation_evidence_v3','evidence_kind':'activation_evidence','evidence_id':'evidence-activation-real',**identity,'probe_id':'forward-probe-real','status':'passed','command_status':'completed','exit_code':0,'implementation_surface_ids':['src/router.py']}
+activation={'schema_version':'auto_research_activation_evidence_v4','evidence_kind':'activation_evidence','evidence_id':'evidence-activation-real',**identity,'probe_id':'forward-probe-real','status':'activated','command_status':'completed','exit_code':0,'expected_surface_ids':['src/router.py'],'observed_surface_ids':['src/router.py'],'activation_delta_threshold':0.01,'surface_measurements':[{'surface_id':'src/router.py','enabled_value':1.0,'disabled_value':0.0,'delta':1.0,'threshold':0.01,'status':'ACTIVATED'}]}
 (root/'runner').mkdir(exist_ok=True); (root/'runner/main.json').write_text(json.dumps(main,sort_keys=True,separators=(',',':'))); (root/'runner/activation.json').write_text(json.dumps(activation,sort_keys=True,separators=(',',':')))
 manifest={**phase,'sample_contract_ref':attempt['frozen_trial_spec']['sample_manifest_ref'],'evaluator_contract_ref':attempt['frozen_trial_spec']['execution_contract']['evaluator_manifest_ref'],'artifacts':[{'kind':'main_results','source_path':'runner/main.json','producer_run_id':producer},{'kind':'activation_evidence','source_path':'runner/activation.json','producer_run_id':producer}]}
 (root/'runner/phase_manifest.json').write_text(json.dumps(manifest,sort_keys=True,separators=(',',':')))
 '''
+
+
+def _assert_generic_receipt_chain(root: Path, *, expected_attempts: int) -> None:
+    ledger = ResearchEventLedger(root)
+    state = ledger.state()
+    store = ContractStore(root)
+    records = list(state["phase_commands"].values())
+    physical = [
+        item for item in records
+        if item["command"]["command_spec_id"] != "full-derive-evidence"
+    ]
+    derived = [
+        item for item in records
+        if item["command"]["command_spec_id"] == "full-derive-evidence"
+    ]
+    assert len(physical) == expected_attempts
+    assert len(derived) == expected_attempts
+    for record in physical:
+        receipt = store.read_json(
+            record["receipt_ref"],
+            schema_file="phase_run_receipt_v5.schema.json",
+        )
+        assert receipt["outputs"] == []
+        assert {item["kind"] for item in receipt["raw_outputs"]} == {
+            "activation_evidence",
+            "main_results",
+        }
+        assert receipt["derivation_ref"] is None
+        assert receipt["derivation_hash"] is None
+    for record in derived:
+        receipt = store.read_json(
+            record["receipt_ref"],
+            schema_file="phase_run_receipt_v5.schema.json",
+        )
+        assert receipt["raw_outputs"] == []
+        assert {item["kind"] for item in receipt["outputs"]} == {
+            "activation_evidence",
+            "main_results",
+        }
+        assert receipt["derivation_ref"]["digest"] == receipt["derivation_hash"]
+        trial = state["trial_results"][record["command"]["attempt_id"]]
+        manifest = trial["evidence_manifest"]
+        assert manifest["derive_receipt_ref"] == record["receipt_ref"]
+        assert manifest["derive_receipt_hash"] == record["receipt_ref"]["digest"]
+        assert manifest["derivation_ref"] == receipt["derivation_ref"]
+        assert manifest["derivation_hash"] == receipt["derivation_hash"]
+    invocations = [
+        json.loads(line)
+        for line in (root / "runner" / "invocations.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert len(invocations) == expected_attempts
+    assert len({item["attempt_id"] for item in invocations}) == expected_attempts
 
 
 def test_generic_full_only_uses_authority_journal_and_gate(tmp_path: Path) -> None:
@@ -118,11 +175,17 @@ def test_generic_full_only_uses_authority_journal_and_gate(tmp_path: Path) -> No
     events = ledger.events()
     assert result["route_outcome"]["next_action"] == "PROPOSE_NEXT_VARIANT"
     assert [event["event_type"] for event in events if event["event_type"].startswith("PhaseCommand")] == [
-        "PhaseCommandStarted", "PhaseCommandCompleted"
+        "PhaseCommandStarted",
+        "PhaseCommandCompleted",
+        "PhaseCommandStarted",
+        "PhaseCommandCompleted",
     ]
-    command = next(iter(ledger.state()["phase_commands"].values()))
-    assert command["status"] == "completed"
-    assert command["command"]["provenance_mode"] == "production"
+    assert all(
+        command["status"] == "completed"
+        and command["command"]["provenance_mode"] == "production"
+        for command in ledger.state()["phase_commands"].values()
+    )
+    _assert_generic_receipt_chain(root, expected_attempts=1)
     assert run_stage_gate("S3_experiment", root, context.config).to_dict()["status"] == "PASS"
 
 
@@ -169,6 +232,7 @@ def test_generic_non_simulated_five_variants_and_sixth_precommand_rejection(tmp_
     assert routes[:4] == ["PROPOSE_NEXT_VARIANT"] * 4 and routes[4] == "FINISH_DIRECTION"
     assert direction_state["budget"] == {"target": 5, "reserved": 0, "consumed": 5}
     assert len(state["trial_results"]) == 5 and state["latest_direction_aggregate"]["selection"]["status"] in {"selected", "inconclusive"}
+    _assert_generic_receipt_chain(root, expected_attempts=5)
     command_count = len(state["phase_commands"])
     sixth = _generic_variant(direction, 6); _write_projection(root, "plan/variant.json", sixth); _write_projection(root, "plan/trial_spec.json", _generic_trial_spec(root, sixth)); _implementation_projection(root, sixth)
     with pytest.raises(Exception, match="closed|FINISHED|direction|budget"):

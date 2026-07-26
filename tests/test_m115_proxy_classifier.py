@@ -15,6 +15,7 @@ from test_m113_ledger_closure import _direction, _variant
 
 
 def _policy() -> dict:
+    readiness_hash = "d" * 64
     return build_proxy_decision_policy(
         primary_metric_id="accuracy",
         objective="maximize",
@@ -25,8 +26,17 @@ def _policy() -> dict:
         roles=["baseline", "candidate"],
         aggregate_improvement_threshold=0.05,
         per_dataset_maximum_regression=0.01,
+        activation_delta_threshold=0.01,
         activation_surface_ids=["src/model.py", "src/router.py"],
         readiness_check_ids=["artifacts", "budget", "runtime"],
+        readiness_check_plan_ref={
+            "schema_version": "auto_research_contract_blob_v1",
+            "algorithm": "sha256",
+            "digest": readiness_hash,
+            "size_bytes": 1,
+            "relative_path": f"meta/contracts/sha256/{readiness_hash[:2]}/{readiness_hash}.json",
+        },
+        readiness_check_plan_hash=readiness_hash,
         evidence_kinds=["activation_evidence", "full_s3_readiness", "proxy_results"],
         mode="gate_to_full",
     )
@@ -87,14 +97,42 @@ def _evidence() -> dict:
             rows.append({"phase": "proxy", "role": role, "dataset_id": dataset_id, "metric_id": "accuracy", "seed": seed, "metric_value": value, "command_status": "completed"})
     return {
         "proxy": {**_identity("proxy_results", "evidence-proxy-m115"), "rows": rows},
-        "activation": {**_identity("activation_evidence", "evidence-activation-m115"), "status": "passed", "command_status": "completed", "exit_code": 0, "implementation_surface_ids": ["src/model.py", "src/router.py"]},
-        "readiness": {**_identity("full_s3_readiness", "evidence-readiness-m115"), "ready": True, "checks": [{"check_id": "artifacts", "status": "PASS"}, {"check_id": "budget", "status": "PASS"}, {"check_id": "runtime", "status": "PASS"}]},
+        "activation": {
+            **_identity("activation_evidence", "evidence-activation-m115"),
+            "status": "activated",
+            "command_status": "completed",
+            "exit_code": 0,
+            "expected_surface_ids": ["src/model.py", "src/router.py"],
+            "observed_surface_ids": ["src/model.py", "src/router.py"],
+            "activation_delta_threshold": 0.01,
+            "surface_measurements": [
+                {"surface_id": surface, "enabled_value": 1.0, "disabled_value": 0.0, "delta": 1.0, "threshold": 0.01, "status": "ACTIVATED"}
+                for surface in ["src/model.py", "src/router.py"]
+            ],
+        },
+        "readiness": {
+            **_identity("full_s3_readiness", "evidence-readiness-m115"),
+            "readiness_check_plan_ref": _policy()["readiness_check_plan_ref"],
+            "readiness_check_plan_hash": _policy()["readiness_check_plan_hash"],
+            "ready": True,
+            "classification": "PASS",
+            "checks": [
+                {"check_id": check_id, "status": "PASS", "measurement": True, "comparator": "eq", "threshold": True}
+                for check_id in ["artifacts", "budget", "runtime"]
+            ],
+        },
     }
 
 
 def _classify(policy: dict | None = None, binding: dict | None = None, evidence: dict | None = None) -> dict:
     policy = policy or _policy()
-    return classify_proxy_outcome(frozen_policy=policy, evaluation_binding=binding or _binding(policy), decoded_evidence=evidence or _evidence(), evidence_manifest_hash="f" * 64)
+    return classify_proxy_outcome(
+        frozen_policy=policy,
+        evaluation_binding=binding or _binding(policy),
+        decoded_evidence=evidence or _evidence(),
+        evidence_manifest_hash="f" * 64,
+        derivation_manifest_hash="e" * 64,
+    )
 
 
 def test_frozen_policy_passes_exact_paired_coverage_without_producer_policy() -> None:
@@ -126,8 +164,8 @@ def test_proxy_attacks_fail_after_valid_baseline(attack: str) -> None:
     if attack == "missing_seed": evidence["proxy"]["rows"].pop()
     elif attack == "extra_dataset": evidence["proxy"]["rows"][0]["dataset_id"] = "dataset-c"
     elif attack == "duplicate": evidence["proxy"]["rows"].append(deepcopy(evidence["proxy"]["rows"][0]))
-    elif attack == "surface": evidence["activation"]["implementation_surface_ids"].pop()
-    elif attack == "readiness": evidence["readiness"]["checks"][0]["status"] = "FAIL"
+    elif attack == "surface": evidence["activation"]["observed_surface_ids"].pop()
+    elif attack == "readiness": evidence["readiness"]["checks"][0]["status"] = "BLOCKED"
     else:
         binding["producer_run_id"] = "other-producer"
         binding["binding_hash"] = canonical_hash({key: value for key, value in binding.items() if key != "binding_hash"})
@@ -136,7 +174,9 @@ def test_proxy_attacks_fail_after_valid_baseline(attack: str) -> None:
 
 
 def test_dataset_regression_blocks_full_even_when_aggregate_passes() -> None:
-    policy = build_proxy_decision_policy(primary_metric_id="accuracy", objective="maximize", aggregation="paired_mean", datasets=["dataset-a", "dataset-b"], seeds=[7, 11], metric_ids=["accuracy"], roles=["baseline", "candidate"], aggregate_improvement_threshold=0.01, per_dataset_maximum_regression=0.01, activation_surface_ids=["src/model.py", "src/router.py"], readiness_check_ids=["artifacts", "budget", "runtime"], evidence_kinds=["activation_evidence", "full_s3_readiness", "proxy_results"], mode="gate_to_full")
+    policy = _policy()
+    policy["aggregate_improvement_threshold"] = 0.01
+    policy["policy_hash"] = canonical_hash({key: value for key, value in policy.items() if key != "policy_hash"})
     evidence = _evidence()
     for row in evidence["proxy"]["rows"]:
         if row["dataset_id"] == "dataset-b" and row["role"] == "candidate": row["metric_value"] -= 0.2
@@ -147,7 +187,7 @@ def test_dataset_regression_blocks_full_even_when_aggregate_passes() -> None:
     assert outcome["decision"] == "PROPOSE_NEXT_VARIANT"
 
 
-def test_trial_spec_v6_freezes_policy_and_proxy_start_binds_runtime_identity(tmp_path) -> None:
+def test_trial_spec_v8_freezes_policy_and_proxy_start_binds_runtime_identity(tmp_path) -> None:
     direction = _direction()
     variant = _variant(direction)
     plan = {
@@ -160,7 +200,7 @@ def test_trial_spec_v6_freezes_policy_and_proxy_start_binds_runtime_identity(tmp
     }
     trial_spec = _trial_spec_from_plan(plan, variant, profile="standard", project_root=tmp_path)
     policy = trial_spec["proxy_decision_policy"]
-    assert trial_spec["schema_version"] == "auto_research_trial_spec_v7"
+    assert trial_spec["schema_version"] == "auto_research_trial_spec_v8"
     assert policy["mode"] == "gate_to_full"
     assert "effective_proxy_policy" not in policy["evidence_kinds"]
     ledger = ResearchEventLedger(tmp_path)

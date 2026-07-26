@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
 import pytest
@@ -24,7 +23,7 @@ def _completed_receipts(root: Path) -> list[tuple[dict, dict, str]]:
     for record in state["phase_commands"].values():
         if record["status"] != "completed":
             continue
-        receipt = store.read_json(record["receipt_ref"], schema_file="phase_run_receipt_v4.schema.json")
+        receipt = store.read_json(record["receipt_ref"], schema_file="phase_run_receipt_v5.schema.json")
         completed.append((record["command"], receipt, record["receipt_ref"]["digest"]))
     return completed
 
@@ -36,28 +35,49 @@ def _assert_receipt_and_derivation_chain(root: Path) -> None:
     assert all(receipt["exit_code"] == 0 for _, receipt, _ in completed)
     assert all(receipt["stdout_ref"]["digest"] == receipt["stdout_hash"] for _, receipt, _ in completed)
     assert all(receipt["stderr_ref"]["digest"] == receipt["stderr_hash"] for _, receipt, _ in completed)
-    derivations = [(command, receipt) for command, receipt, _ in completed if command["command_spec_id"].endswith("derive-evidence")]
+    derivations = [
+        (command, receipt, receipt_hash)
+        for command, receipt, receipt_hash in completed
+        if command["command_spec_id"].endswith("derive-evidence")
+    ]
     assert derivations
-    assert all(receipt["outputs"] for _, receipt in derivations)
+    assert all(receipt["outputs"] for _, receipt, _ in derivations)
     physical_receipt_hashes = {
         receipt_hash
         for command, _, receipt_hash in completed
         if not command["command_spec_id"].endswith("derive-evidence")
     }
-    for _, receipt in derivations:
-        summary = json.loads(store.read_bytes(receipt["stdout_ref"]).decode("utf-8"))
-        assert set(summary["source_receipt_hashes"]).issubset(physical_receipt_hashes)
+    derivation_by_receipt = {}
+    for _, receipt, receipt_hash in derivations:
+        assert receipt["derivation_ref"]
+        assert receipt["derivation_hash"] == receipt["derivation_ref"]["digest"]
+        derivation = store.read_json(
+            receipt["derivation_ref"],
+            schema_file="evidence_derivation_manifest_v2.schema.json",
+        )
+        assert {source["receipt_hash"] for source in derivation["source_commands"]}.issubset(
+            physical_receipt_hashes
+        )
+        derivation_by_receipt[receipt_hash] = derivation
     state = ResearchEventLedger(root).state()
     for trial_result in state["trial_results"].values():
-        entries = trial_result["evidence_manifest"]["entries"]
+        evidence_manifest = trial_result["evidence_manifest"]
+        entries = evidence_manifest["entries"]
         assert entries
+        assert evidence_manifest["derive_receipt_hash"] in derivation_by_receipt
+        assert evidence_manifest["derivation_ref"]["digest"] == evidence_manifest["derivation_hash"]
         for entry in entries:
             assert entry["receipt_ref"]
             assert entry["derivation_ref"]
             derivation = store.read_json(
-                entry["derivation_ref"], schema_file="evidence_derivation_manifest_v1.schema.json"
+                entry["derivation_ref"], schema_file="evidence_derivation_manifest_v2.schema.json"
             )
-            assert derivation["normalized_outputs"][0]["contract_ref"]["digest"] == entry["content_hash"]
+            normalized = next(
+                output for output in derivation["normalized_outputs"] if output["kind"] == entry["kind"]
+            )
+            assert normalized["contract_ref"]["digest"] == entry["content_hash"]
+            assert entry["receipt_hash"] == evidence_manifest["derive_receipt_hash"]
+            assert entry["derivation_hash"] == evidence_manifest["derivation_hash"]
             assert derivation["source_commands"]
 
 

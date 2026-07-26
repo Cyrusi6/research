@@ -78,6 +78,34 @@ def _inventory(context: AuthoritativePhaseContext) -> PhaseArtifactInventory:
     )
 
 
+def _coverage() -> dict:
+    return {
+        "mode": "exact_cartesian",
+        "datasets": ["fixture-dataset"],
+        "seeds": [7],
+        "metrics": ["score"],
+        "roles": ["baseline", "candidate"],
+    }
+
+
+def _proxy_command(tmp_path: Path) -> dict:
+    return {
+        "argv": ["true"],
+        "cwd": str(tmp_path),
+        "physical_raw_outputs": [{
+            "output_id": "raw-proxy-results",
+            "kind": "raw_proxy_results",
+            "schema_version": "auto_research_proxy_results_v1",
+            "locator": "runner/proxy-results.json",
+            "locator_type": "file",
+            "dataset_id": None,
+            "role": None,
+            "required": True,
+            "normalized_kinds": ["proxy_results"],
+        }],
+    }
+
+
 class Authority:
     def __init__(self, authorization):
         self.authorization = authorization
@@ -97,9 +125,11 @@ def test_executor_rechecks_exact_sqlite_authorization_before_and_after_runner(tm
         provenance_mode="production",
         variant_spec_hash=context.variant_spec_hash,
         source_snapshot_hash=context.implementation_hash,
-        command_values=({"argv": ["true"], "cwd": str(tmp_path)},),
+        command_values=(_proxy_command(tmp_path),),
         expected_evidence=({"kind": "proxy_results", "schema_version": "auto_research_proxy_results_v1", "required": True},),
         default_cwd=str(tmp_path),
+        project_root=tmp_path,
+        coverage_contract=_coverage(),
     )
     _, plan_hash = store_phase_command_plan(tmp_path, plan)
     authorization = replace(_authorization(), command_plan_hash=plan_hash)
@@ -114,31 +144,20 @@ def test_executor_rechecks_exact_sqlite_authorization_before_and_after_runner(tm
 
 def test_executor_kind_must_match_authorized_adapter(tmp_path: Path) -> None:
     context = _context(tmp_path)
-    plan = {
-        "schema_version": "auto_research_phase_command_plan_v2",
-        "plan_id": "c2c-phase-adapter:proxy:commands",
-        "phase": "proxy",
-        "adapter_identity": {"adapter_id": "c2c-phase-adapter", "adapter_version": "1", "provenance_mode": "production"},
-        "variant_spec_hash": context.variant_spec_hash,
-        "source_snapshot_hash": context.implementation_hash,
-        "commands": [{
-            "command_spec_id": "proxy-command-000",
-            "phase": "proxy",
-            "ordinal": 0,
-            "dependencies": [],
-            "argv": ["true"],
-            "environment": {},
-            "inherited_environment": ["HOME", "PATH", "TMPDIR"],
-            "cwd": str(tmp_path),
-            "source_snapshot_hash": context.implementation_hash,
-            "expected_outputs": [{"kind": "proxy_results", "schema_version": "auto_research_proxy_results_v1", "required": True}],
-            "resource_policy": {"resource_class": "cpu", "minimum_capacity": 1, "unit": "count"},
-            "retry_policy": {"max_attempts": 1, "retryable_exit_codes": [], "backoff_seconds": 0},
-            "resume_policy": {"mode": "receipt_only", "external_job_attach_required": False},
-            "condition": {"kind": "always", "predicate_hash": None},
-        }],
-    }
-    plan_hash = ContractStore(tmp_path).put_json(plan, schema_file="phase_command_plan_v2.schema.json")["digest"]
+    plan = build_phase_command_plan(
+        phase="proxy",
+        adapter_id="c2c-phase-adapter",
+        adapter_version="1",
+        provenance_mode="production",
+        variant_spec_hash=context.variant_spec_hash,
+        source_snapshot_hash=context.implementation_hash,
+        command_values=(_proxy_command(tmp_path),),
+        expected_evidence=({"kind": "proxy_results", "schema_version": "auto_research_proxy_results_v1", "required": True},),
+        default_cwd=str(tmp_path),
+        project_root=tmp_path,
+        coverage_contract=_coverage(),
+    )
+    _, plan_hash = store_phase_command_plan(tmp_path, plan)
     authorization = replace(_authorization(), command_plan_hash=plan_hash)
     context = replace(context, command_plan_hash=plan_hash, authorization_hash=authorization.authorization_hash)
     calls: list[str] = []

@@ -10,6 +10,7 @@ import pytest
 
 from auto_research.contract_store import ContractStore
 from auto_research.domain_contracts import (
+    TRIAL_RESULT_SCHEMA_VERSION,
     build_direction_spec,
     build_variant_spec,
     canonical_hash,
@@ -28,7 +29,7 @@ from auto_research.research_state import (
     initial_state,
     reduce_event,
 )
-from support.authoritative_evidence import build_failure_evidence_v4, build_resource_failure_evidence_v4
+from support.authoritative_evidence import build_failure_evidence_v6, build_resource_failure_evidence_v4
 from support.authoritative_evidence import record_completed_evidence_command
 
 
@@ -99,7 +100,7 @@ def _variant(direction: dict) -> dict:
     )
 
 
-def _trial_spec_legacy() -> dict:
+def _trial_spec_facts() -> dict:
     runtime = {"device": "cpu", "batch_size": 1}
     sample_id = canonical_hash({"sample": "sample-1"})
     sample_dataset = {
@@ -118,23 +119,18 @@ def _trial_spec_legacy() -> dict:
         }
     )
     sample_manifest = {
-        "schema_version": "auto_research_sample_manifest_v1",
         "manifest_id": "m113-samples",
         "provenance_mode": "synthetic",
         "datasets": [sample_dataset],
-        "artifact_path": "plan/sample_manifest.json",
     }
-    sample_manifest["artifact_hash"] = canonical_hash(sample_manifest)
     evaluator_provenance = {
-        "schema_version": "auto_research_evaluator_provenance_v1",
         "provenance_mode": "synthetic",
-        "evaluator_id": "fake-v1",
+        "evaluator_id": "fixture-evaluator",
         "source_digest": canonical_hash({"source": "fake-evaluator"}),
         "config_hash": canonical_hash({"metric": "accuracy"}),
         "dependency_digest": canonical_hash({"dependencies": []}),
     }
     return {
-        "schema_version": "auto_research_trial_spec_v3",
         "protocol": {
             "protocol_id": "m113-full-v1",
             "required_phases": ["full"],
@@ -190,7 +186,6 @@ def _trial_spec_legacy() -> dict:
                 "kind": "main_results",
                 "required": True,
                 "applicable_phases": ["full"],
-                "schema_version": "auto_research_main_results_v2",
             }
         ],
     }
@@ -198,8 +193,8 @@ def _trial_spec_legacy() -> dict:
 
 
 def _trial_spec(project_root: Path | None = None) -> dict:
-    from support.authoritative_evidence import build_trial_spec_v5
-    return build_trial_spec_v5(_trial_spec_legacy(), project_root=project_root)
+    from support.authoritative_evidence import build_trial_spec_v8
+    return build_trial_spec_v8(_trial_spec_facts(), project_root=project_root)
 
 def _running_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
     from support.authoritative_evidence import start_attempt_phase
@@ -255,7 +250,7 @@ def _forged_trial(tmp_path: Path, attempt: dict) -> dict:
         encoding="utf-8",
     )
     return {
-        "schema_version": "auto_research_trial_result_v4",
+        "schema_version": TRIAL_RESULT_SCHEMA_VERSION,
         "attempt_id": attempt["attempt_id"],
         "observations": [
             {"role": "baseline", "metric_value": 0.0},
@@ -335,7 +330,7 @@ def _failure_evidence(
             exit_code=authoritative_exit,
         )
     else:
-        evidence = build_failure_evidence_v4(
+        evidence = build_failure_evidence_v6(
             tmp_path,
             attempt,
             failure_class=failure_class,

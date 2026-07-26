@@ -35,7 +35,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_trial_result_v5"
+      "const": "auto_research_trial_result_v6"
     },
     "direction_id": {
       "type": "string",
@@ -107,9 +107,7 @@
         "$ref": "#/$defs/hash"
       }
     },
-    "evidence_manifest": {
-      "type": "object"
-    },
+    "evidence_manifest": {"$ref": "evidence_manifest_v6.schema.json"},
     "observations": {
       "type": "array",
       "minItems": 2,

@@ -17,8 +17,14 @@
     "sample_manifest_hash",
     "evaluator_hash",
     "cross_references",
-    "ready",
-    "checks",
+    "probe_id",
+    "status",
+    "command_status",
+    "exit_code",
+    "expected_surface_ids",
+    "observed_surface_ids",
+    "activation_delta_threshold",
+    "surface_measurements",
     "lifecycle_generation",
     "implementation_hash",
     "attempt_input_hash",
@@ -28,10 +34,10 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_full_s3_readiness_v3"
+      "const": "auto_research_activation_evidence_v4"
     },
     "evidence_kind": {
-      "const": "full_s3_readiness"
+      "const": "activation_evidence"
     },
     "evidence_id": {
       "type": "string",
@@ -79,43 +85,45 @@
     },
     "cross_references": {
       "type": "object",
-      "required": [
-        "activation_evidence_hash",
-        "proxy_results_hash"
-      ],
-      "additionalProperties": false,
-      "properties": {
-        "activation_evidence_hash": {
-          "type": "string",
-          "pattern": "^[a-f0-9]{64}$"
-        },
-        "proxy_results_hash": {
-          "type": "string",
-          "pattern": "^[a-f0-9]{64}$"
-        }
-      }
+      "additionalProperties": false
     },
-    "ready": {
-      "const": true
+    "probe_id": {
+      "type": "string",
+      "minLength": 1
     },
-    "checks": {
+    "status": {"enum": ["activated", "not_activated", "command_failed"]},
+    "command_status": {
+      "enum": [
+        "completed",
+        "failed"
+      ]
+    },
+    "exit_code": {
+      "type": "integer"
+    },
+    "expected_surface_ids": {
       "type": "array",
       "minItems": 1,
+      "uniqueItems": true,
       "items": {
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-          "check_id",
-          "status"
-        ],
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "observed_surface_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+    "activation_delta_threshold": {"type": "number"},
+    "surface_measurements": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["surface_id", "enabled_value", "disabled_value", "delta", "threshold", "status"],
         "properties": {
-          "check_id": {
-            "type": "string",
-            "minLength": 1
-          },
-          "status": {
-            "const": "PASS"
-          }
+          "surface_id": {"type": "string", "minLength": 1},
+          "enabled_value": {"type": "number"},
+          "disabled_value": {"type": "number"},
+          "delta": {"type": "number"},
+          "threshold": {"type": "number"},
+          "status": {"enum": ["ACTIVATED", "NOT_ACTIVATED"]}
         }
       }
     },
@@ -148,5 +156,47 @@
       "type": "string",
       "pattern": "^[A-Za-z0-9][A-Za-z0-9:._/-]{0,255}$"
     }
-  }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": ["activated", "not_activated"]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "command_status": {
+            "const": "completed"
+          },
+          "exit_code": {
+            "const": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "command_failed"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "command_status": {
+            "const": "failed"
+          },
+          "exit_code": {
+            "not": {
+              "const": 0
+            }
+          }
+        }
+      }
+    }
+  ]
 }

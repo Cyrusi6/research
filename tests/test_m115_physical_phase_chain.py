@@ -12,6 +12,7 @@ from auto_research.agents.experiment import (
 )
 import auto_research.agents.experiment as experiment_module
 from auto_research.command_journal import LedgerCommandJournal
+from auto_research.contract_store import ContractStore
 from auto_research.domain_contracts import canonical_hash
 from auto_research.phase_execution import (
     C2CFullPhaseExecutor,
@@ -142,20 +143,40 @@ def test_full_callbacks_observe_committed_proxy_and_full_phase_started(tmp_path:
     result_holder: dict[str, dict] = {}
 
     def execute_full(context):
-        raw_output = tmp_path / "experiment" / "phase-authority" / "main_results.json"
-        raw_output.parent.mkdir(parents=True, exist_ok=True)
-        raw_output.write_text("{}", encoding="utf-8")
-        command_result = agent._run_authoritative_step(
-            name="command_0",
-            command=["fixture-phase-command", "full"],
-            command_spec_id="full-command-000",
-            working_dir=tmp_path,
-            authoritative_output_factory=lambda: [
+        frozen_plan = ContractStore(tmp_path).read_json(
+            context.command_plan_hash,
+            schema_file="phase_command_plan_v3.schema.json",
+        )
+        command_spec = next(
+            item for item in frozen_plan["commands"] if item["authority_role"] == "physical"
+        )
+        raw_inventory = []
+        for raw_spec in command_spec["physical_raw_outputs"]:
+            normalized_kind = raw_spec["normalized_kinds"][0]
+            raw_output = (
+                tmp_path
+                / "experiment"
+                / "phase-authority"
+                / f"{normalized_kind}.json"
+            )
+            raw_output.parent.mkdir(parents=True, exist_ok=True)
+            raw_output.write_text("{}", encoding="utf-8")
+            raw_inventory.append(
                 {
-                    "kind": "main_results",
+                    "kind": normalized_kind,
                     "source_path": raw_output.relative_to(tmp_path).as_posix(),
                 }
-            ],
+            )
+        command_result = agent._run_authoritative_step(
+            name=command_spec["command_spec_id"],
+            command={
+                "argv": command_spec["argv"],
+                "environment": command_spec["environment"],
+                "inherited_environment": command_spec["inherited_environment"],
+            },
+            command_spec_id=command_spec["command_spec_id"],
+            working_dir=Path(command_spec["cwd"]),
+            authoritative_raw_output_factory=lambda: raw_inventory,
         )
         assert command_result["status"] == "ok"
         result_holder["result"] = {"metrics": {"datasets": {"fake": 1.0}}}

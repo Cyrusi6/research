@@ -270,7 +270,7 @@ class ContractStore:
                 raise ValueError("evaluator dependency_digest does not prove dependency blob bytes")
             if config_digest != payload["config_digest"]:
                 raise ValueError("evaluator config_digest does not prove config blob bytes")
-        elif schema_file == "phase_run_receipt_v4.schema.json":
+        elif schema_file == "phase_run_receipt_v5.schema.json":
             for output in payload["outputs"]:
                 reference = output["contract_ref"]
                 self.verify(reference)

@@ -9,7 +9,6 @@ from pathlib import Path
 import pytest
 
 from auto_research.domain_contracts import (
-    TRIAL_SPEC_SCHEMA_VERSION,
     build_direction_spec,
     build_variant_spec,
     canonical_hash,
@@ -23,7 +22,7 @@ from auto_research.domain_contracts import (
 )
 from support.authoritative_evidence import (
     build_bootstrap_completion,
-    build_failure_evidence_v4,
+    build_failure_evidence_v6,
     build_quantitative_completion,
     build_resource_failure_evidence_v4,
     record_completed_evidence_command,
@@ -100,10 +99,10 @@ def _trial_spec(
     attempt_kind: str | None = None,
     project_root: Path | None = None,
 ) -> dict:
-    from support.authoritative_evidence import build_trial_spec_v5
+    from support.authoritative_evidence import build_trial_spec_v8
 
-    return build_trial_spec_v5(
-        _trial_spec_legacy(attempt, profile=profile, attempt_kind=attempt_kind),
+    return build_trial_spec_v8(
+        _trial_spec_facts(attempt, profile=profile, attempt_kind=attempt_kind),
         project_root=project_root,
     )
 
@@ -112,7 +111,7 @@ def _initialize(ledger: ResearchEventLedger, direction: dict, variant: dict) -> 
     ledger.plan_variant(variant, feedback_from_attempt_ids=(variant.get("lineage") or {}).get("feedback_from_attempt_ids") or [])
 
 
-def _trial_spec_legacy(attempt: dict | None = None, *, profile: str = "standard", attempt_kind: str | None = None) -> dict:
+def _trial_spec_facts(attempt: dict | None = None, *, profile: str = "standard", attempt_kind: str | None = None) -> dict:
     kind = attempt_kind or ((attempt or {}).get("attempt_kind")) or ("bootstrap_proxy" if profile == "bootstrap" else "full")
     if kind == "proxy_full":
         required_phases = ["proxy", "full"]
@@ -135,19 +134,17 @@ def _trial_spec_legacy(attempt: dict | None = None, *, profile: str = "standard"
         "ordered_sample_ids": [sample_id],
     })
     sample_manifest = {
-        "schema_version": "auto_research_sample_manifest_v1", "manifest_id": "fake-v1",
-        "provenance_mode": "synthetic", "datasets": [sample_dataset],
-        "artifact_path": "plan/sample_manifest.json",
+        "manifest_id": "fixture-samples",
+        "provenance_mode": "synthetic",
+        "datasets": [sample_dataset],
     }
-    sample_manifest["artifact_hash"] = canonical_hash(sample_manifest)
     evaluator = {
-        "schema_version": "auto_research_evaluator_provenance_v1", "provenance_mode": "synthetic",
+        "provenance_mode": "synthetic",
         "evaluator_id": "fake-evaluator", "source_digest": canonical_hash({"source": "fake"}),
         "config_hash": canonical_hash({"metric": "accuracy"}),
         "dependency_digest": canonical_hash({"dependencies": []}),
     }
     return {
-        "schema_version": TRIAL_SPEC_SCHEMA_VERSION,
         "protocol": {
             "protocol_id": f"{kind}-v1",
             "required_phases": required_phases,
@@ -182,7 +179,6 @@ def _trial_spec_legacy(attempt: dict | None = None, *, profile: str = "standard"
             "kind": "main_results",
             "required": True,
             "applicable_phases": [result_phase],
-            "schema_version": "auto_research_main_results_v2",
         }],
     }
 
@@ -225,7 +221,7 @@ def _failure_evidence(ledger: ResearchEventLedger, attempt: dict, failure_class:
             failure_class=failure_class,
             suffix=suffix,
         )
-    return build_failure_evidence_v4(
+    return build_failure_evidence_v6(
         ledger.project_root,
         current,
         failure_class=failure_class,

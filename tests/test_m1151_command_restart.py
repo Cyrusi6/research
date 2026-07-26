@@ -44,13 +44,35 @@ def _with_frozen_command_plan(root: Path, context, authorization):
         provenance_mode="local-external",
         variant_spec_hash=context.variant_spec_hash,
         source_snapshot_hash="f" * 64,
-        command_values=({"argv": ["python", "producer.py"], "cwd": "work"},),
+        command_values=({
+            "argv": ["python", "producer.py"],
+            "cwd": "work",
+            "physical_raw_outputs": [{
+                "output_id": "raw-main-results",
+                "kind": "raw_main_results",
+                "schema_version": "auto_research_main_results_v3",
+                "locator": "raw/main-results.json",
+                "locator_type": "file",
+                "dataset_id": None,
+                "role": None,
+                "required": True,
+                "normalized_kinds": ["main_results"],
+            }],
+        },),
         expected_evidence=({
             "kind": "main_results",
             "schema_version": "auto_research_main_results_v3",
             "required": True,
         },),
         default_cwd="work",
+        project_root=root,
+        coverage_contract={
+            "mode": "exact_cartesian",
+            "datasets": ["dataset-a"],
+            "seeds": [0],
+            "metrics": ["accuracy"],
+            "roles": ["candidate"],
+        },
     )
     _, plan_hash = store_phase_command_plan(root, plan)
     authorization = replace(authorization, command_plan_hash=plan_hash)
@@ -79,8 +101,8 @@ def test_generic_restart_after_command_completed_recovers_receipt_without_rerun(
 
     ledger = ResearchEventLedger(root)
     event_types = [event["event_type"] for event in ledger.events()]
-    assert event_types.count("PhaseCommandStarted") == 1
-    assert event_types.count("PhaseCommandCompleted") == 1
+    assert event_types.count("PhaseCommandStarted") == 2
+    assert event_types.count("PhaseCommandCompleted") == 2
     assert "AttemptFinalized" not in event_types
     assert marker.read_text(encoding="utf-8").splitlines() == ["invoked"]
 
@@ -96,11 +118,11 @@ def test_generic_restart_after_command_completed_recovers_receipt_without_rerun(
         restarted_result = restarted_agent.run()
     except IntegrityError as error:
         assert marker.read_text(encoding="utf-8").splitlines() == ["invoked"]
-        assert _command_event_count(root) == 2
+        assert _command_event_count(root) == 4
         pytest.fail(f"restart could not recover the committed receipt: {error}")
 
     assert marker.read_text(encoding="utf-8").splitlines() == ["invoked"]
-    assert _command_event_count(root) == 2
+    assert _command_event_count(root) == 4
     assert restarted_result["route_outcome"]["next_action"] == "PROPOSE_NEXT_VARIANT"
     assert [event["event_type"] for event in ledger.events()].count("AttemptFinalized") == 1
 
@@ -114,8 +136,8 @@ def test_synthetic_execution_uses_ledger_command_journal(tmp_path: Path) -> None
     ExperimentAgent(context).run()
 
     events = ResearchEventLedger(root).events()
-    assert [event["event_type"] for event in events].count("PhaseCommandStarted") == 1
-    assert [event["event_type"] for event in events].count("PhaseCommandCompleted") == 1
+    assert [event["event_type"] for event in events].count("PhaseCommandStarted") == 2
+    assert [event["event_type"] for event in events].count("PhaseCommandCompleted") == 2
 
 
 def test_authoritative_step_rejects_command_not_in_frozen_plan_before_event_write(
@@ -168,7 +190,7 @@ def test_journal_reconciles_durable_receipt_and_recovers_typed_inventory(tmp_pat
         argv=("python", "producer.py"),
         cwd="work",
         source_snapshot_hash="f" * 64,
-        expected_outputs=("main_results",),
+        expected_outputs=(),
         runner=lambda: calls.append("run") or _command_result(tmp_path),
     )
 
@@ -180,10 +202,12 @@ def test_journal_reconciles_durable_receipt_and_recovers_typed_inventory(tmp_pat
     recovered = journal.run_once(context, **kwargs)
     assert isinstance(recovered, CommandJournalResult)
     assert recovered.execution_result.exit_code == 0
-    assert recovered.execution_result.outputs[0]["kind"] == "main_results"
-    assert recovered.execution_result.outputs[0]["content_hash"] == _command_result(tmp_path).outputs[0]["digest"]
+    assert recovered.execution_result.outputs == ()
+    assert recovered.execution_result.raw_outputs[0]["kind"] == "raw_main_results"
+    assert recovered.execution_result.raw_outputs[0]["content_hash"] == _command_result(tmp_path).raw_outputs[0]["contract_ref"]["digest"]
     assert recovered.artifact_inventory.context == context
-    assert tuple(item["kind"] for item in recovered.artifact_inventory.artifacts) == ("main_results",)
+    assert recovered.artifact_inventory.artifacts == ()
+    assert recovered.artifact_inventory.complete is False
     assert calls == ["run"]
 
     replayed = journal.run_once(context, **kwargs)
@@ -206,7 +230,7 @@ def test_started_without_durable_receipt_is_never_rerun(tmp_path: Path) -> None:
         argv=("python", "producer.py"),
         cwd="work",
         source_snapshot_hash="f" * 64,
-        expected_outputs=("main_results",),
+        expected_outputs=(),
     )
     ledger.start_phase_command(command)
     calls: list[str] = []
@@ -217,7 +241,7 @@ def test_started_without_durable_receipt_is_never_rerun(tmp_path: Path) -> None:
         argv=("python", "producer.py"),
         cwd="work",
         source_snapshot_hash="f" * 64,
-        expected_outputs=("main_results",),
+        expected_outputs=(),
         runner=lambda: calls.append("run") or _command_result(tmp_path),
     )
 
@@ -238,7 +262,7 @@ def test_journal_rejects_wrong_source_before_start(tmp_path: Path) -> None:
             argv=("python", "producer.py"),
             cwd="work",
             source_snapshot_hash="e" * 64,
-            expected_outputs=("main_results",),
+            expected_outputs=(),
             runner=lambda: _command_result(tmp_path),
         )
 

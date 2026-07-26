@@ -105,7 +105,7 @@ def validate_failure_evidence(
         raise ValueError("non-resource failure requires canonical PhaseRunReceipt bytes")
     receipt = _decode_canonical(
         phase_run_receipt_raw,
-        "phase_run_receipt_v4.schema.json",
+        "phase_run_receipt_v5.schema.json",
         label="PhaseRunReceipt",
     )
     _match_receipt_identity(receipt, expected)

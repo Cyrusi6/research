@@ -28,11 +28,14 @@
     "stdout_ref",
     "stderr_ref",
     "external_job_id",
-    "outputs"
+    "outputs",
+    "raw_outputs",
+    "derivation_ref",
+    "derivation_hash"
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_phase_run_receipt_v4"
+      "const": "auto_research_phase_run_receipt_v5"
     },
     "command_id": {
       "$ref": "#/$defs/safe_id"
@@ -130,6 +133,7 @@
         "type": "object",
         "additionalProperties": false,
         "required": [
+          "output_id",
           "kind",
           "schema_version",
           "content_hash",
@@ -139,6 +143,7 @@
           "lifecycle_generation"
         ],
         "properties": {
+          "output_id": {"$ref": "#/$defs/safe_id"},
           "kind": {
             "type": "string",
             "minLength": 1
@@ -240,7 +245,9 @@
           }
         }
       }
-    }
+    },
+    "derivation_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/blob_ref"}]},
+    "derivation_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]}
   },
   "$defs": {
     "blob_ref": {

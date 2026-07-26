@@ -46,7 +46,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_attempt_v8"
+      "const": "auto_research_attempt_v9"
     },
     "attempt_id": {
       "type": "string",
@@ -79,7 +79,7 @@
       "$ref": "#/$defs/hash"
     },
     "frozen_trial_spec": {
-      "$ref": "trial_spec_v7.schema.json"
+      "$ref": "trial_spec_v8.schema.json"
     },
     "trial_spec_hash": {
       "$ref": "#/$defs/hash"

@@ -21,7 +21,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_trial_spec_v7"
+      "const": "auto_research_trial_spec_v8"
     },
     "protocol": {
       "type": "object",
@@ -624,7 +624,13 @@
           "consumes_direction_budget",
           "command_plan",
           "command_plan_ref",
-          "command_plan_hash"
+          "command_plan_hash",
+          "derivation_plan",
+          "derivation_plan_ref",
+          "derivation_plan_hash",
+          "readiness_check_plan",
+          "readiness_check_plan_ref",
+          "readiness_check_plan_hash"
         ],
         "properties": {
           "phase": {
@@ -690,14 +696,20 @@
             "type": "boolean"
           },
           "command_plan": {
-            "$ref": "phase_command_plan_v2.schema.json"
+            "$ref": "phase_command_plan_v3.schema.json"
           },
           "command_plan_ref": {
             "$ref": "#/$defs/contract_blob"
           },
           "command_plan_hash": {
             "$ref": "#/$defs/hash"
-          }
+          },
+          "derivation_plan": {"$ref": "evidence_derivation_plan_v1.schema.json"},
+          "derivation_plan_ref": {"$ref": "#/$defs/contract_blob"},
+          "derivation_plan_hash": {"$ref": "#/$defs/hash"},
+          "readiness_check_plan": {"oneOf": [{"type": "null"}, {"$ref": "readiness_check_plan_v1.schema.json"}]},
+          "readiness_check_plan_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/contract_blob"}]},
+          "readiness_check_plan_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]}
         }
       }
     },
@@ -707,7 +719,7 @@
           "type": "null"
         },
         {
-          "$ref": "proxy_decision_policy_v1.schema.json"
+          "$ref": "proxy_decision_policy_v2.schema.json"
         }
       ]
     },

@@ -14,7 +14,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_event_v8"
+      "const": "auto_research_event_v9"
     },
     "event_id": {
       "type": "string",
@@ -448,9 +448,7 @@
         "attempt_input_hash"
       ],
       "properties": {
-        "trial_result": {
-          "type": "object"
-        },
+        "trial_result": {"$ref": "trial_result_v6.schema.json"},
         "lifecycle_generation": {
           "type": "integer"
         },
@@ -527,11 +525,9 @@
         "evidence_manifest"
       ],
       "properties": {
-        "proxy_outcome": {
-          "type": "object"
-        },
+        "proxy_outcome": {"$ref": "proxy_outcome_v4.schema.json"},
         "evidence_manifest": {
-          "$ref": "evidence_manifest_v5.schema.json"
+          "$ref": "evidence_manifest_v6.schema.json"
         },
         "request_fingerprint": {
           "$ref": "#/$defs/request"
@@ -546,7 +542,7 @@
       ],
       "properties": {
         "command": {
-          "$ref": "phase_command_v3.schema.json"
+          "$ref": "phase_command_v4.schema.json"
         },
         "request_fingerprint": {
           "$ref": "#/$defs/request"

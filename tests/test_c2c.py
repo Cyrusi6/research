@@ -23,8 +23,6 @@ from auto_research.adapters.runner import ExperimentRunner
 from auto_research.agents.debate import MultiAgentReasoningService
 from auto_research.agents.experiment import ExperimentAgent
 from auto_research.agents.experiment import (
-    _c2c_strict_evidence_inventory,
-    _current_authoritative_phase_command_receipts,
     _stage_evidence_inventory,
 )
 from auto_research.agents.intake import IntakeAgent, _c2c_evidence_brief, _c2c_static_bundle_validity
@@ -35,6 +33,7 @@ from auto_research.artifacts import ArtifactManager
 from auto_research.c2c import C2CAdapter, C2CPatchGuard, DEFAULT_C2C_PROXY_SCREEN, c2c_idea_novelty_report, collect_c2c_eval_smoke, default_c2c_ideas
 from auto_research.direction_contracts import build_direction_contract, build_s1_direction_fingerprint, build_s1_evidence_quality_score
 from auto_research.domain_contracts import build_direction_spec, build_variant_spec, canonical_hash
+from auto_research.derivation_validation import validated_physical_receipt_inputs
 from auto_research.evidence_refs import resolve_s1_evidence_refs
 from auto_research.judges import gate_s0
 from auto_research.s2_planner_contracts import build_s2_candidate_pool, build_s2_planner_gate_report, build_s2_variant_scorecard
@@ -69,10 +68,9 @@ from auto_research.phase_execution import (
 )
 from auto_research.phase_receipts import C2C_RAW_OUTPUT_SPECS_ENV
 from auto_research.research_state import IntegrityError, ResearchEventLedger
-from auto_research.s3_validation import S3ValidationError
-from support.authoritative_evidence import build_trial_spec_v5, record_completed_evidence_command, start_attempt_phase
+from support.authoritative_evidence import build_trial_spec_v8, start_attempt_phase
 from test_m113_ledger_closure import _direction as _state_direction
-from test_m113_ledger_closure import _trial_spec_legacy as _state_trial_spec_legacy
+from test_m113_ledger_closure import _trial_spec_facts as _state_trial_spec_facts
 
 
 @pytest.fixture(autouse=True)
@@ -160,7 +158,7 @@ def _authorize_c2c_phase(
         variant_path.write_text(json.dumps(variant, ensure_ascii=False, sort_keys=True), encoding="utf-8")
         ledger.select_direction(direction)
         ledger.plan_variant(variant)
-        trial_spec = _state_trial_spec_legacy()
+        trial_spec = _state_trial_spec_facts()
         configured_datasets = list(
             ((agent.context.config.get("c2c", {}).get("small_loop", {}) or {}).get("eval_datasets") or [])
             or (agent.context.config.get("c2c", {}).get("datasets") or [])
@@ -191,19 +189,19 @@ def _authorize_c2c_phase(
         trial_spec["protocol"]["proxy_terminal_allowed"] = profile == "bootstrap"
         trial_spec["evidence_requirements"] = [
             {"requirement_id": "proxy-results", "kind": "proxy_results", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_results_v1"},
-            {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_activation_evidence_v3"},
+            {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_activation_evidence_v4"},
             {"requirement_id": "proxy-baseline", "kind": "proxy_baseline_fingerprint", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_baseline_fingerprint_v3"},
             {"requirement_id": "proxy-cache", "kind": "proxy_cache_report", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_cache_report_v3"},
             {"requirement_id": "proxy-policy", "kind": "effective_proxy_policy", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_effective_proxy_policy_v3"},
             {"requirement_id": "proxy-calibration", "kind": "proxy_calibration_policy", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_proxy_calibration_policy_v3"},
-            {"requirement_id": "bootstrap" if profile == "bootstrap" else "readiness", "kind": "bootstrap_completion" if profile == "bootstrap" else "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_bootstrap_completion_v3" if profile == "bootstrap" else "auto_research_full_s3_readiness_v3"},
+            {"requirement_id": "bootstrap" if profile == "bootstrap" else "readiness", "kind": "bootstrap_completion" if profile == "bootstrap" else "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": "auto_research_bootstrap_completion_v3" if profile == "bootstrap" else "auto_research_full_s3_readiness_v4"},
         ]
         if profile == "standard":
             trial_spec["evidence_requirements"].append(
                 {"requirement_id": "main", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_main_results_v3"}
             )
         trial_spec["required_artifacts"] = [item["kind"] for item in trial_spec["evidence_requirements"]]
-        trial_spec = build_trial_spec_v5(trial_spec, project_root=project_root)
+        trial_spec = build_trial_spec_v8(trial_spec, project_root=project_root)
         trial_spec = agent._freeze_c2c_phase_command_plans(trial_spec, variant)
         attempt = ledger.reserve_attempt(
             profile=profile,
@@ -255,18 +253,11 @@ def _authorize_c2c_phase(
     assert attempt is not None and trial_spec is not None and comparison is not None and baseline is not None
     if phase == "full":
         _record_proxy_prerequisite_receipts(agent, ledger, attempt, trial_spec)
-        inventory = _c2c_strict_evidence_inventory(
-            project_root=project_root,
-            attempt=attempt,
-            trial_spec=trial_spec,
-            comparison_candidate=None,
-            baseline={},
-            simulate=False,
-            authoritative_command_receipts=_current_authoritative_phase_command_receipts(
-                project_root,
-                attempt=attempt,
-                phase="proxy",
-            ),
+        inventory, _ = _record_c2c_evidence_derivation(
+            agent,
+            ledger,
+            attempt,
+            phase="proxy",
         )
         completion = _stage_evidence_inventory(
             project_root=project_root,
@@ -274,7 +265,6 @@ def _authorize_c2c_phase(
             trial_spec=trial_spec,
             inventory=inventory,
         )
-        record_completed_evidence_command(project_root, ledger, attempt, completion)
         attempt, route = ledger.commit_proxy_evidence(completion)
         assert route["next_action"] == "RUN_FULL"
         attempt = ledger.start_full_phase(
@@ -315,6 +305,7 @@ def _record_proxy_prerequisite_receipts(
         raw_outputs = _materialize_c2c_fixture_raw_outputs(
             agent,
             command_spec,
+            trial_spec=trial_spec,
             metric_values=metric_values,
         )
         journal.run_once(
@@ -343,10 +334,52 @@ def _record_proxy_prerequisite_receipts(
         )
 
 
+def _record_c2c_evidence_derivation(
+    agent: ExperimentAgent,
+    ledger: ResearchEventLedger,
+    attempt: dict,
+    *,
+    phase: str,
+) -> tuple[list[dict], dict]:
+    context = ResearchLedgerPhaseAuthority(ledger).context_for_attempt(
+        agent.context.project_root,
+        attempt["attempt_id"],
+        phase,
+    )
+    agent._active_phase_context = context
+    agent._active_command_journal = LedgerCommandJournal(agent.context.project_root, ledger)
+    derived_inventory: list[dict] = []
+
+    def derive(executor_context):
+        assert executor_context == context
+        inventory = agent._commit_phase_evidence_derivation()
+        assert isinstance(inventory, list) and inventory
+        derived_inventory.extend(dict(item) for item in inventory)
+        return PhaseArtifactInventory(context=context, artifacts=tuple(inventory))
+
+    executor_type = C2CProxyPhaseExecutor if phase == "proxy" else C2CFullPhaseExecutor
+    committed_inventory = executor_type(
+        ResearchLedgerPhaseAuthority(ledger),
+        derive,
+    ).execute(context)
+    assert list(committed_inventory.artifacts) == derived_inventory
+    derive_records = [
+        record
+        for record in ledger.state()["phase_commands"].values()
+        if record["command"]["attempt_id"] == attempt["attempt_id"]
+        and record["command"]["phase"] == phase
+        and record["command"]["command_spec"]["authority_role"] == "derivation"
+    ]
+    assert len(derive_records) == 1
+    assert derive_records[0]["status"] == "completed"
+    return derived_inventory, derive_records[0]
+
+
 def _materialize_c2c_fixture_raw_outputs(
     agent: ExperimentAgent,
     command_spec: dict,
     *,
+    trial_spec: dict,
     metric_values: dict[str, float] | None = None,
 ) -> list[dict]:
     encoded = (command_spec.get("environment") or {}).get(C2C_RAW_OUTPUT_SPECS_ENV)
@@ -364,6 +397,12 @@ def _materialize_c2c_fixture_raw_outputs(
         "coverage": 0.50,
     }
     values.update(metric_values or {})
+    proxy_policy = trial_spec.get("proxy_decision_policy") or {}
+    observed_surface_ids = list(proxy_policy.get("activation_surface_ids") or [])
+    readiness_checks = {
+        check_id: {"measurement": True}
+        for check_id in proxy_policy.get("readiness_check_ids") or []
+    }
     for spec in specs:
         target = cwd / spec["locator"]
         if spec["locator_type"] == "tree":
@@ -381,6 +420,9 @@ def _materialize_c2c_fixture_raw_outputs(
                     "dataset": dataset,
                     "answer_method": "generate",
                     "overall_accuracy": values[role],
+                    "observed_surface_ids": observed_surface_ids,
+                    "ready": True,
+                    "readiness_checks": readiness_checks,
                 }
             ),
             encoding="utf-8",
@@ -645,7 +687,14 @@ def _write_c2c_fixture_checkpoint(command: dict) -> None:
     (final / "marker.txt").write_text("ok", encoding="utf-8")
 
 
-def _write_c2c_fixture_eval(command: dict, accuracy: float, predictions: list[str] | None = None) -> None:
+def _write_c2c_fixture_eval(
+    command: dict,
+    accuracy: float,
+    predictions: list[str] | None = None,
+    *,
+    observed_surface_ids: list[str] | None = None,
+    ready: bool = True,
+) -> None:
     output_dir = Path(command["output_dir"])
     dataset = str(command["dataset"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -656,6 +705,11 @@ def _write_c2c_fixture_eval(command: dict, accuracy: float, predictions: list[st
                 "dataset": dataset,
                 "answer_method": "generate",
                 "overall_accuracy": accuracy,
+                "observed_surface_ids": list(observed_surface_ids or ["src/model.py"]),
+                "ready": ready,
+                "readiness_checks": {
+                    "proxy-ready-for-full": {"measurement": ready},
+                },
             }
         ),
         encoding="utf-8",
@@ -7711,6 +7765,7 @@ def test_c2c_failed_train_checkpoint_does_not_bypass_authoritative_receipt(monke
                 "train_samples": 1,
                 "eval_datasets": ["mmlu-redux", "ai2-arc", "openbookqa"],
                 "min_delta_to_pass": 0.1,
+                "activation_smoke": {"enabled": True, "max_datasets": 3, "min_abs_metric_delta": 0.01},
             },
         },
         "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
@@ -7808,6 +7863,7 @@ def test_c2c_train_oom_uses_memory_safe_recipe_then_eval(monkeypatch, tmp_path: 
                 "train_samples": 1,
                 "eval_datasets": ["mmlu-redux"],
                 "min_delta_to_pass": 0.1,
+                "activation_smoke": {"enabled": True, "max_datasets": 1, "min_abs_metric_delta": 0.01},
             },
         },
         "allowed_files": ["rosetta/model/aligner.py", "rosetta/model/projector.py", "rosetta/model/wrapper.py"],
@@ -7905,21 +7961,21 @@ def test_deterministic_s3_blocks_noop_candidate(monkeypatch, tmp_path: Path) -> 
 
     monkeypatch.setattr(agent.runner, "run_step", fail_run_step)
     _authorize_c2c_phase(agent, phase="proxy")
-    result = _run_authorized_c2c_candidate(agent, phase="proxy",
-        adapter=C2CAdapter(paths.root, config),
-        candidate={"id": "noop", "title": "Noop"},
-        index=0,
-        simulate=False,
-        baseline_mean=50.0,
-        min_delta=0.1,
-        max_regression=2.0,
-        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
-        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
-    )
-
-    assert result["decision"] == "blocked"
-    assert result["command_status"] == "blocked"
-    assert result["has_executable_change"] is False
+    with pytest.raises(IntegrityError, match="cannot freeze scientific authority without physical raw outputs"):
+        _run_authorized_c2c_candidate(agent, phase="proxy",
+            adapter=C2CAdapter(paths.root, config),
+            candidate={"id": "noop", "title": "Noop"},
+            index=0,
+            simulate=False,
+            baseline_mean=50.0,
+            min_delta=0.1,
+            max_regression=2.0,
+            gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+            proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        )
+    event_types = [event["event_type"] for event in ResearchEventLedger(paths.root).events()]
+    assert "AttemptReserved" not in event_types
+    assert "PhaseCommandStarted" not in event_types
 
 
 def test_s3_applies_frozen_patch_archives_snapshot_and_does_not_call_llm(tmp_path: Path) -> None:
@@ -8114,6 +8170,7 @@ def test_s3_blocks_outputs_written_to_original_snapshot(monkeypatch, tmp_path: P
                 "train_samples": 1,
                 "eval_datasets": ["mmlu-redux"],
                 "min_delta_to_pass": 0.1,
+                "activation_smoke": {"enabled": True, "max_datasets": 1, "min_abs_metric_delta": 0.01},
             },
         },
     }
@@ -8550,9 +8607,7 @@ def test_c2c_proxy_carries_instrumentation_quality_repair_request(monkeypatch, t
     patch_dir = paths.root / "plan" / "code_patches" / "quality"
     patch_dir.mkdir(parents=True)
     projector = repo / "rosetta/model/projector.py"
-    (patch_dir / "patch.json").write_text(
-        json.dumps(
-            {
+    patch_payload = {
                 "schema_version": 1,
                 "candidate_id": "quality",
                 "title": "Quality",
@@ -8579,40 +8634,47 @@ def test_c2c_proxy_carries_instrumentation_quality_repair_request(monkeypatch, t
                 },
                 "quality_score": {"score": 70, "soft_issues": ["missing_coverage_diagnostics_evidence"]},
             }
-        ),
+    (patch_dir / "patch.json").write_text(
+        json.dumps(patch_payload),
         encoding="utf-8",
     )
     agent = ExperimentAgent(context)
-    monkeypatch.setattr(agent.runner, "run_step", lambda **kwargs: {"step": kwargs["name"], "status": "ok", "returncode": 0, "stdout": "", "stderr": "", "attempts": []})
-    _authorize_c2c_phase(agent, phase="proxy")
-    result = _run_authorized_c2c_candidate(agent, phase="proxy",
-        adapter=C2CAdapter(paths.root, config),
-        candidate={
-            "id": "quality",
-            "title": "Quality",
-            "code_patch": {
-                "status": "ok",
-                "patch_json": "plan/code_patches/quality/patch.json",
-                "changed_files": ["rosetta/model/projector.py"],
-                "has_executable_change": True,
-            },
-        },
-        index=0,
-        simulate=False,
-        baseline_mean=50.0,
-        min_delta=0.1,
-        max_regression=2.0,
-        gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
-        proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+    monkeypatch.setattr(
+        agent.runner,
+        "run_step",
+        lambda **kwargs: pytest.fail(f"empty static proxy plan ran command {kwargs.get('name')}"),
     )
-
-    assert result["proxy_screen"]["status"] == "repairable_proxy_risk"
-    assert result["proxy_screen"]["repair_mode"] == "full_s3_readiness_repair"
-    assert result["proxy_screen"]["quality_repair"]["needed"] is False
-    assert result["proxy_screen"]["quality_repair"]["deferred"] is True
-    assert result["proxy_screen"]["quality_repair"]["repair_route"] == "paperization"
-    assert result["proxy_screen"]["quality_repair"]["mode"] == "paperization_after_effect"
-    assert result["failure_attribution"]["quality_repair"]["acceptance_guard"]["rerun_same_proxy_subset"] is True
+    quality_repair = experiment_module._instrumentation_quality_repair_request(patch_payload)
+    assert quality_repair["needed"] is False
+    assert quality_repair["deferred"] is True
+    assert quality_repair["repair_route"] == "paperization"
+    assert quality_repair["mode"] == "paperization_after_effect"
+    assert quality_repair["acceptance_guard"]["rerun_same_proxy_subset"] is True
+    _authorize_c2c_phase(agent, phase="proxy")
+    with pytest.raises(IntegrityError, match="cannot freeze scientific authority without physical raw outputs"):
+        _run_authorized_c2c_candidate(agent, phase="proxy",
+            adapter=C2CAdapter(paths.root, config),
+            candidate={
+                "id": "quality",
+                "title": "Quality",
+                "code_patch": {
+                    "status": "ok",
+                    "patch_json": "plan/code_patches/quality/patch.json",
+                    "changed_files": ["rosetta/model/projector.py"],
+                    "has_executable_change": True,
+                },
+            },
+            index=0,
+            simulate=False,
+            baseline_mean=50.0,
+            min_delta=0.1,
+            max_regression=2.0,
+            gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+            proxy_gpu_selection=agent.runner.select_gpus({"gpu_ids": [0], "max_gpus": 1}),
+        )
+    event_types = [event["event_type"] for event in ResearchEventLedger(paths.root).events()]
+    assert "AttemptReserved" not in event_types
+    assert "PhaseCommandStarted" not in event_types
 
 
 def test_s3_replays_authoritative_proxy_receipt_without_rerun(tmp_path: Path) -> None:
@@ -8663,35 +8725,51 @@ def test_s3_replays_authoritative_proxy_receipt_without_rerun(tmp_path: Path) ->
         ledger,
         attempt,
         trial_spec,
-        metric_values={"baseline": 0.50, "candidate": 0.0, "activation_disabled": 0.01},
+        metric_values={"baseline": 0.50, "candidate": 0.0, "activation_disabled": -0.10},
     )
-    authoritative_receipts = _current_authoritative_phase_command_receipts(
-        paths.root,
-        attempt=attempt,
-        phase="proxy",
+    state_before_forgery = ledger.state()
+    forged_phase_commands = deepcopy(state_before_forgery["phase_commands"])
+    proxy_derivation_plan = next(
+        item for item in trial_spec["phase_contracts"] if item["phase"] == "proxy"
+    )["derivation_plan"]
+    source_command_spec_id = proxy_derivation_plan["source_bindings"][0]["command_spec_id"]
+    physical_command_id, physical_record = next(
+        (command_id, record)
+        for command_id, record in forged_phase_commands.items()
+        if record["command"]["attempt_id"] == attempt["attempt_id"]
+        and record["command"]["phase"] == "proxy"
+        and record["command"]["command_spec"]["authority_role"] == "physical"
+        and record["command"]["command_spec_id"] == source_command_spec_id
+        and record["status"] == "completed"
     )
-    forged_receipts = deepcopy(authoritative_receipts)
-    forged_receipts[0]["stdout_hash"] = "0" * 64
+    contract_store = ContractStore(paths.root)
+    forged_receipt = contract_store.read_json(
+        physical_record["receipt_ref"],
+        schema_file="phase_run_receipt_v5.schema.json",
+    )
+    forged_receipt["stdout_hash"] = "0" * 64
+    forged_phase_commands[physical_command_id]["receipt_ref"] = contract_store.put_json(
+        forged_receipt,
+        schema_file="phase_run_receipt_v5.schema.json",
+    )
     before_forgery = ledger.state()["last_sequence"]
-    with pytest.raises(S3ValidationError, match="authoritative Ledger receipts"):
-        _c2c_strict_evidence_inventory(
+    with pytest.raises(ValueError, match="stdout hash mismatch"):
+        validated_physical_receipt_inputs(
             project_root=paths.root,
             attempt=attempt,
-            trial_spec=trial_spec,
-            comparison_candidate=None,
-            baseline={},
-            simulate=False,
-            authoritative_command_receipts=forged_receipts,
+            phase_commands=forged_phase_commands,
+            phase="proxy",
+            derivation_plan=proxy_derivation_plan,
         )
     assert ledger.state()["last_sequence"] == before_forgery
-    inventory = _c2c_strict_evidence_inventory(
-        project_root=paths.root,
-        attempt=attempt,
-        trial_spec=trial_spec,
-        comparison_candidate=None,
-        baseline={},
-        simulate=False,
-        authoritative_command_receipts=authoritative_receipts,
+    inventory, first_record = _record_c2c_evidence_derivation(
+        agent,
+        ledger,
+        attempt,
+        phase="proxy",
+    )
+    assert {item["kind"] for item in inventory} == set(
+        attempt["phase_executions"]["proxy"]["expected_evidence_kinds"]
     )
     completion = _stage_evidence_inventory(
         project_root=paths.root,
@@ -8699,19 +8777,23 @@ def test_s3_replays_authoritative_proxy_receipt_without_rerun(tmp_path: Path) ->
         trial_spec=trial_spec,
         inventory=inventory,
     )
-    first_receipt = record_completed_evidence_command(paths.root, ledger, attempt, completion)
+    first_receipt = ContractStore(paths.root).read_json(
+        first_record["receipt_ref"],
+        schema_file="phase_run_receipt_v5.schema.json",
+    )
     completed = ledger.state()
 
     restarted = ResearchEventLedger(paths.root)
     context = ResearchLedgerPhaseAuthority(restarted).context_for_attempt(paths.root, attempt["attempt_id"], "proxy")
     command_spec = next(item for item in trial_spec["phase_contracts"] if item["phase"] == "proxy")["command_plan"]["commands"][-1]
+    command_id = first_record["command"]["command_id"]
 
     def forbidden_rerun() -> CommandExecutionResult:
         raise AssertionError("completed receipt replay must not rerun its command")
 
     replay_receipt = LedgerCommandJournal(paths.root, restarted).run_once(
         context,
-        command_id=f"fixture-proxy-{attempt['attempt_id'][:12]}",
+        command_id=command_id,
         command_spec_id=command_spec["command_spec_id"],
         argv=tuple(command_spec["argv"]),
         cwd=command_spec["cwd"],
@@ -8726,11 +8808,8 @@ def test_s3_replays_authoritative_proxy_receipt_without_rerun(tmp_path: Path) ->
     )
     replayed = restarted.state()
 
-    assert replay_receipt == {
-        key: value
-        for key, value in first_receipt.items()
-        if key not in {"event_id", "event_hash", "sequence"}
-    }
+    assert replay_receipt.receipt_ref == first_record["receipt_ref"]
+    assert replay_receipt.receipt == first_receipt
     assert replayed["last_sequence"] == completed["last_sequence"]
     assert replayed["phase_commands"] == completed["phase_commands"]
 
@@ -9229,7 +9308,7 @@ def test_c2c_replay_proxy_runs_paired_baseline_before_full_training(monkeypatch,
     baseline_receipts = {
         item["command"]["command_spec_id"]: ContractStore(paths.root).read_json(
             item["receipt_ref"],
-            schema_file="phase_run_receipt_v4.schema.json",
+            schema_file="phase_run_receipt_v5.schema.json",
         )
         for item in baseline_commands
     }
@@ -9305,7 +9384,7 @@ def test_c2c_proxy_baseline_eval_timeout_blocks_without_configured_fallback(monk
                 "allow_configured_baseline_fallback": True,
                 "min_proxy_mean_delta": -0.3,
                 "max_proxy_dataset_regression": 1.5,
-                "activation_smoke": {"enabled": False},
+                "activation_smoke": {"enabled": True, "max_datasets": 1, "min_abs_metric_delta": 0.01},
             },
         },
     }
@@ -9370,7 +9449,7 @@ def test_c2c_proxy_baseline_eval_timeout_blocks_without_configured_fallback(monk
     assert phase_context is not None
     frozen_plan = ContractStore(paths.root).read_json(
         phase_context.command_plan_hash,
-        schema_file="phase_command_plan_v2.schema.json",
+        schema_file="phase_command_plan_v3.schema.json",
     )
     frozen_repo = Path(frozen_plan["commands"][0]["cwd"])
     runtime_config = {
@@ -9417,7 +9496,7 @@ def test_c2c_proxy_baseline_eval_timeout_blocks_without_configured_fallback(monk
     )
     receipt = ContractStore(paths.root).read_json(
         baseline_record["receipt_ref"],
-        schema_file="phase_run_receipt_v4.schema.json",
+        schema_file="phase_run_receipt_v5.schema.json",
     )
     assert baseline_record["status"] == "completed"
     assert receipt["exit_code"] == 124
@@ -9511,7 +9590,7 @@ def test_c2c_proxy_activation_smoke_blocks_no_effect_before_full_training(monkey
     measurement_receipts = {
         item["command"]["command_spec_id"]: ContractStore(paths.root).read_json(
             item["receipt_ref"],
-            schema_file="phase_run_receipt_v4.schema.json",
+            schema_file="phase_run_receipt_v5.schema.json",
         )
         for item in ledger_state["phase_commands"].values()
         if item["command"]["command_spec_id"]
@@ -9754,7 +9833,7 @@ def test_c2c_proxy_activation_wiring_trace_does_not_override_metric_neutral_rece
     )
     activation_receipt = ContractStore(paths.root).read_json(
         activation_record["receipt_ref"],
-        schema_file="phase_run_receipt_v4.schema.json",
+        schema_file="phase_run_receipt_v5.schema.json",
     )
     activation_raw = activation_receipt["raw_outputs"][0]
     assert result["activation_smoke"]["status"] == "failed"
@@ -9858,7 +9937,7 @@ def test_c2c_proxy_activation_prediction_sidecar_does_not_override_metric_neutra
     )
     activation_receipt = ContractStore(paths.root).read_json(
         activation_record["receipt_ref"],
-        schema_file="phase_run_receipt_v4.schema.json",
+        schema_file="phase_run_receipt_v5.schema.json",
     )
     activation_raw = activation_receipt["raw_outputs"][0]
     execution_repo = Path(result["execution_repo"]["repo_root"])
@@ -9980,7 +10059,7 @@ def test_c2c_proxy_all_zero_records_eval_smoke_failure(monkeypatch, tmp_path: Pa
     )
     proxy_eval_receipt = ContractStore(paths.root).read_json(
         proxy_eval_record["receipt_ref"],
-        schema_file="phase_run_receipt_v4.schema.json",
+        schema_file="phase_run_receipt_v5.schema.json",
     )
     proxy_raw = proxy_eval_receipt["raw_outputs"][0]
     assert result["decision"] == "proxy_rejected"

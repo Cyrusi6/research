@@ -15,9 +15,11 @@ from referencing import Registry, Resource
 from .domain_contracts import canonical_hash
 
 
-PROXY_DECISION_POLICY_SCHEMA_VERSION = "auto_research_proxy_decision_policy_v1"
+PROXY_DECISION_POLICY_SCHEMA_VERSION = "auto_research_proxy_decision_policy_v2"
+PROXY_DECISION_POLICY_SCHEMA_FILE = "proxy_decision_policy_v2.schema.json"
 PROXY_EVALUATION_BINDING_SCHEMA_VERSION = "auto_research_proxy_evaluation_binding_v1"
-PROXY_OUTCOME_SCHEMA_VERSION = "auto_research_proxy_outcome_v3"
+PROXY_OUTCOME_SCHEMA_VERSION = "auto_research_proxy_outcome_v4"
+PROXY_OUTCOME_SCHEMA_FILE = "proxy_outcome_v4.schema.json"
 CONSTRAINT_RESULT_SCHEMA_VERSION = "auto_research_constraint_result_v2"
 
 _PROXY_RESULTS_KIND = "proxy_results"
@@ -41,8 +43,11 @@ def build_proxy_decision_policy(
     roles: Sequence[str],
     aggregate_improvement_threshold: float,
     per_dataset_maximum_regression: float,
+    activation_delta_threshold: float,
     activation_surface_ids: Sequence[str],
     readiness_check_ids: Sequence[str],
+    readiness_check_plan_ref: Mapping[str, Any],
+    readiness_check_plan_hash: str,
     evidence_kinds: Sequence[str],
     mode: str,
 ) -> dict[str, Any]:
@@ -57,12 +62,16 @@ def build_proxy_decision_policy(
         "roles": sorted(str(item) for item in roles),
         "aggregate_improvement_threshold": float(aggregate_improvement_threshold),
         "per_dataset_maximum_regression": float(per_dataset_maximum_regression),
+        "activation_delta_threshold": float(activation_delta_threshold),
         "activation_surface_ids": sorted(str(item) for item in activation_surface_ids),
         "readiness_check_ids": sorted(str(item) for item in readiness_check_ids),
+        "readiness_check_plan_ref": _json_value(readiness_check_plan_ref),
+        "readiness_check_plan_hash": readiness_check_plan_hash,
         "evidence_kinds": sorted(str(item) for item in evidence_kinds),
         "mode": mode,
         "route_semantics": {
             "science_reject": "PROPOSE_NEXT_VARIANT" if mode == "gate_to_full" else "FINISH_RUN",
+            "implementation_blocked": "REPAIR_IMPLEMENTATION",
             "integrity_failure": "BLOCK_INTEGRITY",
             "resource_failure": "PAUSE_RESOURCE",
         },
@@ -73,13 +82,15 @@ def build_proxy_decision_policy(
 
 
 def validate_proxy_decision_policy(policy: Mapping[str, Any]) -> None:
-    _validate_schema(policy, "proxy_decision_policy_v1.schema.json")
+    _validate_schema(policy, PROXY_DECISION_POLICY_SCHEMA_FILE)
     if policy["policy_hash"] != _object_hash(policy, "policy_hash"):
         raise ValueError("proxy decision policy hash mismatch")
     if set(policy["roles"]) != {"baseline", "candidate"}:
         raise ValueError("proxy policy roles must be exactly baseline and candidate")
     if policy["primary_metric_id"] not in set(policy["metric_ids"]):
         raise ValueError("proxy primary metric is not registered")
+    if policy["readiness_check_plan_ref"]["digest"] != policy["readiness_check_plan_hash"]:
+        raise ValueError("proxy policy readiness plan reference/hash mismatch")
     expected = {_PROXY_RESULTS_KIND, _ACTIVATION_KIND}
     expected.add(_READINESS_KIND if policy["mode"] == "gate_to_full" else _BOOTSTRAP_KIND)
     if not expected.issubset(set(policy["evidence_kinds"])):
@@ -87,6 +98,14 @@ def validate_proxy_decision_policy(policy: Mapping[str, Any]) -> None:
     forbidden = {"effective_proxy_policy", "proxy_calibration_policy", "proxy_decision_report"}
     if forbidden.intersection(policy["evidence_kinds"]):
         raise ValueError("producer-authored proxy policy cannot be authoritative evidence")
+    expected_routes = {
+        "science_reject": "PROPOSE_NEXT_VARIANT" if policy["mode"] == "gate_to_full" else "FINISH_RUN",
+        "implementation_blocked": "REPAIR_IMPLEMENTATION",
+        "integrity_failure": "BLOCK_INTEGRITY",
+        "resource_failure": "PAUSE_RESOURCE",
+    }
+    if policy["route_semantics"] != expected_routes:
+        raise ValueError("proxy policy route semantics are not canonical")
 
 
 def build_proxy_evaluation_binding(
@@ -166,6 +185,7 @@ def classify_proxy_outcome(
     evaluation_binding: Mapping[str, Any],
     decoded_evidence: Mapping[str, Mapping[str, Any]],
     evidence_manifest_hash: str,
+    derivation_manifest_hash: str,
 ) -> dict[str, Any]:
     """Classify immutable proxy evidence without producer-authored control inputs."""
 
@@ -175,9 +195,10 @@ def classify_proxy_outcome(
     proxy_payload = evidence[_PROXY_RESULTS_KIND]
     observation_ids, observed_delta, dataset_deltas = _paired_deltas(frozen_policy, evaluation_binding, proxy_payload)
     worst_regression = max(max(0.0, -value) for value in dataset_deltas.values())
-    _validate_activation(frozen_policy, evidence[_ACTIVATION_KIND])
+    activation_passed = _activation_passed(frozen_policy, evidence[_ACTIVATION_KIND])
+    readiness_passed = True
     if frozen_policy["mode"] == "gate_to_full":
-        _validate_readiness(frozen_policy, evidence[_READINESS_KIND])
+        readiness_passed = _readiness_passed(frozen_policy, evidence[_READINESS_KIND])
     else:
         _validate_bootstrap(evidence[_BOOTSTRAP_KIND])
 
@@ -205,10 +226,25 @@ def classify_proxy_outcome(
         ),
     ]
     constraints_pass = all(item["status"] == "PASS" for item in results)
-    if frozen_policy["mode"] == "terminal_bootstrap":
+    if not activation_passed:
+        decision = "REPAIR_IMPLEMENTATION"
+    elif frozen_policy["mode"] == "gate_to_full" and not readiness_passed:
+        decision = "REPAIR_IMPLEMENTATION"
+    elif frozen_policy["mode"] == "terminal_bootstrap":
         decision = "FINISH_RUN"
     else:
         decision = "RUN_FULL" if constraints_pass else "PROPOSE_NEXT_VARIANT"
+    reason_codes = [
+        "proxy_contract_constraints_pass" if constraints_pass else "proxy_contract_constraints_fail",
+        "proxy_exact_coverage_pass",
+        "proxy_activation_surfaces_pass" if activation_passed else "proxy_activation_blocked",
+    ]
+    if frozen_policy["mode"] == "gate_to_full":
+        reason_codes.append(
+            "proxy_readiness_checks_pass" if readiness_passed else "proxy_readiness_blocked"
+        )
+    else:
+        reason_codes.append("bootstrap_completion_pass")
     outcome = {
         "schema_version": PROXY_OUTCOME_SCHEMA_VERSION,
         "attempt_id": evaluation_binding["attempt_id"],
@@ -218,6 +254,8 @@ def classify_proxy_outcome(
         "phase_execution_id": evaluation_binding["phase_execution_id"],
         "phase_start_event_id": evaluation_binding["phase_start_event_id"],
         "proxy_decision_policy_hash": frozen_policy["policy_hash"],
+        "readiness_check_plan_hash": frozen_policy["readiness_check_plan_hash"],
+        "derivation_manifest_hash": derivation_manifest_hash,
         "proxy_evaluation_binding_hash": evaluation_binding["binding_hash"],
         "evidence_manifest_hash": evidence_manifest_hash,
         "evidence_set_hash": canonical_hash(sorted((key, value["evidence_id"]) for key, value in evidence.items())),
@@ -226,23 +264,21 @@ def classify_proxy_outcome(
         "worst_dataset_regression": worst_regression,
         "constraint_results": results,
         "activation_surface_ids": list(frozen_policy["activation_surface_ids"]),
+        "activation_status": "ACTIVATED" if activation_passed else "NOT_ACTIVATED",
         "readiness_check_ids": list(frozen_policy["readiness_check_ids"]),
+        "readiness_status": "PASS" if readiness_passed else "BLOCKED",
         "evidence_ids": sorted(str(item["evidence_id"]) for item in evidence.values()),
         "decision": decision,
-        "reason_codes": [
-            "proxy_contract_constraints_pass" if constraints_pass else "proxy_contract_constraints_fail",
-            "proxy_exact_coverage_pass",
-            "proxy_activation_surfaces_pass",
-            "proxy_readiness_checks_pass" if frozen_policy["mode"] == "gate_to_full" else "bootstrap_completion_pass",
-        ],
+        "reason_codes": reason_codes,
     }
-    _validate_schema(outcome, "proxy_outcome_v3.schema.json")
+    _validate_schema(outcome, PROXY_OUTCOME_SCHEMA_FILE)
     return outcome
 
 
 def classify_receipt_bound_proxy_outcome(
     *,
     frozen_policy: Mapping[str, Any],
+    readiness_check_plan: Mapping[str, Any],
     evaluation_binding: Mapping[str, Any],
     receipt_bound_evidence: Any,
     evidence_manifest_hash: str,
@@ -269,11 +305,72 @@ def classify_receipt_bound_proxy_outcome(
             raise ValueError("proxy evidence lineage kind mismatch")
         if not getattr(item, "command_id", None) or not getattr(item, "receipt_hash", None):
             raise ValueError("proxy evidence lacks completed command receipt identity")
+    activation_payload = next(
+        (
+            payload
+            for payload in decoded.values()
+            if payload.get("evidence_kind") == _ACTIVATION_KIND
+        ),
+        None,
+    )
+    if not isinstance(activation_payload, Mapping):
+        raise ValueError("receipt-derived activation evidence is missing")
+    _activation_passed(frozen_policy, activation_payload)
+    readiness_payload = next(
+        (
+            payload
+            for payload in decoded.values()
+            if payload.get("evidence_kind") == _READINESS_KIND
+        ),
+        None,
+    )
+    if frozen_policy["mode"] == "gate_to_full":
+        derived_readiness = derive_readiness_from_receipts(
+            readiness_check_plan=readiness_check_plan,
+            receipt_bound_sources=getattr(
+                receipt_bound_evidence,
+                "receipt_bound_sources",
+                receipt_bound_evidence,
+            ),
+        )
+        if derived_readiness["readiness_check_plan_hash"] != frozen_policy["readiness_check_plan_hash"]:
+            raise ValueError("receipt-derived readiness plan hash differs from frozen proxy policy")
+        plan_check_ids = [
+            item["check_id"]
+            for item in readiness_check_plan["checks"]
+            if item["check_kind"] == "raw_measurement"
+        ]
+        if plan_check_ids != list(frozen_policy["readiness_check_ids"]):
+            raise ValueError("ReadinessCheckPlan raw-measurement identities differ from frozen proxy policy")
+        if not isinstance(readiness_payload, Mapping):
+            raise ValueError("receipt-derived readiness evidence is missing")
+        expected_readiness = {
+            "readiness_check_plan_ref": frozen_policy["readiness_check_plan_ref"],
+            "readiness_check_plan_hash": derived_readiness["readiness_check_plan_hash"],
+            "ready": derived_readiness["ready"],
+            "classification": derived_readiness["classification"],
+            "checks": derived_readiness["checks"],
+        }
+        observed_readiness = {
+            key: readiness_payload.get(key)
+            for key in expected_readiness
+        }
+        if observed_readiness != expected_readiness:
+            raise ValueError("normalized readiness differs from receipt-derived predicates")
+    derivation_manifest_hash = receipt_bound_evidence.manifest.get("derivation_hash")
+    if not isinstance(derivation_manifest_hash, str) or len(derivation_manifest_hash) != 64:
+        raise ValueError("proxy evidence lacks one physical derivation manifest hash")
+    if any(
+        entry.get("derivation_hash") != derivation_manifest_hash
+        for entry in receipt_bound_evidence.manifest.get("entries", [])
+    ):
+        raise ValueError("proxy evidence entries do not share the physical derivation manifest")
     return classify_proxy_outcome(
         frozen_policy=frozen_policy,
         evaluation_binding=evaluation_binding,
         decoded_evidence=decoded,
         evidence_manifest_hash=evidence_manifest_hash,
+        derivation_manifest_hash=derivation_manifest_hash,
     )
 
 
@@ -364,44 +461,314 @@ def _paired_deltas(policy: Mapping[str, Any], binding: Mapping[str, Any], payloa
     return sorted(observation_ids), sum(all_deltas) / len(all_deltas), dataset_deltas
 
 
-def _validate_activation(policy: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
-    if payload.get("status") != "passed" or payload.get("command_status") != "completed" or payload.get("exit_code") != 0:
-        raise ValueError("activation evidence did not pass")
-    surfaces = payload.get("implementation_surface_ids")
-    if not isinstance(surfaces, Sequence) or isinstance(surfaces, (str, bytes)) or set(surfaces) != set(policy["activation_surface_ids"]) or len(surfaces) != len(set(surfaces)):
-        raise ValueError("activation surfaces do not exactly match frozen policy")
+def _activation_passed(policy: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
+    if payload.get("status") == "command_failed":
+        raise ValueError("failed activation command must use structured failure disposition")
+    if payload.get("command_status") != "completed" or payload.get("exit_code") != 0:
+        raise ValueError("activation semantic classification requires a completed command receipt")
+    required = list(policy["activation_surface_ids"])
+    if payload.get("expected_surface_ids") != required:
+        raise ValueError("activation expected surfaces differ from frozen proxy policy")
+    observed = payload.get("observed_surface_ids")
+    if not isinstance(observed, Sequence) or isinstance(observed, (str, bytes)):
+        raise ValueError("activation observed surfaces are malformed")
+    if len(observed) != len(set(observed)) or any(item not in required for item in observed):
+        raise ValueError("activation observed surfaces contain duplicates or unknown identities")
+    threshold = policy["activation_delta_threshold"]
+    if payload.get("activation_delta_threshold") != threshold:
+        raise ValueError("activation evidence threshold differs from frozen proxy policy")
+    measurements = payload.get("surface_measurements")
+    if not isinstance(measurements, Sequence) or isinstance(measurements, (str, bytes)):
+        raise ValueError("activation surface measurements are missing")
+    indexed: dict[str, Mapping[str, Any]] = {}
+    for measurement in measurements:
+        if not isinstance(measurement, Mapping):
+            raise ValueError("activation surface measurement is malformed")
+        surface_id = measurement.get("surface_id")
+        if not isinstance(surface_id, str) or not surface_id or surface_id in indexed:
+            raise ValueError("activation surface measurement identity is invalid or duplicated")
+        enabled = measurement.get("enabled_value")
+        disabled = measurement.get("disabled_value")
+        delta = measurement.get("delta")
+        values = (enabled, disabled, delta, measurement.get("threshold"))
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(float(value)) for value in values):
+            raise ValueError("activation surface measurement values must be finite numbers")
+        expected_delta = float(enabled) - float(disabled)
+        if not math.isclose(float(delta), expected_delta, rel_tol=0.0, abs_tol=1e-12):
+            raise ValueError("activation surface delta is not derived from enabled/disabled values")
+        if float(measurement["threshold"]) != float(threshold):
+            raise ValueError("activation surface threshold differs from frozen proxy policy")
+        expected_measurement_status = "ACTIVATED" if expected_delta >= float(threshold) else "NOT_ACTIVATED"
+        if measurement.get("status") != expected_measurement_status:
+            raise ValueError("activation surface status differs from its frozen delta predicate")
+        indexed[surface_id] = measurement
+    if list(indexed) != list(observed):
+        raise ValueError("activation measurements do not exactly match observed surface order")
+    activated = set(observed) == set(required) and all(
+        item["status"] == "ACTIVATED" for item in indexed.values()
+    )
+    expected_status = "activated" if activated else "not_activated"
+    if payload.get("status") != expected_status:
+        raise ValueError("activation summary differs from receipt-derived measurements")
+    return activated
 
 
-def _validate_readiness(policy: Mapping[str, Any], payload: Mapping[str, Any]) -> None:
+def _readiness_passed(policy: Mapping[str, Any], payload: Mapping[str, Any]) -> bool:
+    if payload.get("readiness_check_plan_ref") != policy["readiness_check_plan_ref"]:
+        raise ValueError("readiness evidence plan reference differs from frozen proxy policy")
+    if payload.get("readiness_check_plan_hash") != policy["readiness_check_plan_hash"]:
+        raise ValueError("readiness evidence plan hash differs from frozen proxy policy")
     checks = payload.get("checks")
     if not isinstance(checks, Sequence) or isinstance(checks, (str, bytes)):
         raise ValueError("readiness checks are missing")
     check_ids = [item.get("check_id") for item in checks if isinstance(item, Mapping)]
-    if len(check_ids) != len(checks) or len(check_ids) != len(set(check_ids)) or set(check_ids) != set(policy["readiness_check_ids"]):
+    if (
+        len(check_ids) != len(checks)
+        or len(check_ids) != len(set(check_ids))
+        or check_ids != list(policy["readiness_check_ids"])
+    ):
         raise ValueError("readiness checks do not exactly match frozen policy")
-    derived_ready = all(item.get("status") == "PASS" for item in checks)
-    if not derived_ready or payload.get("ready") is not derived_ready:
-        raise ValueError("full S3 readiness did not pass canonical checks")
+    statuses = [item.get("status") for item in checks]
+    if any(status not in {"PASS", "BLOCKED"} for status in statuses):
+        raise ValueError("readiness check status is invalid")
+    for item in checks:
+        passed = _readiness_comparison_passes(
+            item.get("comparator"), item.get("measurement"), item.get("threshold")
+        )
+        if item.get("status") != ("PASS" if passed else "BLOCKED"):
+            raise ValueError("readiness check status differs from its measurement predicate")
+    derived_ready = all(status == "PASS" for status in statuses)
+    if payload.get("ready") is not derived_ready:
+        raise ValueError("full S3 readiness summary differs from canonical checks")
+    if payload.get("classification") != ("PASS" if derived_ready else "BLOCKED"):
+        raise ValueError("full S3 readiness classification differs from canonical checks")
+    return derived_ready
 
 
 def derive_readiness_from_receipts(
     *,
-    required_check_ids: Sequence[str],
-    raw_checks: Mapping[str, Mapping[str, Any]],
+    readiness_check_plan: Mapping[str, Any],
+    receipt_bound_sources: Any,
 ) -> dict[str, Any]:
-    """Derive readiness solely from frozen check identities and raw command facts."""
+    """Derive readiness from validated physical receipt facts and a frozen check plan."""
 
-    required = list(required_check_ids)
-    if len(required) != len(set(required)) or set(raw_checks) != set(required):
-        raise ValueError("readiness raw checks do not exactly match the frozen check set")
+    _validate_schema(readiness_check_plan, "readiness_check_plan_v1.schema.json")
+    raw_facts = getattr(receipt_bound_sources, "raw_facts", None)
+    raw_lineage = getattr(receipt_bound_sources, "raw_fact_lineage", None)
+    if not isinstance(raw_facts, Mapping) or not isinstance(raw_lineage, Mapping):
+        raise ValueError("readiness derivation requires receipt-bound physical sources")
+    all_checks = readiness_check_plan.get("checks")
+    if not isinstance(all_checks, Sequence) or isinstance(all_checks, (str, bytes)):
+        raise ValueError("ReadinessCheckPlan checks are missing")
+    checks_plan = [item for item in all_checks if item.get("check_kind") == "raw_measurement"]
+    if not isinstance(checks_plan, Sequence) or isinstance(checks_plan, (str, bytes)):
+        raise ValueError("ReadinessCheckPlan checks are missing")
+    check_ids = [item.get("check_id") for item in checks_plan if isinstance(item, Mapping)]
+    if len(check_ids) != len(checks_plan) or len(check_ids) != len(set(check_ids)):
+        raise ValueError("ReadinessCheckPlan check identities are invalid")
+    expected_keys = {
+        _readiness_source_key(binding)
+        for check_plan in checks_plan
+        for binding in check_plan["source_bindings"]
+    }
+    if set(raw_facts) != set(raw_lineage) or not expected_keys.issubset(set(raw_facts)):
+        raise ValueError("readiness raw facts do not cover the frozen physical source bindings")
     checks = []
-    for check_id in required:
-        raw = raw_checks[check_id]
-        status = str(raw.get("status") or "").upper()
-        exit_code = raw.get("exit_code")
-        passed = status == "PASS" and exit_code == 0 and raw.get("ready", True) is not False
-        checks.append({"check_id": check_id, "status": "PASS" if passed else "BLOCKED"})
-    return {"ready": all(item["status"] == "PASS" for item in checks), "checks": checks}
+    for check_plan in checks_plan:
+        check_id = check_plan["check_id"]
+        facts: dict[str, Mapping[str, Any]] = {}
+        for binding in check_plan["source_bindings"]:
+            key = _readiness_source_key(binding)
+            raw = raw_facts[key]
+            source = raw_lineage[key]
+            if not isinstance(raw, Mapping) or not isinstance(source, Mapping):
+                raise ValueError("readiness raw fact or lineage is malformed")
+            if not _valid_readiness_source_lineage(source, binding):
+                raise ValueError("readiness receipt lineage identity is invalid")
+            facts[binding["output_id"]] = raw
+        passed, measurement = _evaluate_readiness_predicate(check_plan, facts)
+        checks.append(
+            {
+                "check_id": check_id,
+                "status": "PASS" if passed else "BLOCKED",
+                "measurement": measurement,
+                "comparator": check_plan["predicate"]["comparator"],
+                "threshold": check_plan["predicate"]["threshold"],
+            }
+        )
+    ready = all(item["status"] == "PASS" for item in checks)
+    return {
+        "readiness_check_plan_hash": canonical_hash(readiness_check_plan),
+        "ready": ready,
+        "classification": "PASS" if ready else "BLOCKED",
+        "checks": checks,
+    }
+
+
+def _readiness_source_key(binding: Mapping[str, Any]) -> tuple[str, str, str]:
+    return (
+        str(binding["source_phase"]),
+        str(binding["command_spec_id"]),
+        str(binding["output_id"]),
+    )
+
+
+def _valid_readiness_source_lineage(
+    source: Mapping[str, Any], binding: Mapping[str, Any]
+) -> bool:
+    return (
+        source.get("source_phase") == binding["source_phase"]
+        and source.get("command_spec_id") == binding["command_spec_id"]
+        and source.get("output_id") == binding["output_id"]
+        and source.get("output_kind") == binding["output_kind"]
+        and source.get("command_status") == "completed"
+        and source.get("exit_code") == 0
+        and isinstance(source.get("receipt_hash"), str)
+        and isinstance(source.get("receipt_ref"), Mapping)
+        and isinstance(source.get("output_ref"), Mapping)
+        and bool(source.get("completed_event_id"))
+    )
+
+
+def _evaluate_readiness_predicate(
+    check_plan: Mapping[str, Any],
+    facts: Mapping[str, Mapping[str, Any]],
+) -> tuple[bool, Any]:
+    predicate = check_plan.get("predicate")
+    if not isinstance(predicate, Mapping):
+        raise ValueError("readiness predicate is missing")
+    observed = _resolve_readiness_field_path(facts, predicate.get("field_path"))
+    if not _readiness_coverage_passes(check_plan, facts):
+        return False, observed
+    return _readiness_comparison_passes(
+        predicate.get("comparator"), observed, predicate.get("threshold")
+    ), observed
+
+
+def _readiness_comparison_passes(comparator: Any, observed: Any, threshold: Any) -> bool:
+    if comparator == "eq":
+        return observed == threshold
+    if comparator == "exact_set":
+        return _exact_set_equal(observed, threshold)
+    if isinstance(observed, bool) or not isinstance(observed, (int, float)):
+        raise ValueError("readiness numeric predicate requires a finite non-boolean measurement")
+    value = float(observed)
+    if not math.isfinite(value) or isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
+        raise ValueError("readiness predicate threshold is invalid")
+    limit = float(threshold)
+    if comparator in {"gte", "delta_gte"}:
+        return value >= limit
+    if comparator == "gt":
+        return value > limit
+    if comparator == "lte":
+        return value <= limit
+    if comparator == "lt":
+        return value < limit
+    raise ValueError("unsupported readiness predicate comparator")
+
+
+def _resolve_readiness_field_path(
+    facts: Mapping[str, Mapping[str, Any]], field_path: Any
+) -> Any:
+    if not isinstance(field_path, str) or not field_path:
+        raise ValueError("readiness predicate field_path is invalid")
+    matches = [
+        output_id
+        for output_id in facts
+        if field_path == output_id or field_path.startswith(f"{output_id}.")
+    ]
+    if len(matches) == 1:
+        output_id = matches[0]
+        suffix = field_path[len(output_id):].removeprefix(".")
+        parts = suffix.split(".") if suffix else []
+        current: Any = facts[output_id]
+    elif len(facts) == 1:
+        parts = field_path.split(".")
+        current = next(iter(facts.values()))
+    elif not matches:
+        values = [
+            _resolve_readiness_parts(payload, field_path.split("."))
+            for payload in facts.values()
+        ]
+        if not values or any(value != values[0] for value in values[1:]):
+            raise ValueError("readiness predicate sources disagree on one logical measurement")
+        return values[0]
+    else:
+        raise ValueError("readiness predicate field_path must name a source output")
+    return _resolve_readiness_parts(current, parts)
+
+
+def _resolve_readiness_parts(current: Any, parts: Sequence[str]) -> Any:
+    for part in parts:
+        if isinstance(current, Mapping) and part in current:
+            current = current[part]
+        elif isinstance(current, Sequence) and not isinstance(current, (str, bytes)) and part.isdigit():
+            index = int(part)
+            if index >= len(current):
+                raise ValueError("readiness predicate field_path index is out of range")
+            current = current[index]
+        elif isinstance(current, Sequence) and not isinstance(current, (str, bytes)):
+            matches = [
+                item
+                for item in current
+                if isinstance(item, Mapping)
+                and part in {
+                    item.get("check_id"),
+                    item.get("surface_id"),
+                    item.get("output_id"),
+                }
+            ]
+            if len(matches) != 1:
+                raise ValueError("readiness predicate list identity is missing or duplicated")
+            current = matches[0]
+        else:
+            raise ValueError("readiness predicate measurement is missing")
+    return current
+
+
+def _readiness_coverage_passes(
+    check_plan: Mapping[str, Any], facts: Mapping[str, Mapping[str, Any]]
+) -> bool:
+    coverage = check_plan.get("required_coverage")
+    if not isinstance(coverage, Mapping):
+        raise ValueError("readiness required coverage is missing")
+    expected = coverage.get("expected_surface_ids")
+    if not isinstance(expected, Sequence) or isinstance(expected, (str, bytes)):
+        raise ValueError("readiness expected surface coverage is malformed")
+    expected_set = {str(item) for item in expected}
+    observed_candidates = [
+        payload["observed_surface_ids"]
+        for payload in facts.values()
+        if "observed_surface_ids" in payload
+    ]
+    if not expected_set:
+        return True
+    if not observed_candidates:
+        raise ValueError("readiness raw facts omit observed surface coverage")
+    observed = [item for values in observed_candidates for item in values]
+    if any(not isinstance(item, str) or not item for item in observed):
+        raise ValueError("readiness observed surface identity is malformed")
+    if len(observed) != len(set(observed)):
+        raise ValueError("readiness observed surface coverage contains duplicates")
+    observed_set = set(observed)
+    if coverage.get("mode") == "exact":
+        return observed_set == expected_set
+    if coverage.get("mode") == "at_least":
+        return expected_set.issubset(observed_set)
+    raise ValueError("readiness coverage mode is invalid")
+
+
+def _exact_set_equal(observed: Any, expected: Any) -> bool:
+    if (
+        not isinstance(observed, Sequence)
+        or isinstance(observed, (str, bytes))
+        or not isinstance(expected, Sequence)
+        or isinstance(expected, (str, bytes))
+    ):
+        raise ValueError("exact_set readiness predicate requires arrays")
+    if len(observed) != len(set(observed)) or len(expected) != len(set(expected)):
+        raise ValueError("exact_set readiness predicate contains duplicates")
+    return set(observed) == set(expected)
 
 
 def _validate_bootstrap(payload: Mapping[str, Any]) -> None:
@@ -432,8 +799,13 @@ def _validate_schema(payload: Mapping[str, Any], schema_name: str) -> None:
 def _schema_validator(schema_name: str) -> Draft202012Validator:
     schema_dir = Path(__file__).with_name("schemas")
     schema = json.loads((schema_dir / schema_name).read_text(encoding="utf-8"))
-    constraint_schema = json.loads((schema_dir / "constraint_result_v2.schema.json").read_text(encoding="utf-8"))
-    registry = Registry().with_resource("constraint_result_v2.schema.json", Resource.from_contents(constraint_schema))
+    registry = Registry()
+    for referenced_name in (
+        "constraint_result_v2.schema.json",
+        "decoder_descriptor_v1.schema.json",
+    ):
+        referenced = json.loads((schema_dir / referenced_name).read_text(encoding="utf-8"))
+        registry = registry.with_resource(referenced_name, Resource.from_contents(referenced))
     return Draft202012Validator(schema, registry=registry)
 
 

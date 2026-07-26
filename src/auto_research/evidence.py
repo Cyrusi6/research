@@ -16,7 +16,7 @@ from typing import Any, Mapping
 from jsonschema import Draft202012Validator
 
 EXECUTION_OBSERVATION_SCHEMA_VERSION = "auto_research_execution_observation_v4"
-EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v5"
+EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v6"
 COMPLETION_EVIDENCE_SCHEMA_VERSION = "auto_research_completion_evidence_v3"
 QUANTITATIVE_EVIDENCE_SCHEMA_VERSIONS = {
     "main_results": "auto_research_main_results_v3",
@@ -27,10 +27,10 @@ QUANTITATIVE_EVIDENCE_SCHEMA_VERSIONS = {
 }
 EVIDENCE_SCHEMA_VERSIONS = {
     **QUANTITATIVE_EVIDENCE_SCHEMA_VERSIONS,
-    "activation_evidence": "auto_research_activation_evidence_v3",
+    "activation_evidence": "auto_research_activation_evidence_v4",
     "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v3",
     "proxy_cache_report": "auto_research_proxy_cache_report_v3",
-    "full_s3_readiness": "auto_research_full_s3_readiness_v3",
+    "full_s3_readiness": "auto_research_full_s3_readiness_v4",
     "bootstrap_completion": "auto_research_bootstrap_completion_v3",
 }
 
@@ -187,7 +187,7 @@ def decode_evidence_inventory(
     that were content-addressed; this function never reopens an artifact path.
     """
 
-    _validate_schema(manifest, "evidence_manifest_v5.schema.json")
+    _validate_schema(manifest, "evidence_manifest_v6.schema.json")
     _validate_manifest_identity(attempt, trial_spec, manifest)
     entries = manifest["entries"]
     entry_ids = [entry["evidence_id"] for entry in entries]
@@ -547,9 +547,29 @@ def _validate_evidence_semantics(payload: Mapping[str, Any]) -> None:
             if inputs[key] != payload[key]:
                 raise ValueError(f"proxy baseline {key} cross-reference mismatch")
     elif kind == "activation_evidence":
-        passed = payload["status"] == "passed"
-        if passed != (payload["command_status"] == "completed" and payload["exit_code"] == 0):
+        status = payload["status"]
+        command_completed = payload["command_status"] == "completed" and payload["exit_code"] == 0
+        if (status != "command_failed") != command_completed:
             raise ValueError("activation status contradicts command evidence")
+        if status == "command_failed":
+            return
+        expected = set(payload["expected_surface_ids"])
+        observed = set(payload["observed_surface_ids"])
+        measurements = payload["surface_measurements"]
+        measured = {item["surface_id"] for item in measurements}
+        if len(measured) != len(measurements) or measured != observed or not observed.issubset(expected):
+            raise ValueError("activation surface coverage contradicts raw measurements")
+        threshold = float(payload["activation_delta_threshold"])
+        for measurement in measurements:
+            delta = float(measurement["enabled_value"]) - float(measurement["disabled_value"])
+            if float(measurement["delta"]) != delta or float(measurement["threshold"]) != threshold:
+                raise ValueError("activation delta is not reproducible")
+            expected_status = "ACTIVATED" if delta >= threshold else "NOT_ACTIVATED"
+            if measurement["status"] != expected_status:
+                raise ValueError("activation measurement status is not reproducible")
+        activated = observed == expected and all(item["status"] == "ACTIVATED" for item in measurements)
+        if (status == "activated") != activated:
+            raise ValueError("activation status contradicts surface evidence")
 
 
 def _observation_identity(observation: Mapping[str, Any]) -> tuple[Any, ...]:

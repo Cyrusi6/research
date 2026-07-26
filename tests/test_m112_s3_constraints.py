@@ -174,7 +174,8 @@ def _add_role_evidence(
         evidence_kind=kind,
         content_hash=digest,
     )
-    derivation_hash = canonical_hash({"kind": kind, "content_hash": digest})
+    derivation_ref = deepcopy(manifest["derivation_ref"])
+    derivation_hash = manifest["derivation_hash"]
     manifest["entries"].append(
         {
             "evidence_id": evidence_id,
@@ -198,8 +199,8 @@ def _add_role_evidence(
             "command_id": manifest["entries"][0]["command_id"],
             "command_hash": manifest["entries"][0]["command_hash"],
             "command_plan_hash": manifest["entries"][0]["command_plan_hash"],
-            "receipt_ref": deepcopy(manifest["entries"][0]["receipt_ref"]),
-            "receipt_hash": manifest["entries"][0]["receipt_hash"],
+            "receipt_ref": deepcopy(manifest["derive_receipt_ref"]),
+            "receipt_hash": manifest["derive_receipt_hash"],
             "output_ref": {
                 "schema_version": "auto_research_contract_blob_v1",
                 "algorithm": "sha256",
@@ -208,13 +209,7 @@ def _add_role_evidence(
                 "relative_path": f"meta/contracts/sha256/{digest[:2]}/{digest}.json",
             },
             "completed_event_id": manifest["entries"][0]["completed_event_id"],
-            "derivation_ref": {
-                "schema_version": "auto_research_contract_blob_v1",
-                "algorithm": "sha256",
-                "digest": derivation_hash,
-                "size_bytes": 1,
-                "relative_path": f"meta/contracts/sha256/{derivation_hash[:2]}/{derivation_hash}.json",
-            },
+            "derivation_ref": derivation_ref,
             "derivation_hash": derivation_hash,
         }
     )

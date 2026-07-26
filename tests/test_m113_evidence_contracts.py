@@ -7,8 +7,6 @@ from pathlib import Path
 import pytest
 
 from auto_research.domain_contracts import (
-    EVIDENCE_MANIFEST_SCHEMA_VERSION,
-    TRIAL_SPEC_SCHEMA_VERSION,
     acceptance_contract_hash,
     canonical_hash,
     classify_trial_result,
@@ -18,6 +16,7 @@ from auto_research.domain_contracts import (
 )
 from auto_research.evidence import (
     CONTENT_ADDRESSED_EVIDENCE_SCHEMA_VERSIONS,
+    EVIDENCE_MANIFEST_SCHEMA_VERSION,
     EVIDENCE_SCHEMA_VERSIONS,
     TRANSACTION_EVIDENCE_SCHEMA_VERSIONS,
     content_addressed_evidence_path,
@@ -26,7 +25,7 @@ from auto_research.evidence import (
 )
 
 
-def _trial_spec_legacy(*, objective: str = "maximize", datasets: tuple[str, ...] = ("d1",), seeds: tuple[int, ...] = (7,)) -> dict:
+def _trial_spec_facts(*, objective: str = "maximize", datasets: tuple[str, ...] = ("d1",), seeds: tuple[int, ...] = (7,)) -> dict:
     sample_datasets = []
     datasets_spec = []
     for dataset_id in datasets:
@@ -48,26 +47,19 @@ def _trial_spec_legacy(*, objective: str = "maximize", datasets: tuple[str, ...]
             {"dataset_id": dataset_id, "split": "test", "sample_count": len(sample_ids), "sample_hash": content_hash}
         )
     manifest = {
-        "schema_version": "auto_research_sample_manifest_v1",
         "manifest_id": "sample-manifest-1",
         "provenance_mode": "real",
         "datasets": sample_datasets,
-        "artifact_path": "plan/sample_manifest.json",
     }
-    manifest["artifact_hash"] = canonical_hash(manifest)
     evaluator = {
-        "schema_version": "auto_research_evaluator_provenance_v1",
         "provenance_mode": "real",
         "evaluator_id": "accuracy-evaluator",
         "source_digest": canonical_hash({"source": "evaluator.py"}),
         "config_hash": canonical_hash({"threshold": 0.5}),
         "dependency_digest": canonical_hash({"python": "3.11"}),
-        "artifact_path": "plan/evaluator_manifest.json",
     }
-    evaluator["artifact_hash"] = canonical_hash(evaluator)
     runtime = {"device": "cpu"}
     spec = {
-        "schema_version": TRIAL_SPEC_SCHEMA_VERSION,
         "protocol": {"protocol_id": "protocol-1", "required_phases": ["full"], "terminal_phases": ["full"], "proxy_terminal_allowed": False, "aggregation": "mean"},
         "sample_manifest": manifest,
         "datasets": datasets_spec,
@@ -81,7 +73,7 @@ def _trial_spec_legacy(*, objective: str = "maximize", datasets: tuple[str, ...]
         ],
         "execution_contract": {"runtime_config": runtime, "runtime_config_hash": canonical_hash(runtime), "evaluator_provenance": evaluator, "evaluator_hash": canonical_hash(evaluator), "command_contract_hash": canonical_hash(["evaluate"])},
         "required_artifacts": ["main_results"],
-        "evidence_requirements": [{"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_main_results_v2"}],
+        "evidence_requirements": [{"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": ["full"]}],
     }
     return spec
 
@@ -94,9 +86,9 @@ def _trial_spec(
     seeds: tuple[int, ...] = (7,),
     project_root: Path | None = None,
 ) -> dict:
-    from support.authoritative_evidence import build_trial_spec_v7
-    return build_trial_spec_v7(
-        _trial_spec_legacy(objective=objective, datasets=datasets, seeds=seeds),
+    from support.authoritative_evidence import build_trial_spec_v8
+    return build_trial_spec_v8(
+        _trial_spec_facts(objective=objective, datasets=datasets, seeds=seeds),
         project_root=project_root,
     )
 
@@ -131,7 +123,29 @@ def _main_inventory(spec: dict, values: dict[tuple[str, int], tuple[float, float
     path = content_addressed_evidence_path(attempt_id=attempt["attempt_id"], producer_run_id=producer_run_id, evidence_kind="main_results", content_hash=digest)
     blob = lambda value: {"schema_version": "auto_research_contract_blob_v1", "algorithm": "sha256", "digest": value, "size_bytes": 1, "relative_path": f"meta/contracts/sha256/{value[:2]}/{value}.json"}
     entry = {"evidence_id": evidence_id, "kind": "main_results", "relative_path": path, "content_hash": digest, "schema_version": payload["schema_version"], "attempt_id": attempt["attempt_id"], "producer_run_id": producer_run_id, "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], **common, "cross_references": {}, "command_id": "command-main-attempt-1", "command_hash": "a" * 64, "command_plan_hash": "b" * 64, "receipt_ref": blob("c" * 64), "receipt_hash": "c" * 64, "output_ref": blob(digest), "completed_event_id": "event:command:completed:main", "derivation_ref": blob("d" * 64), "derivation_hash": "d" * 64}
-    manifest = {"schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION, "attempt_id": attempt["attempt_id"], "direction_semantic_hash": attempt["direction_semantic_hash"], "direction_spec_hash": attempt["direction_spec_hash"], "variant_semantic_hash": attempt["variant_semantic_hash"], "variant_spec_hash": attempt["variant_spec_hash"], "trial_spec_hash": attempt["trial_spec_hash"], "protocol_hash": attempt["protocol_hash"], "sample_manifest_hash": attempt["sample_manifest_hash"], "evaluator_hash": attempt["evaluator_hash"], "lifecycle_generation": 0, "implementation_hash": attempt["implementation_hash"], "attempt_input_hash": attempt["attempt_input_hash"], "entries": [entry]}
+    manifest = {
+        "schema_version": EVIDENCE_MANIFEST_SCHEMA_VERSION,
+        "attempt_id": attempt["attempt_id"],
+        "direction_semantic_hash": attempt["direction_semantic_hash"],
+        "direction_spec_hash": attempt["direction_spec_hash"],
+        "variant_semantic_hash": attempt["variant_semantic_hash"],
+        "variant_spec_hash": attempt["variant_spec_hash"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "protocol_hash": attempt["protocol_hash"],
+        "sample_manifest_hash": attempt["sample_manifest_hash"],
+        "evaluator_hash": attempt["evaluator_hash"],
+        "phase": "full",
+        "phase_execution_id": execution["phase_execution_id"],
+        "producer_run_id": producer_run_id,
+        "derivation_ref": blob("d" * 64),
+        "derivation_hash": "d" * 64,
+        "derive_receipt_ref": blob("c" * 64),
+        "derive_receipt_hash": "c" * 64,
+        "lifecycle_generation": 0,
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "entries": [entry],
+    }
     return manifest, {evidence_id: raw}
 
 
@@ -262,10 +276,45 @@ def _nonquantitative_payload(kind: str) -> dict:
         "cross_references": {},
     }
     extras = {
-        "activation_evidence": {"probe_id": "forward-probe", "status": "passed", "command_status": "completed", "exit_code": 0, "implementation_surface_ids": ["src/model.py"]},
+        "activation_evidence": {
+            "probe_id": "forward-probe",
+            "status": "activated",
+            "command_status": "completed",
+            "exit_code": 0,
+            "expected_surface_ids": ["src/model.py"],
+            "observed_surface_ids": ["src/model.py"],
+            "activation_delta_threshold": 0.1,
+            "surface_measurements": [{
+                "surface_id": "src/model.py",
+                "enabled_value": 1.0,
+                "disabled_value": 0.0,
+                "delta": 1.0,
+                "threshold": 0.1,
+                "status": "ACTIVATED",
+            }],
+        },
         "proxy_baseline_fingerprint": {"baseline_hash": "9" * 64, "dataset_ids": ["d1"], "seeds": [7], "fingerprint_inputs": {"sample_manifest_hash": "7" * 64, "evaluator_hash": "8" * 64, "protocol_hash": "6" * 64, "phase_execution_id": "phase-proxy-0001"}},
         "proxy_cache_report": {"cross_references": {"proxy_baseline_fingerprint_hash": "a" * 64}, "cache_key": "b" * 64, "baseline_hash": "9" * 64, "cache_entry_hash": "c" * 64, "status": "hit"},
-        "full_s3_readiness": {"cross_references": {"activation_evidence_hash": "a" * 64, "proxy_results_hash": "b" * 64}, "ready": True, "checks": [{"check_id": "activation", "status": "PASS"}]},
+        "full_s3_readiness": {
+            "cross_references": {"activation_evidence_hash": "a" * 64, "proxy_results_hash": "b" * 64},
+            "readiness_check_plan_ref": {
+                "schema_version": "auto_research_contract_blob_v1",
+                "algorithm": "sha256",
+                "digest": "c" * 64,
+                "size_bytes": 1,
+                "relative_path": f"meta/contracts/sha256/cc/{'c' * 64}.json",
+            },
+            "readiness_check_plan_hash": "c" * 64,
+            "ready": True,
+            "classification": "PASS",
+            "checks": [{
+                "check_id": "activation",
+                "status": "PASS",
+                "measurement": True,
+                "comparator": "eq",
+                "threshold": True,
+            }],
+        },
         "bootstrap_completion": {"cross_references": {"activation_evidence_hash": "a" * 64, "proxy_results_hash": "b" * 64}, "completion_status": "verified"},
     }
     base.update(extras[kind])
@@ -314,10 +363,10 @@ def test_completion_manifest_rejects_noncompletion_evidence_kinds(kind: str) -> 
     forged = deepcopy(manifest)
     forged["entries"][0]["kind"] = kind
     with pytest.raises(ValueError):
-        validate_contract(forged, "evidence_manifest_v5.schema.json")
+        validate_contract(forged, "evidence_manifest_v6.schema.json")
 
 
-def test_evidence_manifest_v5_rejects_replaced_inline_derivation() -> None:
+def test_evidence_manifest_v6_rejects_replaced_inline_derivation() -> None:
     spec = _trial_spec()
     manifest, _ = _main_inventory(spec, {("d1", 7): (0.0, 1.0)})
     forged = deepcopy(manifest)
@@ -328,7 +377,7 @@ def test_evidence_manifest_v5_rejects_replaced_inline_derivation() -> None:
         "source_output_hashes": ["f" * 64],
     }
     with pytest.raises(ValueError):
-        validate_contract(forged, "evidence_manifest_v5.schema.json")
+        validate_contract(forged, "evidence_manifest_v6.schema.json")
 
 
 def test_replaced_authoritative_schema_files_are_absent() -> None:

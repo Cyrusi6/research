@@ -1,14 +1,26 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import tempfile
 from copy import deepcopy
 from pathlib import Path
+from typing import Any, Mapping
 
+from auto_research.command_journal import (
+    CommandExecutionResult,
+    CommandJournalResult,
+    LedgerCommandJournal,
+)
 from auto_research.contract_store import ContractStore, canonical_contract_bytes
+from auto_research.derivation_validation import (
+    derive_evidence_deterministically,
+    validated_physical_receipt_inputs,
+)
 from auto_research.domain_contracts import TRIAL_SPEC_SCHEMA_VERSION, canonical_hash, validate_trial_spec
-from auto_research.command_journal import CommandExecutionResult, LedgerCommandJournal
 from auto_research.evidence import (
+    EVIDENCE_SCHEMA_VERSIONS,
+    EvidenceStore,
     content_addressed_evidence_path,
     encode_canonical_evidence,
     stage_completion_evidence,
@@ -37,7 +49,10 @@ def _record_failed_phase_command(
     running_phase = next(phase for phase in ("proxy", "full") if attempt["phases"].get(phase) == "RUNNING")
     ledger = ResearchEventLedger(project_root)
     context = ResearchLedgerPhaseAuthority(ledger).context_for_attempt(project_root, attempt["attempt_id"], running_phase)
-    plan = ContractStore(project_root).read_json(context.command_plan_hash, schema_file="phase_command_plan_v2.schema.json")
+    plan = ContractStore(project_root).read_json(
+        context.command_plan_hash,
+        schema_file="phase_command_plan_v3.schema.json",
+    )
     used = {
         record["command"]["command_spec_id"]
         for record in ledger.state()["phase_commands"].values()
@@ -45,7 +60,11 @@ def _record_failed_phase_command(
         and record["command"]["lifecycle_generation"] == attempt["lifecycle_generation"]
         and record["command"]["phase_execution_id"] == context.phase_execution_id
     }
-    command_spec = next(command for command in plan["commands"] if command["command_spec_id"] not in used)
+    command_spec = next(
+        command
+        for command in plan["commands"]
+        if command["authority_role"] == "physical" and command["command_spec_id"] not in used
+    )
     stdout = ""
     result = LedgerCommandJournal(project_root, ledger).run_once(
         context,
@@ -55,6 +74,11 @@ def _record_failed_phase_command(
         cwd=command_spec["cwd"],
         source_snapshot_hash=command_spec["source_snapshot_hash"],
         expected_outputs=tuple(output["kind"] for output in command_spec["expected_outputs"]),
+        environment=command_spec["environment"],
+        inherited_environment=command_spec["inherited_environment"],
+        retry_policy=command_spec["retry_policy"],
+        resource_policy=command_spec["resource_policy"],
+        resume_policy=command_spec["resume_policy"],
         runner=lambda: CommandExecutionResult(
             exit_code=exit_code,
             stdout_hash=hashlib.sha256(stdout.encode()).hexdigest(),
@@ -73,14 +97,19 @@ def _record_failed_phase_command(
     }
 
 
-def build_trial_spec_v7(
+def build_trial_spec_v8(
     spec: dict,
     *,
     project_root: Path | None = None,
     adapter_id: str = "fixture-phase-adapter",
     command_provenance_mode: str = "synthetic",
 ) -> dict:
-    """Rebuild a legacy test specification as the current strict TrialSpec."""
+    """Build the current strict TrialSpec from test fixture facts.
+
+    This helper is deliberately not a runtime compatibility reader.  It
+    materializes immutable synthetic/fixture sample and evaluator bytes, then
+    freezes the same PhaseCommandPlan/derivation contracts used in production.
+    """
 
     result = deepcopy(spec)
     root = Path(project_root) if project_root is not None else _DEFAULT_CONTRACT_ROOT
@@ -90,13 +119,27 @@ def build_trial_spec_v7(
     legacy_manifest = result["sample_manifest"]
     sample_datasets = []
     dataset_specs = []
-    for index, dataset in enumerate(legacy_manifest["datasets"]):
+    for dataset in legacy_manifest["datasets"]:
         dataset_id = dataset["dataset_id"]
         declared_sample_ids = list(dataset["ordered_sample_ids"])
-        raw_sample_refs = [
-            store.put_bytes(canonical_contract_bytes({"fixture_sample": sample_id, "ordinal": ordinal}))
-            for ordinal, sample_id in enumerate(declared_sample_ids)
-        ]
+        supplied_refs = dataset.get("raw_sample_refs")
+        if supplied_refs:
+            raw_sample_refs = [dict(item) for item in supplied_refs]
+            for reference in raw_sample_refs:
+                store.verify(reference)
+        else:
+            raw_sample_refs = [
+                store.put_bytes(
+                    canonical_contract_bytes(
+                        {
+                            "fixture_sample": sample_id,
+                            "ordinal": ordinal,
+                            "dataset_id": dataset_id,
+                        }
+                    )
+                )
+                for ordinal, sample_id in enumerate(declared_sample_ids)
+            ]
         ordered_sample_ids = [item["digest"] for item in raw_sample_refs]
         content_digest = store.digest_referenced_bytes(raw_sample_refs)
         sample_datasets.append(
@@ -138,9 +181,22 @@ def build_trial_spec_v7(
     result["datasets"] = dataset_specs
 
     legacy_evaluator = result["execution_contract"]["evaluator_provenance"]
-    source_blob = store.put_bytes(canonical_contract_bytes({"source": legacy_evaluator.get("source_digest"), "evaluator_id": legacy_evaluator.get("evaluator_id")}))
-    dependency_blob = store.put_bytes(canonical_contract_bytes({"dependencies": legacy_evaluator.get("dependency_digest")}))
-    config_blob = store.put_bytes(canonical_contract_bytes({"config": legacy_evaluator.get("config_hash") or legacy_evaluator.get("config_digest")}))
+    source_blob = store.put_bytes(
+        canonical_contract_bytes(
+            {
+                "source": legacy_evaluator.get("source_digest"),
+                "evaluator_id": legacy_evaluator.get("evaluator_id"),
+            }
+        )
+    )
+    dependency_blob = store.put_bytes(
+        canonical_contract_bytes({"dependencies": legacy_evaluator.get("dependency_digest")})
+    )
+    config_blob = store.put_bytes(
+        canonical_contract_bytes(
+            {"config": legacy_evaluator.get("config_hash") or legacy_evaluator.get("config_digest")}
+        )
+    )
     evaluator_id = str(legacy_evaluator.get("evaluator_id") or "test-evaluator")
     if len(evaluator_id) < 8:
         evaluator_id = f"fixture-{evaluator_id}"
@@ -164,18 +220,6 @@ def build_trial_spec_v7(
     result["execution_contract"]["evaluator_manifest_ref"] = evaluator_ref
     result["execution_contract"]["evaluator_hash"] = canonical_hash(evaluator_manifest)
 
-    version_map = {
-        "main_results": "auto_research_main_results_v3",
-        "proxy_results": "auto_research_proxy_results_v1",
-        "ablation_results": "auto_research_ablation_results_v3",
-        "coverage_results": "auto_research_coverage_results_v3",
-        "matched_control_results": "auto_research_matched_control_results_v3",
-        "activation_evidence": "auto_research_activation_evidence_v3",
-        "proxy_baseline_fingerprint": "auto_research_proxy_baseline_fingerprint_v3",
-        "proxy_cache_report": "auto_research_proxy_cache_report_v3",
-        "full_s3_readiness": "auto_research_full_s3_readiness_v3",
-        "bootstrap_completion": "auto_research_bootstrap_completion_v3",
-    }
     requirements = []
     for requirement in result.get("evidence_requirements") or []:
         if requirement["kind"] in {"effective_proxy_policy", "proxy_calibration_policy", "proxy_decision_report"}:
@@ -183,7 +227,7 @@ def build_trial_spec_v7(
         if set(result["protocol"]["required_phases"]) == {"proxy"} and requirement["kind"] == "main_results":
             requirement["kind"] = "proxy_results"
             requirement["requirement_id"] = "proxy-results"
-        requirement["schema_version"] = version_map[requirement["kind"]]
+        requirement["schema_version"] = EVIDENCE_SCHEMA_VERSIONS[requirement["kind"]]
         requirements.append(requirement)
     result["evidence_requirements"] = requirements
 
@@ -194,12 +238,14 @@ def build_trial_spec_v7(
     if "proxy" in required_phases:
         mandatory = {
             "proxy_results": ("proxy-results", "auto_research_proxy_results_v1"),
-            "activation_evidence": ("activation", "auto_research_activation_evidence_v3"),
+            "activation_evidence": ("activation", "auto_research_activation_evidence_v4"),
             "proxy_baseline_fingerprint": ("proxy-baseline", "auto_research_proxy_baseline_fingerprint_v3"),
             "proxy_cache_report": ("proxy-cache", "auto_research_proxy_cache_report_v3"),
             "bootstrap_completion" if result["protocol"]["proxy_terminal_allowed"] else "full_s3_readiness": (
                 "bootstrap" if result["protocol"]["proxy_terminal_allowed"] else "readiness",
-                "auto_research_bootstrap_completion_v3" if result["protocol"]["proxy_terminal_allowed"] else "auto_research_full_s3_readiness_v3",
+                "auto_research_bootstrap_completion_v3"
+                if result["protocol"]["proxy_terminal_allowed"]
+                else "auto_research_full_s3_readiness_v4",
             ),
         }
         present = {item["kind"] for item in requirements}
@@ -214,110 +260,227 @@ def build_trial_spec_v7(
                         "schema_version": schema_version,
                     }
                 )
-    result["required_artifacts"] = [item["kind"] for item in requirements]
+    result["required_artifacts"] = list(dict.fromkeys(item["kind"] for item in requirements))
     result["execution_contract"].pop("command_contract_hash", None)
-    phase_contracts = []
-    for phase in required_phases:
-        evidence_kinds = [
-            item["kind"]
-            for item in result["evidence_requirements"]
-            if phase in item["applicable_phases"] or "always" in item["applicable_phases"]
-        ]
-        plan = build_phase_command_plan(
-            phase=phase,
-            adapter_id=adapter_id,
-            adapter_version="1",
-            provenance_mode=command_provenance_mode,
-            variant_spec_hash=canonical_hash({"fixture": "variant"}),
-            source_snapshot_hash=evaluator_manifest["source_digest"],
-            command_values=[["fixture-phase-command", phase]],
-            expected_evidence=[
-                next(item for item in result["evidence_requirements"] if item["kind"] == kind)
-                for kind in evidence_kinds
-            ],
-            default_cwd=str(root),
-        )
-        plan_ref, plan_hash = store_phase_command_plan(root, plan)
-        phase_contracts.append({
-            "phase": phase,
-            "datasets": datasets,
-            "seeds": seeds,
-            "roles": ["baseline", "candidate"] if phase == "proxy" else list(result["required_roles"]),
-            "metrics": [result["primary_metric_id"]],
-            "evidence_kinds": evidence_kinds,
-            "terminal": phase in result["protocol"]["terminal_phases"],
-            "consumes_direction_budget": phase in result["protocol"]["terminal_phases"],
-            "command_plan": plan,
-            "command_plan_ref": plan_ref,
-            "command_plan_hash": plan_hash,
-        })
-    result["phase_contracts"] = phase_contracts
-    result["execution_contract"]["phase_command_plan_hashes"] = {
-        item["phase"]: item["command_plan_hash"] for item in phase_contracts
-    }
-    if "proxy" in required_phases:
-        proxy_contract = next(item for item in result["phase_contracts"] if item["phase"] == "proxy")
-        primary_constraint = next(
-            item
-            for item in result["acceptance_constraints"]
-            if item["kind"] == "minimum_mean_delta" and item.get("metric_id") == result["primary_metric_id"]
-        )
-        regression_constraint = next(
-            (item for item in result["acceptance_constraints"] if item["kind"] == "per_dataset_maximum_regression"),
-            None,
-        )
-        result["proxy_decision_policy"] = build_proxy_decision_policy(
-            primary_metric_id=result["primary_metric_id"],
-            objective=next(item["objective"] for item in result["metrics"] if item["metric_id"] == result["primary_metric_id"]),
-            aggregation="paired_mean",
-            datasets=proxy_contract["datasets"],
-            seeds=proxy_contract["seeds"],
-            metric_ids=proxy_contract["metrics"],
-            roles=proxy_contract["roles"],
-            aggregate_improvement_threshold=float(primary_constraint["threshold"]),
-            per_dataset_maximum_regression=float(regression_constraint["threshold"] if regression_constraint else 0.0),
-            activation_surface_ids=["src/model.py"],
-            readiness_check_ids=[] if result["protocol"]["proxy_terminal_allowed"] else ["proxy-ready-for-full"],
-            evidence_kinds=proxy_contract["evidence_kinds"],
-            mode="terminal_bootstrap" if result["protocol"]["proxy_terminal_allowed"] else "gate_to_full",
-        )
-    else:
-        result["proxy_decision_policy"] = None
+    _rebuild_phase_authority(
+        result,
+        project_root=root,
+        adapter_id=adapter_id,
+        adapter_version="1",
+        provenance_mode=command_provenance_mode,
+        variant_spec_hash=canonical_hash({"fixture": "variant"}),
+        source_snapshot_hash=evaluator_manifest["source_digest"],
+    )
     validate_trial_spec(result)
     return result
 
 
-build_trial_spec_v5 = build_trial_spec_v7
-
-
 def refresh_phase_command_plans(spec: dict, *, project_root: Path | None = None) -> dict:
     root = Path(project_root) if project_root is not None else _DEFAULT_CONTRACT_ROOT
-    source_snapshot_hash = spec["execution_contract"]["evaluator_provenance"]["source_digest"]
-    for contract in spec["phase_contracts"]:
+    existing_plan = next(
+        (item.get("command_plan") for item in spec.get("phase_contracts") or [] if item.get("command_plan")),
+        {},
+    )
+    adapter = existing_plan.get("adapter_identity") or {}
+    _rebuild_phase_authority(
+        spec,
+        project_root=root,
+        adapter_id=str(adapter.get("adapter_id") or "fixture-phase-adapter"),
+        adapter_version=str(adapter.get("adapter_version") or "1"),
+        provenance_mode=str(adapter.get("provenance_mode") or "synthetic"),
+        variant_spec_hash=str(existing_plan.get("variant_spec_hash") or canonical_hash({"fixture": "variant"})),
+        source_snapshot_hash=str(spec["execution_contract"]["evaluator_provenance"]["source_digest"]),
+    )
+    return spec
+
+
+def _rebuild_phase_authority(
+    spec: dict,
+    *,
+    project_root: Path,
+    adapter_id: str,
+    adapter_version: str,
+    provenance_mode: str,
+    variant_spec_hash: str,
+    source_snapshot_hash: str,
+) -> None:
+    existing = {item["phase"]: item for item in spec.get("phase_contracts") or []}
+    datasets = [item["dataset_id"] for item in spec["datasets"]]
+    seeds = list(spec["statistical_testing"]["seeds"])
+    metrics = [spec["primary_metric_id"]]
+    terminal_phases = set(spec["protocol"]["terminal_phases"])
+    activation_surfaces = list(
+        ((spec.get("proxy_decision_policy") or {}).get("activation_surface_ids") or ["src/model.py"])
+    )
+    activation_threshold = float(
+        (spec.get("proxy_decision_policy") or {}).get("activation_delta_threshold", 0.0)
+    )
+    phase_contracts = []
+    for phase in spec["protocol"]["required_phases"]:
         requirements = [
             item
             for item in spec["evidence_requirements"]
-            if contract["phase"] in item["applicable_phases"] or "always" in item["applicable_phases"]
+            if phase in item["applicable_phases"] or "always" in item["applicable_phases"]
         ]
-        plan = build_phase_command_plan(
-            phase=contract["phase"],
-            adapter_id="fixture-phase-adapter",
-            adapter_version="1",
-            provenance_mode="synthetic",
-            variant_spec_hash=canonical_hash({"fixture": "variant"}),
-            source_snapshot_hash=source_snapshot_hash,
-            command_values=[["fixture-phase-command", contract["phase"]]],
-            expected_evidence=requirements,
-            default_cwd=str(root),
+        evidence_kinds = [item["kind"] for item in requirements]
+        previous = existing.get(phase) or {}
+        roles = list(
+            previous.get("roles")
+            or (["baseline", "candidate"] if phase == "proxy" else spec["required_roles"])
         )
-        reference, digest = store_phase_command_plan(root, plan)
-        contract["command_plan"] = plan
-        contract["command_plan_ref"] = reference
-        contract["command_plan_hash"] = digest
+        raw_outputs = [
+            {
+                "output_id": f"raw-{item['kind'].replace('_', '-')}",
+                "kind": item["kind"],
+                "schema_version": item["schema_version"],
+                "locator": f"fixture/{phase}/{item['kind']}.json",
+                "locator_type": "file",
+                "dataset_id": None,
+                "role": None,
+                "required": True,
+                "normalized_kinds": [item["kind"]],
+            }
+            for item in requirements
+        ]
+        readiness_checks: list[dict[str, Any]] = []
+        if "activation_evidence" in evidence_kinds:
+            readiness_checks.append(
+                {
+                    "check_id": "activation-mechanism",
+                    "check_kind": "activation_delta",
+                    "predicate": {
+                        "field_path": "surface_measurements.delta",
+                        "comparator": "delta_gte",
+                        "threshold": activation_threshold,
+                    },
+                    "required_coverage": {
+                        "mode": "exact",
+                        "expected_surface_ids": activation_surfaces,
+                    },
+                }
+            )
+        if "full_s3_readiness" in evidence_kinds:
+            readiness_checks.append(
+                {
+                    "check_id": "proxy-ready-for-full",
+                    "check_kind": "raw_measurement",
+                    "predicate": {
+                        "field_path": "ready",
+                        "comparator": "eq",
+                        "threshold": True,
+                    },
+                    "required_coverage": {"mode": "exact", "expected_surface_ids": []},
+                }
+            )
+        plan = build_phase_command_plan(
+            phase=phase,
+            adapter_id=adapter_id,
+            adapter_version=adapter_version,
+            provenance_mode=provenance_mode,
+            variant_spec_hash=variant_spec_hash,
+            source_snapshot_hash=source_snapshot_hash,
+            command_values=[
+                {
+                    "command_spec_id": "full-train" if phase == "full" else "proxy-fixture-physical",
+                    "authority_role": "physical",
+                    "argv": ["auto-research-adapter", "fixture-evidence", phase],
+                    "cwd": str(project_root),
+                    "physical_raw_outputs": raw_outputs,
+                }
+            ],
+            expected_evidence=requirements,
+            default_cwd=str(project_root),
+            project_root=project_root,
+            coverage_contract={
+                "mode": "exact_cartesian",
+                "datasets": list(previous.get("datasets") or datasets),
+                "seeds": list(previous.get("seeds") or seeds),
+                "metrics": list(previous.get("metrics") or metrics),
+                "roles": roles,
+            },
+            readiness_checks=readiness_checks,
+            decoder_id="canonical-identity",
+            decoder_version="1",
+        )
+        plan_ref, plan_hash = store_phase_command_plan(project_root, plan)
+        terminal = phase in terminal_phases
+        bootstrap_terminal = (
+            terminal
+            and phase == "proxy"
+            and "bootstrap" in str(spec["protocol"]["protocol_id"]).lower()
+        )
+        phase_contracts.append(
+            {
+                "phase": phase,
+                "datasets": list(previous.get("datasets") or datasets),
+                "seeds": list(previous.get("seeds") or seeds),
+                "roles": roles,
+                "metrics": list(previous.get("metrics") or metrics),
+                "evidence_kinds": evidence_kinds,
+                "terminal": terminal,
+                "consumes_direction_budget": bool(
+                    previous.get("consumes_direction_budget", terminal and not bootstrap_terminal)
+                ),
+                "command_plan": plan,
+                "command_plan_ref": plan_ref,
+                "command_plan_hash": plan_hash,
+                "derivation_plan": plan["derivation_plan"],
+                "derivation_plan_ref": plan["derivation_plan_ref"],
+                "derivation_plan_hash": plan["derivation_plan_hash"],
+                "readiness_check_plan": plan["readiness_check_plan"],
+                "readiness_check_plan_ref": plan["readiness_check_plan_ref"],
+                "readiness_check_plan_hash": plan["readiness_check_plan_hash"],
+            }
+        )
+    spec["phase_contracts"] = phase_contracts
     spec["execution_contract"]["phase_command_plan_hashes"] = {
-        item["phase"]: item["command_plan_hash"] for item in spec["phase_contracts"]
+        item["phase"]: item["command_plan_hash"] for item in phase_contracts
     }
-    return spec
+    if "proxy" not in set(spec["protocol"]["required_phases"]):
+        spec["proxy_decision_policy"] = None
+        return
+    proxy_contract = next(item for item in phase_contracts if item["phase"] == "proxy")
+    primary_constraint = next(
+        item
+        for item in spec["acceptance_constraints"]
+        if item["kind"] == "minimum_mean_delta" and item.get("metric_id") == spec["primary_metric_id"]
+    )
+    regression_constraint = next(
+        (item for item in spec["acceptance_constraints"] if item["kind"] == "per_dataset_maximum_regression"),
+        None,
+    )
+    readiness_plan = proxy_contract["readiness_check_plan"]
+    if not isinstance(readiness_plan, Mapping):
+        raise ValueError("proxy fixture requires a frozen ReadinessCheckPlan")
+    readiness_ids = [
+        item["check_id"] for item in readiness_plan["checks"] if item["check_kind"] == "raw_measurement"
+    ]
+    spec["proxy_decision_policy"] = build_proxy_decision_policy(
+        primary_metric_id=spec["primary_metric_id"],
+        objective=next(
+            item["objective"] for item in spec["metrics"] if item["metric_id"] == spec["primary_metric_id"]
+        ),
+        aggregation="paired_mean",
+        datasets=proxy_contract["datasets"],
+        seeds=proxy_contract["seeds"],
+        metric_ids=proxy_contract["metrics"],
+        roles=proxy_contract["roles"],
+        aggregate_improvement_threshold=float(primary_constraint["threshold"]),
+        per_dataset_maximum_regression=float(
+            regression_constraint["threshold"] if regression_constraint else 0.0
+        ),
+        activation_delta_threshold=activation_threshold,
+        activation_surface_ids=activation_surfaces,
+        readiness_check_ids=readiness_ids,
+        readiness_check_plan_ref=proxy_contract["readiness_check_plan_ref"],
+        readiness_check_plan_hash=proxy_contract["readiness_check_plan_hash"],
+        evidence_kinds=proxy_contract["evidence_kinds"],
+        mode=(
+            "terminal_bootstrap"
+            if spec["protocol"]["proxy_terminal_allowed"]
+            else "gate_to_full"
+        ),
+    )
 
 
 def start_attempt_phase(ledger, attempt: dict, phase: str) -> dict:
@@ -350,51 +513,201 @@ def record_completed_evidence_command(
     attempt: dict,
     completion: dict,
 ) -> dict:
-    """Commit the exact frozen command receipt that produced a completion inventory."""
+    """Commit the physical receipt and its one constrained derivation receipt.
+
+    CompletionEvidence remains a staging request.  Its bytes first become raw
+    outputs of the frozen physical fixture command; the production pure decoder
+    then recomputes normalized outputs and a structured derivation manifest.
+    """
 
     phase = completion["entries"][0]["phase"]
+    state = ledger.state()
+    current_attempt = state["attempts"][attempt["attempt_id"]]
     context = ResearchLedgerPhaseAuthority(ledger).context_for_attempt(
         project_root,
-        attempt["attempt_id"],
+        current_attempt["attempt_id"],
         phase,
     )
     phase_contract = next(
-        item for item in attempt["frozen_trial_spec"]["phase_contracts"] if item["phase"] == phase
+        item
+        for item in current_attempt["frozen_trial_spec"]["phase_contracts"]
+        if item["phase"] == phase
     )
-    command_spec = phase_contract["command_plan"]["commands"][-1]
+    plan = phase_contract["command_plan"]
+    if plan["derivation_plan"]["decoder_descriptor"]["decoder_id"] != "canonical-identity":
+        raise ValueError("the common authoritative fixture requires the frozen canonical-identity decoder")
     entries_by_kind = {entry["kind"]: entry for entry in completion["entries"]}
-    outputs = []
     store = ContractStore(project_root)
-    for expected in command_spec["expected_outputs"]:
-        entry = entries_by_kind[expected["kind"]]
-        reference = store.put_bytes((project_root / entry["relative_path"]).read_bytes())
-        outputs.append(
-            {
-                "kind": expected["kind"],
-                "schema_version": expected["schema_version"],
-                "contract_ref": reference,
-            }
+    evidence_store = EvidenceStore(project_root)
+    journal = LedgerCommandJournal(project_root, ledger)
+
+    physical_commands = [
+        item for item in plan["commands"] if item["authority_role"] == "physical"
+    ]
+    for command_spec in physical_commands:
+        if command_spec["expected_outputs"]:
+            raise ValueError("fixture physical commands must publish raw_outputs, not normalized outputs")
+        raw_outputs = []
+        for raw_spec in command_spec["physical_raw_outputs"]:
+            normalized_kinds = list(raw_spec["normalized_kinds"])
+            if len(normalized_kinds) != 1:
+                raise ValueError("canonical fixture raw output must map to exactly one normalized kind")
+            kind = normalized_kinds[0]
+            entry = entries_by_kind.get(kind)
+            if entry is None:
+                raise ValueError(f"CompletionEvidence lacks frozen physical output source: {kind}")
+            raw = evidence_store.read_entry(entry, current_attempt)
+            reference = store.put_bytes(raw)
+            raw_outputs.append(
+                {
+                    "output_id": raw_spec["output_id"],
+                    "kind": raw_spec["kind"],
+                    "schema_version": raw_spec["schema_version"],
+                    "contract_ref": reference,
+                    "locator": raw_spec["locator"],
+                    "locator_type": raw_spec["locator_type"],
+                    "dataset_id": raw_spec["dataset_id"],
+                    "role": raw_spec["role"],
+                }
+            )
+        stdout = f"physical:{current_attempt['attempt_id']}:{phase}:{command_spec['command_spec_id']}"
+        physical_result = journal.run_once(
+            context,
+            command_id=(
+                f"fixture-physical-{phase}-{command_spec['ordinal']:02d}-"
+                f"{current_attempt['attempt_id'][:12]}"
+            ),
+            command_spec_id=command_spec["command_spec_id"],
+            argv=tuple(command_spec["argv"]),
+            cwd=command_spec["cwd"],
+            source_snapshot_hash=command_spec["source_snapshot_hash"],
+            expected_outputs=(),
+            environment=command_spec["environment"],
+            inherited_environment=command_spec["inherited_environment"],
+            retry_policy=command_spec["retry_policy"],
+            resource_policy=command_spec["resource_policy"],
+            resume_policy=command_spec["resume_policy"],
+            runner=lambda raw_outputs=tuple(raw_outputs), stdout=stdout, command_spec=command_spec: CommandExecutionResult(
+                exit_code=0,
+                stdout_hash=hashlib.sha256(stdout.encode("utf-8")).hexdigest(),
+                stderr_hash=hashlib.sha256(b"").hexdigest(),
+                outputs=(),
+                raw_outputs=raw_outputs,
+                stdout=stdout,
+                stderr="",
+                external_job_id=(
+                    f"fixture-physical-{phase}-{command_spec['ordinal']:02d}-"
+                    f"{current_attempt['attempt_id'][:8]}"
+                ),
+            ),
         )
-    result = LedgerCommandJournal(project_root, ledger).run_once(
-        context,
-        command_id=f"fixture-{phase}-{attempt['attempt_id'][:12]}",
-        command_spec_id=command_spec["command_spec_id"],
-        argv=tuple(command_spec["argv"]),
-        cwd=command_spec["cwd"],
-        source_snapshot_hash=command_spec["source_snapshot_hash"],
-        expected_outputs=tuple(item["kind"] for item in command_spec["expected_outputs"]),
-        runner=lambda: CommandExecutionResult(
-            exit_code=0,
-            stdout_hash=hashlib.sha256(f"{attempt['attempt_id']}:{phase}".encode()).hexdigest(),
-            stderr_hash=hashlib.sha256(b"").hexdigest(),
-            outputs=tuple(outputs),
-            stdout=f"{attempt['attempt_id']}:{phase}",
-            stderr="",
-            external_job_id=f"fixture-job-{phase}-{attempt['attempt_id'][:8]}",
+        if physical_result.get("status") != "completed":
+            raise AssertionError(f"fixture physical command did not complete: {physical_result}")
+
+    state = ledger.state()
+    current_attempt = state["attempts"][attempt["attempt_id"]]
+    derivation_plan = plan["derivation_plan"]
+    physical_inputs = validated_physical_receipt_inputs(
+        project_root=project_root,
+        attempt=current_attempt,
+        phase_commands=state["phase_commands"],
+        phase=phase,
+        derivation_plan=derivation_plan,
+    )
+    deterministic = derive_evidence_deterministically(
+        attempt=current_attempt,
+        trial_spec=current_attempt["frozen_trial_spec"],
+        phase=phase,
+        derivation_plan=derivation_plan,
+        physical_inputs=physical_inputs,
+        decoder_implementation_bytes=store.read_bytes(
+            derivation_plan["decoder_descriptor"]["immutable_ref"]
         ),
     )
-    if result["status"] != "completed":
-        raise AssertionError(f"fixture command did not complete: {result}")
+    for output in deterministic.normalized_outputs:
+        staged_entry = entries_by_kind[output.kind]
+        if evidence_store.read_entry(staged_entry, current_attempt) != output.raw_bytes:
+            raise ValueError(
+                f"fixture staged evidence differs from deterministic decoder output: {output.kind}"
+            )
+
+    derive_command = next(
+        item for item in plan["commands"] if item["authority_role"] == "derivation"
+    )
+
+    def derive() -> CommandExecutionResult:
+        outputs = []
+        normalized_outputs = []
+        for ordinal, output in enumerate(deterministic.normalized_outputs):
+            reference = store.put_bytes(output.raw_bytes)
+            outputs.append(
+                {
+                    "output_id": output.output_id,
+                    "kind": output.kind,
+                    "schema_version": output.schema_version,
+                    "contract_ref": reference,
+                }
+            )
+            normalized_outputs.append(
+                {
+                    "ordinal": ordinal,
+                    "output_id": output.output_id,
+                    "kind": output.kind,
+                    "schema_version": output.schema_version,
+                    "contract_ref": deepcopy(reference),
+                    "content_hash": reference["digest"],
+                }
+            )
+        derivation_manifest = {
+            "schema_version": "auto_research_evidence_derivation_manifest_v2",
+            **deepcopy(deterministic.manifest_facts),
+            "derivation_plan_ref": deepcopy(plan["derivation_plan_ref"]),
+            "derivation_plan_hash": plan["derivation_plan_hash"],
+            "normalized_outputs": normalized_outputs,
+        }
+        derivation_ref = store.put_json(
+            derivation_manifest,
+            schema_file="evidence_derivation_manifest_v2.schema.json",
+        )
+        summary = json.dumps(
+            {
+                "derivation": "fixture-receipt-bound-core-v2",
+                "phase_execution_id": context.phase_execution_id,
+                "source_receipt_hashes": [item.receipt_hash for item in physical_inputs],
+                "output_hashes": [item["contract_ref"]["digest"] for item in outputs],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return CommandExecutionResult(
+            exit_code=0,
+            stdout_hash=hashlib.sha256(summary.encode("utf-8")).hexdigest(),
+            stderr_hash=hashlib.sha256(b"").hexdigest(),
+            outputs=tuple(outputs),
+            derivation_ref=derivation_ref,
+            derivation_hash=derivation_ref["digest"],
+            stdout=summary,
+            stderr="",
+            external_job_id=f"fixture-derive-{phase}-{current_attempt['attempt_id'][:8]}",
+        )
+
+    result = journal.run_once(
+        context,
+        command_id=f"fixture-{phase}-{current_attempt['attempt_id'][:12]}",
+        command_spec_id=derive_command["command_spec_id"],
+        argv=tuple(derive_command["argv"]),
+        cwd=derive_command["cwd"],
+        source_snapshot_hash=derive_command["source_snapshot_hash"],
+        expected_outputs=tuple(item["kind"] for item in derive_command["expected_outputs"]),
+        environment=derive_command["environment"],
+        inherited_environment=derive_command["inherited_environment"],
+        retry_policy=derive_command["retry_policy"],
+        resource_policy=derive_command["resource_policy"],
+        resume_policy=derive_command["resume_policy"],
+        runner=derive,
+    )
+    if not isinstance(result, CommandJournalResult) or result.get("status") != "completed":
+        raise AssertionError(f"fixture derivation command did not complete: {result}")
     return dict(result)
 
 
@@ -407,14 +720,15 @@ def validate_authoritative_completion(
     """Return the canonical manifest derived from the committed command receipt."""
 
     state = ledger.state()
+    current_attempt = state["attempts"][attempt["attempt_id"]]
     staged_manifest = manifest_from_completion_evidence(
-        attempt=state["attempts"][attempt["attempt_id"]],
+        attempt=current_attempt,
         completion_evidence=completion,
     )
     return validate_receipt_bound_evidence(
         project_root=project_root,
-        attempt=state["attempts"][attempt["attempt_id"]],
-        trial_spec=attempt["frozen_trial_spec"],
+        attempt=current_attempt,
+        trial_spec=current_attempt["frozen_trial_spec"],
         manifest=staged_manifest,
         phase_commands=state["phase_commands"],
         phase=completion["entries"][0]["phase"],
@@ -440,97 +754,31 @@ def build_quantitative_completion(
     if producer_run_id != phase_execution["producer_run_id"]:
         raise ValueError("producer_run_id must match PhaseExecutionManifest")
     evidence_kind = evidence_kind or ("proxy_results" if phase == "proxy" else "main_results")
-    schema_version = "auto_research_proxy_results_v1" if evidence_kind == "proxy_results" else "auto_research_main_results_v3"
-    evidence_id = f"evidence:{attempt['attempt_id'][:8]}:{evidence_kind}"
-    common = {
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
-        "phase": phase,
-        "phase_execution_id": phase_execution["phase_execution_id"],
-        "phase_start_event_id": phase_execution["phase_start_event_id"],
-    }
-    rows = [
-        {
-            "phase": phase,
-            "role": role,
-            "command_status": "completed",
-            "dataset_id": dataset_id,
-            "metric_id": metric_id,
-            "metric_value": value,
-            "sample_manifest_hash": attempt["sample_manifest_hash"],
-            "evaluator_hash": attempt["evaluator_hash"],
-            "seed": seed,
-            "attempt_id": attempt["attempt_id"],
-            "variant_semantic_hash": attempt["variant_semantic_hash"],
-            "variant_spec_hash": attempt["variant_spec_hash"],
-            "trial_spec_hash": attempt["trial_spec_hash"],
-            "producer_run_id": producer_run_id,
-            **common,
-        }
-        for role, value in role_values.items()
-    ]
-    payload = {
-        "schema_version": schema_version,
-        "evidence_kind": evidence_kind,
-        "evidence_id": evidence_id,
-        "attempt_id": attempt["attempt_id"],
-        "producer_run_id": producer_run_id,
-        "direction_semantic_hash": attempt["direction_semantic_hash"],
-        "direction_spec_hash": attempt["direction_spec_hash"],
-        "variant_semantic_hash": attempt["variant_semantic_hash"],
-        "variant_spec_hash": attempt["variant_spec_hash"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "protocol_hash": attempt["protocol_hash"],
-        "sample_manifest_hash": attempt["sample_manifest_hash"],
-        "evaluator_hash": attempt["evaluator_hash"],
-        "cross_references": {},
-        **common,
-        "rows": rows,
-    }
-    raw = encode_canonical_evidence(payload)
-    content_hash = hashlib.sha256(raw).hexdigest()
-    relative_path = content_addressed_evidence_path(
-        attempt_id=attempt["attempt_id"],
-        producer_run_id=producer_run_id,
-        evidence_kind=evidence_kind,
-        content_hash=content_hash,
+    phase_contract = next(
+        item
+        for item in attempt["frozen_trial_spec"]["phase_contracts"]
+        if item["phase"] == phase
     )
-    artifact = project_root / relative_path
-    artifact.parent.mkdir(parents=True, exist_ok=True)
-    artifact.write_bytes(raw)
-    return {
-        "schema_version": "auto_research_completion_evidence_v3",
-        "attempt_id": attempt["attempt_id"],
-        "trial_spec_hash": attempt["trial_spec_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
-        "phase": phase,
-        "phase_execution_id": phase_execution["phase_execution_id"],
-        "producer_run_id": producer_run_id,
-        "command_plan_hash": phase_execution["command_plan_hash"],
-        "entries": [
-            {
-                "evidence_id": evidence_id,
-                "kind": evidence_kind,
-                "relative_path": relative_path,
-                "content_hash": content_hash,
-                "schema_version": schema_version,
-                "attempt_id": attempt["attempt_id"],
-                "producer_run_id": producer_run_id,
-                "direction_semantic_hash": attempt["direction_semantic_hash"],
-                "direction_spec_hash": attempt["direction_spec_hash"],
-                "variant_semantic_hash": attempt["variant_semantic_hash"],
-                "variant_spec_hash": attempt["variant_spec_hash"],
-                "trial_spec_hash": attempt["trial_spec_hash"],
-                "protocol_hash": attempt["protocol_hash"],
-                "sample_manifest_hash": attempt["sample_manifest_hash"],
-                "evaluator_hash": attempt["evaluator_hash"],
-                **common,
-            }
-        ],
-    }
+    if dataset_id not in phase_contract["datasets"]:
+        raise ValueError("dataset_id is not frozen in the phase contract")
+    if metric_id not in phase_contract["metrics"]:
+        raise ValueError("metric_id is not frozen in the phase contract")
+    if seed not in phase_contract["seeds"]:
+        raise ValueError("seed is not frozen in the phase contract")
+    if evidence_kind not in phase_contract["evidence_kinds"]:
+        raise ValueError("evidence_kind is not frozen in the phase contract")
+    payloads = _build_phase_payloads(
+        attempt,
+        phase=phase,
+        role_values=role_values,
+        preferred_kind=evidence_kind,
+    )
+    return _stage_payloads(
+        project_root,
+        attempt,
+        attempt["frozen_trial_spec"],
+        payloads,
+    )
 
 
 def build_bootstrap_completion(
@@ -541,25 +789,292 @@ def build_bootstrap_completion(
     baseline_value: float = 0.5,
     candidate_value: float = 0.7,
 ) -> dict:
-    """Build the complete strict bootstrap inventory through production staging."""
+    """Build strict bootstrap evidence without caller-authored TrialResult facts."""
 
-    from auto_research.agents.experiment import _c2c_strict_evidence_inventory
-
-    inventory = _c2c_strict_evidence_inventory(
-        project_root=project_root,
-        attempt=attempt,
-        trial_spec=trial_spec,
-        comparison_candidate={
-            "metrics": {"mean": candidate_value, "datasets": {"fake": candidate_value}},
-            "proxy_screen": {
-                "metrics": {"mean": candidate_value, "datasets": {"fake": candidate_value}},
-                "baseline_metrics": {"mean": baseline_value, "datasets": {"fake": baseline_value}},
-            },
-        },
-        baseline={"mean": baseline_value, "datasets": {"fake": baseline_value}},
-        simulate=True,
+    payloads = _build_phase_payloads(
+        attempt,
+        phase="proxy",
+        role_values={"baseline": baseline_value, "candidate": candidate_value},
+        preferred_kind="proxy_results",
     )
-    return stage_authoritative_completion(project_root, attempt, trial_spec, inventory)
+    return _stage_payloads(project_root, attempt, trial_spec, payloads)
+
+
+def _build_phase_payloads(
+    attempt: Mapping[str, Any],
+    *,
+    phase: str,
+    role_values: Mapping[str, float],
+    preferred_kind: str,
+) -> list[dict[str, Any]]:
+    trial_spec = attempt["frozen_trial_spec"]
+    phase_contract = next(
+        item for item in trial_spec["phase_contracts"] if item["phase"] == phase
+    )
+    phase_execution = attempt["phase_executions"][phase]
+    if not isinstance(phase_execution, Mapping):
+        raise ValueError("Attempt phase must be started before building evidence")
+    payloads: dict[str, dict[str, Any]] = {}
+    quantitative_roles = {
+        "main_results": ("baseline", "candidate"),
+        "proxy_results": ("baseline", "candidate"),
+        "ablation_results": ("ablation",),
+        "coverage_results": ("coverage",),
+        "matched_control_results": ("matched_control",),
+    }
+    baseline_value = float(role_values.get("baseline", 0.0))
+    candidate_value = float(role_values.get("candidate", baseline_value))
+    auxiliary_values = {
+        "ablation": baseline_value,
+        "coverage": 1.0,
+        "matched_control": baseline_value,
+    }
+    for kind in phase_contract["evidence_kinds"]:
+        if kind not in quantitative_roles:
+            continue
+        rows = []
+        for dataset_id in phase_contract["datasets"]:
+            for seed in phase_contract["seeds"]:
+                for metric_id in phase_contract["metrics"]:
+                    for role in quantitative_roles[kind]:
+                        value = float(role_values.get(role, auxiliary_values.get(role, candidate_value)))
+                        rows.append(
+                            _measurement_row(
+                                attempt,
+                                phase=phase,
+                                phase_execution=phase_execution,
+                                role=role,
+                                dataset_id=dataset_id,
+                                metric_id=metric_id,
+                                seed=seed,
+                                value=value,
+                            )
+                        )
+        payloads[kind] = {
+            **_evidence_identity(attempt, phase, phase_execution, kind),
+            "rows": rows,
+        }
+
+    policy = trial_spec.get("proxy_decision_policy") or {}
+    if "activation_evidence" in phase_contract["evidence_kinds"]:
+        threshold = float(policy.get("activation_delta_threshold", 0.0))
+        surfaces = list(policy.get("activation_surface_ids") or ["src/model.py"])
+        delta = candidate_value - baseline_value
+        activated = delta >= threshold
+        payloads["activation_evidence"] = {
+            **_evidence_identity(attempt, phase, phase_execution, "activation_evidence"),
+            "probe_id": "activation-mechanism",
+            "status": "activated" if activated else "not_activated",
+            "command_status": "completed",
+            "exit_code": 0,
+            "expected_surface_ids": surfaces,
+            "observed_surface_ids": surfaces,
+            "activation_delta_threshold": threshold,
+            "surface_measurements": [
+                {
+                    "surface_id": surface_id,
+                    "enabled_value": candidate_value,
+                    "disabled_value": baseline_value,
+                    "delta": delta,
+                    "threshold": threshold,
+                    "status": "ACTIVATED" if activated else "NOT_ACTIVATED",
+                }
+                for surface_id in surfaces
+            ],
+        }
+
+    if "proxy_baseline_fingerprint" in phase_contract["evidence_kinds"]:
+        fingerprint_inputs = {
+            "sample_manifest_hash": attempt["sample_manifest_hash"],
+            "evaluator_hash": attempt["evaluator_hash"],
+            "protocol_hash": attempt["protocol_hash"],
+            "phase_execution_id": phase_execution["phase_execution_id"],
+        }
+        payloads["proxy_baseline_fingerprint"] = {
+            **_evidence_identity(
+                attempt, phase, phase_execution, "proxy_baseline_fingerprint"
+            ),
+            "baseline_hash": canonical_hash(fingerprint_inputs),
+            "dataset_ids": list(phase_contract["datasets"]),
+            "seeds": list(phase_contract["seeds"]),
+            "fingerprint_inputs": fingerprint_inputs,
+        }
+
+    if "proxy_cache_report" in phase_contract["evidence_kinds"]:
+        fingerprint = payloads["proxy_baseline_fingerprint"]
+        fingerprint_hash = canonical_hash(fingerprint)
+        baseline_hash = fingerprint["baseline_hash"]
+        payloads["proxy_cache_report"] = {
+            **_evidence_identity(attempt, phase, phase_execution, "proxy_cache_report"),
+            "cross_references": {
+                "proxy_baseline_fingerprint_hash": fingerprint_hash
+            },
+            "cache_key": canonical_hash(
+                {
+                    "attempt_input_hash": attempt["attempt_input_hash"],
+                    "baseline_hash": baseline_hash,
+                }
+            ),
+            "baseline_hash": baseline_hash,
+            "cache_entry_hash": baseline_hash,
+            "status": "created",
+        }
+
+    proxy_results = payloads.get("proxy_results")
+    activation = payloads.get("activation_evidence")
+    proxy_cross_references = {}
+    if proxy_results is not None:
+        proxy_cross_references["proxy_results_hash"] = canonical_hash(proxy_results)
+    if activation is not None:
+        proxy_cross_references["activation_evidence_hash"] = canonical_hash(activation)
+
+    if "full_s3_readiness" in phase_contract["evidence_kinds"]:
+        readiness_plan = phase_contract["readiness_check_plan"]
+        checks = []
+        for check in readiness_plan["checks"]:
+            if check["check_kind"] != "raw_measurement":
+                continue
+            predicate = check["predicate"]
+            measurement = _passing_measurement(
+                predicate["comparator"], predicate["threshold"]
+            )
+            checks.append(
+                {
+                    "check_id": check["check_id"],
+                    "status": "PASS",
+                    "measurement": measurement,
+                    "comparator": predicate["comparator"],
+                    "threshold": predicate["threshold"],
+                }
+            )
+        payloads["full_s3_readiness"] = {
+            **_evidence_identity(attempt, phase, phase_execution, "full_s3_readiness"),
+            "cross_references": proxy_cross_references,
+            "readiness_check_plan_ref": phase_contract["readiness_check_plan_ref"],
+            "readiness_check_plan_hash": phase_contract["readiness_check_plan_hash"],
+            "ready": True,
+            "classification": "PASS",
+            "checks": checks,
+        }
+
+    if "bootstrap_completion" in phase_contract["evidence_kinds"]:
+        payloads["bootstrap_completion"] = {
+            **_evidence_identity(attempt, phase, phase_execution, "bootstrap_completion"),
+            "cross_references": proxy_cross_references,
+            "completion_status": "verified",
+        }
+
+    missing = set(phase_contract["evidence_kinds"]) - set(payloads)
+    if missing:
+        raise ValueError(f"fixture cannot construct frozen evidence kinds: {sorted(missing)}")
+    if preferred_kind not in payloads:
+        raise ValueError("preferred evidence kind is absent from the frozen phase")
+    return [payloads[kind] for kind in phase_contract["evidence_kinds"]]
+
+
+def _evidence_identity(
+    attempt: Mapping[str, Any],
+    phase: str,
+    phase_execution: Mapping[str, Any],
+    kind: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": EVIDENCE_SCHEMA_VERSIONS[kind],
+        "evidence_kind": kind,
+        "evidence_id": f"evidence:{kind}:{phase_execution['producer_run_id']}",
+        "attempt_id": attempt["attempt_id"],
+        "producer_run_id": phase_execution["producer_run_id"],
+        "direction_semantic_hash": attempt["direction_semantic_hash"],
+        "direction_spec_hash": attempt["direction_spec_hash"],
+        "variant_semantic_hash": attempt["variant_semantic_hash"],
+        "variant_spec_hash": attempt["variant_spec_hash"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "protocol_hash": attempt["protocol_hash"],
+        "sample_manifest_hash": attempt["sample_manifest_hash"],
+        "evaluator_hash": attempt["evaluator_hash"],
+        "cross_references": {},
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase": phase,
+        "phase_execution_id": phase_execution["phase_execution_id"],
+        "phase_start_event_id": phase_execution["phase_start_event_id"],
+    }
+
+
+def _measurement_row(
+    attempt: Mapping[str, Any],
+    *,
+    phase: str,
+    phase_execution: Mapping[str, Any],
+    role: str,
+    dataset_id: str,
+    metric_id: str,
+    seed: int,
+    value: float,
+) -> dict[str, Any]:
+    return {
+        "phase": phase,
+        "role": role,
+        "dataset_id": dataset_id,
+        "metric_id": metric_id,
+        "seed": seed,
+        "metric_value": value,
+        "command_status": "completed",
+        "attempt_id": attempt["attempt_id"],
+        "variant_semantic_hash": attempt["variant_semantic_hash"],
+        "variant_spec_hash": attempt["variant_spec_hash"],
+        "trial_spec_hash": attempt["trial_spec_hash"],
+        "sample_manifest_hash": attempt["sample_manifest_hash"],
+        "evaluator_hash": attempt["evaluator_hash"],
+        "producer_run_id": phase_execution["producer_run_id"],
+        "lifecycle_generation": attempt["lifecycle_generation"],
+        "implementation_hash": attempt["implementation_hash"],
+        "attempt_input_hash": attempt["attempt_input_hash"],
+        "phase_execution_id": phase_execution["phase_execution_id"],
+        "phase_start_event_id": phase_execution["phase_start_event_id"],
+    }
+
+
+def _passing_measurement(comparator: str, threshold: Any) -> Any:
+    if comparator in {"eq", "exact_set", "gte", "delta_gte", "lte"}:
+        return deepcopy(threshold)
+    if comparator == "gt":
+        return float(threshold) + 1.0
+    if comparator == "lt":
+        return float(threshold) - 1.0
+    raise ValueError(f"unsupported fixture readiness comparator: {comparator}")
+
+
+def _stage_payloads(
+    project_root: Path,
+    attempt: Mapping[str, Any],
+    trial_spec: Mapping[str, Any],
+    payloads: list[dict[str, Any]],
+) -> dict:
+    staging_root = (
+        Path(".tmp")
+        / "authoritative-evidence"
+        / str(attempt["attempt_id"])
+        / str(payloads[0]["phase_execution_id"])
+    )
+    inventory = []
+    for payload in payloads:
+        raw = encode_canonical_evidence(payload)
+        digest = hashlib.sha256(raw).hexdigest()
+        relative_path = staging_root / f"{payload['evidence_kind']}-{digest}.json"
+        target = project_root / relative_path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(raw)
+        inventory.append(
+            {"kind": payload["evidence_kind"], "source_path": relative_path.as_posix()}
+        )
+    return stage_authoritative_completion(
+        project_root,
+        dict(attempt),
+        dict(trial_spec),
+        inventory,
+    )
 
 
 def build_failure_evidence_v6(

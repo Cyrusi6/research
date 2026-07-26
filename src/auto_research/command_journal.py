@@ -23,8 +23,8 @@ from .phase_execution import (
     PhaseAuthority,
 )
 
-PHASE_COMMAND_SCHEMA_FILE = "phase_command_v3.schema.json"
-PHASE_RUN_RECEIPT_SCHEMA_FILE = "phase_run_receipt_v4.schema.json"
+PHASE_COMMAND_SCHEMA_FILE = "phase_command_v4.schema.json"
+PHASE_RUN_RECEIPT_SCHEMA_FILE = "phase_run_receipt_v5.schema.json"
 COMMAND_RECEIPT_LOCATOR_SCHEMA_VERSION = "auto_research_command_receipt_locator_v1"
 _COMMAND_LOCATOR_ROOT = Path("meta") / "command_receipts"
 _SAFE_COMMAND_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$")
@@ -47,6 +47,8 @@ class CommandExecutionResult:
     stdout_hash: str
     stderr_hash: str
     outputs: tuple[Mapping[str, Any], ...]
+    derivation_ref: Mapping[str, Any] | None = None
+    derivation_hash: str | None = None
     raw_outputs: tuple[Mapping[str, Any], ...] = field(default_factory=tuple)
     external_job_id: str | None = None
     stdout: str | None = None
@@ -176,6 +178,7 @@ class LedgerCommandJournal:
             except (OSError, TypeError, ValueError) as error:
                 self.ledger.mark_phase_command_unknown(command_id, "runner output is not an immutable contract")
                 raise CommandJournalError(f"runner output reference is invalid: {error}") from error
+        self._validate_result_derivation(store, result)
         receipt = self._receipt(command, started, result, store=store)
         receipt_ref = store.put_json(
             receipt,
@@ -253,7 +256,7 @@ class LedgerCommandJournal:
         try:
             frozen_plan = store.read_json(
                 context.command_plan_hash,
-                schema_file="phase_command_plan_v2.schema.json",
+                schema_file="phase_command_plan_v3.schema.json",
             )
             validate_phase_command_plan(
                 frozen_plan,
@@ -396,7 +399,26 @@ class LedgerCommandJournal:
             "external_job_id": result.external_job_id,
             "outputs": LedgerCommandJournal._receipt_outputs(command, result),
             "raw_outputs": LedgerCommandJournal._receipt_raw_outputs(command, result),
+            "derivation_ref": dict(result.derivation_ref) if result.derivation_ref is not None else None,
+            "derivation_hash": result.derivation_hash,
         }
+
+    @staticmethod
+    def _validate_result_derivation(store: ContractStore, result: CommandExecutionResult) -> None:
+        reference = result.derivation_ref
+        digest = result.derivation_hash
+        if (reference is None) != (digest is None):
+            raise CommandJournalError("command derivation reference and hash must be supplied together")
+        if reference is None:
+            return
+        if not isinstance(reference, Mapping) or not isinstance(digest, str):
+            raise CommandJournalError("command derivation identity is malformed")
+        try:
+            verified = store.verify(reference)
+        except (OSError, TypeError, ValueError) as error:
+            raise CommandJournalError(f"command derivation reference is invalid: {error}") from error
+        if verified["digest"] != digest:
+            raise CommandJournalError("command derivation hash differs from its immutable reference")
 
     def _validate_receipt_ref(
         self,
@@ -430,9 +452,12 @@ class LedgerCommandJournal:
                 reference = supplied
                 kind = expected["kind"]
                 schema_version = expected["schema_version"]
+            if supplied.get("output_id", expected["output_id"]) != expected["output_id"]:
+                raise CommandJournalError("command result output_id differs from frozen command spec")
             if kind != expected["kind"] or schema_version != expected["schema_version"]:
                 raise CommandJournalError("command result output kind/schema differs from frozen command spec")
             normalized.append({
+                "output_id": expected["output_id"],
                 "kind": kind,
                 "schema_version": schema_version,
                 "content_hash": reference["digest"],
@@ -490,6 +515,16 @@ class LedgerCommandJournal:
             stdout_hash=str(receipt["stdout_hash"]),
             stderr_hash=str(receipt["stderr_hash"]),
             outputs=tuple(dict(item) for item in receipt["outputs"]),
+            derivation_ref=(
+                dict(receipt["derivation_ref"])
+                if isinstance(receipt.get("derivation_ref"), Mapping)
+                else None
+            ),
+            derivation_hash=(
+                str(receipt["derivation_hash"])
+                if isinstance(receipt.get("derivation_hash"), str)
+                else None
+            ),
             raw_outputs=tuple(dict(item) for item in receipt.get("raw_outputs") or []),
             external_job_id=str(receipt["external_job_id"]) if receipt.get("external_job_id") else None,
             stdout=stdout_raw.decode("utf-8"),
@@ -505,6 +540,8 @@ class LedgerCommandJournal:
     ) -> PhaseArtifactInventory:
         artifacts = []
         for output in receipt["outputs"]:
+            if output["kind"] == "evidence_derivation_manifest":
+                continue
             reference = output["contract_ref"]
             artifacts.append({
                 "kind": output["kind"],

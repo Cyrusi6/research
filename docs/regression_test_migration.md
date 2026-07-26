@@ -1,4 +1,4 @@
-# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.5.1
+# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.5.3
 
 The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M1.1.5.1 does not restore their legacy readers, route policy, schemas, or artifact mirrors. Valid behavior is migrated to the current canonical contracts and SQLite Event v7 state/command layer.
 
@@ -271,3 +271,38 @@ M1.1.5.2 replaces the remaining process-local, mutable-result, and caller-author
 - Non-simulated production-component tests use real local subprocesses and frozen argv/env/cwd, then pass physical raw bytes through Receipt/CAS, deterministic derivation, Ledger/rebuild, and Gate. These fixtures prove production-component authority and exactly-once wiring, not real GPU scientific training or scientific success.
 - Synthetic Generic/C2C five-variant tests prove deterministic semantic identity, evidence, budget, and sixth-attempt rejection only.
 - Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training remain unstarted and are not claimed by this migration.
+
+## M1.1.5.3 Immutable Derivation and Readiness Authority Migration
+
+M1.1.5.3 removes the remaining direct/self derivation and synthetic readiness authority from the M1.1.5.2 execution chain. The runtime now accepts Event/AttemptRecord/ResearchState v9, TrialSpec v8, TrialResult v6, PhaseCommandPlan v3, PhaseCommand v4, PhaseRunReceipt v5, EvidenceManifest v6, EvidenceDerivationManifest v2, ActivationEvidence v4, FullS3Readiness v4, ProxyDecisionPolicy v2, and ProxyOutcome v4. `EvidenceDerivationPlan v1`, `DecoderDescriptor v1`, and `ReadinessCheckPlan v1` are new. Replaced v8/v7/v6/v5/v4/v3 schemas/readers are removed where superseded; there is no dual read, compatibility fallback, or automatic workspace migration.
+
+### Immutable derivation replacement map
+
+| Removed or attacked behavior | Canonical replacement test | Preserved authority |
+|---|---|---|
+| Final EvidenceManifest points to a second direct/self derivation rather than the physical derivation | `tests/test_m1153_derivation_authority.py::test_physical_derivation_ref_is_the_final_evidence_manifest_ref`; `tests/test_m1153_derivation_recovery.py::test_final_evidence_manifest_reuses_the_physical_derivation_reference` | Derive receipt and every EvidenceManifest entry use the identical `EvidenceDerivationManifest v2` ref/hash |
+| Final derivation names the derive command itself as its source | `tests/test_m1153_derivation_authority.py::test_final_derivation_uses_the_frozen_physical_command_exact_set`; `tests/test_m1153_derivation_recovery.py::test_final_derivation_sources_are_the_frozen_physical_command_exact_set` | Sources are the ordered exact-set of frozen completed physical commands and raw outputs |
+| Missing physical derivation is invisible to rebuild/Gate | `tests/test_m1153_derivation_authority.py::test_missing_physical_derivation_manifest_fails_state_rebuild_and_gate_without_repair` | Every authority reader follows the derive receipt to the physical derivation and fails closed |
+| Validator recreates a missing event-referenced derivation blob | `tests/test_m1153_derivation_authority.py::test_missing_event_referenced_receipt_derivation_is_not_recreated_by_authority_reads`; `tests/test_m1153_derivation_recovery.py::test_validator_reads_fail_closed_without_recreating_event_derivation[state|rebuild|query|gate]` | Validation is read-only and leaves CAS, events, receipt locators, evidence files, and projections unchanged |
+| Self source, missing source, duplicate source, extra source, or reordered physical sources are accepted | `tests/test_m1153_derivation_authority.py::test_physical_derivation_source_exact_set_attack_is_rejected[derive-self-source|missing-source|duplicate-source|extra-source|reordered-source]` | EvidenceDerivationPlan v1 fixes source order and exact membership; the derive command cannot source itself |
+| Raw, decoder, derivation, or normalized bytes can disappear or drift without invalidating rebuild | `tests/test_m1153_derivation_recovery.py::test_rebuild_fails_closed_without_repairing_immutable_derivation_inputs` | Delete/corrupt attacks on raw, decoder, physical/event derivation, and normalized blobs raise integrity failure with zero repair |
+| Durable derive receipt before Completed causes Core derivation to rerun | `tests/test_m1153_derivation_recovery.py::test_cold_restart_reconciles_durable_derive_receipt_before_completed_once` | Restart validates the durable receipt and adds only the missing Completed event |
+| Completed derive before evidence event creates a new derivation | `tests/test_m1153_derivation_recovery.py::test_cold_restart_reuses_completed_derive_before_evidence_event_once` | Restart reuses the same manifest, normalized outputs, and derive invocation |
+| An orphan CAS derivation blob is treated as recovery authority | `tests/test_m1153_derivation_recovery.py::test_orphan_derive_blobs_have_no_recovery_authority` | Recovery authority comes only from the SQLite command/event chain and its receipt locator |
+
+### Activation and readiness replacement map
+
+| Removed or attacked behavior | Canonical replacement test | Preserved authority |
+|---|---|---|
+| Activation exit zero is expanded into PASS for every frozen readiness check | `tests/test_m1153_readiness_authority.py::test_real_activation_exit_zero_cannot_batch_synthesize_all_readiness_pass`; `::test_activation_command_exit_zero_without_check_measurements_is_not_readiness_pass` | Each readiness result is derived from its own frozen physical receipt output and predicate |
+| Expected activation surfaces are copied into observed surfaces | `tests/test_m1153_readiness_authority.py::test_real_expected_activation_surfaces_cannot_be_reported_without_observation` | ActivationEvidence v4 uses actual observed surface coverage from raw receipt bytes |
+| Activation delta below threshold, missing surface, or independent readiness BLOCKED still authorizes full | `tests/test_m1153_readiness_authority.py::test_real_receipt_semantic_block_repairs_without_full_and_replays[activation_delta|missing_surface|readiness]` | Valid semantic blocking commits `REPAIR_IMPLEMENTATION`, starts no full work, preserves the reservation, and consumes no outcome |
+| BLOCKED readiness has no canonical deterministic ProxyOutcome | `tests/test_m1153_readiness_authority.py::test_blocked_readiness_has_deterministic_repair_proxy_outcome_and_replay`; `::test_activation_pass_with_independent_readiness_block_repairs_without_full_and_replays` | ProxyOutcome v4 records deterministic reason codes and a replay-stable repair route |
+| Missing, extra, duplicate, wrong-ID, cross-Attempt, or wrong-generation readiness inventory is accepted | `tests/test_m1153_readiness_authority.py::test_readiness_inventory_attacks_are_zero_write_after_valid_baseline` | Exact-set, identity, generation, and receipt lineage attacks are rejected before ProxyEvidenceCommitted |
+
+### Deleted contract migration
+
+- Deleted authority: `_store_direct_derivation_manifest()` and equivalent direct/self derivation; stdout-only derivation references; derive-command self-source lineage; validator-time `put_json`/`put_bytes`; current-source `Path(__file__)` decoder authority; expected-surface-as-observed activation; activation-exit-as-readiness-PASS; caller-authored readiness dictionaries and producer decisions.
+- Frozen replacement chain: `EvidenceDerivationPlan v1` → physical `PhaseCommandCompleted` receipts/raw outputs → constrained Core decoder → `EvidenceDerivationManifest v2` → `PhaseRunReceipt v5.derivation_ref/hash` → identical `EvidenceManifest v6` references → ProxyOutcome v4/TrialResult v6 → RouteOutcome.
+- The M1.1.5.2 `705 passed, 2 skipped` result remains a historical pre-v9 checkpoint. M1.1.5.3's final immutable-derivation/readiness attack group reports `42 passed`, the state/S3 migration group reports `367 passed`, and `tests/test_c2c.py` reports `182 passed, 2 skipped`. The normal, proxy-cleared, empty-HOME/no-Codex, and CPU-only/no-`nvidia-smi` complete suites each report `747 passed, 2 skipped, 0 failed`; the skips remain the existing optional torch/transformers checks.
+- Production-component local subprocess tests prove production wiring through frozen commands, receipts, CAS, Core derivation, Ledger/rebuild, and Gate. Synthetic tests prove deterministic contract/state behavior separately. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training remain outside scope and unstarted.

@@ -62,7 +62,10 @@ def test_conflicting_completion_for_completed_attempt_is_zero_write_integrity_er
     conflicting = _completion_evidence(ledger, attempt, outcome="accepted")
     before = _authoritative_snapshot(ledger, direction, attempt["attempt_id"])
 
-    with pytest.raises(IntegrityError, match="completion fingerprint conflict|receipt output hash"):
+    with pytest.raises(
+        IntegrityError,
+        match="completion fingerprint conflict|receipt output hash|content hash differs",
+    ):
         ledger.complete_attempt(conflicting)
 
     with sqlite3.connect(ledger.db_path) as connection:
@@ -81,7 +84,7 @@ def test_completion_replay_revalidates_immutable_evidence_before_returning_histo
         state_match = "immutable receipt-bound evidence audit failed: evidence path contains a symlink or is unavailable"
     else:
         artifact.write_bytes(artifact.read_bytes() + b"\n")
-        match = "evidence content hash mismatch|receipt output bytes differ"
+        match = "evidence content hash mismatch|receipt output bytes differ|attempt-scoped evidence differs"
         state_match = "immutable receipt-bound evidence audit failed: receipt output bytes differ"
 
     with pytest.raises(IntegrityError, match=match):

@@ -13,7 +13,11 @@ from pathlib import Path
 from typing import Any
 
 from .config import bootstrap_cached_s0_only_enabled
-from .domain_contracts import RESEARCH_STATE_SCHEMA_VERSION, TRIAL_SPEC_SCHEMA_VERSION
+from .domain_contracts import (
+    RESEARCH_STATE_SCHEMA_VERSION,
+    TRIAL_RESULT_SCHEMA_VERSION,
+    TRIAL_SPEC_SCHEMA_VERSION,
+)
 from .research_state import ResearchEventLedger
 from .utils import ensure_dir, now_utc, read_json, read_yaml, sha256_file, write_json
 from .validators.base import load_schema, validate_min_schema
@@ -28,6 +32,7 @@ C2C_REPLAY_PLAN_SCHEMA_VERSION = "c2c_replay_plan_v1"
 C2C_REPLAY_RESULT_SCHEMA_VERSION = "c2c_replay_result_v1"
 C2C_REAL_SMOKE_RECORD_SCHEMA_VERSION = "c2c_real_smoke_record_v1"
 TRIAL_SPEC_SCHEMA = f"{TRIAL_SPEC_SCHEMA_VERSION.removeprefix('auto_research_')}.schema.json"
+TRIAL_RESULT_SCHEMA = f"{TRIAL_RESULT_SCHEMA_VERSION.removeprefix('auto_research_')}.schema.json"
 RESEARCH_STATE_SCHEMA = f"research_{RESEARCH_STATE_SCHEMA_VERSION.removeprefix('auto_research_')}.schema.json"
 
 
@@ -57,7 +62,7 @@ STAGE_ARTIFACT_REQUIREMENTS = {
         ("plan/code_patches/patch_gate_report.json", "s2_5_patch_gate_report.schema.json"),
     ],
     "S3_experiment": [
-        ("experiment/results/trial_result.json", "trial_result_v5.schema.json"),
+        ("experiment/results/trial_result.json", TRIAL_RESULT_SCHEMA),
         ("experiment/results/c2c_proxy_baseline_fingerprint.json", "c2c_proxy_baseline_fingerprint.schema.json"),
         ("experiment/results/c2c_proxy_cache_report.json", "c2c_proxy_cache_report.schema.json"),
         ("experiment/results/c2c_effective_proxy_policy.json", "c2c_effective_proxy_policy.schema.json"),

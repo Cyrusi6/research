@@ -3097,3 +3097,62 @@ The canonical black-box cases are `tests/test_m1152_production_recovery_e2e.py::
 - The normal, proxy-cleared, empty-HOME/empty-HF-cache/PATH-without-Codex, and CPU-only/PATH-without-`nvidia-smi` complete suites each report `705 passed, 2 skipped, 0 failed`. No skip or xfail was added; the two skips remain the existing optional torch/transformers checks.
 - Non-simulated production-component tests run real local subprocesses with frozen argv/env/cwd and verify Receipt/CAS, derivation, Ledger/rebuild, Gate, proxy/full ordering, bootstrap isolation, five-variant budget `5/0/5`, and sixth-attempt rejection. They validate production component wiring, not actual GPU research or scientific success.
 - Synthetic Generic/C2C tests remain deterministic state/evidence/budget checks only. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training have not started.
+
+## 2026-07-26 M1.1.5.3 Immutable Derivation & Readiness Authority Closure
+
+This breaking hardening keeps the M1.1.5.2 physical command and SQLite phase architecture, but removes the remaining second derivation fact source and producer-authored readiness shortcut. It does not start Native Unified S1.
+
+### Breaking Contracts
+
+- Event v9, AttemptRecord v9, and ResearchState v9 remain one SQLite-WAL authority; TrialSpec v8 freezes phase derivation and readiness contracts.
+- TrialResult v6, PhaseCommandPlan v3, PhaseCommand v4, PhaseRunReceipt v5, EvidenceManifest v6, EvidenceDerivationManifest v2, ActivationEvidence v4, FullS3Readiness v4, ProxyDecisionPolicy v2, and ProxyOutcome v4 represent the changed authoritative shapes.
+- EvidenceDerivationPlan v1 freezes the immutable decoder descriptor, ordered physical source bindings, raw identities, canonicalization/coverage, cross-phase bindings, and ordered normalized evidence exact-set. DecoderDescriptor v1 binds decoder ID/version, semantic hash, implementation hash, and immutable implementation bytes.
+- ReadinessCheckPlan v1 freezes each check's physical command/output bindings, predicate, comparator, threshold, coverage, decoder identity, and semantic BLOCKED route.
+- PhaseExecutionManifest v3, SampleManifest v4, CompletionEvidence v3, FailureEvidence v6, ResumeEvidence v5, ResourceProbe v4, RouteOutcome v4, and DirectionOutcomeAggregate v1 retain their current shapes.
+- Superseded schemas and readers are deleted. Old workspaces are breaking-incompatible and must restart from S1; there is no dual read, fallback, repair migration, or auto-upgrade.
+
+### Single Immutable Derivation
+
+```text
+frozen EvidenceDerivationPlan
+→ physical PhaseCommandCompleted receipts/raw ContractRefs
+→ constrained Core derivation over the exact frozen source set
+→ one EvidenceDerivationManifest v2
+→ derive PhaseRunReceipt v5.derivation_ref/hash
+→ the same derivation_ref/hash in every EvidenceManifest v6 entry
+→ ProxyOutcome v4 or TrialResult v6
+→ RouteOutcome
+```
+
+- The derive receipt commits its derivation reference structurally; stdout is not authority.
+- The manifest source set must match the frozen physical command/output order exactly. The derive command cannot list itself, and missing, extra, duplicate, reordered, stale-generation, cross-Attempt, cross-phase, or cross-producer sources are rejected.
+- The former direct/self derivation builder and its second manifest are removed. Staging and already-normalized bytes cannot prove their own provenance.
+- Full-phase cross-phase reuse is allowed only through explicit frozen bindings to the committed proxy physical receipt/output identity.
+
+### Read-Only Validation
+
+Precommit, the public Ledger transaction, reducer/rebuild, state/query, restart replay, and S3 Gate share the immutable derivation validator. It rereads the derive receipt, derivation manifest, frozen decoder bytes, completed physical receipts, and raw ContractRefs; reruns the constrained decoder in memory; and byte-compares normalized outputs, receipt outputs, EvidenceManifest entries, and evidence blobs.
+
+The validator never writes CAS, SQLite, receipts, evidence projections, or JSON projections. It never uses current module bytes via `Path(__file__)`, rebuilds a missing blob, replaces a damaged reference, or reruns a command. Missing/corrupt raw bytes, decoder, derivation manifest, derive receipt, or normalized output therefore fail closed while authority snapshots remain unchanged.
+
+### Receipt-Derived Activation and Readiness
+
+- Exit code zero means command completion only. It cannot prove mechanism activation or readiness.
+- ActivationEvidence v4 is recomputed from enabled/disabled raw measurements, actual observed surfaces, frozen coverage, and the frozen activation-delta threshold. Expected surfaces never substitute for observed surfaces.
+- FullS3Readiness v4 is derived from ReadinessCheckPlan v1 and exact independent receipt outputs. Producer-authored `ready`, PASS lists, thresholds, summaries, and decisions remain diagnostic-only.
+- Valid completed-but-not-activated or completed-but-readiness-BLOCKED evidence maps to `REPAIR_IMPLEMENTATION`. The same Attempt keeps its reservation; no FullPhaseStarted/full subprocess, TrialResult, method-history entry, or budget consumption occurs.
+- Missing, malformed, damaged, cross-identity, or incomplete readiness/derivation evidence maps to integrity failure. Readiness PASS plus scientific proxy rejection maps to `PROPOSE_NEXT_VARIANT`; only readiness PASS plus proxy acceptance commits `RUN_FULL`; verified bootstrap completion maps to `FINISH_RUN`.
+
+### Recovery and Regression Scope
+
+- A durable derive receipt before PhaseCommandCompleted is reconciled without rerunning physical commands or Core derivation.
+- A completed derive command before proxy/final evidence commit reuses the same manifest and normalized output hashes.
+- An orphan derivation blob has no authority without its SQLite command/receipt chain.
+- Cold restart, a new Agent, and a new Orchestrator recover the event-bound route; valid BLOCKED replay remains `REPAIR_IMPLEMENTATION` and cannot start full work.
+- Canonical attacks live in `tests/test_m1153_derivation_authority.py`, `tests/test_m1153_derivation_recovery.py`, and `tests/test_m1153_readiness_authority.py`.
+
+### Acceptance Boundary
+
+M1.1.5.2's `705 passed, 2 skipped` result is historical and does not certify the v9/v8/v6/v5 contracts. M1.1.5.3's immutable-derivation/readiness attack group reports `42 passed`; the state/S3 migration group reports `367 passed`; and the full `tests/test_c2c.py` file reports `182 passed, 2 skipped`. Generic/C2C/bootstrap production-component and five-variant cases are included in every final full run. Normal, proxy-cleared, empty-HOME/no-Codex, and CPU-only/no-`nvidia-smi` environments each report `747 passed, 2 skipped, 0 failed`.
+
+Production-component checks use real local subprocess fixtures and production executors, frozen commands, receipts, CAS, Core derivation, Ledger/rebuild, and Gate. Synthetic checks are labeled separately. Neither is a claim of real scientific success. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training have not started.

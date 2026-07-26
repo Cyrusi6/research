@@ -51,6 +51,13 @@ from ..research_state import ResearchEventLedger
 from .base import AgentContext
 
 
+_AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS = {
+    **EVIDENCE_SCHEMA_VERSIONS,
+    "activation_evidence": "auto_research_activation_evidence_v4",
+    "full_s3_readiness": "auto_research_full_s3_readiness_v4",
+}
+
+
 class PlanAgent:
     stage_key = "S2_plan"
 
@@ -3908,31 +3915,31 @@ def _trial_spec_from_plan(
     if "matched_control" in required_roles:
         required_artifacts.append("matched_control_results")
     evidence_requirements = [
-        {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["proxy" if "proxy" in required_phases else "full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["activation_evidence"]},
+        {"requirement_id": "activation", "kind": "activation_evidence", "required": True, "applicable_phases": ["proxy" if "proxy" in required_phases else "full"], "schema_version": _AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS["activation_evidence"]},
     ]
     if "proxy" in required_phases:
-        evidence_requirements.append({"requirement_id": "proxy-results", "kind": "proxy_results", "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["proxy_results"]})
+        evidence_requirements.append({"requirement_id": "proxy-results", "kind": "proxy_results", "required": True, "applicable_phases": ["proxy"], "schema_version": _AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS["proxy_results"]})
     if "full" in required_phases:
-        evidence_requirements.append({"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["main_results"]})
+        evidence_requirements.append({"requirement_id": "main-results", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": _AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS["main_results"]})
     if ablations and not proxy_terminal:
-        evidence_requirements.append({"requirement_id": "ablation-results", "kind": "ablation_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["ablation_results"]})
+        evidence_requirements.append({"requirement_id": "ablation-results", "kind": "ablation_results", "required": True, "applicable_phases": ["full"], "schema_version": _AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS["ablation_results"]})
     if "coverage" in required_roles:
-        evidence_requirements.append({"requirement_id": "coverage-results", "kind": "coverage_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["coverage_results"]})
+        evidence_requirements.append({"requirement_id": "coverage-results", "kind": "coverage_results", "required": True, "applicable_phases": ["full"], "schema_version": _AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS["coverage_results"]})
     if "matched_control" in required_roles:
-        evidence_requirements.append({"requirement_id": "matched-control-results", "kind": "matched_control_results", "required": True, "applicable_phases": ["full"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["matched_control_results"]})
+        evidence_requirements.append({"requirement_id": "matched-control-results", "kind": "matched_control_results", "required": True, "applicable_phases": ["full"], "schema_version": _AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS["matched_control_results"]})
     if execution.get("collector") == "c2c_small_loop":
         proxy_evidence = [
             ("proxy-baseline", "proxy_baseline_fingerprint"),
             ("proxy-cache", "proxy_cache_report"),
         ]
         evidence_requirements.extend(
-            {"requirement_id": requirement_id, "kind": kind, "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS[kind]}
+            {"requirement_id": requirement_id, "kind": kind, "required": True, "applicable_phases": ["proxy"], "schema_version": _AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS[kind]}
             for requirement_id, kind in proxy_evidence
         )
         if proxy_terminal:
-            evidence_requirements.append({"requirement_id": "bootstrap-completion", "kind": "bootstrap_completion", "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["bootstrap_completion"]})
+            evidence_requirements.append({"requirement_id": "bootstrap-completion", "kind": "bootstrap_completion", "required": True, "applicable_phases": ["proxy"], "schema_version": _AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS["bootstrap_completion"]})
         else:
-            evidence_requirements.append({"requirement_id": "full-readiness", "kind": "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": EVIDENCE_SCHEMA_VERSIONS["full_s3_readiness"]})
+            evidence_requirements.append({"requirement_id": "full-readiness", "kind": "full_s3_readiness", "required": True, "applicable_phases": ["proxy"], "schema_version": _AUTHORITATIVE_EVIDENCE_SCHEMA_VERSIONS["full_s3_readiness"]})
     runtime_config = deepcopy(execution)
     provenance_mode = "synthetic" if execution.get("mode") == "simulate" else "real"
     dataset_ids = [item["dataset_id"] for item in datasets]
@@ -3948,27 +3955,6 @@ def _trial_spec_from_plan(
         provenance_mode=provenance_mode,
     )
     proxy_decision_policy = None
-    if "proxy" in required_phases:
-        proxy_evidence_kinds = sorted(
-            item["kind"]
-            for item in evidence_requirements
-            if "proxy" in item["applicable_phases"] or "always" in item["applicable_phases"]
-        )
-        proxy_decision_policy = build_proxy_decision_policy(
-            primary_metric_id=primary_metric_id,
-            objective=primary[0]["objective"],
-            aggregation="paired_mean",
-            datasets=[item["dataset_id"] for item in datasets],
-            seeds=seeds,
-            metric_ids=[primary_metric_id],
-            roles=["baseline", "candidate"],
-            aggregate_improvement_threshold=float(minimum_delta),
-            per_dataset_maximum_regression=float(maximum_regression if isinstance(maximum_regression, (int, float)) and not isinstance(maximum_regression, bool) else 0.0),
-            activation_surface_ids=list(variant.get("implementation_surface_ids") or ["c2c-surface"]),
-            readiness_check_ids=[] if proxy_terminal else ["proxy-ready-for-full"],
-            evidence_kinds=proxy_evidence_kinds,
-            mode="terminal_bootstrap" if proxy_terminal else "gate_to_full",
-        )
     phase_contracts = []
     adapter_id = _phase_adapter_id(execution, provenance_mode=provenance_mode)
     adapter_version = str(execution.get("adapter_version") or "1")
@@ -3990,6 +3976,36 @@ def _trial_spec_from_plan(
             command_values=phase_commands,
             expected_evidence=phase_requirements,
             default_cwd=str(execution.get("workdir") or project_root),
+            project_root=project_root,
+            coverage_contract={
+                "mode": "exact_cartesian",
+                "datasets": dataset_ids,
+                "seeds": seeds,
+                "metrics": [primary_metric_id],
+                "roles": ["baseline", "candidate"] if phase == "proxy" else list(dict.fromkeys(required_roles)),
+            },
+            readiness_checks=(
+                [{
+                    "check_id": "activation-mechanism",
+                    "check_kind": "activation_delta",
+                    "predicate": {"field_path": "surface_measurements.delta", "comparator": "delta_gte", "threshold": float(acceptance.get("minimum_activation_delta", 0.0))},
+                    "required_coverage": {"mode": "exact", "expected_surface_ids": list(variant.get("implementation_surface_ids") or ["c2c-surface"])},
+                }]
+                + ([] if proxy_terminal or phase != "proxy" else [{
+                    "check_id": "proxy-ready-for-full",
+                    "check_kind": "raw_measurement",
+                    "predicate": {
+                        "field_path": (
+                            "readiness_checks.proxy-ready-for-full.measurement"
+                            if execution.get("collector") == "c2c_small_loop" and provenance_mode != "synthetic"
+                            else "ready"
+                        ),
+                        "comparator": ("gte" if execution.get("collector") == "c2c_small_loop" and provenance_mode != "synthetic" else "eq"),
+                        "threshold": (1.0 if execution.get("collector") == "c2c_small_loop" and provenance_mode != "synthetic" else True),
+                    },
+                    "required_coverage": {"mode": "exact", "expected_surface_ids": []},
+                }])
+            ) if any(item["kind"] == "activation_evidence" for item in phase_requirements) else (),
         )
         command_plan_ref, command_plan_hash = store_phase_command_plan(project_root, command_plan)
         phase_contracts.append(
@@ -4005,7 +4021,39 @@ def _trial_spec_from_plan(
                 "command_plan": command_plan,
                 "command_plan_ref": command_plan_ref,
                 "command_plan_hash": command_plan_hash,
+                "derivation_plan": command_plan["derivation_plan"],
+                "derivation_plan_ref": command_plan["derivation_plan_ref"],
+                "derivation_plan_hash": command_plan["derivation_plan_hash"],
+                "readiness_check_plan": command_plan["readiness_check_plan"],
+                "readiness_check_plan_ref": command_plan["readiness_check_plan_ref"],
+                "readiness_check_plan_hash": command_plan["readiness_check_plan_hash"],
             }
+        )
+    if "proxy" in required_phases:
+        proxy_phase = next(item for item in phase_contracts if item["phase"] == "proxy")
+        if proxy_phase["readiness_check_plan_ref"] is None:
+            raise ValueError("proxy TrialSpec requires a frozen ReadinessCheckPlan")
+        proxy_evidence_kinds = sorted(
+            item["kind"] for item in evidence_requirements
+            if "proxy" in item["applicable_phases"] or "always" in item["applicable_phases"]
+        )
+        proxy_decision_policy = build_proxy_decision_policy(
+            primary_metric_id=primary_metric_id,
+            objective=primary[0]["objective"],
+            aggregation="paired_mean",
+            datasets=dataset_ids,
+            seeds=seeds,
+            metric_ids=[primary_metric_id],
+            roles=["baseline", "candidate"],
+            aggregate_improvement_threshold=float(minimum_delta),
+            per_dataset_maximum_regression=float(maximum_regression if isinstance(maximum_regression, (int, float)) and not isinstance(maximum_regression, bool) else 0.0),
+            activation_delta_threshold=float(acceptance.get("minimum_activation_delta", 0.0)),
+            activation_surface_ids=list(variant.get("implementation_surface_ids") or ["c2c-surface"]),
+            readiness_check_ids=[] if proxy_terminal else ["proxy-ready-for-full"],
+            readiness_check_plan_ref=proxy_phase["readiness_check_plan_ref"],
+            readiness_check_plan_hash=proxy_phase["readiness_check_plan_hash"],
+            evidence_kinds=proxy_evidence_kinds,
+            mode="terminal_bootstrap" if proxy_terminal else "gate_to_full",
         )
     trial_spec = {
         "schema_version": TRIAL_SPEC_SCHEMA_VERSION,

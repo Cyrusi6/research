@@ -5,6 +5,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from auto_research.agents.experiment import ExperimentAgent
+from auto_research.derivation_contracts import build_readiness_check_plan, freeze_decoder_descriptor
+from auto_research.derivation_validation import ReceiptBoundSources
 from auto_research.proxy_classifier import derive_readiness_from_receipts
 from auto_research.research_state import ResearchEventLedger
 from support.local_c2c_execution import build_c2c_context, create_local_c2c_repo, install_fake_gpu
@@ -33,16 +35,59 @@ def test_c2c_command_plan_uses_core_derivation_not_virtual_collect(tmp_path: Pat
 def test_receipt_authorized_readiness_block_is_not_overridden_by_activation_exit_zero(
     tmp_path: Path,
 ) -> None:
-    del tmp_path
+    decoder = freeze_decoder_descriptor(
+        tmp_path,
+        decoder_id="canonical-identity",
+        decoder_version="1",
+        semantic_contract={"readiness": "receipt-bound-v1"},
+    )
+    binding = {
+        "source_ordinal": 0,
+        "source_phase": "proxy",
+        "command_spec_id": "proxy-readiness-command",
+        "output_id": "raw-full-readiness",
+        "output_kind": "raw_readiness_check",
+        "output_schema_version": "auto_research_raw_readiness_check_v1",
+    }
+    plan = build_readiness_check_plan(
+        plan_id="receipt-readiness-block",
+        phase="proxy",
+        checks=[{
+            "ordinal": 0,
+            "check_id": "full-ready",
+            "check_kind": "raw_measurement",
+            "source_bindings": [binding],
+            "predicate": {"field_path": "ready", "comparator": "eq", "threshold": True},
+            "required_coverage": {"mode": "exact", "expected_surface_ids": []},
+            "decoder_descriptor": decoder,
+            "blocked_classification": "IMPLEMENTATION_BLOCKED",
+            "blocked_route": "REPAIR_IMPLEMENTATION",
+        }],
+    )
+    key = ("proxy", "proxy-readiness-command", "raw-full-readiness")
+    sources = ReceiptBoundSources(
+        raw_facts={key: {"ready": False, "activation_exit_code": 0}},
+        raw_fact_lineage={key: {
+            "source_phase": "proxy",
+            "command_spec_id": "proxy-readiness-command",
+            "output_id": "raw-full-readiness",
+            "output_kind": "raw_readiness_check",
+            "command_status": "completed",
+            "exit_code": 0,
+            "receipt_hash": "1" * 64,
+            "receipt_ref": {"digest": "1" * 64},
+            "output_ref": {"digest": "2" * 64},
+            "completed_event_id": "event:readiness:completed",
+        }},
+        surface_checks=(),
+        physical_inputs=(),
+    )
     readiness = derive_readiness_from_receipts(
-        required_check_ids=("activation", "full-ready"),
-        raw_checks={
-            "activation": {"status": "PASS", "exit_code": 0},
-            "full-ready": {"status": "BLOCKED", "ready": False, "exit_code": 0},
-        },
+        readiness_check_plan=plan,
+        receipt_bound_sources=sources,
     )
     assert readiness["ready"] is False
-    assert [item["status"] for item in readiness["checks"]] == ["PASS", "BLOCKED"]
+    assert [item["status"] for item in readiness["checks"]] == ["BLOCKED"]
 
 
 def test_non_simulated_c2c_phase_commits_core_derivation_receipt(

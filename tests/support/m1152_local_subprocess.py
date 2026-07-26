@@ -260,7 +260,7 @@ def command_lineage(root: Path) -> dict[str, tuple[str, tuple[str, ...]]]:
     for command_id, record in state["phase_commands"].items():
         if record["status"] != "completed":
             continue
-        receipt = store.read_json(record["receipt_ref"], schema_file="phase_run_receipt_v4.schema.json")
+        receipt = store.read_json(record["receipt_ref"], schema_file="phase_run_receipt_v5.schema.json")
         lineage[command_id] = (
             record["receipt_ref"]["digest"],
             tuple(output["contract_ref"]["digest"] for output in receipt["outputs"]),
@@ -275,13 +275,18 @@ def assert_trial_lineage(root: Path) -> None:
     assert ledger.rebuild() == state
     for trial_result in state["trial_results"].values():
         for entry in trial_result["evidence_manifest"]["entries"]:
-            receipt = store.read_json(entry["receipt_ref"], schema_file="phase_run_receipt_v4.schema.json")
+            receipt = store.read_json(entry["receipt_ref"], schema_file="phase_run_receipt_v5.schema.json")
             derivation = store.read_json(
                 entry["derivation_ref"],
-                schema_file="evidence_derivation_manifest_v1.schema.json",
+                schema_file="evidence_derivation_manifest_v2.schema.json",
             )
             assert any(output["contract_ref"]["digest"] == entry["content_hash"] for output in receipt["outputs"])
-            assert derivation["normalized_outputs"][0]["contract_ref"]["digest"] == entry["content_hash"]
+            normalized = next(
+                output for output in derivation["normalized_outputs"] if output["kind"] == entry["kind"]
+            )
+            assert normalized["contract_ref"]["digest"] == entry["content_hash"]
+            assert receipt["derivation_ref"] == entry["derivation_ref"]
+            assert receipt["derivation_hash"] == entry["derivation_hash"]
             assert derivation["source_commands"]
 
 
@@ -433,15 +438,25 @@ main_path.write_text(json.dumps({
     'rows': rows,
 }, sort_keys=True, separators=(',', ':')))
 activation_path.write_text(json.dumps({
-    'schema_version': 'auto_research_activation_evidence_v3',
+    'schema_version': 'auto_research_activation_evidence_v4',
     'evidence_kind': 'activation_evidence',
     'evidence_id': 'activation-' + producer,
     **identity,
     'probe_id': 'forward-probe-' + producer,
-    'status': 'passed',
+    'status': 'activated',
     'command_status': 'completed',
     'exit_code': 0,
-    'implementation_surface_ids': ['src/router.py'],
+    'expected_surface_ids': ['src/router.py'],
+    'observed_surface_ids': ['src/router.py'],
+    'activation_delta_threshold': 0.01,
+    'surface_measurements': [{
+        'surface_id': 'src/router.py',
+        'enabled_value': 1.0,
+        'disabled_value': 0.0,
+        'delta': 1.0,
+        'threshold': 0.01,
+        'status': 'ACTIVATED',
+    }],
 }, sort_keys=True, separators=(',', ':')))
 manifest = {
     **phase,

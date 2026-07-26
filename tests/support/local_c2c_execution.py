@@ -41,7 +41,20 @@ def create_local_c2c_repo(root: Path, *, proxy_accuracy: float, full_accuracy: f
         encoding="utf-8",
     )
     (repo / "local_execution_control.json").write_text(
-        json.dumps({"proxy_accuracy": proxy_accuracy, "full_accuracy": full_accuracy}, sort_keys=True),
+        json.dumps(
+            {
+                "proxy_accuracy": proxy_accuracy,
+                "full_accuracy": full_accuracy,
+                "activation_observed_surfaces": ["rosetta/model/wrapper.py"],
+                "readiness_checks": {
+                    "proxy-ready-for-full": {
+                        "measurement": 1.0,
+                        "status": "PASS",
+                    }
+                },
+            },
+            sort_keys=True,
+        ),
         encoding="utf-8",
     )
     (repo / "script/train/SFT_train.py").write_text(_TRAIN_SCRIPT, encoding="utf-8")
@@ -222,13 +235,23 @@ text=str(out)
 if 'proxy_baseline' in text:
     accuracy=0.50
 elif 'activation_smoke_disabled' in text:
-    accuracy=max(0.0,float(control['proxy_accuracy'])-0.02)
+    accuracy=float(control.get('activation_disabled_accuracy',max(0.0,float(control['proxy_accuracy'])-0.02)))
 elif '/proxy/' in text:
     accuracy=float(control['proxy_accuracy'])
 else:
     accuracy=float(control['full_accuracy'])
 dataset=str(payload.get('eval',{}).get('dataset') or 'mmlu-redux')
 summary={'model':'Rosetta','dataset':dataset,'answer_method':'generate','overall_accuracy':accuracy}
+if 'activation_smoke_disabled' in text:
+    summary['observed_surface_ids']=list(control.get('activation_observed_surfaces') or [])
+    summary['readiness_checks']={
+        str(check_id):{'measurement':float(check['measurement'])}
+        for check_id,check in sorted((control.get('readiness_checks') or {}).items())
+    }
+    summary['checks']=[
+        {'check_id':str(check_id),'measurement':float(check['measurement'])}
+        for check_id,check in sorted((control.get('readiness_checks') or {}).items())
+    ]
 (out/f'Rosetta_{dataset}_generate_summary.json').write_text(json.dumps(summary,sort_keys=True))
 (out/'prediction_outputs.jsonl').write_text(
     json.dumps({'prediction':'Answer: A','answer':'A'})+'\n'+

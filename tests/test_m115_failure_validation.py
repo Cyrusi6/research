@@ -60,7 +60,7 @@ def _command_receipt(identity: dict, *, exit_code: int = 2) -> dict:
     stdout_ref = _receipt_ref("b" * 64)
     stderr_ref = _receipt_ref("c" * 64)
     return {
-        "schema_version": "auto_research_phase_run_receipt_v4",
+        "schema_version": "auto_research_phase_run_receipt_v5",
         "command_id": "command-proxy-0001",
         "command_hash": "d" * 64,
         "command_spec_id": "command-spec-proxy-0001",
@@ -86,6 +86,9 @@ def _command_receipt(identity: dict, *, exit_code: int = 2) -> dict:
         "stderr_ref": stderr_ref,
         "external_job_id": None,
         "outputs": [],
+        "raw_outputs": [],
+        "derivation_ref": None,
+        "derivation_hash": None,
     }
 
 
