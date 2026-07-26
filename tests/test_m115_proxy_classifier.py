@@ -187,7 +187,7 @@ def test_dataset_regression_blocks_full_even_when_aggregate_passes() -> None:
     assert outcome["decision"] == "PROPOSE_NEXT_VARIANT"
 
 
-def test_trial_spec_v8_freezes_policy_and_proxy_start_binds_runtime_identity(tmp_path) -> None:
+def test_trial_spec_v9_freezes_policy_and_proxy_start_binds_runtime_identity(tmp_path) -> None:
     direction = _direction()
     variant = _variant(direction)
     plan = {
@@ -200,7 +200,7 @@ def test_trial_spec_v8_freezes_policy_and_proxy_start_binds_runtime_identity(tmp
     }
     trial_spec = _trial_spec_from_plan(plan, variant, profile="standard", project_root=tmp_path)
     policy = trial_spec["proxy_decision_policy"]
-    assert trial_spec["schema_version"] == "auto_research_trial_spec_v8"
+    assert trial_spec["schema_version"] == "auto_research_trial_spec_v9"
     assert policy["mode"] == "gate_to_full"
     assert "effective_proxy_policy" not in policy["evidence_kinds"]
     ledger = ResearchEventLedger(tmp_path)

@@ -141,7 +141,7 @@ def _physical_derivation(root: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     reference = receipt["derivation_ref"]
     assert isinstance(reference, dict)
     assert receipt["derivation_hash"] == reference["digest"]
-    manifest = store.read_json(reference, schema_file="evidence_derivation_manifest_v2.schema.json")
+    manifest = store.read_json(reference, schema_file="evidence_derivation_manifest_v3.schema.json")
     return reference, manifest
 
 
@@ -241,7 +241,7 @@ def test_final_derivation_sources_are_the_frozen_physical_command_exact_set(
     expected_sources = physical["source_commands"]
 
     for reference in _event_derivation_refs(root):
-        committed = store.read_json(reference, schema_file="evidence_derivation_manifest_v2.schema.json")
+        committed = store.read_json(reference, schema_file="evidence_derivation_manifest_v3.schema.json")
         assert committed["source_commands"] == expected_sources
         assert all(
             source["command_id"] != derive_record["command"]["command_id"]
@@ -325,7 +325,7 @@ def tracked_put_json(self, payload, *args, **kwargs):
     decoder = payload.get("decoder_descriptor") if isinstance(payload, dict) else None
     if (
         isinstance(payload, dict)
-        and payload.get("schema_version") == "auto_research_evidence_derivation_manifest_v2"
+        and payload.get("schema_version") == "auto_research_evidence_derivation_manifest_v3"
         and isinstance(decoder, dict)
         and decoder.get("decoder_id") == "c2c-receipt-measurements"
     ):

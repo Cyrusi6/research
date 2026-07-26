@@ -10,9 +10,9 @@ from .phase_command_plan import validate_phase_command_plan
 
 
 PHASE_RUN_RECEIPT_SCHEMA_FILE = "phase_run_receipt_v5.schema.json"
-PHASE_COMMAND_PLAN_SCHEMA_FILE = "phase_command_plan_v3.schema.json"
-EVIDENCE_DERIVATION_PLAN_SCHEMA_FILE = "evidence_derivation_plan_v1.schema.json"
-EVIDENCE_DERIVATION_MANIFEST_SCHEMA_FILE = "evidence_derivation_manifest_v2.schema.json"
+PHASE_COMMAND_PLAN_SCHEMA_FILE = "phase_command_plan_v4.schema.json"
+EVIDENCE_DERIVATION_PLAN_SCHEMA_FILE = "evidence_derivation_plan_v2.schema.json"
+EVIDENCE_DERIVATION_MANIFEST_SCHEMA_FILE = "evidence_derivation_manifest_v3.schema.json"
 C2C_RAW_OUTPUT_SPECS_ENV = "AUTO_RESEARCH_C2C_RAW_OUTPUT_SPECS"
 
 

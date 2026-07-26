@@ -46,7 +46,7 @@ from test_m113_ledger_closure import (
 
 
 def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dict, dict, dict]:
-    from support.authoritative_evidence import start_attempt_phase, build_trial_spec_v8
+    from support.authoritative_evidence import start_attempt_phase, build_trial_spec_v9
     ledger = ResearchEventLedger(tmp_path)
     direction = _direction()
     variant = _variant(direction)
@@ -73,7 +73,7 @@ def _c2c_inputs(tmp_path: Path, *, profile: str = "standard") -> tuple[dict, dic
     if profile == "standard":
         trial_spec["evidence_requirements"].append({"requirement_id": "main", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_main_results_v3"})
     trial_spec["required_artifacts"] = [item["kind"] for item in trial_spec["evidence_requirements"]]
-    trial_spec = build_trial_spec_v8(
+    trial_spec = build_trial_spec_v9(
         trial_spec,
         project_root=tmp_path,
         adapter_id="auto-research-c2c",

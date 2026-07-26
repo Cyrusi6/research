@@ -1,0 +1,92 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "decoder_id", "decoder_version", "decoder_kind", "semantic_contract", "operations", "operation_contract", "authority_role_contract", "output_contract"],
+  "properties": {
+    "schema_version": {"const": "auto_research_decoder_program_v1"},
+    "decoder_id": {"enum": ["canonical-identity", "c2c-receipt-measurements"]},
+    "decoder_version": {"type": "string", "minLength": 1, "maxLength": 64},
+    "decoder_kind": {"enum": ["canonical_identity", "c2c_receipt_measurements"]},
+    "semantic_contract": {"$ref": "#/$defs/semantic_contract"},
+    "operations": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/operation"}},
+    "operation_contract": {"const": {"source_json":{"canonical_bytes_required":true,"object_required":true,"unknown_field_policy":"schema_reject"},"measurement":{"value_fields":["metric_value","accuracy_percent","overall_accuracy","accuracy","mean"],"dataset_field":"dataset","fractional_scale_fields":["overall_accuracy","accuracy"],"fractional_scale_min":0.0,"fractional_scale_max":1.0,"fractional_scale_multiplier":100.0,"pairing_key_fields":["phase_execution_id","role","dataset_id","metric_id","seed"],"duplicate_policy":"reject","numeric_policy":"finite_non_boolean"},"activation":{"enabled_role":"candidate","disabled_role":"activation_disabled","surface_field":"observed_surface_ids","comparison":"paired_mean_delta_gte","surface_coverage":"ordered_exact","command_status_source":"phase_receipt"},"readiness":{"check_identity_fields":["check_id","readiness_checks","checks"],"source_inventory":"ordered_exact","check_inventory":"ordered_exact","predicate_source":"frozen_readiness_check_plan","command_status_source":"phase_receipt"},"auxiliary":{"baseline_fingerprint_fields":["sample_manifest_hash","evaluator_hash","protocol_hash","phase_execution_id"],"cache_key_fields":["attempt_input_hash","source_hashes"],"cross_reference_hash":"sha256_canonical_json"},"output_identity_fields":["attempt_id","trial_spec_hash","sample_manifest_hash","evaluator_hash","lifecycle_generation","implementation_hash","attempt_input_hash","phase","phase_execution_id","phase_start_event_id","producer_run_id"]}},
+    "authority_role_contract": {"$ref": "#/$defs/authority_role_contract"},
+    "output_contract": {"$ref": "#/$defs/output_contract"}
+  },
+  "allOf": [
+    {"if": {"properties": {"decoder_id": {"const": "canonical-identity"}}}, "then": {"properties": {"decoder_kind": {"const": "canonical_identity"}, "operations": {"prefixItems": [{"const": "validate_ordered_source_inventory"}, {"const": "parse_canonical_json"}, {"const": "validate_authority_roles"}, {"const": "copy_registered_evidence"}, {"const": "validate_exact_output_inventory"}, {"const": "emit_canonical_outputs"}], "items": false, "minItems": 6, "maxItems": 6}}}},
+    {"if": {"properties": {"decoder_id": {"const": "c2c-receipt-measurements"}}}, "then": {"properties": {"decoder_kind": {"const": "c2c_receipt_measurements"}, "operations": {"prefixItems": [{"const": "validate_ordered_source_inventory"}, {"const": "parse_canonical_json"}, {"const": "validate_authority_roles"}, {"const": "extract_finite_measurements"}, {"const": "normalize_metric_units"}, {"const": "validate_exact_cartesian_coverage"}, {"const": "derive_measurement_rows"}, {"const": "derive_activation_evidence"}, {"const": "derive_readiness_evidence"}, {"const": "derive_auxiliary_evidence"}, {"const": "validate_exact_output_inventory"}, {"const": "emit_canonical_outputs"}], "items": false, "minItems": 12, "maxItems": 12}}}}
+  ],
+  "$defs": {
+    "safe_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{2,127}$"},
+    "evidence_kind": {"enum": ["main_results", "proxy_results", "ablation_results", "coverage_results", "matched_control_results", "activation_evidence", "proxy_baseline_fingerprint", "proxy_cache_report", "full_s3_readiness", "bootstrap_completion"]},
+    "operation": {"enum": ["validate_ordered_source_inventory", "parse_canonical_json", "validate_authority_roles", "copy_registered_evidence", "extract_finite_measurements", "normalize_metric_units", "validate_exact_cartesian_coverage", "derive_measurement_rows", "derive_activation_evidence", "derive_readiness_evidence", "derive_auxiliary_evidence", "validate_exact_output_inventory", "emit_canonical_outputs"]},
+    "canonicalization": {
+      "type": "object", "additionalProperties": false,
+      "required": ["encoding", "object_key_order", "row_order", "duplicate_policy", "numeric_policy"],
+      "properties": {
+        "encoding": {"const": "utf-8"},
+        "object_key_order": {"const": "lexicographic"},
+        "row_order": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "duplicate_policy": {"const": "reject"},
+        "numeric_policy": {"const": "finite_non_boolean"}
+      }
+    },
+    "coverage_contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["mode", "datasets", "seeds", "metrics", "roles"],
+      "properties": {
+        "mode": {"const": "exact_cartesian"},
+        "datasets": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "seeds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}},
+        "metrics": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "roles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      }
+    },
+    "semantic_contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["canonicalization", "coverage_contract"],
+      "properties": {
+        "canonicalization": {"$ref": "#/$defs/canonicalization"},
+        "coverage_contract": {"$ref": "#/$defs/coverage_contract"}
+      }
+    },
+    "authority_binding": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_ordinal", "source_phase", "command_spec_id", "output_id", "authority_roles", "readiness_check_ids"],
+      "properties": {
+        "source_ordinal": {"type": "integer", "minimum": 0},
+        "source_phase": {"enum": ["proxy", "full"]},
+        "command_spec_id": {"$ref": "#/$defs/safe_id"},
+        "output_id": {"$ref": "#/$defs/safe_id"},
+        "authority_roles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["normalized_evidence_source", "scientific_metric", "activation_enabled", "activation_disabled", "activation_surface", "readiness"]}},
+        "readiness_check_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/safe_id"}}
+      }
+    },
+    "authority_role_contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source_bindings"],
+      "properties": {
+        "source_bindings": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/authority_binding"}}
+      }
+    },
+    "normalized_output": {
+      "type": "object", "additionalProperties": false,
+      "required": ["ordinal", "output_id", "kind", "schema_version"],
+      "properties": {
+        "ordinal": {"type": "integer", "minimum": 0},
+        "output_id": {"$ref": "#/$defs/safe_id"},
+        "kind": {"$ref": "#/$defs/evidence_kind"},
+        "schema_version": {"type": "string", "pattern": "^auto_research_[a-z0-9_]+_v[0-9]+$"}
+      }
+    },
+    "output_contract": {
+      "type": "object", "additionalProperties": false,
+      "required": ["expected_normalized_outputs"],
+      "properties": {
+        "expected_normalized_outputs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/normalized_output"}}
+      }
+    }
+  }
+}

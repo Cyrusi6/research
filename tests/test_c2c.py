@@ -68,7 +68,7 @@ from auto_research.phase_execution import (
 )
 from auto_research.phase_receipts import C2C_RAW_OUTPUT_SPECS_ENV
 from auto_research.research_state import IntegrityError, ResearchEventLedger
-from support.authoritative_evidence import build_trial_spec_v8, start_attempt_phase
+from support.authoritative_evidence import build_trial_spec_v9, start_attempt_phase
 from test_m113_ledger_closure import _direction as _state_direction
 from test_m113_ledger_closure import _trial_spec_facts as _state_trial_spec_facts
 
@@ -201,7 +201,7 @@ def _authorize_c2c_phase(
                 {"requirement_id": "main", "kind": "main_results", "required": True, "applicable_phases": ["full"], "schema_version": "auto_research_main_results_v3"}
             )
         trial_spec["required_artifacts"] = [item["kind"] for item in trial_spec["evidence_requirements"]]
-        trial_spec = build_trial_spec_v8(trial_spec, project_root=project_root)
+        trial_spec = build_trial_spec_v9(trial_spec, project_root=project_root)
         trial_spec = agent._freeze_c2c_phase_command_plans(trial_spec, variant)
         attempt = ledger.reserve_attempt(
             profile=profile,
@@ -8488,7 +8488,7 @@ def test_c2c_static_proxy_rejects_evaluator_patch_before_training(monkeypatch, t
             "gpu_ids": [0],
             "proxy_screen": {
                 "enabled": True,
-                "mode": "static",
+                "mode": "command",
                 "reject_eval_code_changes": True,
                 "reject_if_no_executable_change": True,
             },
@@ -8541,6 +8541,7 @@ def test_c2c_static_proxy_rejects_evaluator_patch_before_training(monkeypatch, t
         candidate={
             "id": "eval_risk",
             "title": "Eval Risk",
+            "experiment_contract": {"ablation_switch": "disable_eval_risk"},
             "code_patch": {
                 "status": "ok",
                 "patch_json": "plan/code_patches/eval_risk/patch.json",
@@ -9449,7 +9450,7 @@ def test_c2c_proxy_baseline_eval_timeout_blocks_without_configured_fallback(monk
     assert phase_context is not None
     frozen_plan = ContractStore(paths.root).read_json(
         phase_context.command_plan_hash,
-        schema_file="phase_command_plan_v3.schema.json",
+        schema_file="phase_command_plan_v4.schema.json",
     )
     frozen_repo = Path(frozen_plan["commands"][0]["cwd"])
     runtime_config = {

@@ -195,7 +195,36 @@ def test_readiness_blocked_cannot_be_overridden_by_zero_exit_activation(tmp_path
         tmp_path,
         decoder_id="canonical-identity",
         decoder_version="1",
-        semantic_contract={"readiness": "receipt-bound-raw-measurement-v1"},
+        semantic_contract={
+            "canonicalization": {
+                "encoding": "utf-8",
+                "object_key_order": "lexicographic",
+                "row_order": ["phase", "role", "dataset_id", "metric_id", "seed"],
+                "duplicate_policy": "reject",
+                "numeric_policy": "finite_non_boolean",
+            },
+            "coverage_contract": {
+                "mode": "exact_cartesian",
+                "datasets": ["readiness-dataset"],
+                "seeds": [0],
+                "metrics": ["readiness"],
+                "roles": ["readiness"],
+            },
+        },
+        authority_role_contract={"source_bindings": [{
+            "source_ordinal": 0,
+            "source_phase": "proxy",
+            "command_spec_id": "proxy-readiness-command",
+            "output_id": "raw-readiness-output",
+            "authority_roles": ["readiness"],
+            "readiness_check_ids": ["full-ready-check"],
+        }]},
+        output_contract={"expected_normalized_outputs": [{
+            "ordinal": 0,
+            "output_id": "normalized-full-readiness",
+            "kind": "full_s3_readiness",
+            "schema_version": "auto_research_full_s3_readiness_v4",
+        }]},
     )
     binding = {
         "source_ordinal": 0,
@@ -204,6 +233,8 @@ def test_readiness_blocked_cannot_be_overridden_by_zero_exit_activation(tmp_path
         "output_id": "raw-readiness-output",
         "output_kind": "c2c_activation_measurement",
         "output_schema_version": "auto_research_c2c_raw_measurement_v1",
+        "required_authority_roles": ["readiness"],
+        "check_id": "full-ready-check",
     }
     plan = build_readiness_check_plan(
         plan_id="proxy-readiness-authority",
@@ -227,6 +258,8 @@ def test_readiness_blocked_cannot_be_overridden_by_zero_exit_activation(tmp_path
         "command_spec_id": "proxy-readiness-command",
         "output_id": "raw-readiness-output",
         "output_kind": "c2c_activation_measurement",
+        "authority_roles": ["readiness"],
+        "readiness_check_ids": ["full-ready-check"],
         "command_status": "completed",
         "exit_code": 0,
         "receipt_hash": raw_ref["digest"],
@@ -235,7 +268,7 @@ def test_readiness_blocked_cannot_be_overridden_by_zero_exit_activation(tmp_path
         "completed_event_id": "event:readiness:completed",
     }
     passing_sources = ReceiptBoundSources(
-        raw_facts={key: {"ready": True}},
+        raw_facts={key: {"check_id": "full-ready-check", "ready": True}},
         raw_fact_lineage={key: lineage},
         surface_checks=(),
         physical_inputs=(),
@@ -245,7 +278,7 @@ def test_readiness_blocked_cannot_be_overridden_by_zero_exit_activation(tmp_path
     assert passing["classification"] == "PASS"
 
     blocked_sources = ReceiptBoundSources(
-        raw_facts={key: {"ready": False}},
+        raw_facts={key: {"check_id": "full-ready-check", "ready": False}},
         raw_fact_lineage={key: lineage},
         surface_checks=(),
         physical_inputs=(),

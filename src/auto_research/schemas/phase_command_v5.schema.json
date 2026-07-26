@@ -24,7 +24,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_phase_command_v4"
+      "const": "auto_research_phase_command_v5"
     },
     "command_id": {
       "$ref": "#/$defs/safe_id"
@@ -35,7 +35,7 @@
     "command_spec_id": {
       "$ref": "#/$defs/safe_id"
     },
-    "command_spec": {"$ref": "phase_command_plan_v3.schema.json#/$defs/command_spec"},
+    "command_spec": {"$ref": "phase_command_plan_v4.schema.json#/$defs/command_spec"},
     "command_plan_hash": {
       "$ref": "#/$defs/hash"
     },

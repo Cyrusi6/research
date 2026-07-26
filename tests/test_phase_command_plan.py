@@ -5,6 +5,7 @@ from copy import deepcopy
 import pytest
 
 from auto_research.agents.plan import _trial_spec_from_plan
+from auto_research.contract_store import ContractStore
 from auto_research.domain_contracts import canonical_hash, validate_trial_spec
 from auto_research.phase_command_plan import (
     build_phase_command_plan,
@@ -74,6 +75,20 @@ def test_phase_command_plan_is_content_addressed_and_ordered(tmp_path) -> None:
     )
     reference, digest = store_phase_command_plan(tmp_path, plan)
     assert reference["digest"] == digest == canonical_hash(plan)
+    assert plan["schema_version"] == "auto_research_phase_command_plan_v4"
+    assert plan["derivation_plan"]["schema_version"] == "auto_research_evidence_derivation_plan_v2"
+    descriptor = plan["derivation_plan"]["decoder_descriptor"]
+    assert descriptor["schema_version"] == "auto_research_decoder_descriptor_v2"
+    assert descriptor["implementation_hash"] == descriptor["immutable_ref"]["digest"]
+    bundle = ContractStore(tmp_path).read_json(
+        descriptor["immutable_ref"],
+        schema_file="decoder_implementation_bundle_v1.schema.json",
+    )
+    assert bundle["schema_version"] == "auto_research_decoder_implementation_bundle_v1"
+    assert bundle["decoder_program"]["schema_version"] == "auto_research_decoder_program_v1"
+    assert descriptor["semantic_hash"] == canonical_hash(bundle["decoder_program"])
+    assert bundle["decoder_program"]["authority_role_contract"]["source_bindings"]
+    assert bundle["decoder_program"]["output_contract"]["expected_normalized_outputs"]
     assert plan["commands"][1]["dependencies"] == [plan["commands"][0]["command_spec_id"]]
     assert plan["commands"][1]["physical_raw_outputs"][0]["normalized_kinds"] == ["main_results"]
     assert plan["commands"][2]["dependencies"] == [plan["commands"][1]["command_spec_id"]]
@@ -112,7 +127,7 @@ def test_phase_command_plan_rejects_dag_and_identity_attacks(tmp_path, mutate, m
         validate_phase_command_plan(attacked, expected_evidence_kinds=["main_results"])
 
 
-def test_trial_spec_v8_embeds_nonempty_frozen_synthetic_plan(tmp_path) -> None:
+def test_trial_spec_v9_embeds_nonempty_frozen_synthetic_plan(tmp_path) -> None:
     variant = {
         "variant_id": "variant-command-plan",
         "variant_spec_hash": canonical_hash({"variant": "command-plan"}),
@@ -140,7 +155,9 @@ def test_trial_spec_v8_embeds_nonempty_frozen_synthetic_plan(tmp_path) -> None:
     trial_spec = _trial_spec_from_plan(plan, variant, project_root=tmp_path)
     validate_trial_spec(trial_spec)
     command_plan = phase_command_plan_for_phase(trial_spec, "full")
-    assert trial_spec["schema_version"] == "auto_research_trial_spec_v8"
+    assert trial_spec["schema_version"] == "auto_research_trial_spec_v9"
+    assert command_plan["schema_version"] == "auto_research_phase_command_plan_v4"
+    assert command_plan["derivation_plan"]["decoder_descriptor"]["schema_version"] == "auto_research_decoder_descriptor_v2"
     assert command_plan["commands"][0]["argv"] == ["auto-research-adapter", "synthetic", "full"]
     assert trial_spec["phase_contracts"][0]["command_plan_hash"] == canonical_hash(command_plan)
 

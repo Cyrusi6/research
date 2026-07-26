@@ -193,8 +193,8 @@ def _trial_spec_facts() -> dict:
 
 
 def _trial_spec(project_root: Path | None = None) -> dict:
-    from support.authoritative_evidence import build_trial_spec_v8
-    return build_trial_spec_v8(_trial_spec_facts(), project_root=project_root)
+    from support.authoritative_evidence import build_trial_spec_v9
+    return build_trial_spec_v9(_trial_spec_facts(), project_root=project_root)
 
 def _running_attempt(tmp_path: Path) -> tuple[ResearchEventLedger, dict]:
     from support.authoritative_evidence import start_attempt_phase

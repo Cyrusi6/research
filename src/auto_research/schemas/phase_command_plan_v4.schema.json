@@ -19,7 +19,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_phase_command_plan_v3"
+      "const": "auto_research_phase_command_plan_v4"
     },
     "plan_id": {
       "$ref": "#/$defs/safe_id"

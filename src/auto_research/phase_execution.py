@@ -313,7 +313,7 @@ def _required_executor_names(context: AuthoritativePhaseContext) -> frozenset[st
     try:
         plan = ContractStore(context.project_root).read_json(
             context.command_plan_hash,
-            schema_file="phase_command_plan_v3.schema.json",
+            schema_file="phase_command_plan_v4.schema.json",
         )
     except (OSError, TypeError, ValueError):
         return frozenset()

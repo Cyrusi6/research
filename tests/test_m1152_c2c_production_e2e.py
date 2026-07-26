@@ -53,7 +53,7 @@ def _assert_receipt_and_derivation_chain(root: Path) -> None:
         assert receipt["derivation_hash"] == receipt["derivation_ref"]["digest"]
         derivation = store.read_json(
             receipt["derivation_ref"],
-            schema_file="evidence_derivation_manifest_v2.schema.json",
+            schema_file="evidence_derivation_manifest_v3.schema.json",
         )
         assert {source["receipt_hash"] for source in derivation["source_commands"]}.issubset(
             physical_receipt_hashes
@@ -70,7 +70,7 @@ def _assert_receipt_and_derivation_chain(root: Path) -> None:
             assert entry["receipt_ref"]
             assert entry["derivation_ref"]
             derivation = store.read_json(
-                entry["derivation_ref"], schema_file="evidence_derivation_manifest_v2.schema.json"
+                entry["derivation_ref"], schema_file="evidence_derivation_manifest_v3.schema.json"
             )
             normalized = next(
                 output for output in derivation["normalized_outputs"] if output["kind"] == entry["kind"]

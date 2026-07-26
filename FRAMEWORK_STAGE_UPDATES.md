@@ -3156,3 +3156,55 @@ The validator never writes CAS, SQLite, receipts, evidence projections, or JSON 
 M1.1.5.2's `705 passed, 2 skipped` result is historical and does not certify the v9/v8/v6/v5 contracts. M1.1.5.3's immutable-derivation/readiness attack group reports `42 passed`; the state/S3 migration group reports `367 passed`; and the full `tests/test_c2c.py` file reports `182 passed, 2 skipped`. Generic/C2C/bootstrap production-component and five-variant cases are included in every final full run. Normal, proxy-cleared, empty-HOME/no-Codex, and CPU-only/no-`nvidia-smi` environments each report `747 passed, 2 skipped, 0 failed`.
 
 Production-component checks use real local subprocess fixtures and production executors, frozen commands, receipts, CAS, Core derivation, Ledger/rebuild, and Gate. Synthetic checks are labeled separately. Neither is a claim of real scientific success. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training have not started.
+
+## 2026-07-26 M1.1.5.3.1 Frozen Decoder, Exact-Set & Recovery Acceptance Closure
+
+Commit `1fd4e84` established the M1.1.5.3 physical-receipt derivation and readiness chain, but its descriptor still allowed current runtime code to reinterpret historical decoder identity and its derive operation ran before the command journal checked history. This breaking acceptance closure keeps the physical command, receipt, CAS, SQLite, proxy, budget, and phase architecture, while removing those remaining authority gaps. It does not start Native Unified S1, M1.2, M2, external Codex S1, real GPU training, or scientific metric experiments.
+
+### Breaking Contracts
+
+- Event v10, AttemptRecord v10, and ResearchState v10 remain one SQLite-WAL authority; TrialSpec v9 freezes the executable decoder, ordered source roles, and readiness input domain.
+- PhaseCommandPlan v4 and PhaseCommand v5 freeze derivation/readiness authority roles and operation identity.
+- EvidenceDerivationPlan v2, EvidenceDerivationManifest v3, DecoderDescriptor v2, and ReadinessCheckPlan v2 carry the changed derivation/readiness shapes.
+- `DecoderProgram v1` and `DecoderImplementationBundle v1` are new content-addressed contracts for the actual executable transformation semantics.
+- TrialResult v6, PhaseRunReceipt v5, EvidenceManifest v6, ActivationEvidence v4, FullS3Readiness v4, ProxyDecisionPolicy v2, ProxyOutcome v4, PhaseExecutionManifest v3, SampleManifest v4, CompletionEvidence v3, FailureEvidence v6, ResumeEvidence v5, ResourceProbe v4, RouteOutcome v4, and DirectionOutcomeAggregate v1 retain their shapes.
+- Superseded v9/v8/v4/v3/v2/v1 schemas and readers are deleted. Old workspaces must restart from S1; there is no dual read, fallback, repair migration, or auto-upgrade.
+
+### Frozen Executable Decoder
+
+```text
+DecoderDescriptor v2
+→ immutable DecoderImplementationBundle v1
+→ declarative DecoderProgram v1
+→ runtime ABI + entrypoint + dependency contract
+→ canonical JSON, measurement, pairing, activation/readiness, and output rules
+```
+
+`implementation_hash` is the hash of the immutable executable-semantics artifact itself. `immutable_ref` points to those bytes, not an ID/version description. Replay and validation load the bundle/program from CAS and execute the constrained declarative VM; `_DECODER_REGISTRY` is not consulted for historical transformation logic, and current source files are not used to reconstruct missing artifacts.
+
+### Journal-Owned Derivation
+
+1. Command identity and expected output identity are built without executing the decoder.
+2. `journal.run_once()` checks SQLite history and commits `PhaseCommandStarted` before invoking the producing decoder.
+3. The runner reads the ordered frozen physical receipts and raw outputs, executes the frozen decoder, writes normalized CAS blobs, writes one EvidenceDerivationManifest v3, and persists the durable derive receipt/locator.
+4. Completed replay returns the historical receipt and outputs without invoking the decoder.
+5. Durable receipt without Completed runs the read-only semantic validator and commits only the missing Completed event.
+6. Started without a trustworthy receipt commits one typed, queryable, replayable `BLOCK_INTEGRITY` route; orphan blobs are never recovery authority.
+
+`PhaseCommandCompleted`, derive-receipt precommit, EvidenceManifest binding, reducer/rebuild, state/query, replay, and S3 Gate share the same raw-to-normalized recomputation core. A schema- and hash-consistent but semantically wrong derivation is rejected before Completed and writes no event.
+
+### Exact Activation and Readiness Domain
+
+Physical raw bindings explicitly declare authority roles such as proxy metrics, activation enabled/disabled/observed surface, and readiness `<check_id>`. The observed ordered inventory must equal the frozen plan exactly. Missing, extra, duplicate, reordered, cross-Attempt, cross-phase, wrong-generation, wrong-producer, wrong-command/output, wrong-decoder, and wrong-authority inputs fail closed. Expected surfaces never populate observed coverage, and synthetic execution emits explicit synthetic measurement facts instead of copying the expected list.
+
+The deterministic route priority remains: invalid receipt/decoder/derivation/coverage → `BLOCK_INTEGRITY`; authoritative resource insufficiency → `PAUSE_RESOURCE`; valid activation/readiness BLOCKED → `REPAIR_IMPLEMENTATION`; readiness PASS with proxy science reject → `PROPOSE_NEXT_VARIANT`; readiness PASS with proxy science pass → `RUN_FULL`; verified bootstrap completion → `FINISH_RUN`. Only `RUN_FULL` can create `FullPhaseStarted`.
+
+### Derive/Readiness Crash Matrix
+
+The production-component cold-restart harness uses real SQLite, a new ExperimentAgent and Orchestrator, real local subprocesses with frozen `argv/env/cwd` and `shell=False`, separate append-only physical/producing-decoder/validator markers, and immutable receipts. It covers: before derive Started; after normalized/manifest orphan creation; after durable derive receipt; after derive Completed; after durable readiness receipt; after readiness Completed; and after ProxyEvidenceCommitted before route delivery. Recovery never repeats an authoritative physical or producing-decoder invocation, never duplicates evidence or route events, and never consumes budget twice.
+
+### Acceptance Boundary
+
+M1.1.5.3's earlier `747 passed, 2 skipped` runs are historical v9/v8 checkpoint evidence and do not certify v10/v9. M1.1.5.3.1 collects 781 tests; normal (`1:05:20`), proxy-cleared (`1:05:19`), empty HOME/HF cache without Codex (`1:04:14`), and CPU-only without `nvidia-smi` (`1:04:19`) each report `779 passed, 2 skipped, 0 failed`. The skips remain the existing optional torch/transformers probes, with no added skip or xfail. All results are local attestations because this repository has no GitHub Actions workflow.
+
+Production-component fixtures prove authority wiring through real local subprocesses, frozen commands, physical receipts/raw bytes, immutable decoder execution, derivation, Ledger/rebuild, and Gate. Synthetic fixtures prove deterministic state/evidence/budget behavior separately. Neither is a scientific-success claim; Native Unified S1, external Codex S1, M2, and real GPU scientific training remain unstarted.

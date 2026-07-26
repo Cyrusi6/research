@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "decoder_id", "decoder_version", "runtime_abi", "entrypoint", "semantic_hash", "implementation_hash", "immutable_ref"],
+  "properties": {
+    "schema_version": {"const": "auto_research_decoder_descriptor_v2"},
+    "decoder_id": {"enum": ["canonical-identity", "c2c-receipt-measurements"]},
+    "decoder_version": {"type": "string", "minLength": 1, "maxLength": 64},
+    "runtime_abi": {"const": "auto_research_declarative_decoder_vm_v1"},
+    "entrypoint": {"const": "execute_decoder_program"},
+    "semantic_hash": {"$ref": "#/$defs/hash"},
+    "implementation_hash": {"$ref": "#/$defs/hash"},
+    "immutable_ref": {"$ref": "#/$defs/blob"}
+  },
+  "$defs": {
+    "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "blob": {"type": "object", "additionalProperties": false, "required": ["schema_version", "algorithm", "digest", "size_bytes", "relative_path"], "properties": {"schema_version": {"const": "auto_research_contract_blob_v1"}, "algorithm": {"const": "sha256"}, "digest": {"$ref": "#/$defs/hash"}, "size_bytes": {"type": "integer", "minimum": 1}, "relative_path": {"type": "string", "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"}}}
+  }
+}

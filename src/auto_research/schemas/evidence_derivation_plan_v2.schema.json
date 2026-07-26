@@ -4,49 +4,14 @@
   "additionalProperties": false,
   "required": ["schema_version", "plan_id", "phase", "decoder_descriptor", "source_bindings", "expected_normalized_outputs", "canonicalization", "coverage_contract", "cross_phase_bindings"],
   "properties": {
-    "schema_version": {"const": "auto_research_evidence_derivation_plan_v1"},
+    "schema_version": {"const": "auto_research_evidence_derivation_plan_v2"},
     "plan_id": {"$ref": "#/$defs/safe_id"},
     "phase": {"enum": ["proxy", "full"]},
     "decoder_descriptor": {"$ref": "#/$defs/decoder"},
-    "source_bindings": {
-      "type": "array", "minItems": 1,
-      "items": {"$ref": "#/$defs/source_binding"}
-    },
-    "expected_normalized_outputs": {
-      "type": "array", "minItems": 1,
-      "items": {
-        "type": "object", "additionalProperties": false,
-        "required": ["ordinal", "output_id", "kind", "schema_version"],
-        "properties": {
-          "ordinal": {"type": "integer", "minimum": 0},
-          "output_id": {"$ref": "#/$defs/safe_id"},
-          "kind": {"$ref": "#/$defs/evidence_kind"},
-          "schema_version": {"type": "string", "pattern": "^auto_research_[a-z0-9_]+_v[0-9]+$"}
-        }
-      }
-    },
-    "canonicalization": {
-      "type": "object", "additionalProperties": false,
-      "required": ["encoding", "object_key_order", "row_order", "duplicate_policy", "numeric_policy"],
-      "properties": {
-        "encoding": {"const": "utf-8"},
-        "object_key_order": {"const": "lexicographic"},
-        "row_order": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
-        "duplicate_policy": {"const": "reject"},
-        "numeric_policy": {"const": "finite_non_boolean"}
-      }
-    },
-    "coverage_contract": {
-      "type": "object", "additionalProperties": false,
-      "required": ["mode", "datasets", "seeds", "metrics", "roles"],
-      "properties": {
-        "mode": {"const": "exact_cartesian"},
-        "datasets": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-        "seeds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}},
-        "metrics": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
-        "roles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
-      }
-    },
+    "source_bindings": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/source_binding"}},
+    "expected_normalized_outputs": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/normalized_output"}},
+    "canonicalization": {"$ref": "#/$defs/canonicalization"},
+    "coverage_contract": {"$ref": "#/$defs/coverage_contract"},
     "cross_phase_bindings": {
       "type": "array",
       "items": {
@@ -69,12 +34,15 @@
   "$defs": {
     "hash": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
     "blob": {"type": "object", "additionalProperties": false, "required": ["schema_version", "algorithm", "digest", "size_bytes", "relative_path"], "properties": {"schema_version": {"const": "auto_research_contract_blob_v1"}, "algorithm": {"const": "sha256"}, "digest": {"$ref": "#/$defs/hash"}, "size_bytes": {"type": "integer", "minimum": 1}, "relative_path": {"type": "string", "pattern": "^meta/contracts/sha256/[a-f0-9]{2}/[a-f0-9]{64}\\.json$"}}},
-    "decoder": {"type": "object", "additionalProperties": false, "required": ["schema_version", "decoder_id", "decoder_version", "semantic_hash", "implementation_hash", "immutable_ref"], "properties": {"schema_version": {"const": "auto_research_decoder_descriptor_v1"}, "decoder_id": {"enum": ["canonical-identity", "c2c-receipt-measurements"]}, "decoder_version": {"type": "string", "minLength": 1}, "semantic_hash": {"$ref": "#/$defs/hash"}, "implementation_hash": {"$ref": "#/$defs/hash"}, "immutable_ref": {"$ref": "#/$defs/blob"}}},
+    "decoder": {"type": "object", "additionalProperties": false, "required": ["schema_version", "decoder_id", "decoder_version", "runtime_abi", "entrypoint", "semantic_hash", "implementation_hash", "immutable_ref"], "properties": {"schema_version": {"const": "auto_research_decoder_descriptor_v2"}, "decoder_id": {"enum": ["canonical-identity", "c2c-receipt-measurements"]}, "decoder_version": {"type": "string", "minLength": 1, "maxLength": 64}, "runtime_abi": {"const": "auto_research_declarative_decoder_vm_v1"}, "entrypoint": {"const": "execute_decoder_program"}, "semantic_hash": {"$ref": "#/$defs/hash"}, "implementation_hash": {"$ref": "#/$defs/hash"}, "immutable_ref": {"$ref": "#/$defs/blob"}}},
     "safe_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{7,127}$"},
     "evidence_kind": {"enum": ["main_results", "proxy_results", "ablation_results", "coverage_results", "matched_control_results", "activation_evidence", "proxy_baseline_fingerprint", "proxy_cache_report", "full_s3_readiness", "bootstrap_completion"]},
+    "canonicalization": {"type": "object", "additionalProperties": false, "required": ["encoding", "object_key_order", "row_order", "duplicate_policy", "numeric_policy"], "properties": {"encoding": {"const": "utf-8"}, "object_key_order": {"const": "lexicographic"}, "row_order": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "duplicate_policy": {"const": "reject"}, "numeric_policy": {"const": "finite_non_boolean"}}},
+    "coverage_contract": {"type": "object", "additionalProperties": false, "required": ["mode", "datasets", "seeds", "metrics", "roles"], "properties": {"mode": {"const": "exact_cartesian"}, "datasets": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "seeds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}}, "metrics": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}, "roles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}}},
+    "normalized_output": {"type": "object", "additionalProperties": false, "required": ["ordinal", "output_id", "kind", "schema_version"], "properties": {"ordinal": {"type": "integer", "minimum": 0}, "output_id": {"$ref": "#/$defs/safe_id"}, "kind": {"$ref": "#/$defs/evidence_kind"}, "schema_version": {"type": "string", "pattern": "^auto_research_[a-z0-9_]+_v[0-9]+$"}}},
     "source_binding": {
       "type": "object", "additionalProperties": false,
-      "required": ["source_ordinal", "source_phase", "command_spec_id", "output_id", "output_kind", "output_schema_version", "normalized_kinds", "role", "dataset_id", "seeds", "metrics"],
+      "required": ["source_ordinal", "source_phase", "command_spec_id", "output_id", "output_kind", "output_schema_version", "normalized_kinds", "authority_roles", "readiness_check_ids", "role", "dataset_id", "seeds", "metrics"],
       "properties": {
         "source_ordinal": {"type": "integer", "minimum": 0},
         "source_phase": {"enum": ["proxy", "full"]},
@@ -83,6 +51,8 @@
         "output_kind": {"type": "string", "minLength": 1},
         "output_schema_version": {"type": "string", "pattern": "^auto_research_[a-z0-9_]+_v[0-9]+$"},
         "normalized_kinds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence_kind"}},
+        "authority_roles": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["normalized_evidence_source", "scientific_metric", "activation_enabled", "activation_disabled", "activation_surface", "readiness"]}},
+        "readiness_check_ids": {"type": "array", "uniqueItems": true, "items": {"$ref": "#/$defs/safe_id"}},
         "role": {"type": ["string", "null"]},
         "dataset_id": {"type": ["string", "null"]},
         "seeds": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}},

@@ -28,7 +28,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_state_v9"
+      "const": "auto_research_state_v10"
     },
     "project_id": {
       "type": "string",

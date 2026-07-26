@@ -39,7 +39,36 @@ def test_receipt_authorized_readiness_block_is_not_overridden_by_activation_exit
         tmp_path,
         decoder_id="canonical-identity",
         decoder_version="1",
-        semantic_contract={"readiness": "receipt-bound-v1"},
+        semantic_contract={
+            "canonicalization": {
+                "encoding": "utf-8",
+                "object_key_order": "lexicographic",
+                "row_order": ["phase", "role", "dataset_id", "metric_id", "seed"],
+                "duplicate_policy": "reject",
+                "numeric_policy": "finite_non_boolean",
+            },
+            "coverage_contract": {
+                "mode": "exact_cartesian",
+                "datasets": ["readiness-dataset"],
+                "seeds": [0],
+                "metrics": ["readiness"],
+                "roles": ["readiness"],
+            },
+        },
+        authority_role_contract={"source_bindings": [{
+            "source_ordinal": 0,
+            "source_phase": "proxy",
+            "command_spec_id": "proxy-readiness-command",
+            "output_id": "raw-full-readiness",
+            "authority_roles": ["readiness"],
+            "readiness_check_ids": ["full-ready"],
+        }]},
+        output_contract={"expected_normalized_outputs": [{
+            "ordinal": 0,
+            "output_id": "normalized-full-readiness",
+            "kind": "full_s3_readiness",
+            "schema_version": "auto_research_full_s3_readiness_v4",
+        }]},
     )
     binding = {
         "source_ordinal": 0,
@@ -48,6 +77,8 @@ def test_receipt_authorized_readiness_block_is_not_overridden_by_activation_exit
         "output_id": "raw-full-readiness",
         "output_kind": "raw_readiness_check",
         "output_schema_version": "auto_research_raw_readiness_check_v1",
+        "required_authority_roles": ["readiness"],
+        "check_id": "full-ready",
     }
     plan = build_readiness_check_plan(
         plan_id="receipt-readiness-block",
@@ -66,12 +97,14 @@ def test_receipt_authorized_readiness_block_is_not_overridden_by_activation_exit
     )
     key = ("proxy", "proxy-readiness-command", "raw-full-readiness")
     sources = ReceiptBoundSources(
-        raw_facts={key: {"ready": False, "activation_exit_code": 0}},
+        raw_facts={key: {"check_id": "full-ready", "ready": False, "activation_exit_code": 0}},
         raw_fact_lineage={key: {
             "source_phase": "proxy",
             "command_spec_id": "proxy-readiness-command",
             "output_id": "raw-full-readiness",
             "output_kind": "raw_readiness_check",
+            "authority_roles": ["readiness"],
+            "readiness_check_ids": ["full-ready"],
             "command_status": "completed",
             "exit_code": 0,
             "receipt_hash": "1" * 64,

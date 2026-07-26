@@ -86,8 +86,8 @@ def _trial_spec(
     seeds: tuple[int, ...] = (7,),
     project_root: Path | None = None,
 ) -> dict:
-    from support.authoritative_evidence import build_trial_spec_v8
-    return build_trial_spec_v8(
+    from support.authoritative_evidence import build_trial_spec_v9
+    return build_trial_spec_v9(
         _trial_spec_facts(objective=objective, datasets=datasets, seeds=seeds),
         project_root=project_root,
     )

@@ -20,7 +20,7 @@ from .derivation_contracts import (
 )
 
 
-PHASE_COMMAND_PLAN_SCHEMA_VERSION = "auto_research_phase_command_plan_v3"
+PHASE_COMMAND_PLAN_SCHEMA_VERSION = "auto_research_phase_command_plan_v4"
 
 _PHASES = {"proxy", "full"}
 _PROVENANCE_MODES = {"synthetic", "local-external", "production"}
@@ -137,21 +137,27 @@ def build_phase_command_plan(
         outputs,
         phase=phase,
         coverage_contract=coverage_contract,
+        readiness_checks=readiness_checks,
     )
+    canonicalization = {
+        "encoding": "utf-8",
+        "object_key_order": "lexicographic",
+        "row_order": ["phase", "role", "dataset_id", "metric_id", "seed"],
+        "duplicate_policy": "reject",
+        "numeric_policy": "finite_non_boolean",
+    }
+    output_contract = _decoder_output_contract(outputs)
+    authority_role_contract = _decoder_authority_role_contract(source_bindings)
     decoder = freeze_decoder_descriptor(
         project_root,
         decoder_id=decoder_id,
         decoder_version=decoder_version,
         semantic_contract={
-            "canonicalization": {
-                "encoding": "utf-8",
-                "object_key_order": "lexicographic",
-                "row_order": ["phase", "role", "dataset_id", "metric_id", "seed"],
-                "duplicate_policy": "reject",
-                "numeric_policy": "finite_non_boolean",
-            },
+            "canonicalization": canonicalization,
             "coverage_contract": dict(coverage_contract),
         },
+        authority_role_contract=authority_role_contract,
+        output_contract=output_contract,
     )
     derivation_plan = build_evidence_derivation_plan(
         plan_id=f"{adapter_id}:{phase}:derivation",
@@ -162,13 +168,7 @@ def build_phase_command_plan(
             {"ordinal": index, "output_id": item["output_id"], "kind": item["kind"], "schema_version": item["schema_version"]}
             for index, item in enumerate(outputs)
         ],
-        canonicalization={
-            "encoding": "utf-8",
-            "object_key_order": "lexicographic",
-            "row_order": ["phase", "role", "dataset_id", "metric_id", "seed"],
-            "duplicate_policy": "reject",
-            "numeric_policy": "finite_non_boolean",
-        },
+        canonicalization=canonicalization,
         coverage_contract=coverage_contract,
         cross_phase_bindings=cross_phase_bindings,
     )
@@ -219,7 +219,7 @@ def store_phase_command_plan(project_root: Path, plan: Mapping[str, Any]) -> tup
     validate_phase_command_plan(plan)
     reference = ContractStore(project_root).put_json(
         dict(plan),
-        schema_file="phase_command_plan_v3.schema.json",
+        schema_file="phase_command_plan_v4.schema.json",
     )
     return reference, str(reference["digest"])
 
@@ -233,7 +233,7 @@ def validate_phase_command_plan(
 
     from .contract_store import validate_schema
 
-    validate_schema(plan, "phase_command_plan_v3.schema.json")
+    validate_schema(plan, "phase_command_plan_v4.schema.json")
     validate_evidence_derivation_plan(plan["derivation_plan"])
     if plan["derivation_plan_ref"]["digest"] != plan["derivation_plan_hash"]:
         raise ValueError("PhaseCommandPlan derivation plan reference mismatch")
@@ -400,6 +400,7 @@ def _derivation_source_bindings(
     *,
     phase: str,
     coverage_contract: Mapping[str, Any],
+    readiness_checks: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
     physical = [item for item in commands if item["authority_role"] == "physical"]
     raw_outputs = [
@@ -432,6 +433,24 @@ def _derivation_source_bindings(
         output["normalized_kinds"] = normalized_kinds
         if not normalized_kinds:
             continue
+        authority_roles = _source_authority_roles(
+            output_kind=str(output["kind"]),
+            role=output.get("role"),
+            normalized_kinds=normalized_kinds,
+        )
+        matched_readiness_checks = [
+            check
+            for check in readiness_checks
+            if _source_matches_readiness_check(
+                check,
+                role=output.get("role"),
+                normalized_kinds=normalized_kinds,
+                authority_roles=authority_roles,
+            )
+        ]
+        readiness_check_ids = [str(check["check_id"]) for check in matched_readiness_checks]
+        if any(str(check.get("check_kind") or "raw_measurement") == "raw_measurement" for check in matched_readiness_checks):
+            authority_roles.append("readiness")
         bindings.append({
             "source_ordinal": len(bindings),
             "source_phase": phase,
@@ -440,6 +459,8 @@ def _derivation_source_bindings(
             "output_kind": output["kind"],
             "output_schema_version": output["schema_version"],
             "normalized_kinds": normalized_kinds,
+            "authority_roles": authority_roles,
+            "readiness_check_ids": readiness_check_ids,
             "role": output.get("role"),
             "dataset_id": output.get("dataset_id"),
             "seeds": list(coverage_contract["seeds"]),
@@ -504,10 +525,10 @@ def _freeze_readiness_checks(
     for ordinal, value in enumerate(checks):
         check = deepcopy(dict(value))
         check_kind = str(check.get("check_kind") or "raw_measurement")
-        normalized_kind = "activation_evidence" if check_kind == "activation_delta" else "full_s3_readiness"
-        matching = [item for item in source_bindings if normalized_kind in item["normalized_kinds"]]
+        check_id = str(check.get("check_id") or "")
+        matching = [item for item in source_bindings if check_id in item["readiness_check_ids"]]
         if not matching:
-            raise ValueError(f"readiness check lacks a physical source for {normalized_kind}")
+            raise ValueError(f"readiness check lacks a frozen authority source: {check_id}")
         check["ordinal"] = ordinal
         check["check_kind"] = check_kind
         check["source_bindings"] = [
@@ -518,6 +539,16 @@ def _freeze_readiness_checks(
                 "output_id": item["output_id"],
                 "output_kind": item["output_kind"],
                 "output_schema_version": item["output_schema_version"],
+                "required_authority_roles": (
+                    ["readiness"]
+                    if check_kind == "raw_measurement"
+                    else [
+                        role
+                        for role in ("activation_enabled", "activation_disabled", "activation_surface")
+                        if role in item["authority_roles"]
+                    ]
+                ),
+                "check_id": check_id,
             }
             for index, item in enumerate(matching)
         ]
@@ -526,6 +557,78 @@ def _freeze_readiness_checks(
         check["blocked_route"] = "REPAIR_IMPLEMENTATION"
         result.append(check)
     return result
+
+
+def _source_authority_roles(
+    *,
+    output_kind: str,
+    role: Any,
+    normalized_kinds: Sequence[str],
+) -> list[str]:
+    result = ["normalized_evidence_source"]
+    if set(normalized_kinds) & {
+        "main_results",
+        "proxy_results",
+        "ablation_results",
+        "coverage_results",
+        "matched_control_results",
+    }:
+        result.append("scientific_metric")
+    canonical_activation = "activation_evidence" in normalized_kinds and role is None
+    if (role == "candidate" and "activation_evidence" in normalized_kinds) or canonical_activation:
+        result.append("activation_enabled")
+    if role == "activation_disabled" or canonical_activation:
+        result.append("activation_disabled")
+    if output_kind == "c2c_activation_measurement" or canonical_activation:
+        result.append("activation_surface")
+    return result
+
+
+def _source_matches_readiness_check(
+    check: Mapping[str, Any],
+    *,
+    role: Any,
+    normalized_kinds: Sequence[str],
+    authority_roles: Sequence[str],
+) -> bool:
+    check_kind = str(check.get("check_kind") or "raw_measurement")
+    if check_kind == "activation_delta":
+        return (
+            "activation_evidence" in normalized_kinds
+            or role in {"candidate", "activation_disabled"}
+            or "activation_surface" in authority_roles
+        )
+    return "full_s3_readiness" in normalized_kinds
+
+
+def _decoder_authority_role_contract(source_bindings: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "source_bindings": [
+            {
+                "source_ordinal": item["source_ordinal"],
+                "source_phase": item["source_phase"],
+                "command_spec_id": item["command_spec_id"],
+                "output_id": item["output_id"],
+                "authority_roles": list(item["authority_roles"]),
+                "readiness_check_ids": list(item["readiness_check_ids"]),
+            }
+            for item in source_bindings
+        ],
+    }
+
+
+def _decoder_output_contract(outputs: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    return {
+        "expected_normalized_outputs": [
+            {
+                "ordinal": index,
+                "output_id": item["output_id"],
+                "kind": item["kind"],
+                "schema_version": item["schema_version"],
+            }
+            for index, item in enumerate(outputs)
+        ],
+    }
 
 
 def _validate_cwd(value: str) -> None:

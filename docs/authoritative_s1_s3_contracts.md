@@ -6,17 +6,17 @@
 |---|---|---|---|
 | Direction | `DirectionSpec v3` | `literature/direction.json` | Complete research direction with separate semantic and full-spec identities |
 | Variant | `VariantSpec v4` | `plan/variant.json` | One scientific intervention bound to the current DirectionSpec |
-| Trial | `TrialSpec v8` | frozen in `AttemptReserved`; projected under `plan/attempts/<attempt_id>/trial_spec/<trial_spec_hash>.json` | Preregistered protocol, phase contracts, proxy/readiness policy, derivation plans, acceptance, and immutable contract references |
-| Event | `Event v9` | `meta/research_events.sqlite3` | Sole S1-S3 authority: SQLite WAL, continuous sequence, and hash chain |
-| State | `ResearchState v9` | rebuilt from `meta/research_events.sqlite3` | Deterministic state, budget, active-attempt, command, route, and aggregate reduction |
-| Attempt | `AttemptRecord v9` | `meta/attempts/<attempt_id>.json` | Rebuildable lifecycle, reservation, phase, implementation-revision, command, receipt, and frozen derivation projection |
+| Trial | `TrialSpec v9` | frozen in `AttemptReserved`; projected under `plan/attempts/<attempt_id>/trial_spec/<trial_spec_hash>.json` | Preregistered protocol, phase contracts, proxy/readiness policy, derivation plans, acceptance, and immutable contract references |
+| Event | `Event v10` | `meta/research_events.sqlite3` | Sole S1-S3 authority: SQLite WAL, continuous sequence, and hash chain |
+| State | `ResearchState v10` | rebuilt from `meta/research_events.sqlite3` | Deterministic state, budget, active-attempt, command, route, and aggregate reduction |
+| Attempt | `AttemptRecord v10` | `meta/attempts/<attempt_id>.json` | Rebuildable lifecycle, reservation, phase, implementation-revision, command, receipt, and frozen derivation projection |
 | Result | `TrialResult v6` | diagnostic projection under `experiment/results/` | Reducer-generated result decoded from one immutable receipt-derived evidence chain |
 | Observation | `ExecutionObservation v4` | embedded in TrialResult | Deterministically decoded row-level measurement with evidence and phase identity |
-| Derivation plan | `EvidenceDerivationPlan v1` | frozen in each TrialSpec phase contract and content-addressed | Ordered physical source bindings, immutable decoder identity, canonicalization/coverage, cross-phase bindings, and exact normalized output set |
-| Decoder | `DecoderDescriptor v1` | frozen in the derivation/readiness plan and content-addressed | Decoder ID/version plus semantic hash, implementation hash, and immutable implementation bytes |
-| Evidence derivation | `EvidenceDerivationManifest v2` | immutable `ContractStore` object referenced by the derive receipt | The sole deterministic physical-receipt/raw-output to normalized-evidence lineage for one phase |
+| Derivation plan | `EvidenceDerivationPlan v2` | frozen in each TrialSpec phase contract and content-addressed | Ordered physical source bindings and roles, immutable decoder identity, canonicalization/coverage, cross-phase bindings, and exact normalized output set |
+| Decoder | `DecoderDescriptor v2` + `DecoderImplementationBundle v1` + `DecoderProgram v1` | frozen in the derivation/readiness plan and content-addressed | Decoder identity plus the actual declarative executable semantics, runtime ABI, entrypoint, dependencies, and implementation hash |
+| Evidence derivation | `EvidenceDerivationManifest v3` | immutable `ContractStore` object referenced by the derive receipt | The sole deterministic physical-receipt/raw-output to normalized-evidence lineage for one phase |
 | Evidence manifest | `EvidenceManifest v6` | event-bound/projected | Exact normalized evidence set; every entry points to the same derive-receipt derivation reference/hash |
-| Readiness plan | `ReadinessCheckPlan v1` | frozen in the proxy phase contract and content-addressed | Receipt source bindings, predicates, thresholds, coverage, decoder identity, and BLOCKED route semantics |
+| Readiness plan | `ReadinessCheckPlan v2` | frozen in the proxy phase contract and content-addressed | Ordered authority-role/check bindings, predicates, thresholds, coverage, decoder identity, and BLOCKED route semantics |
 | Route | `RouteOutcome v4` | `meta/route_outcome.json` | Reducer-derived control projection bound to a source event and sequence |
 | Proxy outcome | `ProxyOutcome v4` | event-bound/projected | Reducer-derived scientific, activation, readiness, and authorization decision |
 | Aggregate | `DirectionOutcomeAggregate v1` | `meta/direction_outcome_aggregate.json` | Exactly five verified standard outcomes |
@@ -30,22 +30,23 @@
 - `variant_semantic_hash` is derived from intervention operations/configuration, controls, ablation, implementation surfaces, metric expectations, hypotheses, and falsification. ID/lineage/nonce-only changes do not create a new method.
 - `variant_spec_hash` locks the complete VariantSpec and its DirectionSpec lineage.
 - `implementation_hash` binds the frozen patch, resulting files, and implementation manifest.
-- `trial_spec_hash` locks TrialSpec v8, including phase contracts, acceptance constraints, immutable ContractRefs, ProxyDecisionPolicy, ReadinessCheckPlan, EvidenceDerivationPlan, and PhaseCommandPlan references.
+- `trial_spec_hash` locks TrialSpec v9, including phase contracts, acceptance constraints, immutable ContractRefs, ProxyDecisionPolicy, ReadinessCheckPlan, EvidenceDerivationPlan, and PhaseCommandPlan references.
 - `attempt_input_hash` binds implementation, frozen TrialSpec, runtime configuration, evaluator identity, seeds, and sample provenance.
 
 Canonical JSON sorts object keys and rejects non-finite numbers. Attempt and TrialResult bind complete spec hashes, not only semantic hashes.
 
 ## Frozen Trial and ContractStore
 
-TrialSpec v8 freezes before reservation:
+TrialSpec v9 freezes before reservation:
 
 - protocol, datasets, metrics, primary metric, objective, aggregation, statistical testing, and seeds;
 - required roles, acceptance constraints, required artifacts, and exact evidence requirements;
 - per-phase datasets, seeds, roles, metrics, evidence kinds, terminal semantics, and budget semantics;
-- `ProxyDecisionPolicy v2` and `ReadinessCheckPlan v1` when a proxy phase is required;
-- one `EvidenceDerivationPlan v1` per executable phase, including its immutable `DecoderDescriptor v1`, ordered physical source bindings, canonicalization and coverage rules, cross-phase bindings, and ordered normalized evidence exact-set;
+- `ProxyDecisionPolicy v2` and `ReadinessCheckPlan v2` when a proxy phase is required;
+- one `EvidenceDerivationPlan v2` per executable phase, including its immutable `DecoderDescriptor v2`, ordered physical source bindings and authority roles, canonicalization and coverage rules, cross-phase bindings, and ordered normalized evidence exact-set;
+- the descriptor's immutable `DecoderImplementationBundle v1` and `DecoderProgram v1`, which freeze the actual declarative transformation algorithm, runtime ABI, entrypoint, dependencies, canonical JSON semantics, measurement mapping, finite-number rules, pairing, activation/readiness derivation, and output identity;
 - a `ContractRef v1` to immutable `SampleManifest v4` bytes;
-- content-addressed `PhaseCommandPlan v3` references for applicable phases;
+- content-addressed `PhaseCommandPlan v4` references for applicable phases;
 - evaluator provenance resolved from immutable evaluator source/config/dependency bytes.
 
 `ContractStore` uses content-addressed files and safe path resolution. Reservation rereads the referenced bytes inside the authoritative transaction and verifies path, hash, schema, kind, source revision, ordered sample identities, evaluator file hashes, configuration, dependencies, and provenance. In real mode, `SampleManifest v4` references the actual selected record/shard bytes; Core recomputes record boundaries, ordering, sample IDs, counts, shard digests, and aggregate digests from those bytes. Missing raw refs, metadata-derived IDs, changed ordering, or changed sample bytes fail before reservation. Ancestor/leaf symlinks, path escape, hard-link substitution, and hash drift also fail closed. Mutable sample/evaluator projections are not authority.
@@ -54,12 +55,12 @@ Synthetic sample/evaluator provenance is explicit. Local non-simulated subproces
 
 ## Frozen Proxy Policy and Runtime Binding
 
-`ProxyDecisionPolicy v2` is scientific policy frozen in TrialSpec v8. It contains:
+`ProxyDecisionPolicy v2` is scientific policy frozen in TrialSpec v9. It contains:
 
 - primary metric, objective, paired aggregation;
 - exact datasets, seeds, metrics, and roles;
 - aggregate improvement and per-dataset maximum-regression thresholds;
-- required activation surfaces, activation-delta threshold, readiness check IDs, and the immutable `ReadinessCheckPlan v1` reference/hash;
+- required activation surfaces, activation-delta threshold, readiness check IDs, and the immutable `ReadinessCheckPlan v2` reference/hash;
 - the exact authoritative evidence-kind set;
 - `gate_to_full` or `terminal_bootstrap` mode;
 - deterministic science-reject, integrity-failure, and resource-failure semantics;
@@ -71,7 +72,7 @@ It deliberately excludes Attempt, generation, implementation, producer, and phas
 
 The single pure proxy classifier is shared by proxy precommit, `ProxyEvidenceCommitted`, reducer/rebuild, and Gate audit. It reads only the frozen policy, Ledger binding, exact EvidenceManifest, immutable receipt-bound evidence bytes, and frozen ReadinessCheckPlan. It rejects missing, duplicate, extra, or aggregate-expanded rows; validates exact dataset × seed × metric × role coverage; computes paired deltas and per-dataset regression; recomputes activation from enabled/disabled measurements plus observed surfaces; and evaluates readiness predicates over independently bound raw receipt outputs. Producer-authored effective policy, calibration, threshold, PASS list, decision, constraints, summary, or route has no authority and cannot enter the authoritative evidence set.
 
-Command completion, activation, readiness, and scientific proxy acceptance are separate facts. Exit code zero proves only that a command completed. `ActivationEvidence v4` requires real observed surfaces and a frozen delta threshold; expected surfaces cannot be copied into observed coverage. `FullS3Readiness v4` records the deterministic results of `ReadinessCheckPlan v1`; each check has its own receipt source binding, predicate, comparator, threshold, and coverage rule.
+Command completion, activation, readiness, and scientific proxy acceptance are separate facts. Exit code zero proves only that a command completed. `ActivationEvidence v4` requires explicit enabled/disabled and observed-surface measurements; expected surfaces cannot be copied into observed coverage. `FullS3Readiness v4` records the deterministic results of `ReadinessCheckPlan v2`; each check has an ordered exact set of receipt authority roles/check IDs, predicate, comparator, threshold, and coverage rule. Missing, extra, duplicate, reordered, or cross-authority inputs are integrity failures.
 
 The reducer applies this priority: malformed or incomplete receipt/derivation/coverage → `BLOCK_INTEGRITY`; authoritative resource insufficiency → `PAUSE_RESOURCE`; valid activation or readiness `BLOCKED` → `REPAIR_IMPLEMENTATION`; readiness PASS plus a scientific proxy miss → `PROPOSE_NEXT_VARIANT`; readiness PASS plus scientific proxy acceptance → `RUN_FULL`; verified bootstrap proxy completion → `FINISH_RUN`. A `REPAIR_IMPLEMENTATION` proxy outcome preserves the reservation, creates no TrialResult or method-history entry, consumes no direction outcome, and never authorizes `FullPhaseStarted`.
 
@@ -102,9 +103,9 @@ The executors are phase-specific: `C2CProxyPhaseExecutor`, `C2CFullPhaseExecutor
 
 ## Ledger Command Lifecycle
 
-Command execution is part of Event v9 authority:
+Command execution is part of Event v10 authority:
 
-- `PhaseCommandStarted` validates `PhaseCommand v4` against the current `PhaseCommandPlan v3`: command-spec ID, typed `argv[]`, `cwd`, environment overrides, inherited-environment allowlist, source snapshot, phase, ordinal/dependencies, authority role, physical/derivation output contracts, policies, condition, authorization, and idempotency identity are frozen before a side effect.
+- `PhaseCommandStarted` validates `PhaseCommand v5` against the current `PhaseCommandPlan v4`: command-spec ID, typed `argv[]`, `cwd`, environment overrides, inherited-environment allowlist, source snapshot, phase, ordinal/dependencies, authority role, readiness check binding, physical/derivation output contracts, policies, condition, authorization, and idempotency identity are frozen before a side effect.
 - `ExperimentRunner` executes the exact frozen invocation with `subprocess.Popen(argv, shell=False, env=...)`; shell strings and display rendering are never execution inputs.
 - A physical `PhaseRunReceipt v5` is content-addressed and binds the Started event ID/hash, Attempt/generation/phase identity, command and command-plan identity, timestamps, exit status, durable stdout/stderr ContractRefs, external job identity, and the exact immutable physical raw-output ContractRefs.
 - The derive `PhaseRunReceipt v5` additionally commits one structured `derivation_ref/hash` and the exact normalized output ContractRefs. The reference is transaction data, not a value parsed from stdout.
@@ -126,19 +127,21 @@ A normal process crash preserves generation, phase execution ID, and producer ru
 Adapters return an explicit `PhaseArtifactInventory`; they do not scan fixed result directories. The only authoritative derivation is:
 
 ```text
-frozen EvidenceDerivationPlan v1
+frozen EvidenceDerivationPlan v2
 → completed physical PhaseCommand receipts and immutable raw outputs
-→ constrained Core decoder over those exact bytes
-→ one EvidenceDerivationManifest v2
+→ journal-owned execution of DecoderProgram v1 over those exact bytes
+→ one EvidenceDerivationManifest v3
 → derive PhaseRunReceipt v5.derivation_ref/hash
 → EvidenceManifest v6 entries using that identical ref/hash
 → ProxyOutcome v4 or TrialResult v6
 → RouteOutcome
 ```
 
-The derivation plan and manifest bind the ordered/exact physical command and raw-output set, completed-event and receipt identities, decoder descriptor and immutable implementation bytes, frozen evaluator/sample/protocol identities, coverage/canonicalization, cross-phase bindings, and ordered normalized outputs. A derive command cannot list itself as a physical source. Missing, extra, duplicate, reordered, cross-Attempt, cross-generation, cross-phase, or cross-producer sources fail closed. The former direct/self derivation builder, which created a second manifest from already normalized derive outputs, is deleted.
+The derivation plan and manifest bind the ordered/exact physical command and raw-output set, explicit authority roles, completed-event and receipt identities, decoder descriptor and actual immutable implementation bundle/program, frozen evaluator/sample/protocol identities, coverage/canonicalization, cross-phase bindings, and ordered normalized outputs. A derive command cannot list itself as a physical source. Missing, extra, duplicate, reordered, cross-Attempt, cross-generation, cross-phase, cross-producer, wrong-command/output, wrong-decoder, or wrong-authority sources fail closed. The former direct/self derivation builder, which created a second manifest from already normalized derive outputs, is deleted.
 
-`validate_immutable_derivation()` is the shared read-only authority used by public precommit, Ledger transaction, reducer/rebuild, state/query, restart replay, and S3 Gate. It obtains the derivation reference only from the completed derive receipt, rereads the frozen decoder and physical raw bytes, reruns the constrained pure decoder in memory, and byte-compares the recomputed normalized outputs with the derivation manifest, derive receipt outputs, EvidenceManifest entries, and content-addressed evidence blobs. It does not call `put_json`, `put_bytes`, write SQLite/projections, read `Path(__file__)` as decoder authority, reconstruct missing blobs, or rerun physical/derive commands. Deleting or corrupting raw bytes, decoder bytes, derivation manifest, receipt, or normalized output therefore produces an integrity error without changing CAS, events, receipt locators, evidence files, or projections.
+`validate_immutable_derivation()` is the shared read-only authority used by derive-receipt precommit, `PhaseCommandCompleted`, EvidenceManifest binding, Ledger transaction, reducer/rebuild, state/query, restart replay, and S3 Gate. It obtains the derivation reference only from the durable/completed derive receipt, loads DecoderProgram v1 from the immutable implementation bundle, rereads the exact physical raw bytes, runs the constrained declarative VM in memory, and byte-compares recomputed normalized outputs with the derivation manifest, derive receipt outputs, EvidenceManifest entries, and content-addressed evidence blobs. It does not call `put_json`, `put_bytes`, write SQLite/projections, consult the current decoder registry/source file for historical semantics, reconstruct missing blobs, or rerun physical/producing derive commands.
+
+The producing decoder executes only inside `journal.run_once()` after a successful `PhaseCommandStarted`. Completed replay returns the historical receipt. Durable receipt without Completed performs the same semantic validation and commits only the missing Completed event. Started without a trustworthy receipt does not rederive; it commits one typed, queryable, replayable `BLOCK_INTEGRITY` control route. Orphan normalized or manifest blobs never become recovery authority.
 
 Every authoritative normalized item has one precise path/hash/kind and the same phase-level derivation reference. Decoders read only immutable receipt outputs; staging, mutable comparison state, result directories, producer summaries, caller dictionaries, and semantically similar manifests cannot supply scientific values. The inventory kind set and order must exactly equal the frozen derivation/phase contract: required kinds cannot be missing, optional-but-unregistered kinds cannot be added, and each kind appears at most once.
 
@@ -195,12 +198,14 @@ Read-only state, rebuild, query, and Gate operations do not perform recovery wri
 
 ## Deleted Runtime Contracts
 
-The current runtime authority is Event/AttemptRecord/ResearchState v9, TrialSpec v8, TrialResult v6, PhaseExecutionManifest v3, PhaseCommandPlan v3, PhaseCommand v4, PhaseRunReceipt v5, EvidenceManifest v6, EvidenceDerivationManifest v2, EvidenceDerivationPlan v1, DecoderDescriptor v1, ReadinessCheckPlan v1, ActivationEvidence v4, FullS3Readiness v4, ProxyDecisionPolicy v2, ProxyOutcome v4, SampleManifest v4, CompletionEvidence v3, FailureEvidence v6, ResumeEvidence v5, and ResourceProbe v4. Replaced readers must not be restored as dual-read or migration paths.
+The current runtime authority is Event/AttemptRecord/ResearchState v10, TrialSpec v9, TrialResult v6, PhaseExecutionManifest v3, PhaseCommandPlan v4, PhaseCommand v5, PhaseRunReceipt v5, EvidenceManifest v6, EvidenceDerivationManifest v3, EvidenceDerivationPlan v2, DecoderDescriptor v2, DecoderImplementationBundle v1, DecoderProgram v1, ReadinessCheckPlan v2, ActivationEvidence v4, FullS3Readiness v4, ProxyDecisionPolicy v2, ProxyOutcome v4, SampleManifest v4, CompletionEvidence v3, FailureEvidence v6, ResumeEvidence v5, and ResourceProbe v4. Replaced readers must not be restored as dual-read or migration paths.
 
 It also does not use direct/self derivation, a second derivation manifest synthesized from normalized outputs, stdout-only derivation authority, `Path(__file__)` decoder authority, validator-time CAS repair, mutable sample/evaluator canonical paths, fixed result/evidence discovery, arbitrary hash glob lookup, producer-authored activation/readiness/proxy decisions, caller-authored TrialResult/failure/resume outcomes, a phase-agnostic production C2C runner, validation-only phase spoofing, legacy direction/variant/route readers, or compatibility fallback. Historical documentation may mention these names only as removed designs.
 
 ## Scope Boundary
 
-M1.1.5.3 closes the immutable derivation and readiness authority gap without starting a new S1 milestone. It applies to the four PhaseExecutor production-component entries, typed command DAGs, physical raw-output receipts, the single receipt-committed Core derivation, SQLite replay/rebuild, receipt-derived activation/readiness, bootstrap/standard isolation, failure/resource authority, and S3 Gate. M1.1.5.2's `705 passed, 2 skipped` result is retained only as a historical pre-v9 checkpoint. M1.1.5.3's normal (`44:35`), proxy-cleared (`43:32`), empty-HOME/no-Codex (`44:23`), and CPU-only/no-`nvidia-smi` (`43:49`) runs each report `747 passed, 2 skipped, 0 failed`; the skips remain the pre-existing optional torch/transformers checks.
+Commit `1fd4e84` established the M1.1.5.3 physical derivation/readiness chain but is a migration checkpoint, not final acceptance. M1.1.5.3.1 freezes the executable decoder semantics, moves producing derivation behind journal idempotency, validates raw-to-normalized semantics at Completed, enforces ordered exact activation/readiness authority sets, and verifies seven derivation/readiness cold-restart boundaries. Earlier `747 passed, 2 skipped` results certify only the replaced v9/v8 contracts and are not reused as current evidence.
 
-Production-component validation runs real local subprocess fixtures through frozen typed `argv/env/cwd`, `shell=False`, immutable physical raw outputs, `PhaseRunReceipt v5`, `EvidenceDerivationManifest v2`, normalized evidence, Ledger, rebuild, and Gate. Synthetic tests separately validate deterministic state, budget, and evidence semantics. These are engineering acceptance paths, not claims of scientific success: Native Unified S1 Producer/Core, real external Codex S1, and real GPU scientific training have not started.
+The current v10/v9 acceptance collects 781 tests and reports `779 passed, 2 skipped, 0 failed` in normal, proxy-cleared, empty-HOME/no-Codex, and CPU-only/no-`nvidia-smi` local environments. The two skips are unchanged optional torch/transformers probes; no skip or xfail was added.
+
+Production-component validation runs real local subprocess fixtures through frozen typed `argv/env/cwd`, `shell=False`, immutable physical raw outputs, `PhaseRunReceipt v5`, `EvidenceDerivationManifest v3`, normalized evidence, Ledger, rebuild, and Gate. Synthetic tests separately validate deterministic state, budget, and evidence semantics. These are local engineering attestations, not claims of scientific success: Native Unified S1 Producer/Core, real external Codex S1, M2, and real GPU scientific training have not started.

@@ -12,7 +12,6 @@ from auto_research.agents.experiment import (
     _c2c_strict_evidence_inventory,
 )
 from auto_research.contract_store import ContractStore
-from auto_research.derivation_contracts import build_readiness_check_plan
 from auto_research.derivation_validation import ReceiptBoundSources
 from auto_research.domain_contracts import canonical_hash
 from auto_research.evidence import encode_canonical_evidence
@@ -21,6 +20,7 @@ from auto_research.proxy_classifier import (
     classify_proxy_outcome,
     derive_readiness_from_receipts,
 )
+from auto_research.phase_command_plan import build_phase_command_plan
 from auto_research.research_state import IntegrityError, ResearchEventLedger
 from auto_research.validators import run_stage_gate
 from support.authoritative_evidence import (
@@ -398,72 +398,105 @@ def test_real_receipt_semantic_block_repairs_without_full_and_replays(
         monkeypatch.undo()
 
 
-def _readiness_sources(*, include_measurements: bool) -> tuple[dict[str, Any], ReceiptBoundSources]:
-    decoder_ref = {
-        "schema_version": "auto_research_contract_blob_v1",
-        "algorithm": "sha256",
-        "digest": "e" * 64,
-        "size_bytes": 1,
-        "relative_path": f"meta/contracts/sha256/ee/{'e' * 64}.json",
-    }
-    decoder = {
-        "schema_version": "auto_research_decoder_descriptor_v1",
-        "decoder_id": "canonical-identity",
-        "decoder_version": "1",
-        "semantic_hash": "f" * 64,
-        "implementation_hash": "e" * 64,
-        "immutable_ref": decoder_ref,
-    }
-    checks: list[dict[str, Any]] = []
-    raw_facts: dict[tuple[str, str, str], dict[str, Any]] = {}
-    raw_lineage: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for ordinal, check_id in enumerate(("runtime-ready", "storage-ready")):
-        command_spec_id = f"proxy-check-{ordinal:02d}"
-        output_id = f"proxy-check-output-{ordinal:02d}"
-        binding = {
-            "source_ordinal": 0,
-            "source_phase": "proxy",
-            "command_spec_id": command_spec_id,
-            "output_id": output_id,
-            "output_kind": "raw_readiness_check",
-            "output_schema_version": "auto_research_raw_readiness_check_v1",
-        }
-        checks.append(
+def _readiness_sources(
+    tmp_path: Path,
+    *,
+    include_measurements: bool,
+) -> tuple[dict[str, Any], ReceiptBoundSources]:
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    command_spec_id = "proxy-readiness-checks"
+    output_id = "proxy-readiness-output"
+    check_ids = ("runtime-ready", "storage-ready")
+    command_plan = build_phase_command_plan(
+        phase="proxy",
+        adapter_id="readiness-authority-fixture",
+        adapter_version="1",
+        provenance_mode="synthetic",
+        variant_spec_hash=canonical_hash({"variant": "readiness-authority"}),
+        source_snapshot_hash=canonical_hash({"source": "readiness-authority"}),
+        command_values=[
             {
-                "ordinal": ordinal,
+                "command_spec_id": command_spec_id,
+                "authority_role": "physical",
+                "argv": ["auto-research-adapter", "readiness-authority", "proxy"],
+                "cwd": str(tmp_path),
+                "physical_raw_outputs": [
+                    {
+                        "output_id": output_id,
+                        "kind": "raw_readiness_check",
+                        "schema_version": "auto_research_raw_readiness_check_v1",
+                        "locator": "fixture/proxy/readiness-checks.json",
+                        "locator_type": "file",
+                        "dataset_id": None,
+                        "role": None,
+                        "required": True,
+                        "normalized_kinds": ["full_s3_readiness"],
+                    }
+                ],
+            }
+        ],
+        expected_evidence=[
+            {
+                "kind": "full_s3_readiness",
+                "schema_version": "auto_research_full_s3_readiness_v4",
+                "required": True,
+            }
+        ],
+        default_cwd=str(tmp_path),
+        project_root=tmp_path,
+        coverage_contract={
+            "mode": "exact_cartesian",
+            "datasets": ["dataset-a"],
+            "seeds": [7],
+            "metrics": ["accuracy"],
+            "roles": ["baseline", "candidate"],
+        },
+        readiness_checks=[
+            {
                 "check_id": check_id,
                 "check_kind": "raw_measurement",
-                "source_bindings": [binding],
                 "predicate": {
-                    "field_path": f"{output_id}.ready",
+                    "field_path": f"{output_id}.readiness_checks.{check_id}.ready",
                     "comparator": "eq",
                     "threshold": True,
                 },
                 "required_coverage": {"mode": "exact", "expected_surface_ids": []},
-                "decoder_descriptor": decoder,
-                "blocked_classification": "IMPLEMENTATION_BLOCKED",
-                "blocked_route": "REPAIR_IMPLEMENTATION",
             }
+            for check_id in check_ids
+        ],
+    )
+    plan = command_plan["readiness_check_plan"]
+    assert isinstance(plan, dict)
+    source_binding = command_plan["derivation_plan"]["source_bindings"][0]
+    key = ("proxy", command_spec_id, output_id)
+    raw_facts = {
+        key: (
+            {
+                "readiness_checks": {
+                    check_id: {"ready": True}
+                    for check_id in check_ids
+                }
+            }
+            if include_measurements
+            else {"exit_code": 0}
         )
-        key = ("proxy", command_spec_id, output_id)
-        raw_facts[key] = {"ready": True} if include_measurements else {"exit_code": 0}
-        raw_lineage[key] = {
+    }
+    raw_lineage = {
+        key: {
             "source_phase": "proxy",
             "command_spec_id": command_spec_id,
             "output_id": output_id,
             "output_kind": "raw_readiness_check",
+            "authority_roles": list(source_binding["authority_roles"]),
+            "readiness_check_ids": list(source_binding["readiness_check_ids"]),
             "command_status": "completed",
             "exit_code": 0,
             "receipt_hash": "1" * 64,
             "receipt_ref": {"digest": "1" * 64},
             "output_ref": {"digest": "2" * 64},
-            "completed_event_id": f"event:completed:{ordinal}",
+            "completed_event_id": "event:completed:readiness",
         }
-    plan = build_readiness_check_plan(
-        plan_id="readiness-plan-m1153",
-        phase="proxy",
-        checks=checks,
-    )
+    }
     sources = ReceiptBoundSources(
         raw_facts=raw_facts,
         raw_fact_lineage=raw_lineage,
@@ -473,8 +506,10 @@ def _readiness_sources(*, include_measurements: bool) -> tuple[dict[str, Any], R
     return plan, sources
 
 
-def test_activation_command_exit_zero_without_check_measurements_is_not_readiness_pass() -> None:
-    plan, sources = _readiness_sources(include_measurements=True)
+def test_activation_command_exit_zero_without_check_measurements_is_not_readiness_pass(
+    tmp_path: Path,
+) -> None:
+    plan, sources = _readiness_sources(tmp_path, include_measurements=True)
     valid = derive_readiness_from_receipts(
         readiness_check_plan=plan,
         receipt_bound_sources=sources,
@@ -501,7 +536,10 @@ def test_activation_command_exit_zero_without_check_measurements_is_not_readines
         ],
     }
 
-    exit_only_plan, exit_only_sources = _readiness_sources(include_measurements=False)
+    exit_only_plan, exit_only_sources = _readiness_sources(
+        tmp_path / "exit-only",
+        include_measurements=False,
+    )
     with pytest.raises(ValueError, match="receipt|predicate|measurement|readiness"):
         derive_readiness_from_receipts(
             readiness_check_plan=exit_only_plan,

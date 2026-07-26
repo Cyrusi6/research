@@ -145,7 +145,7 @@ def test_full_callbacks_observe_committed_proxy_and_full_phase_started(tmp_path:
     def execute_full(context):
         frozen_plan = ContractStore(tmp_path).read_json(
             context.command_plan_hash,
-            schema_file="phase_command_plan_v3.schema.json",
+            schema_file="phase_command_plan_v4.schema.json",
         )
         command_spec = next(
             item for item in frozen_plan["commands"] if item["authority_role"] == "physical"

@@ -1,4 +1,4 @@
-# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.5.3
+# Regression Test Migration: 71d3875 → 80d6b7e → M1.1.5.3.1
 
 The `71d38750..80d6b7e` range removed or substantially reduced 98 named tests. M1.1.5.1 does not restore their legacy readers, route policy, schemas, or artifact mirrors. Valid behavior is migrated to the current canonical contracts and SQLite Event v7 state/command layer.
 
@@ -306,3 +306,40 @@ M1.1.5.3 removes the remaining direct/self derivation and synthetic readiness au
 - Frozen replacement chain: `EvidenceDerivationPlan v1` → physical `PhaseCommandCompleted` receipts/raw outputs → constrained Core decoder → `EvidenceDerivationManifest v2` → `PhaseRunReceipt v5.derivation_ref/hash` → identical `EvidenceManifest v6` references → ProxyOutcome v4/TrialResult v6 → RouteOutcome.
 - The M1.1.5.2 `705 passed, 2 skipped` result remains a historical pre-v9 checkpoint. M1.1.5.3's final immutable-derivation/readiness attack group reports `42 passed`, the state/S3 migration group reports `367 passed`, and `tests/test_c2c.py` reports `182 passed, 2 skipped`. The normal, proxy-cleared, empty-HOME/no-Codex, and CPU-only/no-`nvidia-smi` complete suites each report `747 passed, 2 skipped, 0 failed`; the skips remain the existing optional torch/transformers checks.
 - Production-component local subprocess tests prove production wiring through frozen commands, receipts, CAS, Core derivation, Ledger/rebuild, and Gate. Synthetic tests prove deterministic contract/state behavior separately. Native Unified S1 Producer/Core, real external Codex S1 smoke, and real GPU scientific training remain outside scope and unstarted.
+
+## M1.1.5.3.1 Frozen Decoder, Exact-Set and Recovery Acceptance Migration
+
+Commit `1fd4e84` is retained as the M1.1.5.3 migration checkpoint, not as final acceptance. M1.1.5.3.1 raises Event/AttemptRecord/ResearchState to v10, TrialSpec to v9, PhaseCommandPlan to v4, PhaseCommand to v5, EvidenceDerivationPlan to v2, EvidenceDerivationManifest to v3, DecoderDescriptor to v2, and ReadinessCheckPlan to v2. `DecoderProgram v1` and `DecoderImplementationBundle v1` are new. TrialResult v6, PhaseRunReceipt v5, EvidenceManifest v6, ActivationEvidence v4, FullS3Readiness v4, ProxyDecisionPolicy v2, and ProxyOutcome v4 retain their shapes. Replaced schemas/readers are deleted without dual read, fallback, or automatic migration.
+
+### P0 and exact-set replacement map
+
+| Removed or attacked behavior | Canonical replacement test | Preserved authority |
+|---|---|---|
+| Same decoder ID/version is reinterpreted by a changed runtime registry implementation | `tests/test_m11531_decoder_authority.py::test_same_id_version_runtime_decoder_drift_cannot_reinterpret_frozen_plan` | Replay executes the immutable DecoderProgram v1 bundle; registry drift cannot change historical normalized bytes |
+| Producing decoder executes before command-history lookup | `tests/test_m11531_decoder_authority.py::test_derive_execution_occurs_only_inside_journal_runner` | Producing decoder runs only after a new `PhaseCommandStarted` inside `journal.run_once()` |
+| Durable derive receipt recovery invokes the producing decoder again | `tests/test_m11531_decoder_authority.py::test_durable_derive_receipt_recovery_does_not_reinvoke_producing_decoder` | Recovery semantically validates the receipt and adds only the missing Completed event |
+| Hash-consistent but semantically wrong normalized output reaches Completed | `tests/test_m11531_decoder_authority.py::test_phase_command_completed_rejects_hash_consistent_semantically_wrong_derivation` | `PhaseCommandCompleted` invokes the same frozen raw-to-normalized validator used by reducer/rebuild/Gate |
+| An extra schema/hash/identity-valid readiness fact is ignored | `tests/test_m11531_readiness_exact_set.py::test_extra_valid_lineage_readiness_raw_fact_is_rejected_exact_set` | Ordered readiness authority roles/check IDs must equal the frozen ReadinessCheckPlan exactly |
+| Missing decoder/plan/raw authority leaves a running Attempt or only raises text | `tests/test_m11531_readiness_exact_set.py::test_prederive_integrity_failure_commits_replayable_block_integrity` | Agent commits one SQLite-bound `BLOCK_INTEGRITY` result and cold restart returns the same route without rerun |
+| Self, missing, extra, duplicate, reordered, cross-Attempt, cross-phase, wrong-generation, wrong-producer, wrong-command/output, wrong-decoder, or raw-to-normalized attacks fail only on an unrelated hash | `tests/test_m11531_hash_consistent_attacks.py` | Each malicious candidate keeps outer schema/ref/hash consistency and is rejected for its precise frozen-plan semantic reason |
+| Expected activation surfaces are copied into observed coverage | `tests/test_m11531_hash_consistent_attacks.py`; `tests/test_m1153_readiness_authority.py` | Only explicit activation authority-role measurements can produce observed surfaces; synthetic runs emit separate observed facts |
+
+### Derive/readiness cold-restart map
+
+| Boundary | Canonical replacement test | Recovery authority |
+|---|---|---|
+| Physical receipts complete, before derive Started | `tests/test_m11531_derivation_crash_matrix.py::test_crash_after_all_physical_receipts_before_derive_started_recovers_once` | Physical commands remain once; restart invokes producing decoder once |
+| Normalized blobs/manifest durable, before derive receipt locator | `tests/test_m11531_derivation_crash_matrix.py::test_crash_after_normalized_manifest_before_durable_derive_receipt_blocks_integrity` | Orphan blobs have no authority; restart commits deterministic `BLOCK_INTEGRITY` without rederive |
+| Durable derive receipt, before derive Completed | `tests/test_m11531_derivation_crash_matrix.py::test_crash_after_durable_derive_receipt_before_completed_reconciles_without_rederive` | Restart validates receipt/manifest/raw/program and commits only Completed |
+| Derive Completed, before proxy/final evidence event | `tests/test_m11531_derivation_crash_matrix.py::test_crash_after_derive_completed_before_proxy_evidence_commit_reuses_manifest_once` | Restart reuses the same manifest and normalized refs; evidence event occurs once |
+| Durable readiness physical receipt, before its Completed event | `tests/test_m11531_derivation_crash_matrix.py::test_crash_after_readiness_receipt_before_completed_reconciles_physical_once` | Readiness physical command remains once and Completed is reconciled |
+| Readiness command Completed, before proxy evidence commit | `tests/test_m11531_derivation_crash_matrix.py::test_crash_after_readiness_completed_before_proxy_commit_preserves_run_full_barrier` | Restart reuses the exact receipt and returns stable PASS/BLOCKED routing |
+| ProxyEvidenceCommitted, before route delivery | `tests/test_m11531_derivation_crash_matrix.py::test_crash_after_proxy_evidence_commit_before_route_delivery_replays_blocked_route` | Historical route, event count, budget, physical count, and derive count remain unchanged |
+
+### Acceptance and scope
+
+- The M1.1.5.3 `747 passed, 2 skipped` result is historical v9/v8 evidence and does not certify v10/v9.
+- M1.1.5.3.1 adds 32 tests for a total collection of 781. Normal (`1:05:20`), proxy-cleared (`1:05:19`), empty HOME/HF cache without Codex (`1:04:14`), and CPU-only without `nvidia-smi` (`1:04:19`) each report `779 passed, 2 skipped, 0 failed`. The two skips remain the existing optional torch/transformers forward probes; no skip or xfail was added.
+- M1.1.5.3.1 tests distinguish the physical subprocess marker, producing decoder marker, and read-only validator recomputation marker. State/rebuild/query/Gate snapshot attacks cover SQLite rows/hash chain, CAS paths/bytes, receipt locators, evidence trees, projections, and invocation markers.
+- Production-component local subprocess tests prove frozen-command, physical receipt/raw byte, immutable decoder, derivation, Ledger/rebuild, and Gate wiring. Synthetic tests separately prove deterministic state/evidence/budget behavior. Neither path is a scientific-success claim.
+- Native Unified S1 Producer/Core, real external Codex S1, M2, and real GPU scientific training remain unstarted.

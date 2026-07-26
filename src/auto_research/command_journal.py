@@ -23,7 +23,7 @@ from .phase_execution import (
     PhaseAuthority,
 )
 
-PHASE_COMMAND_SCHEMA_FILE = "phase_command_v4.schema.json"
+PHASE_COMMAND_SCHEMA_FILE = "phase_command_v5.schema.json"
 PHASE_RUN_RECEIPT_SCHEMA_FILE = "phase_run_receipt_v5.schema.json"
 COMMAND_RECEIPT_LOCATOR_SCHEMA_VERSION = "auto_research_command_receipt_locator_v1"
 _COMMAND_LOCATOR_ROOT = Path("meta") / "command_receipts"
@@ -202,6 +202,38 @@ class LedgerCommandJournal:
         self._authorize(context)
         return self._recover_completed(context, command, command_record)
 
+    def reconcile_started(
+        self,
+        context: AuthoritativePhaseContext,
+        command_id: str,
+    ) -> CommandJournalResult | Mapping[str, Any]:
+        """Reconcile one previously-started command without invoking its runner."""
+
+        record = self.ledger.phase_command(command_id)
+        if not isinstance(record, Mapping):
+            raise CommandJournalError("started command projection is unavailable")
+        if record.get("status") == "completed":
+            return self.recover_completed(context, command_id)
+        if record.get("status") == "unknown":
+            return record
+        if record.get("status") != "started":
+            raise CommandJournalError("only a started command can be reconciled")
+        command = record.get("command")
+        if not isinstance(command, Mapping):
+            raise CommandJournalError("started command identity is missing")
+        self._assert_command_matches_context(command, context)
+        self._authorize(context)
+        receipt_ref = self._read_receipt_locator(command)
+        if receipt_ref is None:
+            return self.ledger.mark_phase_command_unknown(
+                command_id,
+                "started command has no trustworthy receipt and cannot be silently rerun",
+            )
+        self._validate_receipt_ref(command, record, receipt_ref)
+        completed = self.ledger.complete_phase_command(command_id, receipt_ref)
+        self._authorize(context)
+        return self._recover_completed(context, command, completed)
+
     def _recover_completed(
         self,
         context: AuthoritativePhaseContext,
@@ -256,7 +288,7 @@ class LedgerCommandJournal:
         try:
             frozen_plan = store.read_json(
                 context.command_plan_hash,
-                schema_file="phase_command_plan_v3.schema.json",
+                schema_file="phase_command_plan_v4.schema.json",
             )
             validate_phase_command_plan(
                 frozen_plan,

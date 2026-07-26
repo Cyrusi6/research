@@ -85,7 +85,10 @@ def test_completion_replay_revalidates_immutable_evidence_before_returning_histo
     else:
         artifact.write_bytes(artifact.read_bytes() + b"\n")
         match = "evidence content hash mismatch|receipt output bytes differ|attempt-scoped evidence differs"
-        state_match = "immutable receipt-bound evidence audit failed: receipt output bytes differ"
+        state_match = (
+            "immutable receipt-bound evidence audit failed: "
+            "attempt-scoped evidence differs from deterministic derive output"
+        )
 
     with pytest.raises(IntegrityError, match=match):
         ledger.complete_attempt(completion)

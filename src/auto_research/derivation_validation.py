@@ -16,6 +16,10 @@ from typing import Any, Callable, Mapping, Sequence
 
 from .contract_store import ContractStore, canonical_contract_bytes, contract_digest, validate_schema
 from .derivation_contracts import (
+    DECODER_ENTRYPOINT,
+    DECODER_OPERATION_CONTRACT,
+    DECODER_RUNTIME_ABI,
+    DECODER_RUNTIME_IMPLEMENTATION_HASH,
     derivation_plan_for_phase,
     readiness_check_plan_for_phase,
     validate_evidence_derivation_plan,
@@ -24,8 +28,8 @@ from .evidence import EVIDENCE_SCHEMA_VERSIONS
 from .phase_receipts import validate_phase_run_receipt
 
 
-DERIVATION_PLAN_SCHEMA_FILE = "evidence_derivation_plan_v1.schema.json"
-DERIVATION_MANIFEST_SCHEMA_FILE = "evidence_derivation_manifest_v2.schema.json"
+DERIVATION_PLAN_SCHEMA_FILE = "evidence_derivation_plan_v2.schema.json"
+DERIVATION_MANIFEST_SCHEMA_FILE = "evidence_derivation_manifest_v3.schema.json"
 
 
 @dataclass(frozen=True)
@@ -37,6 +41,8 @@ class PhysicalRawOutput:
     role: str | None
     dataset_id: str | None
     normalized_kinds: tuple[str, ...]
+    authority_roles: tuple[str, ...]
+    readiness_check_ids: tuple[str, ...]
     seeds: tuple[int, ...]
     metrics: tuple[str, ...]
     contract_ref: dict[str, Any]
@@ -127,16 +133,13 @@ def derive_evidence_deterministically(
     validate_evidence_derivation_plan(derivation_plan)
     _validate_derivation_identity(attempt, trial_spec, phase, derivation_plan)
     decoder = derivation_plan["decoder_descriptor"]
-    _validate_decoder_implementation(
+    decoder_program = _load_decoder_program(
         derivation_plan,
         decoder_implementation_bytes,
     )
-    decoder_key = (str(decoder["decoder_id"]), str(decoder["decoder_version"]))
-    implementation = _DECODER_REGISTRY.get(decoder_key)
-    if implementation is None:
-        raise ValueError(f"unsupported frozen evidence decoder: {decoder_key[0]}@{decoder_key[1]}")
     sources = _receipt_bound_sources(physical_inputs)
-    outputs = implementation(
+    outputs = _execute_decoder_program(
+        decoder_program,
         attempt,
         trial_spec,
         phase,
@@ -162,19 +165,20 @@ def derive_evidence_deterministically(
         version_suffix = output.schema_version.rsplit("_v", 1)[-1]
         validate_schema(payload, f"{output.kind}_v{version_suffix}.schema.json")
 
+    phase_execution = attempt["phase_executions"][phase]
     derivation_identity_hash = contract_digest(canonical_contract_bytes({
         "plan_id": derivation_plan["plan_id"],
-        "phase_execution_id": attempt["phase_executions"][phase]["phase_execution_id"],
+        "phase_execution_id": phase_execution["phase_execution_id"],
     }))
     facts = {
         "derivation_id": f"derive:{derivation_identity_hash[:24]}",
         "attempt_id": str(attempt["attempt_id"]),
-        "lifecycle_generation": attempt["lifecycle_generation"],
+        "lifecycle_generation": phase_execution["lifecycle_generation"],
         "phase": phase,
-        "phase_execution_id": str(attempt["phase_executions"][phase]["phase_execution_id"]),
-        "producer_run_id": str(attempt["phase_executions"][phase]["producer_run_id"]),
-        "implementation_hash": str(attempt["implementation_hash"]),
-        "attempt_input_hash": str(attempt["attempt_input_hash"]),
+        "phase_execution_id": str(phase_execution["phase_execution_id"]),
+        "producer_run_id": str(phase_execution["producer_run_id"]),
+        "implementation_hash": str(phase_execution["implementation_hash"]),
+        "attempt_input_hash": str(phase_execution["attempt_input_hash"]),
         "trial_spec_hash": str(attempt["trial_spec_hash"]),
         "protocol_hash": str(attempt["protocol_hash"]),
         "sample_manifest_hash": str(attempt["sample_manifest_hash"]),
@@ -221,10 +225,81 @@ def validate_immutable_derivation(
         plan_ref=plan_ref,
         plan_hash=plan_hash,
     )
+    validated = _validate_derive_receipt_contents(
+        project_root=project_root,
+        attempt=attempt,
+        trial_spec=trial_spec,
+        phase_commands=phase_commands,
+        phase=phase,
+        derive_record=derive_record,
+        derive_receipt=derive_receipt,
+        plan=plan,
+        plan_ref=plan_ref,
+        plan_hash=plan_hash,
+    )
+    _validate_evidence_manifest_binding(validated, evidence_manifest)
+    return validated
+
+
+def validate_derive_receipt_precommit(
+    *,
+    project_root: Path,
+    attempt: Mapping[str, Any],
+    trial_spec: Mapping[str, Any],
+    phase_commands: Mapping[str, Mapping[str, Any]],
+    phase: str,
+    derive_record: Mapping[str, Any],
+    receipt_ref: Mapping[str, Any],
+) -> ValidatedEvidenceDerivation:
+    """Validate a candidate derive receipt before PhaseCommandCompleted exists.
+
+    This path is read-only and intentionally does not require an EvidenceManifest
+    event.  It proves the immutable raw-to-normalized transformation before the
+    reducer is allowed to commit command completion.
+    """
+
+    store = ContractStore(project_root)
+    plan, plan_ref, plan_hash = _frozen_derivation_plan(store, trial_spec, phase)
+    _validate_derive_record_identity(
+        attempt=attempt,
+        phase=phase,
+        derive_record=derive_record,
+        plan_ref=plan_ref,
+        plan_hash=plan_hash,
+    )
+    derive_receipt = validate_phase_run_receipt(project_root, derive_record, receipt_ref)
+    return _validate_derive_receipt_contents(
+        project_root=project_root,
+        attempt=attempt,
+        trial_spec=trial_spec,
+        phase_commands=phase_commands,
+        phase=phase,
+        derive_record=derive_record,
+        derive_receipt=derive_receipt,
+        plan=plan,
+        plan_ref=plan_ref,
+        plan_hash=plan_hash,
+    )
+
+
+def _validate_derive_receipt_contents(
+    *,
+    project_root: Path,
+    attempt: Mapping[str, Any],
+    trial_spec: Mapping[str, Any],
+    phase_commands: Mapping[str, Mapping[str, Any]],
+    phase: str,
+    derive_record: Mapping[str, Any],
+    derive_receipt: Mapping[str, Any],
+    plan: Mapping[str, Any],
+    plan_ref: Mapping[str, Any],
+    plan_hash: str,
+) -> ValidatedEvidenceDerivation:
+    store = ContractStore(project_root)
     derivation_ref = derive_receipt.get("derivation_ref")
     derivation_hash = derive_receipt.get("derivation_hash")
     if not isinstance(derivation_ref, Mapping) or not isinstance(derivation_hash, str):
-        raise ValueError("completed derive receipt lacks structured derivation authority")
+        raise ValueError("derive receipt lacks structured derivation authority")
     derivation_blob = store.verify(derivation_ref)
     if derivation_blob["digest"] != derivation_hash:
         raise ValueError("derive receipt derivation hash mismatch")
@@ -252,6 +327,11 @@ def validate_immutable_derivation(
         physical_inputs=physical_inputs,
         decoder_implementation_bytes=store.read_bytes(plan["decoder_descriptor"]["immutable_ref"]),
     )
+    _validate_derivation_manifest_authority(
+        derivation_manifest=derivation_manifest,
+        deterministic=deterministic,
+        derive_receipt=derive_receipt,
+    )
     receipt_outputs = list(derive_receipt.get("outputs") or [])
     output_refs: dict[str, dict[str, Any]] = {}
     output_bytes: dict[str, bytes] = {}
@@ -267,7 +347,7 @@ def validate_immutable_derivation(
             raise ValueError("derive receipt normalized output lacks immutable reference")
         raw = store.read_bytes(reference)
         if raw != expected.raw_bytes:
-            raise ValueError(f"derive receipt normalized bytes differ from deterministic decoder: {expected.kind}")
+            raise ValueError(_normalized_derivation_mismatch_reason(expected.kind, expected.raw_bytes, raw))
         if receipt_output.get("output_id") != expected.output_id:
             raise ValueError("derive receipt normalized output_id mismatch")
         if receipt_output.get("kind") != expected.kind or receipt_output.get("schema_version") != expected.schema_version:
@@ -296,34 +376,123 @@ def validate_immutable_derivation(
     if canonical_contract_bytes(derivation_manifest) != canonical_contract_bytes(expected_manifest):
         raise ValueError("EvidenceDerivationManifest differs from deterministic receipt-derived facts")
 
-    entries = evidence_manifest.get("entries")
-    if not isinstance(entries, list) or not entries:
-        raise ValueError("EvidenceManifest entries are required for derivation validation")
-    entry_kinds = [str(item.get("kind")) for item in entries if isinstance(item, Mapping)]
-    if entry_kinds != [item.kind for item in deterministic.normalized_outputs]:
-        raise ValueError("EvidenceManifest entry order differs from frozen normalized output order")
-    for entry in entries:
-        kind = str(entry["kind"])
-        if entry.get("derivation_ref") not in (None, derivation_ref):
-            raise ValueError("EvidenceManifest points to a different derivation manifest")
-        if entry.get("derivation_hash") not in (None, derivation_hash):
-            raise ValueError("EvidenceManifest derivation hash differs from derive receipt")
-        if entry.get("content_hash") != output_refs[kind]["digest"]:
-            raise ValueError("EvidenceManifest content hash differs from derive output")
-        supplied_output_ref = entry.get("output_ref")
-        if supplied_output_ref is not None and supplied_output_ref != output_refs[kind]:
-            raise ValueError("EvidenceManifest output reference differs from derive receipt")
     return ValidatedEvidenceDerivation(
         derivation_ref=deepcopy(dict(derivation_ref)),
         derivation_hash=derivation_hash,
         derivation_manifest=deepcopy(derivation_manifest),
         derive_record=deepcopy(dict(derive_record)),
-        derive_receipt=deepcopy(derive_receipt),
+        derive_receipt=deepcopy(dict(derive_receipt)),
         normalized_outputs=deterministic.normalized_outputs,
         output_refs=output_refs,
         output_bytes=output_bytes,
         receipt_bound_sources=deterministic.receipt_bound_sources,
     )
+
+
+def _validate_evidence_manifest_binding(
+    validated: ValidatedEvidenceDerivation,
+    evidence_manifest: Mapping[str, Any],
+) -> None:
+    entries = evidence_manifest.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise ValueError("EvidenceManifest entries are required for derivation validation")
+    entry_kinds = [str(item.get("kind")) for item in entries if isinstance(item, Mapping)]
+    if entry_kinds != [item.kind for item in validated.normalized_outputs]:
+        raise ValueError("EvidenceManifest entry order differs from frozen normalized output order")
+    for entry in entries:
+        kind = str(entry["kind"])
+        if entry.get("derivation_ref") not in (None, validated.derivation_ref):
+            raise ValueError("EvidenceManifest points to a different derivation manifest")
+        if entry.get("derivation_hash") not in (None, validated.derivation_hash):
+            raise ValueError("EvidenceManifest derivation hash differs from derive receipt")
+        if kind not in validated.output_refs:
+            raise ValueError("EvidenceManifest contains an unregistered derived evidence kind")
+        if entry.get("content_hash") != validated.output_refs[kind]["digest"]:
+            raise ValueError("EvidenceManifest content hash differs from derive output")
+        supplied_output_ref = entry.get("output_ref")
+        if supplied_output_ref is not None and supplied_output_ref != validated.output_refs[kind]:
+            raise ValueError("EvidenceManifest output reference differs from derive receipt")
+
+
+def _validate_derivation_manifest_authority(
+    *,
+    derivation_manifest: Mapping[str, Any],
+    deterministic: DeterministicDerivation,
+    derive_receipt: Mapping[str, Any],
+) -> None:
+    expected_sources = list(deterministic.manifest_facts["source_commands"])
+    actual_sources = list(derivation_manifest.get("source_commands") or [])
+    derive_command_id = derive_receipt.get("command_id")
+    derive_spec_id = derive_receipt.get("command_spec_id")
+    if any(
+        source.get("command_id") == derive_command_id
+        or source.get("command_spec_id") == derive_spec_id
+        for source in actual_sources
+        if isinstance(source, Mapping)
+    ):
+        raise ValueError("derivation self source is forbidden")
+    actual_identities = [
+        (source.get("command_id"), source.get("output_id"))
+        for source in actual_sources
+        if isinstance(source, Mapping)
+    ]
+    if len(actual_identities) != len(actual_sources):
+        raise ValueError("derivation source inventory contains a malformed source")
+    if len(actual_sources) < len(expected_sources):
+        raise ValueError("derivation source inventory has a missing source")
+    if len(actual_sources) > len(expected_sources):
+        extra = actual_sources[len(expected_sources):]
+        if any("readiness" in list(item.get("authority_roles") or []) for item in extra):
+            raise ValueError("derivation readiness inventory has an extra source")
+        if len(actual_identities) != len(set(actual_identities)):
+            raise ValueError("derivation source inventory contains a duplicate source")
+        raise ValueError("derivation source inventory has an extra source")
+    if len(actual_identities) != len(set(actual_identities)):
+        raise ValueError("derivation source inventory contains a duplicate source")
+    expected_identities = [
+        (source["command_id"], source["output_id"])
+        for source in expected_sources
+    ]
+    if actual_identities != expected_identities and set(actual_identities) == set(expected_identities):
+        raise ValueError("derivation source order differs from the frozen source order")
+    for expected, actual in zip(expected_sources, actual_sources, strict=True):
+        if actual.get("command_id") != expected["command_id"]:
+            raise ValueError("derivation command source mismatch")
+        if actual.get("command_spec_id") != expected["command_spec_id"]:
+            raise ValueError("derivation command specification source mismatch")
+        if actual.get("output_id") != expected["output_id"]:
+            raise ValueError("derivation output source mismatch")
+        if actual.get("authority_roles") != expected["authority_roles"]:
+            expected_roles = set(expected["authority_roles"])
+            actual_roles = set(actual.get("authority_roles") or [])
+            if any(role.startswith("activation_") for role in expected_roles - actual_roles):
+                raise ValueError("activation source authority mismatch")
+            if "readiness" in expected_roles ^ actual_roles:
+                raise ValueError("readiness source authority mismatch")
+            raise ValueError("derivation source authority-role mismatch")
+        if actual.get("readiness_check_ids") != expected["readiness_check_ids"]:
+            raise ValueError("readiness source check identity mismatch")
+        if canonical_contract_bytes(actual) != canonical_contract_bytes(expected):
+            raise ValueError("derivation physical source facts mismatch")
+    if derivation_manifest.get("decoder_descriptor") != deterministic.manifest_facts["decoder_descriptor"]:
+        raise ValueError("derivation decoder differs from the frozen decoder artifact")
+    if derivation_manifest.get("derivation_id") != deterministic.manifest_facts["derivation_id"]:
+        raise ValueError("derivation manifest canonical identity mismatch")
+
+
+def _normalized_derivation_mismatch_reason(kind: str, expected_raw: bytes, actual_raw: bytes) -> str:
+    if kind == "full_s3_readiness":
+        expected = _json_object(expected_raw, label="expected readiness evidence")
+        actual = _json_object(actual_raw, label="candidate readiness evidence")
+        expected_ids = [item.get("check_id") for item in expected.get("checks") or []]
+        actual_ids = [item.get("check_id") for item in actual.get("checks") or []]
+        if len(actual_ids) > len(expected_ids):
+            raise ValueError("readiness normalized evidence contains an extra check")
+        if len(actual_ids) < len(expected_ids):
+            raise ValueError("readiness normalized evidence contains a missing check")
+        if actual_ids != expected_ids:
+            raise ValueError("readiness normalized check order differs from the frozen plan")
+    return f"derive receipt normalized bytes differ from deterministic decoder: {kind}"
 
 
 def validated_physical_receipt_inputs(
@@ -362,6 +531,8 @@ def validated_physical_receipt_inputs(
             "output_kind": cross_binding["output_kind"],
             "output_schema_version": cross_binding["output_schema_version"],
             "normalized_kinds": list(cross_binding["normalized_kinds"]),
+            "authority_roles": list(cross_binding.get("authority_roles") or ["normalized_evidence_source"]),
+            "readiness_check_ids": list(cross_binding.get("readiness_check_ids") or []),
             "role": None,
             "dataset_id": None,
             "seeds": list(derivation_plan["coverage_contract"]["seeds"]),
@@ -462,6 +633,8 @@ def validated_physical_receipt_inputs(
             role=str(actual["role"]) if actual.get("role") is not None else None,
             dataset_id=str(actual["dataset_id"]) if actual.get("dataset_id") is not None else None,
             normalized_kinds=tuple(str(item) for item in binding["normalized_kinds"]),
+            authority_roles=tuple(str(item) for item in binding["authority_roles"]),
+            readiness_check_ids=tuple(str(item) for item in binding["readiness_check_ids"]),
             seeds=tuple(int(item) for item in binding["seeds"]),
             metrics=tuple(str(item) for item in binding["metrics"]),
             contract_ref=deepcopy(dict(reference)),
@@ -578,13 +751,47 @@ def _completed_derive_receipt(
         raise ValueError("derive command lacks frozen PhaseCommandPlan reference")
     command_plan = ContractStore(project_root).read_json(
         command_plan_ref,
-        schema_file="phase_command_plan_v3.schema.json",
+        schema_file="phase_command_plan_v4.schema.json",
     )
     if command_plan.get("derivation_plan_ref") != plan_ref:
         raise ValueError("derive command PhaseCommandPlan derivation reference mismatch")
     if command_plan.get("derivation_plan_hash") != plan_hash:
         raise ValueError("derive command PhaseCommandPlan derivation hash mismatch")
     return deepcopy(dict(record)), deepcopy(receipt)
+
+
+def _validate_derive_record_identity(
+    *,
+    attempt: Mapping[str, Any],
+    phase: str,
+    derive_record: Mapping[str, Any],
+    plan_ref: Mapping[str, Any],
+    plan_hash: str,
+) -> None:
+    command = derive_record.get("command")
+    phase_execution = (attempt.get("phase_executions") or {}).get(phase)
+    if not isinstance(command, Mapping) or not isinstance(phase_execution, Mapping):
+        raise ValueError("derive command or phase execution identity is missing")
+    command_spec = command.get("command_spec")
+    if not isinstance(command_spec, Mapping) or command_spec.get("authority_role") != "derivation":
+        raise ValueError("derive receipt must belong to the frozen derivation command")
+    expected = {
+        "attempt_id": attempt.get("attempt_id"),
+        "lifecycle_generation": phase_execution.get("lifecycle_generation"),
+        "phase": phase,
+        "phase_execution_id": phase_execution.get("phase_execution_id"),
+        "phase_start_event_id": phase_execution.get("phase_start_event_id"),
+        "producer_run_id": phase_execution.get("producer_run_id"),
+        "implementation_hash": phase_execution.get("implementation_hash"),
+        "attempt_input_hash": phase_execution.get("attempt_input_hash"),
+    }
+    for field_name, value in expected.items():
+        if command.get(field_name) != value:
+            raise ValueError(f"derive command {field_name} differs from the authoritative Attempt")
+    if command_spec.get("derivation_plan_ref") != plan_ref:
+        raise ValueError("derive command derivation plan reference mismatch")
+    if command_spec.get("derivation_plan_hash") != plan_hash:
+        raise ValueError("derive command derivation plan hash mismatch")
 
 
 def _validate_derivation_identity(
@@ -600,10 +807,36 @@ def _validate_derivation_identity(
     del attempt, trial_spec, allow_attempt_missing
 
 
-def _validate_decoder_implementation(
+_DECODER_PROGRAM_OPERATIONS = {
+    "canonical_identity": (
+        "validate_ordered_source_inventory",
+        "parse_canonical_json",
+        "validate_authority_roles",
+        "copy_registered_evidence",
+        "validate_exact_output_inventory",
+        "emit_canonical_outputs",
+    ),
+    "c2c_receipt_measurements": (
+        "validate_ordered_source_inventory",
+        "parse_canonical_json",
+        "validate_authority_roles",
+        "extract_finite_measurements",
+        "normalize_metric_units",
+        "validate_exact_cartesian_coverage",
+        "derive_measurement_rows",
+        "derive_activation_evidence",
+        "derive_readiness_evidence",
+        "derive_auxiliary_evidence",
+        "validate_exact_output_inventory",
+        "emit_canonical_outputs",
+    ),
+}
+
+
+def _load_decoder_program(
     derivation_plan: Mapping[str, Any],
     raw: bytes,
-) -> None:
+) -> dict[str, Any]:
     if not isinstance(raw, bytes):
         raise ValueError("frozen decoder implementation must be immutable bytes")
     descriptor = derivation_plan["decoder_descriptor"]
@@ -611,19 +844,99 @@ def _validate_decoder_implementation(
     digest = contract_digest(raw)
     if reference["digest"] != descriptor["implementation_hash"] or digest != descriptor["implementation_hash"]:
         raise ValueError("frozen decoder implementation hash mismatch")
+    try:
+        bundle = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("frozen decoder implementation bundle is not canonical JSON") from error
+    if not isinstance(bundle, dict) or canonical_contract_bytes(bundle) != raw:
+        raise ValueError("frozen decoder implementation bundle bytes are not canonical")
+    validate_schema(bundle, "decoder_implementation_bundle_v1.schema.json")
+    if bundle.get("runtime_abi") != DECODER_RUNTIME_ABI or descriptor.get("runtime_abi") != DECODER_RUNTIME_ABI:
+        raise ValueError("frozen decoder runtime ABI is unsupported")
+    if bundle.get("entrypoint") != DECODER_ENTRYPOINT or descriptor.get("entrypoint") != DECODER_ENTRYPOINT:
+        raise ValueError("frozen decoder entrypoint is unsupported")
+    program = bundle.get("decoder_program")
+    if not isinstance(program, dict):
+        raise ValueError("frozen decoder implementation lacks DecoderProgram")
+    validate_schema(program, "decoder_program_v1.schema.json")
+    if program.get("decoder_id") != descriptor.get("decoder_id") or program.get("decoder_version") != descriptor.get("decoder_version"):
+        raise ValueError("frozen DecoderProgram identity differs from its descriptor")
+    if contract_digest(canonical_contract_bytes(program)) != descriptor.get("semantic_hash"):
+        raise ValueError("frozen decoder semantic hash mismatch")
     semantic_contract = {
         "canonicalization": deepcopy(derivation_plan["canonicalization"]),
         "coverage_contract": deepcopy(derivation_plan["coverage_contract"]),
     }
-    expected = {
-        "decoder_id": descriptor["decoder_id"],
-        "decoder_version": descriptor["decoder_version"],
-        "semantic_contract": semantic_contract,
+    if program.get("semantic_contract") != semantic_contract:
+        raise ValueError("frozen DecoderProgram semantic contract differs from the derivation plan")
+    expected_authority = {
+        "source_bindings": [
+            {
+                "source_ordinal": item["source_ordinal"],
+                "source_phase": item["source_phase"],
+                "command_spec_id": item["command_spec_id"],
+                "output_id": item["output_id"],
+                "authority_roles": list(item["authority_roles"]),
+                "readiness_check_ids": list(item["readiness_check_ids"]),
+            }
+            for item in derivation_plan["source_bindings"]
+        ]
     }
-    if canonical_contract_bytes(expected) != raw:
-        raise ValueError("frozen decoder implementation bytes differ from its semantic contract")
-    if contract_digest(canonical_contract_bytes(semantic_contract)) != descriptor["semantic_hash"]:
-        raise ValueError("frozen decoder semantic hash mismatch")
+    if program.get("authority_role_contract") != expected_authority:
+        raise ValueError("frozen DecoderProgram authority-role contract differs from source bindings")
+    expected_outputs = {
+        "expected_normalized_outputs": deepcopy(list(derivation_plan["expected_normalized_outputs"]))
+    }
+    if program.get("output_contract") != expected_outputs:
+        raise ValueError("frozen DecoderProgram output contract differs from the derivation plan")
+    decoder_kind = str(program.get("decoder_kind") or "")
+    expected_operations = _DECODER_PROGRAM_OPERATIONS.get(decoder_kind)
+    if expected_operations is None or tuple(program.get("operations") or ()) != expected_operations:
+        raise ValueError("frozen DecoderProgram operations are unsupported")
+    if program.get("operation_contract") != DECODER_OPERATION_CONTRACT:
+        raise ValueError("frozen DecoderProgram operation semantics are unsupported")
+    dependencies = bundle.get("dependencies")
+    if not isinstance(dependencies, list) or [item.get("dependency_id") for item in dependencies] != [
+        "declarative-decoder-vm",
+        "canonical-contract-json",
+        "normalized-output-contract",
+    ]:
+        raise ValueError("frozen decoder dependency inventory is not exact")
+    expected_dependency_hashes = {
+        "declarative-decoder-vm": DECODER_RUNTIME_IMPLEMENTATION_HASH,
+        "canonical-contract-json": contract_digest(canonical_contract_bytes(program["semantic_contract"]["canonicalization"])),
+        "normalized-output-contract": contract_digest(canonical_contract_bytes(program["output_contract"])),
+    }
+    for dependency in dependencies:
+        dependency_id = dependency["dependency_id"]
+        if dependency_id in expected_dependency_hashes and dependency.get("content_hash") != expected_dependency_hashes[dependency_id]:
+            raise ValueError(f"frozen decoder dependency hash mismatch: {dependency_id}")
+    return deepcopy(program)
+
+
+def _execute_decoder_program(
+    decoder_program: Mapping[str, Any],
+    attempt: Mapping[str, Any],
+    trial_spec: Mapping[str, Any],
+    phase: str,
+    plan: Mapping[str, Any],
+    inputs: Sequence[PhysicalReceiptInput],
+    sources: ReceiptBoundSources,
+) -> tuple[DerivedEvidence, ...]:
+    decoder_kind = decoder_program["decoder_kind"]
+    if decoder_kind == "canonical_identity":
+        return _canonical_passthrough_decoder(attempt, trial_spec, phase, plan, inputs, sources)
+    if decoder_kind == "c2c_receipt_measurements":
+        return _c2c_physical_decoder(
+            attempt,
+            trial_spec,
+            phase,
+            plan,
+            inputs,
+            sources,
+            operation_contract=decoder_program["operation_contract"],
+        )
+    raise ValueError(f"unsupported frozen DecoderProgram kind: {decoder_kind}")
 
 
 def _source_output_fact(
@@ -643,6 +956,8 @@ def _source_output_fact(
         "output_schema_version": output.schema_version,
         "output_ref": deepcopy(output.contract_ref),
         "output_hash": output.content_hash,
+        "authority_roles": list(output.authority_roles),
+        "readiness_check_ids": list(output.readiness_check_ids),
     }
 
 
@@ -665,6 +980,8 @@ def _receipt_bound_sources(inputs: Sequence[PhysicalReceiptInput]) -> ReceiptBou
                 "output_kind": output.kind,
                 "role": output.role,
                 "dataset_id": output.dataset_id,
+                "authority_roles": list(output.authority_roles),
+                "readiness_check_ids": list(output.readiness_check_ids),
                 "command_status": "completed",
                 "exit_code": int(item.receipt["exit_code"]),
                 "receipt_ref": deepcopy(item.receipt_ref),
@@ -673,11 +990,12 @@ def _receipt_bound_sources(inputs: Sequence[PhysicalReceiptInput]) -> ReceiptBou
                 "output_ref": deepcopy(output.contract_ref),
                 "output_hash": output.content_hash,
             }
-            for surface_id in payload.get("observed_surface_ids") or []:
-                if not isinstance(surface_id, str) or not surface_id:
-                    raise ValueError("physical activation surface identity is invalid")
-                if surface_id not in observed_surfaces:
-                    observed_surfaces.append(surface_id)
+            if "activation_surface" in output.authority_roles:
+                for surface_id in payload.get("observed_surface_ids") or []:
+                    if not isinstance(surface_id, str) or not surface_id:
+                        raise ValueError("physical activation surface identity is invalid")
+                    if surface_id not in observed_surfaces:
+                        observed_surfaces.append(surface_id)
             physical.append({
                 "command_id": item.command_id,
                 "command_spec_id": item.command_spec_id,
@@ -740,6 +1058,8 @@ def _c2c_physical_decoder(
     plan: Mapping[str, Any],
     inputs: Sequence[PhysicalReceiptInput],
     sources: ReceiptBoundSources,
+    *,
+    operation_contract: Mapping[str, Any],
 ) -> tuple[DerivedEvidence, ...]:
     measurements: dict[tuple[str, str, int, str], float] = {}
     for source in inputs:
@@ -755,7 +1075,7 @@ def _c2c_physical_decoder(
             identity = (output.role, output.dataset_id, output.seeds[0], output.metrics[0])
             if identity in measurements:
                 raise ValueError("C2C physical measurement identity is duplicate")
-            measurements[identity] = _metric_value(payload)
+            measurements[identity] = _metric_value(payload, operation_contract["measurement"])
 
     phase_execution = attempt["phase_executions"][phase]
     expected_outputs = list(plan["expected_normalized_outputs"])
@@ -799,11 +1119,6 @@ def _c2c_physical_decoder(
             sources=sources,
             physical_inputs=inputs,
             schema_version=next(str(item["schema_version"]) for item in expected_outputs if item["kind"] == "activation_evidence"),
-        )
-        _bind_activation_readiness_facts(
-            trial_spec=trial_spec,
-            sources=sources,
-            activation_payload=payloads["activation_evidence"],
         )
     _derive_auxiliary_proxy_payloads(
         attempt=attempt,
@@ -867,7 +1182,7 @@ def _derive_auxiliary_proxy_payloads(
         payloads["proxy_cache_report"] = {
             **_evidence_identity(attempt, phase, phase_execution, "proxy_cache_report", expected["proxy_cache_report"]),
             "cross_references": {"proxy_baseline_fingerprint_hash": fingerprint_hash},
-            "cache_key": contract_digest(canonical_contract_bytes({"attempt_input_hash": attempt["attempt_input_hash"], "source_hashes": source_hashes})),
+        "cache_key": contract_digest(canonical_contract_bytes({"attempt_input_hash": phase_execution["attempt_input_hash"], "source_hashes": source_hashes})),
             "baseline_hash": baseline_hash,
             "cache_entry_hash": baseline_hash,
             "status": "created",
@@ -915,47 +1230,6 @@ def _derive_auxiliary_proxy_payloads(
         }
 
 
-def _bind_activation_readiness_facts(
-    *,
-    trial_spec: Mapping[str, Any],
-    sources: ReceiptBoundSources,
-    activation_payload: Mapping[str, Any],
-) -> None:
-    readiness_plan = readiness_check_plan_for_phase(trial_spec, "proxy")
-    if not isinstance(readiness_plan, Mapping):
-        raise ValueError("activation facts require frozen proxy ReadinessCheckPlan")
-    checks = [item for item in readiness_plan["checks"] if item["check_kind"] == "activation_delta"]
-    if len(checks) != 1:
-        raise ValueError("proxy readiness plan must contain one activation_delta check")
-    candidate_values = [
-        _metric_value(sources.raw_facts[key])
-        for key, lineage in sources.raw_fact_lineage.items()
-        if lineage.get("role") == "candidate"
-    ]
-    disabled_values = [
-        _metric_value(sources.raw_facts[key])
-        for key, lineage in sources.raw_fact_lineage.items()
-        if lineage.get("role") == "activation_disabled"
-    ]
-    if not candidate_values or len(candidate_values) != len(disabled_values):
-        raise ValueError("activation readiness lacks paired physical measurements")
-    observed_delta = (
-        sum(candidate_values) / len(candidate_values)
-        - sum(disabled_values) / len(disabled_values)
-    )
-    for binding in checks[0]["source_bindings"]:
-        key = (
-            str(binding["source_phase"]),
-            str(binding["command_spec_id"]),
-            str(binding["output_id"]),
-        )
-        raw = sources.raw_facts.get(key)
-        if not isinstance(raw, dict):
-            raise ValueError("activation readiness source is not receipt-bound")
-        raw["surface_measurements"] = {"delta": observed_delta}
-        raw["observed_surface_ids"] = list(activation_payload["observed_surface_ids"])
-
-
 def _activation_payload(
     *,
     attempt: Mapping[str, Any],
@@ -987,16 +1261,23 @@ def _activation_payload(
     observed = {item["surface_id"] for item in sources.surface_checks if item.get("observed") is True}
     phase_contract = next(item for item in trial_spec["phase_contracts"] if item["phase"] == "proxy")
     frozen_sources = [
-        (item["source_phase"], item["command_spec_id"], item["output_id"])
+        (
+            (item["source_phase"], item["command_spec_id"], item["output_id"]),
+            tuple(item["required_authority_roles"]),
+        )
         for item in activation_check["source_bindings"]
     ]
-    actual_sources = {
-        (item.phase, item.command_spec_id, output.output_id)
+    actual_sources = [
+        (
+            (item.phase, item.command_spec_id, output.output_id),
+            tuple(role for role in output.authority_roles if role.startswith("activation_")),
+        )
         for item in physical_inputs
         for output in item.raw_outputs
-    }
-    if len(frozen_sources) != len(set(frozen_sources)) or not set(frozen_sources).issubset(actual_sources):
-        raise ValueError("activation_delta source bindings are not receipt-bound")
+        if any(role.startswith("activation_") for role in output.authority_roles)
+    ]
+    if frozen_sources != actual_sources:
+        raise ValueError("activation source inventory differs from the frozen ordered exact set")
     paired_values: list[tuple[float, float]] = []
     for dataset_id in phase_contract["datasets"]:
         for seed in phase_contract["seeds"]:
@@ -1066,9 +1347,9 @@ def _evidence_identity(
         "protocol_hash": attempt["protocol_hash"],
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
+        "lifecycle_generation": phase_execution["lifecycle_generation"],
+        "implementation_hash": phase_execution["implementation_hash"],
+        "attempt_input_hash": phase_execution["attempt_input_hash"],
         "phase": phase,
         "phase_execution_id": phase_execution["phase_execution_id"],
         "phase_start_event_id": phase_execution["phase_start_event_id"],
@@ -1102,24 +1383,29 @@ def _measurement_row(
         "sample_manifest_hash": attempt["sample_manifest_hash"],
         "evaluator_hash": attempt["evaluator_hash"],
         "producer_run_id": phase_execution["producer_run_id"],
-        "lifecycle_generation": attempt["lifecycle_generation"],
-        "implementation_hash": attempt["implementation_hash"],
-        "attempt_input_hash": attempt["attempt_input_hash"],
+        "lifecycle_generation": phase_execution["lifecycle_generation"],
+        "implementation_hash": phase_execution["implementation_hash"],
+        "attempt_input_hash": phase_execution["attempt_input_hash"],
         "phase_execution_id": phase_execution["phase_execution_id"],
         "phase_start_event_id": phase_execution["phase_start_event_id"],
     }
 
 
-def _metric_value(payload: Mapping[str, Any]) -> float:
+def _metric_value(payload: Mapping[str, Any], contract: Mapping[str, Any]) -> float:
     raw_value = next(
-        (payload[key] for key in ("metric_value", "accuracy_percent", "overall_accuracy", "accuracy", "mean") if key in payload),
+        (payload[key] for key in contract["value_fields"] if key in payload),
         None,
     )
     if isinstance(raw_value, bool) or not isinstance(raw_value, (int, float)) or not math.isfinite(float(raw_value)):
         raise ValueError("C2C raw measurement lacks a finite numeric metric")
     value = float(raw_value)
-    if "overall_accuracy" in payload or ("accuracy" in payload and 0.0 <= value <= 1.0):
-        value *= 100.0
+    fractional_fields = set(contract["fractional_scale_fields"])
+    selected_field = next((key for key in contract["value_fields"] if key in payload), None)
+    if (
+        selected_field in fractional_fields
+        and float(contract["fractional_scale_min"]) <= value <= float(contract["fractional_scale_max"])
+    ):
+        value *= float(contract["fractional_scale_multiplier"])
     return round(value, 10)
 
 
@@ -1156,6 +1442,7 @@ __all__ = [
     "ReceiptBoundSources",
     "ValidatedEvidenceDerivation",
     "derive_evidence_deterministically",
+    "validate_derive_receipt_precommit",
     "validate_immutable_derivation",
     "validated_physical_receipt_inputs",
 ]

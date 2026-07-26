@@ -278,7 +278,7 @@ def assert_trial_lineage(root: Path) -> None:
             receipt = store.read_json(entry["receipt_ref"], schema_file="phase_run_receipt_v5.schema.json")
             derivation = store.read_json(
                 entry["derivation_ref"],
-                schema_file="evidence_derivation_manifest_v2.schema.json",
+                schema_file="evidence_derivation_manifest_v3.schema.json",
             )
             assert any(output["contract_ref"]["digest"] == entry["content_hash"] for output in receipt["outputs"])
             normalized = next(

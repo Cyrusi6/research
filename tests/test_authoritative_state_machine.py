@@ -99,9 +99,9 @@ def _trial_spec(
     attempt_kind: str | None = None,
     project_root: Path | None = None,
 ) -> dict:
-    from support.authoritative_evidence import build_trial_spec_v8
+    from support.authoritative_evidence import build_trial_spec_v9
 
-    return build_trial_spec_v8(
+    return build_trial_spec_v9(
         _trial_spec_facts(attempt, profile=profile, attempt_kind=attempt_kind),
         project_root=project_root,
     )

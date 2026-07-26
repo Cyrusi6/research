@@ -21,7 +21,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_trial_spec_v8"
+      "const": "auto_research_trial_spec_v9"
     },
     "protocol": {
       "type": "object",
@@ -696,7 +696,7 @@
             "type": "boolean"
           },
           "command_plan": {
-            "$ref": "phase_command_plan_v3.schema.json"
+            "$ref": "phase_command_plan_v4.schema.json"
           },
           "command_plan_ref": {
             "$ref": "#/$defs/contract_blob"
@@ -704,10 +704,10 @@
           "command_plan_hash": {
             "$ref": "#/$defs/hash"
           },
-          "derivation_plan": {"$ref": "evidence_derivation_plan_v1.schema.json"},
+          "derivation_plan": {"$ref": "evidence_derivation_plan_v2.schema.json"},
           "derivation_plan_ref": {"$ref": "#/$defs/contract_blob"},
           "derivation_plan_hash": {"$ref": "#/$defs/hash"},
-          "readiness_check_plan": {"oneOf": [{"type": "null"}, {"$ref": "readiness_check_plan_v1.schema.json"}]},
+          "readiness_check_plan": {"oneOf": [{"type": "null"}, {"$ref": "readiness_check_plan_v2.schema.json"}]},
           "readiness_check_plan_ref": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/contract_blob"}]},
           "readiness_check_plan_hash": {"oneOf": [{"type": "null"}, {"$ref": "#/$defs/hash"}]}
         }

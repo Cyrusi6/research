@@ -11,6 +11,7 @@ import pytest
 
 from auto_research.agents.experiment import ExperimentAgent
 from auto_research.contract_store import ContractStore, canonical_contract_bytes
+from auto_research.derivation_validation import validate_derive_receipt_precommit
 from auto_research.research_state import (
     IntegrityError,
     ResearchEventLedger,
@@ -159,44 +160,96 @@ def test_missing_event_referenced_receipt_derivation_is_not_recreated_by_authori
 
 
 @pytest.mark.parametrize(
-    ("attack", "mutate"),
+    ("attack", "mutate", "reason"),
     [
-        pytest.param("derive-self-source", lambda sources, self_source: [self_source], id="derive-self-source"),
-        pytest.param("missing-source", lambda sources, self_source: sources[:-1], id="missing-source"),
-        pytest.param("duplicate-source", lambda sources, self_source: sources + [deepcopy(sources[0])], id="duplicate-source"),
-        pytest.param("extra-source", lambda sources, self_source: sources + [_extra_source(sources[0])], id="extra-source"),
-        pytest.param("reordered-source", lambda sources, self_source: list(reversed(sources)), id="reordered-source"),
+        pytest.param(
+            "derive-self-source",
+            lambda sources, self_source: [self_source],
+            "self source",
+            id="derive-self-source",
+        ),
+        pytest.param(
+            "missing-source",
+            lambda sources, self_source: sources[:-1],
+            "missing source",
+            id="missing-source",
+        ),
+        pytest.param(
+            "duplicate-source",
+            lambda sources, self_source: sources + [deepcopy(sources[0])],
+            "duplicate source",
+            id="duplicate-source",
+        ),
+        pytest.param(
+            "extra-source",
+            lambda sources, self_source: sources + [_extra_source(sources[0])],
+            "extra source",
+            id="extra-source",
+        ),
+        pytest.param(
+            "reordered-source",
+            lambda sources, self_source: list(reversed(sources)),
+            "source order",
+            id="reordered-source",
+        ),
     ],
 )
 def test_physical_derivation_source_exact_set_attack_is_rejected(
     authoritative_project: _BaselineProject,
     attack: str,
     mutate: Callable[[list[dict[str, Any]], dict[str, Any]], list[dict[str, Any]]],
+    reason: str,
 ) -> None:
     root, config = authoritative_project.root, authoritative_project.config
     _assert_valid_baseline(root, config)
-    physical_ref, physical_manifest, derive_record, derive_receipt = _physical_derivation(root)
+    _, physical_manifest, derive_record, derive_receipt = _physical_derivation(root)
+    ledger = ResearchEventLedger(root)
+    state = ledger.state()
+    attempt = next(iter(state["attempts"].values()))
+    original = validate_derive_receipt_precommit(
+        project_root=root,
+        attempt=attempt,
+        trial_spec=attempt["frozen_trial_spec"],
+        phase_commands=state["phase_commands"],
+        phase="full",
+        derive_record=derive_record,
+        receipt_ref=derive_record["receipt_ref"],
+    )
+    assert original.derivation_hash == derive_receipt["derivation_hash"]
     original_sources = deepcopy(physical_manifest["source_commands"])
     assert len(original_sources) >= 2, original_sources
     attacked_sources = mutate(original_sources, _derive_self_source(derive_record, derive_receipt))
     attacked_manifest = deepcopy(physical_manifest)
     attacked_manifest["source_commands"] = attacked_sources
-    attacked_raw = canonical_contract_bytes(attacked_manifest)
-    physical_path = root / physical_ref["relative_path"]
-    physical_path.write_bytes(attacked_raw)
-    attacked_hash = hashlib.sha256(attacked_raw).hexdigest()
-
-    outcomes = {
-        reader: _authority_read(root, config, reader)
-        for reader in ("state", "rebuild", "gate")
-    }
-
-    assert all(outcome != "PASS" for outcome in outcomes.values()), (
-        "a hash-consistent derive receipt/event chain bypassed the frozen physical source exact-set; "
-        f"attack={attack} referenced={physical_ref['digest']} attacked_bytes={attacked_hash} "
-        f"derive={derive_record['command']['command_id']} outcomes={outcomes} "
-        f"sources={_source_identity(attacked_sources)}"
+    store = ContractStore(root)
+    attacked_manifest_ref = store.put_json(
+        attacked_manifest,
+        schema_file="evidence_derivation_manifest_v3.schema.json",
     )
+    attacked_receipt = deepcopy(derive_receipt)
+    attacked_receipt["derivation_ref"] = attacked_manifest_ref
+    attacked_receipt["derivation_hash"] = attacked_manifest_ref["digest"]
+    attacked_receipt_ref = store.put_json(
+        attacked_receipt,
+        schema_file="phase_run_receipt_v5.schema.json",
+    )
+    assert attacked_receipt_ref["digest"] == hashlib.sha256(
+        canonical_contract_bytes(attacked_receipt)
+    ).hexdigest()
+
+    before_events = ledger.events()
+    with pytest.raises(ValueError, match=reason):
+        validate_derive_receipt_precommit(
+            project_root=root,
+            attempt=attempt,
+            trial_spec=attempt["frozen_trial_spec"],
+            phase_commands=state["phase_commands"],
+            phase="full",
+            derive_record=derive_record,
+            receipt_ref=attacked_receipt_ref,
+        )
+    assert ledger.events() == before_events
+    assert _authority_read(root, config, "state") == "PASS"
 
 
 def _assert_valid_baseline(root: Path, config: dict[str, Any]) -> None:
@@ -232,7 +285,7 @@ def _physical_derivation(
     assert receipt["derivation_hash"] == physical_ref["digest"]
     physical_manifest = store.read_json(
         physical_ref,
-        schema_file="evidence_derivation_manifest_v2.schema.json",
+        schema_file="evidence_derivation_manifest_v3.schema.json",
     )
     return physical_ref, physical_manifest, record, receipt
 
@@ -246,7 +299,7 @@ def _final_evidence_manifest(root: Path) -> dict[str, Any]:
 def _final_derivation_manifests(root: Path) -> list[dict[str, Any]]:
     store = ContractStore(root)
     return [
-        store.read_json(entry["derivation_ref"], schema_file="evidence_derivation_manifest_v2.schema.json")
+        store.read_json(entry["derivation_ref"], schema_file="evidence_derivation_manifest_v3.schema.json")
         for entry in _final_evidence_manifest(root)["entries"]
     ]
 
@@ -269,6 +322,8 @@ def _derive_self_source(
         "output_schema_version": output["schema_version"],
         "output_ref": deepcopy(output["contract_ref"]),
         "output_hash": output["content_hash"],
+        "authority_roles": ["normalized_evidence_source"],
+        "readiness_check_ids": [],
     }
 
 
@@ -294,9 +349,17 @@ def _authority_read(root: Path, config: dict[str, Any], reader: str) -> str:
     raise AssertionError(f"unknown authority reader: {reader}")
 
 
-def _source_identity(sources: list[dict[str, Any]]) -> tuple[tuple[str, str, str], ...]:
+def _source_identity(
+    sources: list[dict[str, Any]],
+) -> tuple[tuple[str, str, str, tuple[str, ...], tuple[str, ...]], ...]:
     return tuple(
-        (str(item["command_id"]), str(item["receipt_hash"]), str(item["output_hash"]))
+        (
+            str(item["command_id"]),
+            str(item["receipt_hash"]),
+            str(item["output_hash"]),
+            tuple(item["authority_roles"]),
+            tuple(item["readiness_check_ids"]),
+        )
         for item in sources
     )
 

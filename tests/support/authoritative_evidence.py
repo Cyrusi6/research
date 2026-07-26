@@ -51,7 +51,7 @@ def _record_failed_phase_command(
     context = ResearchLedgerPhaseAuthority(ledger).context_for_attempt(project_root, attempt["attempt_id"], running_phase)
     plan = ContractStore(project_root).read_json(
         context.command_plan_hash,
-        schema_file="phase_command_plan_v3.schema.json",
+        schema_file="phase_command_plan_v4.schema.json",
     )
     used = {
         record["command"]["command_spec_id"]
@@ -97,7 +97,7 @@ def _record_failed_phase_command(
     }
 
 
-def build_trial_spec_v8(
+def build_trial_spec_v9(
     spec: dict,
     *,
     project_root: Path | None = None,
@@ -607,35 +607,36 @@ def record_completed_evidence_command(
     state = ledger.state()
     current_attempt = state["attempts"][attempt["attempt_id"]]
     derivation_plan = plan["derivation_plan"]
-    physical_inputs = validated_physical_receipt_inputs(
-        project_root=project_root,
-        attempt=current_attempt,
-        phase_commands=state["phase_commands"],
-        phase=phase,
-        derivation_plan=derivation_plan,
-    )
-    deterministic = derive_evidence_deterministically(
-        attempt=current_attempt,
-        trial_spec=current_attempt["frozen_trial_spec"],
-        phase=phase,
-        derivation_plan=derivation_plan,
-        physical_inputs=physical_inputs,
-        decoder_implementation_bytes=store.read_bytes(
-            derivation_plan["decoder_descriptor"]["immutable_ref"]
-        ),
-    )
-    for output in deterministic.normalized_outputs:
-        staged_entry = entries_by_kind[output.kind]
-        if evidence_store.read_entry(staged_entry, current_attempt) != output.raw_bytes:
-            raise ValueError(
-                f"fixture staged evidence differs from deterministic decoder output: {output.kind}"
-            )
-
     derive_command = next(
         item for item in plan["commands"] if item["authority_role"] == "derivation"
     )
 
     def derive() -> CommandExecutionResult:
+        derive_state = ledger.state()
+        derive_attempt = derive_state["attempts"][attempt["attempt_id"]]
+        physical_inputs = validated_physical_receipt_inputs(
+            project_root=project_root,
+            attempt=derive_attempt,
+            phase_commands=derive_state["phase_commands"],
+            phase=phase,
+            derivation_plan=derivation_plan,
+        )
+        deterministic = derive_evidence_deterministically(
+            attempt=derive_attempt,
+            trial_spec=derive_attempt["frozen_trial_spec"],
+            phase=phase,
+            derivation_plan=derivation_plan,
+            physical_inputs=physical_inputs,
+            decoder_implementation_bytes=store.read_bytes(
+                derivation_plan["decoder_descriptor"]["immutable_ref"]
+            ),
+        )
+        for output in deterministic.normalized_outputs:
+            staged_entry = entries_by_kind[output.kind]
+            if evidence_store.read_entry(staged_entry, derive_attempt) != output.raw_bytes:
+                raise ValueError(
+                    f"fixture staged evidence differs from deterministic decoder output: {output.kind}"
+                )
         outputs = []
         normalized_outputs = []
         for ordinal, output in enumerate(deterministic.normalized_outputs):
@@ -659,7 +660,7 @@ def record_completed_evidence_command(
                 }
             )
         derivation_manifest = {
-            "schema_version": "auto_research_evidence_derivation_manifest_v2",
+            "schema_version": "auto_research_evidence_derivation_manifest_v3",
             **deepcopy(deterministic.manifest_facts),
             "derivation_plan_ref": deepcopy(plan["derivation_plan_ref"]),
             "derivation_plan_hash": plan["derivation_plan_hash"],
@@ -667,7 +668,7 @@ def record_completed_evidence_command(
         }
         derivation_ref = store.put_json(
             derivation_manifest,
-            schema_file="evidence_derivation_manifest_v2.schema.json",
+            schema_file="evidence_derivation_manifest_v3.schema.json",
         )
         summary = json.dumps(
             {
@@ -688,7 +689,7 @@ def record_completed_evidence_command(
             derivation_hash=derivation_ref["digest"],
             stdout=summary,
             stderr="",
-            external_job_id=f"fixture-derive-{phase}-{current_attempt['attempt_id'][:8]}",
+            external_job_id=f"fixture-derive-{phase}-{derive_attempt['attempt_id'][:8]}",
         )
 
     result = journal.run_once(

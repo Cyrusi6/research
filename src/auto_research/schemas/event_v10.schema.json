@@ -14,7 +14,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "auto_research_event_v9"
+      "const": "auto_research_event_v10"
     },
     "event_id": {
       "type": "string",
@@ -542,7 +542,7 @@
       ],
       "properties": {
         "command": {
-          "$ref": "phase_command_v4.schema.json"
+          "$ref": "phase_command_v5.schema.json"
         },
         "request_fingerprint": {
           "$ref": "#/$defs/request"
@@ -585,10 +585,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
+        "attempt_id",
         "command_id",
         "reason"
       ],
       "properties": {
+        "attempt_id": {
+          "type": "string",
+          "minLength": 1
+        },
         "command_id": {
           "type": "string",
           "minLength": 1

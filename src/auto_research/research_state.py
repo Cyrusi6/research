@@ -414,7 +414,7 @@ class ResearchEventLedger:
                 trial_spec=frozen_trial_spec,
                 timestamp=timestamp,
             )
-            validate_contract(attempt, "attempt_record_v9.schema.json")
+            validate_contract(attempt, "attempt_record_v10.schema.json")
             existing = state["attempts"].get(attempt_id)
             if existing is not None:
                 immutable_keys = [
@@ -590,7 +590,7 @@ class ResearchEventLedger:
         return authorization
 
     def start_phase_command(self, command: dict[str, Any]) -> dict[str, Any]:
-        validate_contract(command, "phase_command_v4.schema.json")
+        validate_contract(command, "phase_command_v5.schema.json")
         request_fingerprint = canonical_hash({"operation": "start_phase_command", "command": command})
 
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
@@ -625,7 +625,7 @@ class ResearchEventLedger:
             if record["status"] != "started":
                 raise IntegrityError("only a started phase command can complete")
             _validate_phase_command_authorization(state, record["command"])
-            _validate_phase_run_receipt(self.project_root, record, receipt_ref)
+            _validate_phase_run_receipt_in_state(state, record, receipt_ref, project_root=self.project_root)
             return "PhaseCommandCompleted", payload, f"phase-command-completed:{request_fingerprint}"
 
         event, state, _ = self._domain_transact(build)
@@ -639,14 +639,19 @@ class ResearchEventLedger:
 
         def build(state: dict[str, Any]) -> tuple[str, dict[str, Any], str]:
             record = _phase_command(state, command_id)
+            payload = {
+                "attempt_id": record["command"]["attempt_id"],
+                "command_id": command_id,
+                "reason": reason,
+            }
             if record["status"] == "unknown":
                 if record["unknown_reason"] != reason:
                     raise IntegrityError("unknown phase command reason conflict")
-                return "PhaseCommandUnknownOutcome", {"command_id": command_id, "reason": reason}, record["unknown_event_id"]
+                return "PhaseCommandUnknownOutcome", payload, record["unknown_event_id"]
             if record["status"] != "started":
                 raise IntegrityError("only a started phase command can become unknown")
             _validate_phase_command_authorization(state, record["command"])
-            return "PhaseCommandUnknownOutcome", {"command_id": command_id, "reason": reason}, f"phase-command-unknown:{request_fingerprint}"
+            return "PhaseCommandUnknownOutcome", payload, f"phase-command-unknown:{request_fingerprint}"
 
         event, state, _ = self._domain_transact(build)
         return _phase_command_operation_result(state["phase_commands"][command_id], event)
@@ -656,7 +661,12 @@ class ResearchEventLedger:
             state = self._state_in_transaction(connection, allow_cache=True)
         record = state["phase_commands"].get(command_id)
         if isinstance(record, dict) and record.get("status") == "completed":
-            _validate_phase_run_receipt(self.project_root, record, record["receipt_ref"])
+            _validate_phase_run_receipt_in_state(
+                state,
+                record,
+                record["receipt_ref"],
+                project_root=self.project_root,
+            )
         return deepcopy(record) if record is not None else None
 
     def revise_implementation(self, attempt_id: str, *, implementation_hash: str, event_id: str | None = None) -> dict[str, Any]:
@@ -717,7 +727,7 @@ class ResearchEventLedger:
             if phase is None:
                 raise IntegrityError("resource measurement requires an authoritative running phase")
             execution = attempt["phase_executions"][phase]
-            plan = ContractStore(self.project_root).read_json(execution["command_plan_hash"], schema_file="phase_command_plan_v3.schema.json")
+            plan = ContractStore(self.project_root).read_json(execution["command_plan_hash"], schema_file="phase_command_plan_v4.schema.json")
             gpu_policies = [item["resource_policy"] for item in plan["commands"] if item["resource_policy"]["resource_class"] == "gpu_memory"]
             if not gpu_policies:
                 result = None
@@ -1068,23 +1078,34 @@ class ResearchEventLedger:
             and self._transaction_cache_sequence == sequence
             and self._transaction_cache_event_hash == event_hash
         ):
-            self._validate_cached_authoritative_references(events, self._transaction_state_cache)
-            cached_result = deepcopy(self._transaction_state_cache)
-            cached_result.pop("project_root", None)
-            return cached_result
+            try:
+                self._validate_cached_authoritative_references(events, self._transaction_state_cache)
+            except IntegrityError:
+                self._transaction_state_cache = None
+                self._transaction_cache_sequence = -1
+                self._transaction_cache_event_hash = None
+            else:
+                cached_result = deepcopy(self._transaction_state_cache)
+                cached_result.pop("project_root", None)
+                return cached_result
         process_key = str(self.project_root.resolve())
         if allow_cache:
             with _PROCESS_STATE_CACHE_LOCK:
                 process_cached = _PROCESS_STATE_CACHE.get(process_key)
             if process_cached is not None and process_cached[0] == sequence and process_cached[1] == event_hash:
                 cached_state = process_cached[2]
-                self._validate_cached_authoritative_references(events, cached_state)
-                self._transaction_state_cache = deepcopy(cached_state)
-                self._transaction_cache_sequence = sequence
-                self._transaction_cache_event_hash = event_hash
-                cached_result = deepcopy(cached_state)
-                cached_result.pop("project_root", None)
-                return cached_result
+                try:
+                    self._validate_cached_authoritative_references(events, cached_state)
+                except IntegrityError:
+                    with _PROCESS_STATE_CACHE_LOCK:
+                        _PROCESS_STATE_CACHE.pop(process_key, None)
+                else:
+                    self._transaction_state_cache = deepcopy(cached_state)
+                    self._transaction_cache_sequence = sequence
+                    self._transaction_cache_event_hash = event_hash
+                    cached_result = deepcopy(cached_state)
+                    cached_result.pop("project_root", None)
+                    return cached_result
         state = _reduce_all(self.project_root.name, events, project_root=self.project_root)
         if allow_cache:
             self._transaction_state_cache = deepcopy(state)
@@ -1398,7 +1419,7 @@ def reduce_event(
         next_state["current_variant_spec_hash"] = variant["variant_spec_hash"]
     elif event_type == "AttemptReserved":
         attempt = payload["attempt"]
-        validate_contract(attempt, "attempt_record_v9.schema.json")
+        validate_contract(attempt, "attempt_record_v10.schema.json")
         project_root = next_state.get("project_root")
         if not project_root:
             raise IntegrityError("AttemptReserved rebuild requires authoritative project_root")
@@ -1503,7 +1524,7 @@ def reduce_event(
         attempt["updated_at"] = event["created_at"]
     elif event_type == "PhaseCommandStarted":
         command = payload["command"]
-        validate_contract(command, "phase_command_v4.schema.json")
+        validate_contract(command, "phase_command_v5.schema.json")
         if command["command_id"] in next_state["phase_commands"]:
             raise IntegrityError("duplicate PhaseCommandStarted command_id")
         _validate_phase_command_authorization(next_state, command)
@@ -1538,7 +1559,7 @@ def reduce_event(
         project_root = next_state.get("project_root")
         if not project_root:
             raise IntegrityError("PhaseCommandCompleted rebuild requires authoritative project_root")
-        _validate_phase_run_receipt(Path(project_root), record, payload["receipt_ref"])
+        _validate_phase_run_receipt_in_state(next_state, record, payload["receipt_ref"])
         record.update(
             status="completed",
             receipt_ref=deepcopy(payload["receipt_ref"]),
@@ -1551,6 +1572,8 @@ def reduce_event(
         record = _phase_command(next_state, payload["command_id"])
         if record["status"] != "started":
             raise IntegrityError("PhaseCommandUnknownOutcome requires started command")
+        if payload["attempt_id"] != record["command"]["attempt_id"]:
+            raise IntegrityError("PhaseCommandUnknownOutcome attempt identity mismatch")
         _validate_phase_command_authorization(next_state, record["command"])
         record.update(
             status="unknown",
@@ -1938,7 +1961,7 @@ def _validate_event_request(event_type: str, payload: dict[str, Any], event_id: 
         raise IntegrityError(f"invalid event_id format: {event_id}")
     if not isinstance(payload, dict):
         raise IntegrityError("event payload must be an object")
-    required = {"DirectionSelected": {"direction"}, "VariantPlanned": {"variant", "feedback_from_attempt_ids"}, "AttemptReserved": {"attempt"}, "AttemptTransitioned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "new_state", "phase", "phase_state"}, "ProxyPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "FullPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "ProxyEvidenceCommitted": {"proxy_outcome", "evidence_manifest"}, "PhaseCommandStarted": {"command"}, "PhaseCommandCompleted": {"command_id", "command_hash", "command_plan_hash", "receipt_ref", "receipt_hash"}, "PhaseCommandUnknownOutcome": {"command_id", "reason"}, "AttemptImplementationRevised": {"attempt_id", "lifecycle_generation", "previous_implementation_hash", "previous_attempt_input_hash", "expected_state", "implementation_hash", "attempt_input_hash"}, "AttemptResumed": {"resume_evidence"}, "AttemptAbandoned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "reason"}, "AttemptDispositioned": {"failure_evidence"}, "AttemptFinalized": {"trial_result", "lifecycle_generation", "expected_state", "implementation_hash", "attempt_input_hash"}, "AuditMarker": {"index"}}[event_type]
+    required = {"DirectionSelected": {"direction"}, "VariantPlanned": {"variant", "feedback_from_attempt_ids"}, "AttemptReserved": {"attempt"}, "AttemptTransitioned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "new_state", "phase", "phase_state"}, "ProxyPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "FullPhaseStarted": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "phase_execution_manifest"}, "ProxyEvidenceCommitted": {"proxy_outcome", "evidence_manifest"}, "PhaseCommandStarted": {"command"}, "PhaseCommandCompleted": {"command_id", "command_hash", "command_plan_hash", "receipt_ref", "receipt_hash"}, "PhaseCommandUnknownOutcome": {"attempt_id", "command_id", "reason"}, "AttemptImplementationRevised": {"attempt_id", "lifecycle_generation", "previous_implementation_hash", "previous_attempt_input_hash", "expected_state", "implementation_hash", "attempt_input_hash"}, "AttemptResumed": {"resume_evidence"}, "AttemptAbandoned": {"attempt_id", "lifecycle_generation", "implementation_hash", "attempt_input_hash", "expected_state", "reason"}, "AttemptDispositioned": {"failure_evidence"}, "AttemptFinalized": {"trial_result", "lifecycle_generation", "expected_state", "implementation_hash", "attempt_input_hash"}, "AuditMarker": {"index"}}[event_type]
     actual = set(payload) - {"request_fingerprint"}
     if actual != required or ("request_fingerprint" in payload and not re.fullmatch(r"[a-f0-9]{64}", payload["request_fingerprint"])):
         raise IntegrityError(f"{event_type} payload fields must be {sorted(required)}")
@@ -1946,11 +1969,11 @@ def _validate_event_request(event_type: str, payload: dict[str, Any], event_id: 
 
 def _validate_event(event: dict[str, Any]) -> None:
     if event.get("schema_version") != EVENT_SCHEMA_VERSION:
-        raise BreakingSchemaError("invalid or unsupported Event v9 schema")
+        raise BreakingSchemaError("invalid or unsupported Event v10 schema")
     try:
-        validate_contract(event, "event_v9.schema.json")
+        validate_contract(event, "event_v10.schema.json")
     except ValueError as exc:
-        raise IntegrityError(f"invalid Event v9 schema: {exc}") from exc
+        raise IntegrityError(f"invalid Event v10 schema: {exc}") from exc
     _validate_event_request(event["event_type"], event["payload"], event["event_id"])
 
 
@@ -2138,7 +2161,7 @@ def _validate_phase_command_authorization(state: dict[str, Any], command: dict[s
         raise IntegrityError("PhaseCommand command_plan_hash differs from frozen phase contract")
     try:
         store = ContractStore(Path(state["project_root"]))
-        frozen_plan = store.read_json(command["command_plan_ref"], schema_file="phase_command_plan_v3.schema.json")
+        frozen_plan = store.read_json(command["command_plan_ref"], schema_file="phase_command_plan_v4.schema.json")
         validate_phase_command_plan(frozen_plan, expected_evidence_kinds=phase_contract["evidence_kinds"])
         plan_blob = store.verify(command["command_plan_ref"])
     except (KeyError, OSError, TypeError, ValueError) as exc:
@@ -2238,6 +2261,42 @@ def _validate_phase_run_receipt(project_root: Path, record: dict[str, Any], rece
         raise IntegrityError(f"PhaseRunReceipt rejected: {exc}") from exc
 
 
+def _validate_phase_run_receipt_in_state(
+    state: dict[str, Any],
+    record: dict[str, Any],
+    receipt_ref: dict[str, Any],
+    *,
+    project_root: Path | None = None,
+) -> dict[str, Any]:
+    root_value: str | Path | None = project_root or state.get("project_root")
+    if not isinstance(root_value, (str, Path)) or not str(root_value):
+        raise IntegrityError("authoritative receipt validation requires project_root")
+    root = Path(root_value)
+    receipt = _validate_phase_run_receipt(root, record, receipt_ref)
+    command = record.get("command") or {}
+    command_spec = command.get("command_spec") or {}
+    if command_spec.get("authority_role") != "derivation" or int(receipt.get("exit_code", 1)) != 0:
+        return receipt
+    attempt = state.get("attempts", {}).get(command.get("attempt_id"))
+    if not isinstance(attempt, dict):
+        raise IntegrityError("derive receipt Attempt identity is missing")
+    try:
+        from .derivation_validation import validate_derive_receipt_precommit
+
+        validate_derive_receipt_precommit(
+            project_root=root,
+            attempt=attempt,
+            trial_spec=attempt["frozen_trial_spec"],
+            phase_commands=state["phase_commands"],
+            phase=command["phase"],
+            derive_record=record,
+            receipt_ref=receipt_ref,
+        )
+    except (KeyError, TypeError, ValueError, OSError) as exc:
+        raise IntegrityError(f"derive PhaseRunReceipt semantic validation rejected: {exc}") from exc
+    return receipt
+
+
 def _phase_command(state: dict[str, Any], command_id: str) -> dict[str, Any]:
     record = state["phase_commands"].get(command_id)
     if not isinstance(record, dict):
@@ -2300,7 +2359,7 @@ def _validate_state_invariants(state: dict[str, Any]) -> None:
                 raise IntegrityError("completed phase command lacks receipt/event identity")
             project_root = state.get("project_root")
             if project_root:
-                _validate_phase_run_receipt(Path(project_root), record, record["receipt_ref"])
+                _validate_phase_run_receipt_in_state(state, record, record["receipt_ref"])
         elif record.get("receipt_ref") is not None or record.get("completed_event_id") is not None:
             raise IntegrityError("non-completed phase command carries completion data")
         if record["status"] == "unknown" and (not record.get("unknown_event_id") or not record.get("unknown_reason")):
@@ -2313,7 +2372,7 @@ def _validate_state_invariants(state: dict[str, Any]) -> None:
         if candidate_phases != {trial["completeness"]}:
             raise IntegrityError("TrialResult observations disagree with completeness")
     for attempt in state["attempts"].values():
-        validate_contract(attempt, "attempt_record_v9.schema.json")
+        validate_contract(attempt, "attempt_record_v10.schema.json")
         _validate_frozen_trial_spec(attempt)
         expected_consumes, expected_reserved_at_reservation = _profile_budget_mapping(attempt["profile"], attempt["attempt_kind"])
         if attempt["consumes_direction_budget"] != expected_consumes:

@@ -552,7 +552,7 @@ def derive_readiness_from_receipts(
 ) -> dict[str, Any]:
     """Derive readiness from validated physical receipt facts and a frozen check plan."""
 
-    _validate_schema(readiness_check_plan, "readiness_check_plan_v1.schema.json")
+    _validate_schema(readiness_check_plan, "readiness_check_plan_v2.schema.json")
     raw_facts = getattr(receipt_bound_sources, "raw_facts", None)
     raw_lineage = getattr(receipt_bound_sources, "raw_fact_lineage", None)
     if not isinstance(raw_facts, Mapping) or not isinstance(raw_lineage, Mapping):
@@ -566,13 +566,44 @@ def derive_readiness_from_receipts(
     check_ids = [item.get("check_id") for item in checks_plan if isinstance(item, Mapping)]
     if len(check_ids) != len(checks_plan) or len(check_ids) != len(set(check_ids)):
         raise ValueError("ReadinessCheckPlan check identities are invalid")
-    expected_keys = {
-        _readiness_source_key(binding)
+    if list(raw_facts) != list(raw_lineage):
+        raise ValueError("readiness raw fact and lineage inventories differ")
+    expected_inventory = [
+        (_readiness_source_key(binding), str(check_plan["check_id"]))
         for check_plan in checks_plan
         for binding in check_plan["source_bindings"]
-    }
-    if set(raw_facts) != set(raw_lineage) or not expected_keys.issubset(set(raw_facts)):
-        raise ValueError("readiness raw facts do not cover the frozen physical source bindings")
+    ]
+    expected_check_ids = {str(item["check_id"]) for item in checks_plan}
+    observed_inventory: list[tuple[tuple[str, str, str], str]] = []
+    for key, source in raw_lineage.items():
+        if not isinstance(source, Mapping):
+            raise ValueError("readiness raw lineage is malformed")
+        authority_roles = list(source.get("authority_roles") or [])
+        readiness_check_ids = list(source.get("readiness_check_ids") or [])
+        if "readiness" not in authority_roles:
+            if any(str(check_id) in expected_check_ids for check_id in readiness_check_ids):
+                raise ValueError("non-readiness raw fact declares readiness check authority")
+            continue
+        raw = raw_facts.get(key)
+        if not isinstance(raw, Mapping):
+            raise ValueError("readiness raw fact is malformed")
+        if isinstance(raw.get("check_id"), str):
+            observed_check_ids = [str(raw["check_id"])]
+        elif isinstance(raw.get("readiness_checks"), Mapping):
+            observed_check_ids = [str(check_id) for check_id in raw["readiness_checks"]]
+        elif isinstance(raw.get("checks"), Sequence) and not isinstance(raw.get("checks"), (str, bytes)):
+            observed_check_ids = [
+                str(item.get("check_id"))
+                for item in raw["checks"]
+                if isinstance(item, Mapping) and isinstance(item.get("check_id"), str)
+            ]
+        else:
+            raise ValueError("readiness-authority raw fact contains no observed check identity")
+        if any(check_id not in readiness_check_ids for check_id in observed_check_ids):
+            raise ValueError("readiness raw fact declares a check outside its frozen source authority")
+        observed_inventory.extend((key, check_id) for check_id in observed_check_ids)
+    if observed_inventory != expected_inventory:
+        raise ValueError("readiness raw fact inventory differs from the frozen ordered exact set")
     checks = []
     for check_plan in checks_plan:
         check_id = check_plan["check_id"]
@@ -585,6 +616,8 @@ def derive_readiness_from_receipts(
                 raise ValueError("readiness raw fact or lineage is malformed")
             if not _valid_readiness_source_lineage(source, binding):
                 raise ValueError("readiness receipt lineage identity is invalid")
+            if check_id not in list(source.get("readiness_check_ids") or []):
+                raise ValueError("readiness source is bound to a different frozen check")
             facts[binding["output_id"]] = raw
         passed, measurement = _evaluate_readiness_predicate(check_plan, facts)
         checks.append(
@@ -621,6 +654,10 @@ def _valid_readiness_source_lineage(
         and source.get("command_spec_id") == binding["command_spec_id"]
         and source.get("output_id") == binding["output_id"]
         and source.get("output_kind") == binding["output_kind"]
+        and set(binding.get("required_authority_roles") or []).issubset(
+            set(source.get("authority_roles") or [])
+        )
+        and binding.get("check_id") in list(source.get("readiness_check_ids") or [])
         and source.get("command_status") == "completed"
         and source.get("exit_code") == 0
         and isinstance(source.get("receipt_hash"), str)
@@ -802,7 +839,7 @@ def _schema_validator(schema_name: str) -> Draft202012Validator:
     registry = Registry()
     for referenced_name in (
         "constraint_result_v2.schema.json",
-        "decoder_descriptor_v1.schema.json",
+        "decoder_descriptor_v2.schema.json",
     ):
         referenced = json.loads((schema_dir / referenced_name).read_text(encoding="utf-8"))
         registry = registry.with_resource(referenced_name, Resource.from_contents(referenced))

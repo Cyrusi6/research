@@ -57,7 +57,12 @@ from ..evidence import (
     stage_completion_evidence,
 )
 from ..research_state import IntegrityError, ResearchEventLedger
-from ..command_journal import CommandExecutionResult, CommandJournalResult, LedgerCommandJournal
+from ..command_journal import (
+    CommandExecutionResult,
+    CommandJournalError,
+    CommandJournalResult,
+    LedgerCommandJournal,
+)
 from ..contract_store import ContractStore
 from ..phase_receipts import C2C_RAW_OUTPUT_SPECS_ENV, validate_phase_run_receipt
 from ..phase_execution import (
@@ -125,6 +130,9 @@ class ExperimentAgent:
                 "attempt": existing_attempt,
                 "route_outcome": deepcopy(route),
                 "blocked_reason": "authoritative command outcome is unknown",
+                "committed_event_id": route["source"]["event_id"],
+                "committed_event_sequence": route["source"]["sequence"],
+                "committed_attempt_id": existing_attempt["attempt_id"],
                 "artifacts": [],
             }
         if existing_attempt is not None:
@@ -344,7 +352,7 @@ class ExperimentAgent:
             plan_hashes[str(phase_contract["phase"])] = command_plan_hash
         frozen["phase_contracts"] = phase_contracts
         frozen["execution_contract"]["phase_command_plan_hashes"] = plan_hashes
-        validate_contract(frozen, "trial_spec_v8.schema.json")
+        validate_contract(frozen, "trial_spec_v9.schema.json")
         write_json(self.context.project_root / "plan" / "trial_spec.json", frozen)
         return frozen
 
@@ -511,36 +519,36 @@ class ExperimentAgent:
         store = ContractStore(self.context.project_root)
         frozen_plan = store.read_json(
             context.command_plan_hash,
-            schema_file="phase_command_plan_v3.schema.json",
+            schema_file="phase_command_plan_v4.schema.json",
         )
         derivation_spec_id = f"{context.phase}-derive-evidence"
         matches = [item for item in frozen_plan["commands"] if item["command_spec_id"] == derivation_spec_id]
         if len(matches) != 1:
             raise IntegrityError("C2C phase lacks its frozen evidence derivation command")
         command_spec = matches[0]
-        state = ResearchEventLedger(self.context.project_root).state()
-        current_attempt = state["attempts"][context.attempt_id]
         derivation_plan = frozen_plan["derivation_plan"]
-        physical_inputs = validated_physical_receipt_inputs(
-            project_root=self.context.project_root,
-            attempt=current_attempt,
-            phase_commands=state["phase_commands"],
-            phase=context.phase,
-            derivation_plan=derivation_plan,
-        )
-        deterministic = derive_evidence_deterministically(
-            attempt=current_attempt,
-            trial_spec=current_attempt["frozen_trial_spec"],
-            phase=context.phase,
-            derivation_plan=derivation_plan,
-            physical_inputs=physical_inputs,
-            decoder_implementation_bytes=store.read_bytes(
-                derivation_plan["decoder_descriptor"]["immutable_ref"]
-            ),
-        )
         expected = command_spec["expected_outputs"]
 
         def derive() -> CommandExecutionResult:
+            state = ResearchEventLedger(self.context.project_root).state()
+            current_attempt = state["attempts"][context.attempt_id]
+            physical_inputs = validated_physical_receipt_inputs(
+                project_root=self.context.project_root,
+                attempt=current_attempt,
+                phase_commands=state["phase_commands"],
+                phase=context.phase,
+                derivation_plan=derivation_plan,
+            )
+            deterministic = derive_evidence_deterministically(
+                attempt=current_attempt,
+                trial_spec=current_attempt["frozen_trial_spec"],
+                phase=context.phase,
+                derivation_plan=derivation_plan,
+                physical_inputs=physical_inputs,
+                decoder_implementation_bytes=store.read_bytes(
+                    derivation_plan["decoder_descriptor"]["immutable_ref"]
+                ),
+            )
             outputs: list[dict[str, Any]] = []
             normalized_outputs: list[dict[str, Any]] = []
             for ordinal, output in enumerate(deterministic.normalized_outputs):
@@ -564,7 +572,7 @@ class ExperimentAgent:
                     }
                 )
             derivation_manifest = {
-                "schema_version": "auto_research_evidence_derivation_manifest_v2",
+                "schema_version": "auto_research_evidence_derivation_manifest_v3",
                 **deepcopy(deterministic.manifest_facts),
                 "derivation_plan_ref": deepcopy(frozen_plan["derivation_plan_ref"]),
                 "derivation_plan_hash": frozen_plan["derivation_plan_hash"],
@@ -572,7 +580,7 @@ class ExperimentAgent:
             }
             derivation_ref = store.put_json(
                 derivation_manifest,
-                schema_file="evidence_derivation_manifest_v2.schema.json",
+                schema_file="evidence_derivation_manifest_v3.schema.json",
             )
             summary = json.dumps(
                 {
@@ -597,21 +605,44 @@ class ExperimentAgent:
             )
 
         command_id = f"cmd-{context.phase}-{canonical_hash({'spec': derivation_spec_id, 'execution': context.phase_execution_id})[:24]}"
-        journal_result = journal.run_once(
-            context,
-            command_id=command_id,
-            command_spec_id=derivation_spec_id,
-            argv=tuple(command_spec["argv"]),
-            cwd=command_spec["cwd"],
-            source_snapshot_hash=command_spec["source_snapshot_hash"],
-            expected_outputs=tuple(item["kind"] for item in expected),
-            environment=command_spec["environment"],
-            inherited_environment=command_spec["inherited_environment"],
-            retry_policy=command_spec["retry_policy"],
-            resource_policy=command_spec["resource_policy"],
-            resume_policy=command_spec["resume_policy"],
-            runner=derive,
-        )
+        try:
+            journal_result = journal.run_once(
+                context,
+                command_id=command_id,
+                command_spec_id=derivation_spec_id,
+                argv=tuple(command_spec["argv"]),
+                cwd=command_spec["cwd"],
+                source_snapshot_hash=command_spec["source_snapshot_hash"],
+                expected_outputs=tuple(item["kind"] for item in expected),
+                environment=command_spec["environment"],
+                inherited_environment=command_spec["inherited_environment"],
+                retry_policy=command_spec["retry_policy"],
+                resource_policy=command_spec["resource_policy"],
+                resume_policy=command_spec["resume_policy"],
+                runner=derive,
+            )
+        except (CommandJournalError, IntegrityError, OSError, ValueError) as error:
+            state = ResearchEventLedger(self.context.project_root).state()
+            current_attempt = state["attempts"][context.attempt_id]
+            route = state.get("last_route_outcome")
+            if (
+                current_attempt.get("state") != "INTEGRITY_BLOCKED"
+                or not isinstance(route, dict)
+                or route.get("source", {}).get("attempt_id") != context.attempt_id
+                or route.get("next_action") != "BLOCK_INTEGRITY"
+            ):
+                raise
+            return {
+                "status": "blocked",
+                "failure_class": "integrity_failure",
+                "blocked_reason": str(error),
+                "attempt": deepcopy(current_attempt),
+                "route_outcome": deepcopy(route),
+                "committed_event_id": route["source"]["event_id"],
+                "committed_event_sequence": route["source"]["sequence"],
+                "committed_attempt_id": context.attempt_id,
+                "artifacts": [],
+            }
         if not isinstance(journal_result, CommandJournalResult):
             state = ResearchEventLedger(self.context.project_root).state()
             current_attempt = state["attempts"][context.attempt_id]
@@ -803,7 +834,7 @@ class ExperimentAgent:
                 evidence_kinds=old_policy["evidence_kinds"],
                 mode=old_policy["mode"],
             )
-        validate_contract(frozen, "trial_spec_v8.schema.json")
+        validate_contract(frozen, "trial_spec_v9.schema.json")
         write_json(self.context.project_root / "plan" / "trial_spec.json", frozen)
         return frozen
 
@@ -1254,6 +1285,17 @@ class ExperimentAgent:
             else ((trial_spec.get("proxy_decision_policy") or {}).get("activation_delta_threshold", 0.0))
         )
         activation_delta = activation_threshold + 1.0
+        synthetic_surface_measurements = _synthetic_activation_probe_measurements(
+            activation_surfaces,
+            enabled_value=activation_delta,
+            disabled_value=0.0,
+            threshold=activation_threshold,
+        )
+        synthetic_observed_surfaces = [
+            item["surface_id"]
+            for item in synthetic_surface_measurements
+            if item["observed"]
+        ]
         main_payload = _quantitative_evidence_payload(
             attempt=attempt,
             trial_spec=trial_spec,
@@ -1302,18 +1344,11 @@ class ExperimentAgent:
                         "command_status": "completed",
                         "exit_code": 0,
                         "expected_surface_ids": activation_surfaces,
-                        "observed_surface_ids": activation_surfaces,
+                        "observed_surface_ids": synthetic_observed_surfaces,
                         "activation_delta_threshold": activation_threshold,
                         "surface_measurements": [
-                            {
-                                "surface_id": surface_id,
-                                "enabled_value": activation_delta,
-                                "disabled_value": 0.0,
-                                "delta": activation_delta,
-                                "threshold": activation_threshold,
-                                "status": "ACTIVATED",
-                            }
-                            for surface_id in activation_surfaces
+                            {key: value for key, value in item.items() if key != "observed"}
+                            for item in synthetic_surface_measurements
                         ],
                     },
                 ),
@@ -2044,7 +2079,7 @@ class ExperimentAgent:
         command_id = f"cmd-{context.phase}-{canonical_hash(command_intent)[:24]}"
         frozen_plan = ContractStore(self.context.project_root).read_json(
             context.command_plan_hash,
-            schema_file="phase_command_plan_v3.schema.json",
+            schema_file="phase_command_plan_v4.schema.json",
         )
         expected_spec_id = kwargs.pop("command_spec_id", None)
         frozen_adapter_id = str((frozen_plan.get("adapter_identity") or {}).get("adapter_id") or "")
@@ -2367,7 +2402,7 @@ class ExperimentAgent:
             raise IntegrityError("frozen command lookup requires an authoritative phase context")
         plan = ContractStore(self.context.project_root).read_json(
             context.command_plan_hash,
-            schema_file="phase_command_plan_v3.schema.json",
+            schema_file="phase_command_plan_v4.schema.json",
         )
         matches = [item for item in plan["commands"] if item["command_spec_id"] == command_spec_id]
         if len(matches) != 1:
@@ -2459,8 +2494,9 @@ class ExperimentAgent:
             raise IntegrityError("phase receipt recovery requires the active Ledger journal")
         state = ResearchEventLedger(self.context.project_root).state()
         artifacts: list[dict[str, str]] = []
+        matching: list[tuple[str, dict[str, Any]]] = []
         for command_id, record in state.get("phase_commands", {}).items():
-            if not isinstance(record, dict) or record.get("status") != "completed":
+            if not isinstance(record, dict):
                 continue
             command = record.get("command") if isinstance(record.get("command"), dict) else record
             if any(
@@ -2477,7 +2513,43 @@ class ExperimentAgent:
                 )
             ):
                 continue
-            recovered = journal.recover_completed(context, command_id)
+            matching.append((command_id, record))
+        for command_id, record in matching:
+            if record.get("status") == "started":
+                reconciled = journal.reconcile_started(context, command_id)
+                if not isinstance(reconciled, CommandJournalResult):
+                    latest = ResearchEventLedger(self.context.project_root).state()
+                    attempt = latest["attempts"][context.attempt_id]
+                    route = latest.get("last_route_outcome")
+                    if (
+                        attempt.get("state") != "INTEGRITY_BLOCKED"
+                        or not isinstance(route, dict)
+                        or route.get("source", {}).get("attempt_id") != context.attempt_id
+                    ):
+                        raise IntegrityError("unreconciled phase command lacks an integrity RouteOutcome")
+                    result = {
+                        "status": "blocked",
+                        "failure_class": "integrity_failure",
+                        "blocked_reason": str(reconciled.get("unknown_reason") or "phase command outcome is unknown"),
+                        "attempt": deepcopy(attempt),
+                        "route_outcome": deepcopy(route),
+                        "committed_event_id": route["source"]["event_id"],
+                        "committed_event_sequence": route["source"]["sequence"],
+                        "committed_attempt_id": context.attempt_id,
+                        "artifacts": [],
+                    }
+                    raise TypedPhaseFailure(
+                        "integrity_failure",
+                        result["blocked_reason"],
+                        phase=context.phase,
+                        executor="phase-recovery",
+                        details={"result": result},
+                    )
+                recovered = reconciled
+            elif record.get("status") == "completed":
+                recovered = journal.recover_completed(context, command_id)
+            else:
+                continue
             artifacts.extend(dict(item) for item in recovered.artifact_inventory.artifacts)
         if {item["kind"] for item in artifacts} != set(context.expected_evidence_kinds):
             return None
@@ -2489,7 +2561,7 @@ class ExperimentAgent:
             raise IntegrityError("frozen adapter command requires the active Ledger journal")
         plan = ContractStore(self.context.project_root).read_json(
             context.command_plan_hash,
-            schema_file="phase_command_plan_v3.schema.json",
+            schema_file="phase_command_plan_v4.schema.json",
         )
         physical_commands = [item for item in plan["commands"] if item["authority_role"] == "physical"]
         if len(physical_commands) != 1:
@@ -8799,6 +8871,32 @@ def _stage_evidence_inventory(
         raise S3ValidationError(str(exc)) from exc
 
 
+def _synthetic_activation_probe_measurements(
+    surface_ids: list[str],
+    *,
+    enabled_value: float,
+    disabled_value: float,
+    threshold: float,
+) -> list[dict[str, Any]]:
+    """Produce explicit synthetic probe facts, separate from expected coverage."""
+
+    measurements = []
+    for surface_id in surface_ids:
+        delta = float(enabled_value) - float(disabled_value)
+        measurements.append(
+            {
+                "surface_id": str(surface_id),
+                "enabled_value": float(enabled_value),
+                "disabled_value": float(disabled_value),
+                "delta": delta,
+                "threshold": float(threshold),
+                "status": "ACTIVATED" if delta >= float(threshold) else "NOT_ACTIVATED",
+                "observed": True,
+            }
+        )
+    return measurements
+
+
 def _identity_evidence_payload(
     *,
     attempt: dict[str, Any],
@@ -9204,11 +9302,21 @@ def _c2c_strict_evidence_payloads(
         activation_exit_code = int(activation_receipt["exit_code"]) if activation_receipt is not None else 0
         activation_threshold = float(proxy_policy.get("activation_delta_threshold", 0.0))
         if simulate:
-            observed_surfaces = list(
-                activation.get("observed_surface_ids")
-                or (activation_surfaces if activation.get("status") == "passed" else [])
-            )
             activation_delta = activation_threshold + 1.0 if activation.get("status") == "passed" else activation_threshold - 1.0
+            declared_observed = activation.get("observed_surface_ids")
+            if isinstance(declared_observed, list):
+                observed_surfaces = [str(item) for item in declared_observed]
+            else:
+                observed_surfaces = [
+                    item["surface_id"]
+                    for item in _synthetic_activation_probe_measurements(
+                        activation_surfaces,
+                        enabled_value=activation_delta,
+                        disabled_value=0.0,
+                        threshold=activation_threshold,
+                    )
+                    if item["observed"]
+                ]
         else:
             observed_surfaces = []
             for record in _c2c_raw_measurements_from_receipts(project_root, authoritative_command_receipts or []):

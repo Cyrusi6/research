@@ -22,16 +22,16 @@ from .derivation_contracts import validate_evidence_derivation_plan, validate_re
 
 DIRECTION_SCHEMA_VERSION = "auto_research_direction_v3"
 VARIANT_SCHEMA_VERSION = "auto_research_variant_v4"
-EVENT_SCHEMA_VERSION = "auto_research_event_v9"
-ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v9"
-RESEARCH_STATE_SCHEMA_VERSION = "auto_research_state_v9"
-TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v8"
+EVENT_SCHEMA_VERSION = "auto_research_event_v10"
+ATTEMPT_SCHEMA_VERSION = "auto_research_attempt_v10"
+RESEARCH_STATE_SCHEMA_VERSION = "auto_research_state_v10"
+TRIAL_SPEC_SCHEMA_VERSION = "auto_research_trial_spec_v9"
 TRIAL_RESULT_SCHEMA_VERSION = "auto_research_trial_result_v6"
 ROUTE_OUTCOME_SCHEMA_VERSION = "auto_research_route_outcome_v4"
 CONSTRAINT_RESULT_SCHEMA_VERSION = "auto_research_constraint_result_v2"
 DIRECTION_AGGREGATE_SCHEMA_VERSION = "auto_research_direction_outcome_aggregate_v1"
 PHASE_EXECUTION_MANIFEST_SCHEMA_VERSION = "auto_research_phase_execution_manifest_v3"
-PHASE_COMMAND_SCHEMA_VERSION = "auto_research_phase_command_v4"
+PHASE_COMMAND_SCHEMA_VERSION = "auto_research_phase_command_v5"
 PHASE_RUN_RECEIPT_SCHEMA_VERSION = "auto_research_phase_run_receipt_v5"
 AUTHORITATIVE_EVIDENCE_MANIFEST_SCHEMA_VERSION = "auto_research_evidence_manifest_v6"
 SAMPLE_MANIFEST_SCHEMA_VERSION = "auto_research_sample_manifest_v4"
@@ -225,7 +225,7 @@ def validate_variant_identity(direction: dict[str, Any], spec: dict[str, Any], *
 
 
 def validate_trial_spec(trial_spec: dict[str, Any]) -> None:
-    validate_contract(trial_spec, "trial_spec_v8.schema.json")
+    validate_contract(trial_spec, "trial_spec_v9.schema.json")
     datasets = {item["dataset_id"] for item in trial_spec["datasets"]}
     manifest_datasets = {item["dataset_id"] for item in trial_spec["sample_manifest"]["datasets"]}
     if datasets != manifest_datasets:
